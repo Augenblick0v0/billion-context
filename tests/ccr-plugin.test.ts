@@ -24,7 +24,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions } from "../src/session.ts";
+import { dropSessionForGc, listSessions } from "../src/session.ts";
 import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
 import { findCcrPluginDivergences, loadOptions } from "../src/config.ts";
@@ -284,6 +284,8 @@ test("e2e #1460 raw retransmission: a stored ref's raw bytes never leak back ont
         );
     } finally {
         await closeRig(rig);
+        // SessionStore is file-global: drop this armed session so later global session-count assertions stay clean (#1460).
+        dropSessionForGc("ccr-1460-conv");
     }
 });
 
@@ -302,7 +304,12 @@ test("e2e route-scoped CCR: plugin lane stays verbatim, proxy lane arms", async 
         const f1 = rig.forwards[0]!;
         assert.ok(f1.includes(BIG_TEXT), "plugin lane forwards the oversized result verbatim when CCR is route-scoped only");
         assert.ok(!f1.includes("[acp-stored"), "no stored placeholder on the plugin wire");
-        assert.equal(listSessions().filter((s) => ccrEnabled(s)).length, 0, "no session arms CCR from a route-scoped-only config on the plugin lane");
+        // Scoped to this test's plugin-lane conversation: other tests' sessions (file-global SessionStore) are outside this config-arming check.
+        assert.equal(
+            listSessions().filter((s) => s.id === "ccr-e2e-conv" && ccrEnabled(s)).length,
+            0,
+            "no session arms CCR from a route-scoped-only config on the plugin lane",
+        );
 
         // Proxy lane (no plugin header, fresh conversation id): the
         // route-level merge arms CCR and the proxy injects acp_retrieve.
