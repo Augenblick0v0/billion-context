@@ -111,6 +111,7 @@ export function adoptContentStore(session: Session, store: MessageContentStore):
             kind: entry.kind,
             tokens: entry.tokens,
             head: entry.head,
+            command: entry.command,
             retrieveToolName: retrieveToolName(session),
         });
         saved += Math.max(0, entry.chars - Buffer.byteLength(placeholder, "utf8"));
