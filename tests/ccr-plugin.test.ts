@@ -200,6 +200,12 @@ const BASE_MSGS = (): unknown[] => [
     { role: "tool", tool_call_id: "call_1", content: BIG_TEXT },
 ];
 
+const toolContentOf = (body: string): string => {
+    const parsed = JSON.parse(body) as { messages: Array<{ role: string; content?: unknown }> };
+    const toolMsg = parsed.messages.find((m) => m.role === "tool");
+    return toolMsg && typeof toolMsg.content === "string" ? toolMsg.content : "";
+};
+
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
     await once(rig.proxy, "close");
@@ -250,6 +256,32 @@ test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides fu
         assert.equal(rig.forwards.length, 2, "second outbound forward after turn 2");
         const f2 = rig.forwards[1]!;
         assert.ok(f2.includes(BIG_TEXT.slice(0, 120)), "full original rides back onto the turn-2 wire");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e #1460 raw retransmission: a stored ref's raw bytes never leak back onto the wire", async () => {
+    const rig = await startRig();
+    try {
+        await postOpenai(rig, BASE_MSGS(), "ccr-1460-conv");
+        const f1 = rig.forwards[0]!;
+        assert.ok(f1.includes("[acp-stored"), "turn-1 wire carries the placeholder");
+        assert.ok(!f1.includes(BIG_TEXT), "original must not be on the turn-1 wire");
+
+        // The host re-sends its OWN history with the tool result still raw —
+        // the client never saw the placeholder (fork/replay/state-loss lane).
+        await postOpenai(rig, [
+            ...BASE_MSGS(),
+            { role: "user", content: "did it work?" },
+        ], "ccr-1460-conv");
+        const f2 = rig.forwards[1]!;
+        assert.ok(!f2.includes(BIG_TEXT), "raw original leaked back onto the turn-2 wire (#1460)");
+        assert.equal(
+            toolContentOf(f2),
+            toolContentOf(f1),
+            "placeholder bytes must be identical across turns (replace-once-at-arrival)",
+        );
     } finally {
         await closeRig(rig);
     }
