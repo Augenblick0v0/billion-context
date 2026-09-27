@@ -65,9 +65,26 @@ Two lanes, same plugin (#941):
    for conversation …` warning, and the dsh plugin logs each distinct endpoint
    the attribution gate lets through unproxied (once per process). Reliable
    workaround meanwhile: launch through `bili dsh` instead — the launcher's
-   settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
-   the traffic reaches the proxy regardless of which fetch the transport uses
-   or what the attribution state is.
+    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
+    the traffic reaches the proxy regardless of which fetch the transport uses
+    or what the attribution state is.
+- **Interop note — retry on malformed tool args (#1518):** in plugin mode the
+  model generates `compress` arguments and dsh parses them strictly. On long
+  free-text summaries the model occasionally emits JSON with escape errors —
+  unescaped `"` inside prose, illegal escapes (e.g. `` \` ``), raw newlines
+  or tabs inside string literals. That class is *semantic* (telling which
+  quotes are structural vs content requires understanding the text), so no
+  syntactic salvage ladder can repair it, and bili passes plugin-mode
+  responses through verbatim — it has no seat at the parsing table. When dsh
+  rejects such a call (`MALFORMED_RESPONSE`) the whole turn dies unless it is
+  retried. Host-side mitigation: add `MALFORMED_RESPONSE` to
+  `retryPolicy.retryableCodes` — escape errors are sampling noise, so one
+  extra full call usually succeeds (one field report: ~7% of compress calls
+  failed this way over 285 attempts, while all other tool calls had zero
+  failures). The root fix — provider-side constrained decoding (e.g.
+  DeepSeek's Beta `tools[].function.strict`, Chat Completions wire only) — is
+  a host/provider work item; bili cannot enable it in plugin mode because it
+  does not construct the provider request.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
