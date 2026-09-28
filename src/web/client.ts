@@ -299,7 +299,11 @@ export const WEB_CLIENT = `(function () {
             if (a && a.id) {
                 ab.hidden = false;
                 ab.classList.add("show");
-                ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + a.id + "]</span> " + t("advisory.desc") + "<span>" + (a.reason || "") + "</span>" + t("advisory.hint") + '<span class="mono">npm install -g billion-context@' + (a.targetFailed ? "latest" : a.target || "latest") + "</span>";
+                if (a.pendingRestart) {
+                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + a.id + "]</span> " + t("advisory.restartDesc") + "<span>" + (a.reason || "") + "</span>" + t("advisory.restartHint");
+                } else {
+                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + a.id + "]</span> " + t("advisory.desc") + "<span>" + (a.reason || "") + "</span>" + t("advisory.hint") + '<span class="mono">npm install -g billion-context@' + (a.targetFailed ? "latest" : a.target || "latest") + "</span>";
+                }
             } else {
                 ab.hidden = true;
                 ab.classList.remove("show");

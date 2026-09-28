@@ -27,7 +27,7 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
-import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring } from "./advisory.js";
+import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
@@ -590,6 +590,10 @@ export async function main(): Promise<void> {
             // registry must not stall the normal self-update loop forever —
             // advisoryDeferring() goes false while lastError says "cannot resolve".
             advisoryActive: advisoryDeferring,
+            // #1588-A: even when no advisory is active against this machine,
+            // never install a candidate that falls inside a freshly parsed
+            // affected range (rollback-form advisories cover latest too).
+            advisoryBlocksVersion,
             onStaleInstall: createAutoRestartHandler({
                 enabled: opts.autoRestartOnUpdate,
                 packageName: PACKAGE_NAME,

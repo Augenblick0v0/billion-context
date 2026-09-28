@@ -15,6 +15,17 @@
  * never degrade a working proxy — model traffic is never blocked by this
  * mechanism. Trust domain: the document comes from the same registry bili
  * already auto-installs tarballs from; no new trust boundary.
+ *
+ * #1588 — rollback-form advisories (target OLDER than the registry's latest,
+ * whose affected range also covers latest) need two refinements:
+ *  - the normal self-update loop must refuse to install a candidate covered
+ *    by a freshly parsed affected range (advisoryBlocksVersion), so a clean
+ *    disk is never pulled back into the defect and rolled out again
+ *    (target↔latest ping-pong);
+ *  - once the forced install lands, the banner/status stays up until the
+ *    RUNNING version leaves the affected range — i.e. until a restart —
+ *    because a rollback leaves disk < running and the stale-install machinery
+ *    (#806/#811) is silent for that direction.
  */
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -50,12 +61,21 @@ export type AdvisoryEntry = {
 
 export type AdvisoryState = {
     /** Set while an entry matches the local version (whether or not the
-     *  forced install has succeeded yet). */
-    active?: AdvisoryEntry & { currentVersion: string };
+     *  forced install has succeeded yet). After a successful install it
+     *  persists until the RUNNING version leaves the affected range — i.e.
+     *  until a restart completes (#1588-B): a rollback install leaves disk <
+     *  running, so the stale-install machinery is silent and this banner is
+     *  the only persistent "restart bili" prompt. */
+    active?: AdvisoryEntry & { currentVersion: string; pendingRestart?: boolean; installedVersion?: string };
     lastCheckAt?: number;
-    /** Last failure reason (source fetch / parse / install); cleared on a
-     *  clean check. */
     lastError?: string;
+    /** Entries from the most recent cleanly parsed document — consumed by
+     *  advisoryBlocksVersion() so the normal self-update loop can refuse to
+     *  install a candidate that falls inside an active affected range even
+     *  when no advisory is active against THIS machine (#1588-A). Cleared on
+     *  every unhealthy feed state (fetch/parse failure) and when the matched
+     *  target cannot be installed (F2), so the block always fails open. */
+    entries?: AdvisoryEntry[];
 };
 
 let state: AdvisoryState = {};
@@ -72,6 +92,21 @@ export function getAdvisoryState(): AdvisoryState {
  *  @latest and the normal loop keeps the install alive. */
 export function advisoryDeferring(): boolean {
     return state.active !== undefined && !cannotResolveTarget(state.lastError);
+}
+
+/** #1588-A: true when `version` falls inside any freshly parsed advisory's
+ *  affected range. The normal self-update loop consults this BEFORE installing
+ *  its candidate: a rollback-form advisory ({affected covers the registry's
+ *  latest, target older}) leaves this machine's disk clean while latest stays
+ *  affected — blindly following latest would pull the machine back into the
+ *  defect and the watcher would roll it back again, ping-ponging every cycle.
+ *  Fails open like everything else here: no fresh parse (feed unreachable or
+ *  malformed) or an uninstallable target (F2) means no block. */
+export function advisoryBlocksVersion(version: string): boolean {
+    const entries = state.entries;
+    if (!entries || entries.length === 0) return false;
+    if (cannotResolveTarget(state.lastError)) return false;
+    return matchAdvisories(entries, version).length > 0;
 }
 
 export function cannotResolveTarget(err: string | undefined): boolean {
@@ -226,30 +261,49 @@ export async function runAdvisoryCheck(opts: AdvisoryWatcherOptions, force = fal
             const res = await fetch(url, init as RequestInit);
             if (!res.ok) throw new Error(`advisory source returned HTTP ${res.status}`);
             data = await res.json();
-        } catch (e) {
-            state.lastError = String(e);
-            warnOnce(log, `fetch:${String(e)}`, `[advisory] check failed (${String(e)}) — continuing without advisories`);
-            return;
-        }
-        const parsed = parseAdvisoryDoc(data);
-        if (parsed.error) {
-            state.lastError = parsed.error;
-            warnOnce(log, `parse:${parsed.error}`, `[advisory] ignoring malformed advisory document: ${parsed.error}`);
-            return;
-        }
-        state.lastError = undefined;
+    } catch (e) {
+        state.lastError = String(e);
+        // Fail-open the candidate block too (#1588-A): an unreachable feed must
+        // never keep gating the normal self-update loop on stale data.
+        state.entries = undefined;
+        warnOnce(log, `fetch:${String(e)}`, `[advisory] check failed (${String(e)}) — continuing without advisories`);
+        return;
+    }
+
+    const parsed = parseAdvisoryDoc(data);
+    if (parsed.error) {
+        state.lastError = parsed.error;
+        state.entries = undefined;
+        warnOnce(log, `parse:${parsed.error}`, `[advisory] ignoring malformed advisory document: ${parsed.error}`);
+        return;
+    }
+    state.lastError = undefined;
+    state.entries = parsed.entries;
 
         const installDir = opts.installDir ?? (await findInstallDir(opts.packageName));
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
         const matched = matchAdvisories(parsed.entries, currentVersion);
-        state.lastCheckAt = now;
+        state.lastCheckAt = Date.now();
         if (matched.length === 0) {
-            state.active = undefined;
+            // #1588-B: the disk copy left the affected range (forced install
+            // landed) but the RUNNING process may still execute an affected
+            // version — and with a rollback install (disk < running) the
+            // stale-install machinery is silent. Keep the banner alive until
+            // a restart completes instead of clearing it silently.
+            const runningMatched = matchAdvisories(parsed.entries, opts.currentVersion);
+            if (runningMatched.length === 0) {
+                state.active = undefined;
+                return;
+            }
+            const adv = runningMatched[0];
+            state.active = { ...(state.active ?? { ...adv, currentVersion: opts.currentVersion }), pendingRestart: true, installedVersion: diskVersion };
+            warnOnce(log, adv.id, `[advisory] ⚠️ ${adv.id}: running version ${opts.currentVersion} is affected (${adv.reason}) while the on-disk version ${diskVersion ?? "?"} is outside the range — restart bili to finish`);
             return;
         }
         const adv = matched[0];
-        state.active = { ...adv, currentVersion };
+        const active = { ...adv, currentVersion };
+        state.active = active;
         warnOnce(log, adv.id, `[advisory] ⚠️ ${adv.id}: version ${currentVersion} is affected (${adv.reason}) — forcing update to ${adv.target}`);
         const result = await forceInstallVersion(
             adv.target,
@@ -265,13 +319,22 @@ export async function runAdvisoryCheck(opts: AdvisoryWatcherOptions, force = fal
         );
         if (!result.ok) {
             state.lastError = result.error;
+            // F2: an uninstallable target must not leave this entry's ranges
+            // gating the normal loop either — release the candidate block the
+            // same way advisoryDeferring() releases the deferral.
+            if (cannotResolveTarget(result.error)) state.entries = undefined;
             return;
         }
-        // Install landed: re-evaluate against the new disk version so the
-        // banner clears in this same cycle when the target is clean.
+        // Install landed: re-evaluate against the RUNNING version, not the
+        // disk — the process keeps executing the old code until a restart,
+        // and a rollback leaves disk < running so the stale-install machinery
+        // is silent (#1588-B). Clears on the first check after the restart.
         const diskAfter = installDir ? await readDiskVersion(installDir) : undefined;
-        const still = matchAdvisories(parsed.entries, diskAfter ?? opts.currentVersion);
-        if (still.length === 0) state.active = undefined;
+        if (matchAdvisories(parsed.entries, opts.currentVersion).length === 0) {
+            state.active = undefined;
+        } else {
+            state.active = { ...active, pendingRestart: true, installedVersion: diskAfter ?? adv.target };
+        }
     } catch (e) {
         state.lastError = String(e);
         warnOnce(log, `check:${String(e)}`, `[advisory] check failed: ${String(e)}`);

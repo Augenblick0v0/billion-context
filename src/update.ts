@@ -100,6 +100,14 @@ export function _resetAdvisoryRefusalWarnsForTest(): void {
     advisoryRefusalWarnKeys.clear();
 }
 
+// THROTTLE_FILE is resolved once at module load, so every test in a process
+// shares one throttle state — non-forced checkForUpdate tests must reset it
+// or they inherit the previous test's "last checked" timestamp.
+export async function _resetUpdateThrottleForTest(): Promise<void> {
+    firstCheckDone = false;
+    await rm(THROTTLE_FILE, { force: true });
+}
+
 function warnAdvisoryOnce(advisoryId: string, message: string): void {
     const key = `${advisoryId}\u0000${message}`;
     if (advisoryRefusalWarnKeys.has(key)) return;
@@ -520,6 +528,16 @@ export type UpdateOptions = {
      *  wins over "follow latest"), otherwise the two loops would fight over
      *  the install dir every cycle. A forced manual check still proceeds. */
     advisoryActive?: () => boolean;
+    /** #1588-A: returns true when a candidate version falls inside any freshly
+     *  parsed advisory's affected range. Consulted right before the normal
+     *  loop installs its candidate: a rollback-form advisory leaves this
+     *  machine's disk clean while the registry's latest stays affected, and
+     *  following latest would pull the machine back into the defect (the
+     *  watcher would roll it back again — ping-pong). The blocklist wins over
+     *  "follow latest" until the advisory stops covering the candidate. The
+     *  predicate fails open; a forced manual check still proceeds. Absent =
+     *  no-op. */
+    advisoryBlocksVersion?: (version: string) => boolean;
     /** Fired whenever this process detects the on-disk install is newer than
      *  the running code (#811): right after a successful in-place install and
      *  on every subsequent up-to-date check while the process stays stale.
@@ -702,14 +720,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         await writeLastCheck(now);
         firstCheckDone = true;
 
-        if (!force && opts.advisoryActive?.()) {
-            // An active critical-bug advisory owns writable installs — its target
-            // version wins over "follow latest", otherwise the two loops fight
-            // over the install dir every cycle. Host-managed lanes are different:
-            // the advisory refuses to write them in place (#991), so their
-            // owner-channel self-heal (#1196) must keep running while deferred.
-            // A forced manual check still proceeds.
-            const dir = await findInstallDir(opts.packageName);
+    if (!force && opts.advisoryActive?.()) {
+        // The advisory watcher is working on this install dir: let its target
+        // version win instead of racing it with "follow latest".
+        const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
             const managed = dir ? hostManagedInstall(dir) : undefined;
             if (managed && dir) {
                 loggerLog("info", `[update] deferring to the advisory loop; ${managed.owner}-managed install keeps its owner-channel refresh (#991/#1196)`);
@@ -789,6 +803,18 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             // version — dsh reads the yml from here but the entry module from
             // each profile, so a stale copy hard-crashes dsh at boot.
             await convergeDshProfileBundles(installDir, diskVersion, process.env);
+            return;
+        }
+
+        // #1588-A: the candidate itself may sit inside a freshly parsed
+        // advisory's affected range even though no advisory is active against
+        // THIS machine (rollback form: disk/target clean, latest still
+        // affected). Installing it would pull the machine back into the defect
+        // and the watcher would roll it back again — ping-pong every cycle.
+        // Skip the candidate: the blocklist wins over "follow latest" until
+        // the advisory document stops covering it.
+        if (!force && opts.advisoryBlocksVersion?.(latest)) {
+            loggerLog("info", `[update] skipping ${latest}: covered by a critical-bug advisory's affected range (#1588) — not pulling this install back into the defect; retrying next cycle`);
             return;
         }
 

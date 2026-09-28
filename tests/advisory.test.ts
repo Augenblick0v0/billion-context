@@ -13,10 +13,11 @@ import {
     getAdvisoryState,
     _resetAdvisoryWatcherForTest,
     advisoryDeferring,
+    advisoryBlocksVersion,
     cannotResolveTarget,
     type AdvisoryEntry,
 } from "../src/advisory.ts";
-import { checkForUpdate, _resetAdvisoryRefusalWarnsForTest } from "../src/update.ts";
+import { checkForUpdate, _resetAdvisoryRefusalWarnsForTest, _resetUpdateThrottleForTest } from "../src/update.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -167,8 +168,25 @@ test("runAdvisoryCheck: forces the target version onto an affected install", { t
         );
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.9");
         assert.equal(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), "export const loaded = '1.2.9';\n");
-        const st = getAdvisoryState();
-        assert.equal(st.active, undefined, "banner clears once the target version is clean");
+        // #1588-B: the disk copy is clean but this process still runs 1.2.3 —
+        // the banner must persist with a restart prompt instead of clearing.
+        let st = getAdvisoryState();
+        assert.equal(st.active?.id, "bc-test-001", "banner persists while the running version is still affected");
+        assert.equal(st.active?.pendingRestart, true);
+        assert.equal(st.active?.installedVersion, "1.2.9");
+        assert.equal(st.lastError, undefined);
+        await withFetch(
+            [
+                { match: /billion-context-advisories/, body: doc },
+                { match: /\/billion-context\/1\.2\.9$/, body: { dist: { tarball: "https://registry.test/pkg-1.2.9.tgz", integrity } } },
+                { match: /pkg-1\.2\.9\.tgz/, body: tgz },
+            ],
+            async () => {
+                await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.9", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+            },
+        );
+        st = getAdvisoryState();
+        assert.equal(st.active, undefined, "banner clears only after a restart completes (running version leaves the range)");
         assert.equal(st.lastError, undefined);
     } finally {
         delete process.env.XDG_CACHE_HOME;
@@ -183,6 +201,7 @@ test("runAdvisoryCheck: rollback semantics — target OLDER than the current ver
     writeFileSync(path.join(fx.installDir, "dist", "index.js"), "export const loaded = '1.2.9';\n");
     process.env.XDG_CACHE_HOME = fx.cacheDir;
     _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
     try {
         const { tgz, integrity } = fx.makeTarball({ "package.json": pkgJson("1.2.4"), "dist/index.js": "export const loaded = '1.2.4';\n" });
         const doc = advisoryDoc([{ id: "bc-test-002", affected: ">=1.2.5 <1.3.0", target: "1.2.4", reason: "regression in 1.2.5+" }]);
@@ -197,7 +216,26 @@ test("runAdvisoryCheck: rollback semantics — target OLDER than the current ver
             },
         );
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.4");
-        assert.equal(getAdvisoryState().active, undefined);
+        // #1588-B: rollback leaves disk < running — the stale-install machinery
+        // is silent in that direction, so the banner is the persistent restart
+        // prompt and must survive the successful install.
+        const st = getAdvisoryState();
+        assert.equal(st.active?.id, "bc-test-002", "banner persists while the running version is still affected");
+        assert.equal(st.active?.pendingRestart, true);
+        assert.equal(st.active?.installedVersion, "1.2.4");
+        // #1588-A main variant: with the banner up, the normal loop keeps
+        // deferring instead of pulling latest (still affected) back onto disk.
+        const lines: string[] = [];
+        setLogCapture((_level, msg) => { lines.push(msg); });
+        try {
+            const calls = await withFetch([], async () => {
+                await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.9", autoUpdate: true, advisoryActive: () => getAdvisoryState().active !== undefined, installDir: fx.installDir }, false);
+            });
+            assert.equal(calls, 0, "normal loop must not touch the registry while the advisory owns the install");
+        } finally {
+            setLogCapture(null);
+        }
+        assert.ok(lines.some((l) => l.includes("deferring to the advisory loop")), `must log the deferral decision itself, got: ${JSON.stringify(lines)}`);
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
@@ -386,6 +424,7 @@ test("checkForUpdate: defers to an active advisory instead of fighting it", asyn
     mkdirSync(path.join(fx.installDir, ".git"), { recursive: true });
     process.env.XDG_CACHE_HOME = fx.cacheDir;
     _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
     try {
         const doc = advisoryDoc([{ id: "bc-test-005", affected: ">=1.2.0", target: "1.2.9", reason: "r" }]);
         await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
@@ -407,5 +446,97 @@ test("checkForUpdate: defers to an active advisory instead of fighting it", asyn
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
         rmrf(fx.root);
+    }
+});
+
+test("checkForUpdate: skips a candidate covered by a freshly parsed advisory range (#1588 ping-pong window)", async () => {
+    // Residual window the deferral cannot cover: this machine is clean
+    // (running == disk == 1.2.3, outside the range) while a rollback-form
+    // advisory covers everything from 1.2.4 up — including the registry's
+    // latest. Blindly following latest would pull the machine back into the
+    // defect and the watcher would roll it back again, every cycle.
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
+    try {
+        const { tgz, integrity } = fx.makeTarball({ "package.json": pkgJson("1.2.9"), "dist/index.js": "export const loaded = '1.2.9';\n" });
+        const doc = advisoryDoc([{ id: "bc-test-010", affected: ">=1.2.4", target: "1.2.3", reason: "regression in 1.2.4+" }]);
+        await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
+            await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.3", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+        });
+        assert.equal(getAdvisoryState().active, undefined, "precondition: no advisory active against this machine");
+        assert.equal(advisoryBlocksVersion("1.2.9"), true, "freshly parsed range blocks the candidate");
+        assert.equal(advisoryBlocksVersion("1.2.3"), false);
+        const lines: string[] = [];
+        setLogCapture((_level, msg) => { lines.push(msg); });
+        try {
+            const calls = await withFetch(
+                [
+                    { match: /\/billion-context\/latest$/, body: { version: "1.2.9", dist: { tarball: "https://registry.test/pkg-1.2.9.tgz", integrity } } },
+                    { match: /pkg-1\.2\.9\.tgz/, body: tgz },
+                ],
+                async () => {
+                    await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.3", autoUpdate: true, advisoryActive: () => getAdvisoryState().active !== undefined, advisoryBlocksVersion, installDir: fx.installDir }, false);
+                },
+            );
+            assert.equal(calls, 1, "only the registry packument was fetched — the tarball was never downloaded");
+        } finally {
+            setLogCapture(null);
+        }
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "install untouched");
+        assert.ok(lines.some((l) => l.includes("skipping 1.2.9") && l.includes("#1588")), `must log the skip decision itself, got: ${JSON.stringify(lines)}`);
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmSync(fx.root, { recursive: true, force: true });
+    }
+});
+
+test("advisoryBlocksVersion: fails open when the feed goes unhealthy", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    try {
+        const doc = advisoryDoc([{ id: "bc-test-012", affected: ">=1.2.4", target: "1.2.3", reason: "r" }]);
+        await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
+            await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.3", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+        });
+        assert.equal(advisoryBlocksVersion("1.2.9"), true, "clean parse arms the block");
+        const original = globalThis.fetch;
+        globalThis.fetch = (() => Promise.reject(new Error("ECONNREFUSED"))) as unknown as typeof fetch;
+        await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.3", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+        globalThis.fetch = original;
+        assert.match(getAdvisoryState().lastError ?? "", /ECONNREFUSED/);
+        assert.equal(advisoryBlocksVersion("1.2.9"), false, "an unreachable feed must never keep gating the normal loop on stale data");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmSync(fx.root, { recursive: true, force: true });
+    }
+});
+
+test("advisoryBlocksVersion: released together with the deferral when the target cannot be resolved (F2)", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    _resetAdvisoryRefusalWarnsForTest();
+    try {
+        // Same typo scenario as the F2 test above, asserted through the block:
+        // an uninstallable target must release BOTH escape hatches, or the
+        // normal loop stalls forever in its new form (#1196 wedge class).
+        const doc = advisoryDoc([{ id: "bc-test-013", affected: ">=1.2.0", target: "9.9.9", reason: "escape-hatch version unpublished (typo)" }]);
+        await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
+            await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.3", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+        });
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "install untouched");
+        assert.match(getAdvisoryState().lastError ?? "", /cannot resolve 9\.9\.9 on the registry/);
+        assert.equal(advisoryDeferring(), false, "deferral released (existing F2 contract)");
+        assert.equal(advisoryBlocksVersion("1.2.9"), false, "candidate block released in the same state");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        _resetAdvisoryRefusalWarnsForTest();
+        rmSync(fx.root, { recursive: true, force: true });
     }
 });
