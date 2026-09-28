@@ -1172,6 +1172,50 @@ const CLEAN_TURN_REASONS = new Set(["stop", "end_turn", "stop_sequence"]);
 
 const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
 
+/** #1518 stage 1: post-hoc strict-JSON check of model-emitted tool-call
+ *  arguments on the VERBATIM plugin lane. In plugin mode the host parses these
+ *  strings strictly at its terminal (DSH: message_stop) and a malformed one
+ *  kills the whole turn (MALFORMED_RESPONSE); bili forwards them untouched
+ *  (#1039) and has no seat at the parsing table, so this observe-only pass
+ *  records what the host is about to reject — tool name, V8 error class,
+ *  length, error position — the telemetry that previously required reconstructing
+ *  argument deltas by hand out of zstd-framed session logs (issue #1518).
+ *  Forwarding bytes are never altered; the proxy's own salvage ladder
+ *  (#603/#1508) stays off this lane by design. Gated on a bound session: the
+ *  proxy-mode #460 lanes deliberately pass none, keeping their diagnostics in
+ *  the ladder's own hands. Structured-object args (anthropic `input`, gemini
+ *  `args`) are parse-valid by construction and never reach this. */
+function noteMalformedToolArgs(
+    session: Session | undefined,
+    protocol: string,
+    calls: ReadonlyArray<{ name: string; args: string }>,
+    log?: (msg: string) => void,
+): void {
+    if (!session) return;
+    for (const c of calls) {
+        if (c.name.length === 0 || c.args.trim().length === 0) continue;
+        let errMessage = "";
+        try {
+            JSON.parse(c.args);
+        } catch (e) {
+            errMessage = e instanceof Error ? e.message : String(e);
+        }
+        if (!errMessage) continue;
+        // V8 appends "in JSON at position N" + "(line L column C)" and, for
+        // short inputs, an embedded snippet of the offending text — strip all
+        // three so the error CLASS is the stable part of the line and no
+        // payload content is ever echoed into the log.
+        const pos = /position (\d+)/.exec(errMessage)?.[1];
+        const cls = errMessage
+            .replace(/\s*in JSON at position \d+/, "")
+            .replace(/\s*\(line \d+ column \d+\)$/, "")
+            .replace(/,\s*".*" is not valid JSON$/s, "");
+        const msg = `[plugin] [${session.id}] malformed tool-call args forwarded verbatim (${protocol}, tool=${c.name}, len=${c.args.length}${pos !== undefined ? `, err@${pos}` : ""}): ${cls} (#1518 observe-only)`;
+        loggerLog("warn", msg);
+        log?.(msg);
+    }
+}
+
 /** Plugin-mode streaming passthrough for the OpenAI chat-completions and
  *  Anthropic wires: forward upstream events byte-identical (the agent's
  *  native tool loop must see the model's tool calls untouched) while (a)
@@ -1289,7 +1333,7 @@ export async function pipePluginChatWithStrip(
     // settles a once-per-response warn when upstream emits a call whose name
     // never arrives (#1484 class), so the observed rate can settle the
     // drop-vs-keep policy without touching fidelity.
-    const seenToolCalls = new Map<string, { label: string; id: string; name: string; argsLen: number; frags: number }>();
+    const seenToolCalls = new Map<string, { label: string; id: string; name: string; argsLen: number; args: string; frags: number }>();
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
     // terminal event is dropped when the retry takes over, so the client sees
     // one turn: its framing stays open, and the retry's content blocks are
@@ -1523,13 +1567,18 @@ export async function pipePluginChatWithStrip(
                         const t = tcf as Record<string, unknown>;
                         const tIdx = typeof t["index"] === "number" ? t["index"] : ti;
                         const key = `${ci}:${tIdx}`;
-                        const accTc = seenToolCalls.get(key) ?? { label: `idx=${tIdx}`, id: "", name: "", argsLen: 0, frags: 0 };
+                        const accTc = seenToolCalls.get(key) ?? { label: `idx=${tIdx}`, id: "", name: "", argsLen: 0, args: "", frags: 0 };
                         if (typeof t["id"] === "string" && t["id"]) accTc.id = t["id"];
                         const fn = t["function"];
                         if (fn && typeof fn === "object") {
                             const f = fn as Record<string, unknown>;
                             if (typeof f["name"] === "string") accTc.name += f["name"];
-                            if (typeof f["arguments"] === "string") accTc.argsLen += f["arguments"].length;
+                            if (typeof f["arguments"] === "string") {
+                                // #1518 stage 1: keep the raw string itself so the
+                                // stream-end pass can strict-parse it (#1501 kept length only).
+                                accTc.argsLen += f["arguments"].length;
+                                accTc.args += f["arguments"];
+                            }
                         }
                         accTc.frags++;
                         seenToolCalls.set(key, accTc);
@@ -1627,6 +1676,7 @@ export async function pipePluginChatWithStrip(
                     id: cb && typeof cb["id"] === "string" ? cb["id"] : "",
                     name: cb && typeof cb["name"] === "string" ? cb["name"] : "",
                     argsLen: 0,
+                    args: "",
                     frags: 1,
                 });
             } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
@@ -1641,7 +1691,10 @@ export async function pipePluginChatWithStrip(
         // #1039 — argument bytes are user intent, forwarded verbatim.
         if (d?.["type"] === "input_json_delta") {
             const accTc = seenToolCalls.get(`block:${index}`);
-            if (accTc && typeof d["partial_json"] === "string") accTc.argsLen += d["partial_json"].length;
+            if (accTc && typeof d["partial_json"] === "string") {
+                accTc.argsLen += d["partial_json"].length;
+                accTc.args += d["partial_json"];
+            }
         }
         const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
         if (field === null || typeof d?.[field] !== "string") {
@@ -1717,11 +1770,14 @@ export async function pipePluginChatWithStrip(
                     // Gemini delivers functionCall whole in one part, so a missing
                     // name is final here (#1501). Observe-only — bytes untouched.
                     const fcObj = p["functionCall"] && typeof p["functionCall"] === "object" ? p["functionCall"] as Record<string, unknown> : undefined;
+                    // Gemini delivers args as a structured object (parse-valid by
+                    // construction) — no argument string to check (#1518).
                     seenToolCalls.set(`cand:${ci}/part:${pi}`, {
                         label: `candidate=${ci}/part=${pi}`,
                         id: "",
                         name: fcObj && typeof fcObj["name"] === "string" ? fcObj["name"] : "",
                         argsLen: fcObj && fcObj["args"] !== null && typeof fcObj["args"] === "object" ? JSON.stringify(fcObj["args"]).length : 0,
+                        args: "",
                         frags: 1,
                     });
                 }
@@ -1897,6 +1953,7 @@ export async function pipePluginChatWithStrip(
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
         maybeWarnNamelessToolCalls();
+        noteMalformedToolArgs(session, protocol, [...seenToolCalls.values()].map((tc) => ({ name: tc.name, args: tc.args })), log);
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
@@ -2024,6 +2081,9 @@ export async function pipePluginResponsesWithStrip(
     );
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
+    // #1518 stage 1: final argument string per function_call item — the host
+    // parses these strictly at completion; record what it would reject.
+    const respToolArgs = new Map<string, { name: string; args: string }>();
     let sawReasoning = false;
     /** The model emitted markup the filter stripped (or would strip): proof the
      *  turn produced output, even when none survived to be visible. */
@@ -2284,6 +2344,15 @@ export async function pipePluginResponsesWithStrip(
                             const item = ev["item"] as Record<string, unknown> | undefined;
                             const it = item?.["type"];
                             if (it === "function_call" || it === "custom_tool_call") sawFunctionCall = true;
+                            // #1518 stage 1: added announces the name (arguments
+                            // still ""); done carries the final arguments string.
+                            if (it === "function_call" && item) {
+                                const key = typeof item["id"] === "string" ? item["id"] : String(ev["output_index"] ?? 0);
+                                const e = respToolArgs.get(key) ?? { name: "", args: "" };
+                                if (typeof item["name"] === "string") e.name = item["name"];
+                                if (typeof item["arguments"] === "string" && item["arguments"].length > 0) e.args = item["arguments"];
+                                respToolArgs.set(key, e);
+                            }
                         }
                         const resp = ev["response"] as Record<string, unknown> | undefined;
                         if (resp && typeof resp["status"] === "string") responseStatus = resp["status"] as string;
@@ -2302,7 +2371,23 @@ export async function pipePluginResponsesWithStrip(
                     // function_call_arguments.done carries tool arguments, not
                     // visible text: forwarded verbatim (#1039).
                     if (type === "response.function_call_arguments.done") {
+                        // #1518 stage 1: the done event's arguments string is the
+                        // authoritative final value for its item.
+                        const key = typeof ev["item_id"] === "string" ? ev["item_id"] : String(ev["output_index"] ?? 0);
+                        const e = respToolArgs.get(key) ?? { name: "", args: "" };
+                        if (typeof ev["arguments"] === "string") e.args = ev["arguments"];
+                        respToolArgs.set(key, e);
                         await write(flushArgTails() + rawEvent + "\n\n");
+                        continue;
+                    }
+                    // #1518 stage 1: accumulate argument deltas per item — bytes
+                    // forward exactly as today (the generic write did that before).
+                    if (type === "response.function_call_arguments.delta" && typeof ev["delta"] === "string") {
+                        const key = typeof ev["item_id"] === "string" ? ev["item_id"] : String(ev["output_index"] ?? 0);
+                        const e = respToolArgs.get(key) ?? { name: "", args: "" };
+                        e.args += ev["delta"];
+                        respToolArgs.set(key, e);
+                        await write(rawEvent + "\n\n");
                         continue;
                     }
                     // #933: done-family events also carry full text payloads — strip those too.
@@ -2359,6 +2444,7 @@ export async function pipePluginResponsesWithStrip(
                             // call would have blocked the retry via sawFunctionCall.
                             for (const s of argStreams.values()) s.filter.flush();
                             argStreams.clear();
+                            respToolArgs.clear();
                             heldEvents = [];
                             heldVisibleChars = 0;
                             continue;
@@ -2415,7 +2501,8 @@ export async function pipePluginResponsesWithStrip(
                     }
                     // Reasoning summary deltas carry visible prose; function_call
                     // argument deltas are user intent and pass through verbatim
-                    // (#1039), falling into the generic rawEvent write below.
+                    // (#1039) — their own branch above accumulates them for the
+                    // #1518 observe-only pass and writes them byte-identical.
                     const argField = type === "response.reasoning_summary_text.delta" ? "delta" : null;
                     if (argField !== null && typeof type === "string") {
                         const v = ev[argField];
@@ -2452,6 +2539,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        noteMalformedToolArgs(session, "responses", [...respToolArgs.values()], log);
         settleUsage();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
@@ -2615,6 +2703,48 @@ export async function pipePluginJson(
         }
         // #1595: parsed success body carrying no input usage report — name it.
         if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        // #1518 stage 1: the non-streaming twin — string-carried tool arguments
+        // (openai chat.completion, responses function_call) get the same post-hoc
+        // strict check; structured-object args are parse-valid by construction.
+        if (session) {
+            const calls: Array<{ name: string; args: string }> = [];
+            if (protocol === "responses") {
+                const output = json["output"];
+                if (Array.isArray(output)) {
+                    for (const item of output) {
+                        if (!item || typeof item !== "object") continue;
+                        const o = item as Record<string, unknown>;
+                        if (o["type"] !== "function_call") continue;
+                        calls.push({
+                            name: typeof o["name"] === "string" ? o["name"] : "",
+                            args: typeof o["arguments"] === "string" ? o["arguments"] : "",
+                        });
+                    }
+                }
+            } else {
+                const choices = json["choices"];
+                if (Array.isArray(choices)) {
+                    for (const ch of choices) {
+                        if (!ch || typeof ch !== "object") continue;
+                        const msg = (ch as Record<string, unknown>)["message"];
+                        if (!msg || typeof msg !== "object") continue;
+                        const arr = (msg as Record<string, unknown>)["tool_calls"];
+                        if (!Array.isArray(arr)) continue;
+                        for (const tc of arr) {
+                            if (!tc || typeof tc !== "object") continue;
+                            const fn = (tc as Record<string, unknown>)["function"];
+                            if (!fn || typeof fn !== "object") continue;
+                            const fnRec = fn as Record<string, unknown>;
+                            calls.push({
+                                name: typeof fnRec["name"] === "string" ? fnRec["name"] : "",
+                                args: typeof fnRec["arguments"] === "string" ? fnRec["arguments"] : "",
+                            });
+                        }
+                    }
+                }
+            }
+            noteMalformedToolArgs(session, protocol ?? "unknown", calls);
+        }
     } catch { /* non-JSON body — forward verbatim */ }
         if (json && (containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
