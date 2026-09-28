@@ -509,15 +509,17 @@ export async function main(): Promise<void> {
         }
         let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
         let updateTag: string | undefined;
+        let advisoryUrl: string | undefined;
         try {
             const o = loadOptions();
             updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
             updateTag = o.updateTag;
+            advisoryUrl = o.advisoryUrl;
         } catch {
             // config unloadable — registry egress goes direct
         }
         try {
-            const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag });
+            const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag, advisoryUrl });
             process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
         } catch (error) {
             console.error(`bili doctor: ${error instanceof Error ? error.message : String(error)}`);

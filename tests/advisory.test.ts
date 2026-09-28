@@ -11,6 +11,8 @@ import {
     resolveAdvisoryUrl,
     runAdvisoryCheck,
     getAdvisoryState,
+    evaluateAdvisories,
+    describeAdvisory,
     _resetAdvisoryWatcherForTest,
     advisoryDeferring,
     cannotResolveTarget,
@@ -146,6 +148,52 @@ test("resolveAdvisoryUrl: explicit override wins, default is the companion packa
     assert.equal(resolveAdvisoryUrl("  https://example.test/feed.json "), "https://example.test/feed.json");
     assert.ok(resolveAdvisoryUrl(undefined).endsWith("/billion-context-advisories/latest"));
     assert.ok(resolveAdvisoryUrl("   ").endsWith("/billion-context-advisories/latest"));
+});
+
+const EVAL_URL = "https://registry.test/billion-context-advisories/latest";
+
+test("#1577: evaluateAdvisories matches an affected version read-only (no install)", async () => {
+    const doc = advisoryDoc([{ id: "bc-2026-001", affected: ">=1.2.0 <1.2.5", target: "1.2.9", reason: "corrupts tool-call arguments" }]);
+    await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
+        const r = await evaluateAdvisories({ version: "1.2.3", advisoryUrl: EVAL_URL });
+        assert.equal(r.error, undefined);
+        assert.deepEqual(r.active, { id: "bc-2026-001", affected: ">=1.2.0 <1.2.5", target: "1.2.9", reason: "corrupts tool-call arguments", currentVersion: "1.2.3" });
+        assert.equal(getAdvisoryState().active, undefined, "read-only eval must not mutate module state");
+    });
+});
+
+test("#1577: evaluateAdvisories returns clean when no range covers the version", async () => {
+    const doc = advisoryDoc([{ id: "bc-2026-001", affected: ">=1.2.0 <1.2.5", target: "1.2.9", reason: "r" }]);
+    await withFetch([{ match: /billion-context-advisories/, body: doc }], async () => {
+        const r = await evaluateAdvisories({ version: "9.9.9", advisoryUrl: EVAL_URL });
+        assert.equal(r.error, undefined);
+        assert.equal(r.active, undefined);
+    });
+});
+
+test("#1577: evaluateAdvisories fails open on fetch error and malformed doc", async () => {
+    await withFetch([], async () => {
+        const r = await evaluateAdvisories({ version: "1.2.3", advisoryUrl: EVAL_URL });
+        assert.match(r.error ?? "", /unexpected fetch|failed/i);
+        assert.equal(r.active, undefined);
+    });
+    await withFetch([{ match: /billion-context-advisories/, body: { billionContextAdvisories: { schema: 99, advisories: [] } } }], async () => {
+        const r = await evaluateAdvisories({ version: "1.2.3", advisoryUrl: EVAL_URL });
+        assert.match(r.error ?? "", /unsupported schema 99/);
+        assert.equal(r.active, undefined);
+    });
+});
+
+test("#1577: describeAdvisory renders id/version/reason + manual command; falls back to @latest when unresolvable", () => {
+    const active = { id: "bc-2026-001", affected: ">=1.2.0", target: "1.2.9", reason: "corrupts tool-call arguments", currentVersion: "1.2.3" };
+    const normal = describeAdvisory(active, undefined);
+    assert.ok(normal.includes("[bc-2026-001] version 1.2.3 is affected (corrupts tool-call arguments)"), normal);
+    assert.ok(normal.includes("npm install -g billion-context@1.2.9"), normal);
+    assert.ok(!normal.includes("latest"), "no fallback note for a resolvable target");
+
+    const unresolved = describeAdvisory(active, "cannot resolve 1.2.9 on the registry");
+    assert.ok(unresolved.includes("npm install -g billion-context@latest"), unresolved);
+    assert.ok(unresolved.includes("pinned target unresolvable"), unresolved);
 });
 
 test("runAdvisoryCheck: forces the target version onto an affected install", { timeout: 30_000 }, async () => {

@@ -78,12 +78,30 @@ export function cannotResolveTarget(err: string | undefined): boolean {
     return typeof err === "string" && err.includes("cannot resolve");
 }
 
+/** Canonical one-sentence description of an active advisory (#1577), shared by
+ *  every visibility surface (acp_status, /acp panel, bili doctor) so they
+ *  cannot drift apart. When the pinned target is unresolvable on the registry
+ *  (`lastError` says so) it falls back to @latest — mirroring the web banner's
+ *  escape hatch — and notes that. */
+export function describeAdvisory(active: AdvisoryEntry & { currentVersion: string }, lastError: string | undefined): string {
+    const failed = cannotResolveTarget(lastError);
+    const target = failed ? "latest" : active.target;
+    const fallback = failed ? " (pinned target unresolvable — use latest)" : "";
+    return `[${active.id}] version ${active.currentVersion} is affected (${active.reason}) — upgrade to ${target}: npm install -g billion-context@${target}${fallback}`;
+}
+
 /** Test seam: clear state, warn dedupe, and stop the timer. */
 export function _resetAdvisoryWatcherForTest(): void {
     state = {};
     warnedKeys.clear();
     firstCheckDone = false;
     stopAdvisoryWatcher();
+}
+
+/** Test seam: replace the live advisory state (surfaces read it via
+ *  getAdvisoryState()) without driving the watcher. */
+export function _setAdvisoryStateForTest(s: AdvisoryState): void {
+    state = s;
 }
 
 /** Default source: the npm companion package's `latest` doc on the SAME
@@ -298,4 +316,44 @@ export function stopAdvisoryWatcher(): void {
         clearInterval(timer);
         timer = undefined;
     }
+}
+
+export type AdvisoryEvaluation = {
+    /** Set when `version` falls inside an entry's affected range. */
+    active?: AdvisoryEntry & { currentVersion: string };
+    /** Set when the source fetch or parse failed — callers report "unknown". */
+    error?: string;
+};
+
+/** Read-only advisory evaluation (#1577): fetch + validate + match against
+ *  `version`, with NO install side effects and NO in-process state mutation.
+ *  Used by `bili doctor`, which runs in its own process where the watcher's
+ *  module state is empty. Fail-open like runAdvisoryCheck — an unreachable or
+ *  malformed source yields `{ error }`, never a throw. */
+export async function evaluateAdvisories(opts: {
+    version: string;
+    advisoryUrl?: string;
+    resolveProxy?: (url: string) => string | undefined;
+}): Promise<AdvisoryEvaluation> {
+    const url = resolveAdvisoryUrl(opts.advisoryUrl);
+    let data: unknown;
+    try {
+        const dispatcher = egressDispatcher({ resolveProxy: opts.resolveProxy }, url);
+        const init: FetchOptions = {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(5000),
+            ...(dispatcher ? { dispatcher } : {}),
+        };
+        const res = await fetch(url, init as RequestInit);
+        if (!res.ok) return { error: `advisory source returned HTTP ${res.status}` };
+        data = await res.json();
+    } catch (e) {
+        return { error: String(e) };
+    }
+    const parsed = parseAdvisoryDoc(data);
+    if (parsed.error) return { error: parsed.error };
+    const matched = matchAdvisories(parsed.entries, opts.version);
+    if (matched.length === 0) return {};
+    return { active: { ...matched[0], currentVersion: opts.version } };
 }

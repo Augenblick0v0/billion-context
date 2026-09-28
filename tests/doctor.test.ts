@@ -319,3 +319,77 @@ test("runDoctor: unreachable registry never produces a false-stale verdict", asy
         rmrf(base);
     }
 });
+
+function advisoryDocFor(entries: Array<{ id: string; affected: string; target: string; reason: string }>): Record<string, unknown> {
+    return { billionContextAdvisories: { schema: 1, updated: "2026-09-28", advisories: entries } };
+}
+
+const ADVISORY_URL = "https://registry.test/bc-advisories.json";
+
+function doctorSandboxEnv(base: string): Record<string, string | undefined> {
+    return {
+        HOME: path.join(base, "home"),
+        XDG_CONFIG_HOME: path.join(base, "xdg-config"),
+        XDG_DATA_HOME: path.join(base, "xdg-data"),
+        XDG_CACHE_HOME: path.join(base, "xdg-cache"),
+        XDG_STATE_HOME: path.join(base, "xdg-state"),
+        PI_CODING_AGENT_DIR: undefined, PI_HOME: undefined, DSH_HOME: undefined, HERMES_HOME: undefined,
+        KIMI_CODE_HOME: undefined, CODEX_HOME: undefined, CLAUDE_CONFIG_DIR: undefined, OPENCODE_CONFIG: undefined,
+    };
+}
+
+test("#1577: bili doctor reports an active advisory against the on-disk version", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-adv-"));
+    const advDoc = advisoryDocFor([{ id: "bc-2026-001", affected: ">=0.0.0", target: "99.0.0", reason: "corrupts tool-call arguments" }]);
+    const runWithFetch = mockFetch((url) =>
+        url.includes("bc-advisories.json")
+            ? new Response(JSON.stringify(advDoc))
+            : new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    try {
+        await runWithFetch(async () => {
+            await withEnv(doctorSandboxEnv(base), async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143", advisoryUrl: ADVISORY_URL });
+                assert.equal(report.global.advisory?.error, undefined);
+                assert.equal(report.global.advisory?.active?.id, "bc-2026-001");
+                assert.equal(report.global.advisory?.active?.currentVersion, report.global.diskVersion ?? "0.1.143");
+                const text = renderDoctorReport(report);
+                assert.match(text, /advisory      ⚠️ \[bc-2026-001\] .*corrupts tool-call arguments/);
+                assert.ok(text.includes("npm install -g billion-context@99.0.0"));
+            });
+        });
+    } finally {
+        rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("#1577: bili doctor reports a clean advisory state as 'none' and a failed source as unknown", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-adv-none-"));
+    const cleanDoc = advisoryDocFor([]);
+    const runClean = mockFetch((url) =>
+        url.includes("bc-advisories.json")
+            ? new Response(JSON.stringify(cleanDoc))
+            : new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    try {
+        await runClean(async () => {
+            await withEnv(doctorSandboxEnv(base), async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143", advisoryUrl: ADVISORY_URL });
+                assert.equal(report.global.advisory?.active, undefined);
+                assert.equal(report.global.advisory?.error, undefined);
+                assert.match(renderDoctorReport(report), /advisory      none/);
+            });
+        });
+        const runFail = mockFetch(() => Promise.reject(new Error("ENOTFOUND")));
+        await runFail(async () => {
+            await withEnv(doctorSandboxEnv(base), async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143", advisoryUrl: ADVISORY_URL });
+                assert.equal(report.global.advisory?.active, undefined);
+                assert.match(report.global.advisory?.error ?? "", /ENOTFOUND|fetch/i);
+                assert.match(renderDoctorReport(report), /advisory      check failed .*— status unknown/);
+            });
+        });
+    } finally {
+        rmSync(base, { recursive: true, force: true });
+    }
+});
