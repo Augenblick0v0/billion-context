@@ -261,24 +261,24 @@ export async function runAdvisoryCheck(opts: AdvisoryWatcherOptions, force = fal
             const res = await fetch(url, init as RequestInit);
             if (!res.ok) throw new Error(`advisory source returned HTTP ${res.status}`);
             data = await res.json();
-    } catch (e) {
-        state.lastError = String(e);
-        // Fail-open the candidate block too (#1588-A): an unreachable feed must
-        // never keep gating the normal self-update loop on stale data.
-        state.entries = undefined;
-        warnOnce(log, `fetch:${String(e)}`, `[advisory] check failed (${String(e)}) — continuing without advisories`);
-        return;
-    }
+        } catch (e) {
+            state.lastError = String(e);
+            // Fail-open the candidate block too (#1588-A): an unreachable feed must
+            // never keep gating the normal self-update loop on stale data.
+            state.entries = undefined;
+            warnOnce(log, `fetch:${String(e)}`, `[advisory] check failed (${String(e)}) — continuing without advisories`);
+            return;
+        }
 
-    const parsed = parseAdvisoryDoc(data);
-    if (parsed.error) {
-        state.lastError = parsed.error;
-        state.entries = undefined;
-        warnOnce(log, `parse:${parsed.error}`, `[advisory] ignoring malformed advisory document: ${parsed.error}`);
-        return;
-    }
-    state.lastError = undefined;
-    state.entries = parsed.entries;
+        const parsed = parseAdvisoryDoc(data);
+        if (parsed.error) {
+            state.lastError = parsed.error;
+            state.entries = undefined;
+            warnOnce(log, `parse:${parsed.error}`, `[advisory] ignoring malformed advisory document: ${parsed.error}`);
+            return;
+        }
+        state.lastError = undefined;
+        state.entries = parsed.entries;
 
         const installDir = opts.installDir ?? (await findInstallDir(opts.packageName));
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;

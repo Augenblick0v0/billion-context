@@ -720,10 +720,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         await writeLastCheck(now);
         firstCheckDone = true;
 
-    if (!force && opts.advisoryActive?.()) {
-        // The advisory watcher is working on this install dir: let its target
-        // version win instead of racing it with "follow latest".
-        const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
+        if (!force && opts.advisoryActive?.()) {
+            // The advisory watcher is working on this install dir: let its target
+            // version win instead of racing it with "follow latest".
+            const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
             const managed = dir ? hostManagedInstall(dir) : undefined;
             if (managed && dir) {
                 loggerLog("info", `[update] deferring to the advisory loop; ${managed.owner}-managed install keeps its owner-channel refresh (#991/#1196)`);
