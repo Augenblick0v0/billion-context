@@ -867,7 +867,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         preFooter.push(`Web UI: ${webUrl}`);
     }
     if (panel !== undefined && preFooter.length > 0) {
-        panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`);
+        // Escape $ so advisory text (remote doc content) cannot be read as
+        // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
+        panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

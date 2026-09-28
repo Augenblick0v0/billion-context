@@ -47,6 +47,16 @@ test("#1577: /acp panel surfaces an active advisory before the footer (stripper-
         assert.ok(p1.includes("npm install -g billion-context@0.1.157"), "carries the manual command");
         assert.ok(p1.includes(PANEL_BOX_FOOTER), "footer still present with the advisory");
         assert.ok(p1.indexOf("CRITICAL ADVISORY") < p1.indexOf(PANEL_BOX_FOOTER), "advisory sits BEFORE the footer so the stripper still matches");
+
+        // Remote-doc content must render verbatim: $ sequences are replace()
+        // pattern syntax and would corrupt the box lines unescaped.
+        const dollarReason = "costs $5M; echo $& back";
+        _setAdvisoryStateForTest({ active: { id: "bc-2026-002", affected: ">=1.0.0", target: "1.0.9", reason: dollarReason, currentVersion: "1.0.1" } });
+        const r2 = mockRes();
+        handlePluginStatus("never-seen", r2.res, deps, true);
+        const p2 = JSON.parse(r2.body).panel as string;
+        assert.ok(p2.includes(dollarReason), "dollar-sign reason survives byte-exact");
+        assert.equal((p2.match(new RegExp(PANEL_BOX_FOOTER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length, 1, "footer appears exactly once");
     } finally {
         _setAdvisoryStateForTest({});
         _resetAdvisoryWatcherForTest();
