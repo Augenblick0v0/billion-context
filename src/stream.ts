@@ -379,9 +379,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // originals are still in hand — persist them into the content store so
         // retrieve-by-ref / range-restore work for FOLDED content, not just
         // oversized tool results stored at arrival. First-write-wins keeps
-        // arrival-time entries authoritative; reasoning is skipped. Proxy mode
-        // only: plugin-mode agents own their folds, so bili never sees those
-        // originals.
+        // arrival-time entries authoritative; reasoning is skipped. Lanes where
+        // the host runs the kernel locally (pi) prune before re-sending, so
+        // their folds carry nothing to store; plugin lanes that forward tool
+        // execution to the proxy (opencode native) keep the pre-fold snapshot
+        // (#1702), so they are covered too.
         if (ccrEnabled(ctx.session)) {
             const newBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
             if (newBlocks.length > 0) {
