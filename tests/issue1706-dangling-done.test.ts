@@ -172,6 +172,14 @@ test("#1706 control: a dangling block carrying more than one data line is NOT re
     assert.ok(out.includes("upstream_stream_truncated"), `conservative error frame expected, got: ${out}`);
 });
 
+test("#1706 control: a sentinel cut mid-token is NOT recognized as [DONE]", async () => {
+    const { out } = await run([
+        chatChunk({ content: "x" }),
+        "data: [DO\n",
+    ]);
+    assert.ok(out.includes("upstream_stream_truncated"), `partial sentinel must stay on the truncation path, got: ${out}`);
+});
+
 test("#1706 control: properly terminated [DONE] remains clean", async () => {
     const { out, logs } = await run([
         chatChunk({ content: "ok" }),
