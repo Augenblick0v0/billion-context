@@ -1205,6 +1205,13 @@ export async function pipePluginChatWithStrip(
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
+    // #1706: truncation forensics — when the stream dies without a terminal,
+    // "bytes in N ms, last byte M ms ago" names the cutting hop's idle budget
+    // (M≈BILI_UPSTREAM_TIMEOUT_MS ⇒ bili's own watchdog; M≈300s/600s ⇒ a
+    // middlebox; 0B ⇒ the connection never produced anything).
+    const tStart = Date.now();
+    let lastByteAt = tStart;
+    let upstreamBytes = 0;
     const acc: UsageSample = {};
     let sawStrippedEcho = false;
     const onTagDrop = (snippet: string) => {
@@ -1811,6 +1818,8 @@ export async function pipePluginChatWithStrip(
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.length > 0) {
+                lastByteAt = Date.now();
+                upstreamBytes += value.length;
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -1880,13 +1889,24 @@ export async function pipePluginChatWithStrip(
         // stream bare — the agent would persist the partial turn as complete
         // (the #719 chain). finished=true when a finish reason was delivered:
         // only the trailing terminal byte ([DONE]/message_stop) is missing.
+        // A final `data: [DONE]` that arrived without its terminating blank
+        // line is still the completion marker (some gateways close right after
+        // the line, #1706): recognize it at EOF and forward it properly
+        // terminated instead of reporting a completed stream as truncated.
+        let danglingDone = false;
+        if (!sawTerminal && protocol === "openai" && buf.length > 0) {
+            const dataLines = buf.split("\n").filter((l) => l.startsWith("data:"));
+            danglingDone = dataLines.length === 1 && dataLines[0].slice(5).replace(/^ /, "").trim() === "[DONE]";
+            if (danglingDone) sawTerminal = true;
+        }
         const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
         // A dangling partial event left in buf by a mid-event cut would fuse
         // with the next complete frame — SSE joins every data line inside one
         // blank-line-delimited block — corrupting the truncation signal. Drop
         // it when the signal follows: an unterminated event is unparseable by
-        // the client anyway (same as the pre-#721 bare end).
-        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(buf));
+        // the client anyway (same as the pre-#721 bare end). The recognized
+        // [DONE] sentinel gets its terminator restored (#1706).
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(danglingDone ? buf.replace(/\n+$/, "") + "\n\n" : buf));
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(rest));
         // Settle BEFORE res.end() in the finally below: the client can issue
@@ -1898,6 +1918,7 @@ export async function pipePluginChatWithStrip(
         maybeWarnProtocolFragment();
         maybeWarnNamelessToolCalls();
         if (truncated) {
+            loggerLog("warn", `[plugin] upstream stream ended without terminal (${protocol}): ${upstreamBytes}B in ${Date.now() - tStart}ms, last byte ${Date.now() - lastByteAt}ms ago — emitting in-band truncation signal (#721)`);
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
         }
@@ -1920,7 +1941,7 @@ export async function pipePluginChatWithStrip(
         } catch {
             /* client half-gone; the emission below is best-effort too */
         }
-        loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)}; ${upstreamBytes}B in ${Date.now() - tStart}ms, last byte ${Date.now() - lastByteAt}ms ago — emitting in-band truncation signal (#721)`);
         emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
         return;
     } finally {
@@ -2003,6 +2024,10 @@ export async function pipePluginResponsesWithStrip(
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
+    // #1706: truncation forensics — same contract as the chat-pipe twin.
+    const tStart = Date.now();
+    let lastByteAt = tStart;
+    let upstreamBytes = 0;
     const acc: UsageSample = {};
     const onTagDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -2255,6 +2280,8 @@ export async function pipePluginResponsesWithStrip(
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.length > 0) {
+                lastByteAt = Date.now();
+                upstreamBytes += value.length;
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -2457,6 +2484,7 @@ export async function pipePluginResponsesWithStrip(
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            loggerLog("warn", `[plugin] upstream stream ended without terminal (responses): ${upstreamBytes}B in ${Date.now() - tStart}ms, last byte ${Date.now() - lastByteAt}ms ago — emitting in-band truncation signal (#721)`);
             emitUpstreamTruncation(res, "responses", false, log);
             return;
         }
@@ -2476,7 +2504,7 @@ export async function pipePluginResponsesWithStrip(
         } catch {
             /* client half-gone; the emission below is best-effort too */
         }
-        loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)}; ${upstreamBytes}B in ${Date.now() - tStart}ms, last byte ${Date.now() - lastByteAt}ms ago — emitting in-band truncation signal (#721)`);
         emitUpstreamTruncation(res, "responses", false, log);
         return;
     } finally {
