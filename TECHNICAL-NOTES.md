@@ -207,3 +207,50 @@ so direct callers cannot corrupt a store either. Mixing *commands* is fine
 mixing *writers* is what the guard forbids. `bili plugin update [client]`
 is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
+
+## Mechanical identifier preservation at fold commit (#1702)
+
+Fold protection is tool-name-keyed and content-blind (`ALWAYS_PROTECTED_TOOLS`
+covers only the kernel's own metadata tools; the soft zone is last-5-msgs /
+5K tokens). An opencode subagent dispatch pair — the tool-call args carrying
+the `ses_` session id plus its result — is an ordinary exchange to the kernel:
+five messages later it folds, and the id's only survival channel was the
+model's free-text summary. That channel is probabilistic (#1563 A/B probe: 20%
+id loss for weak models; #475 prompt-naming still truncated ids), which broke
+subagent resume ("Subagent session not found").
+
+The fix is mechanical, at fold commit (`src/stream.ts` → `applyRanges`, the
+single adoption point for every fold path — model-driven compress, preflight
+overflow, in-place refolds): identifiers are extracted from the covered
+originals by code and pinned as a machine appendix line on each changed block
+summary, **after** the model output exists and **before** any consumer reads
+the summary (fingerprint excerpts, token estimate, persistence). The model
+never transcribes them, so fidelity does not depend on the model:
+
+```
+<model-written summary, byte-untouched>
+
+[acp-mechanical-preserve] ses_abc123…, ses_def456…
+```
+
+Properties that make this safe to leave running forever:
+
+- **Idempotent.** Re-pin strips any prior appendix lines first (including ones
+  a model echoed into its own summary) and re-appends from the covered text —
+  refolds converge to one canonical line per block.
+- **Tier-transparent.** T2 distillation re-pins automatically: a child block's
+  summary (with its appendix line) is itself covered text of the parent fold.
+- **Zero-cost when inert.** No matching identifier in the covered range → the
+  model summary stays byte-identical (no line, no bytes). Lanes whose host
+  runs its own kernel (pi-style) never see folded originals and extract
+  nothing — structurally unchanged.
+- **Scope is deliberately narrow** (#1702): subagent dispatch ids
+  (`ses_[A-Za-z0-9]+`) only. Commit hashes / PR numbers can extend
+  `ID_PATTERNS` in `src/mechanical-preserve.ts` later; generalization was
+  explicitly deferred. The prompt layer is untouched — writing rules for every
+  summary channel are unchanged.
+
+Regression pin: `tests/mechanical-preserve.test.ts` asserts the invariant
+mechanically (full-string match inside the block summary regardless of what
+the model summary says), including the #1563 truncated-id failure mode, T2
+propagation, refold normalization, and the zero-cost case.

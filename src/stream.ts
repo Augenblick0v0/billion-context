@@ -9,6 +9,7 @@ import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, 
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
+import { pinMechanicalIds } from "./mechanical-preserve.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 
 export type RewriteCtx = {
@@ -385,6 +386,30 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const newBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
             if (newBlocks.length > 0) {
                 adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
+            }
+        }
+        // #1702 (subtask of #1563): mechanical identifier fidelity at fold commit.
+        // Fold protection is tool-name-keyed and content-blind, so opencode
+        // subagent dispatch pairs (ses_ session ids in tool-call args + results)
+        // fold like ordinary exchanges and their ids would survive only via the
+        // model's free-text summary — probabilistic fidelity (#1563). Extract the
+        // ids from the covered originals (machine read) and pin a machine
+        // appendix line on every changed block: new blocks and in-place refolds
+        // alike. T2 distillation re-pins automatically — child summaries (with
+        // their appendix lines) are the parent fold's covered text. Lanes that
+        // never see folded originals (host-side kernels) extract nothing and
+        // stay byte-identical. Runs after adoption, before any consumer
+        // (fingerprint excerpts, anchor token estimate, persistence) reads the
+        // summary. Prompt layer untouched by design.
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev !== undefined && prev === b.summary) continue;
+            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
+            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            const pinned = pinMechanicalIds(b.summary, [full.text, one.text]);
+            if (pinned.changed) {
+                b.summary = pinned.summary;
+                ctx.log(`[acp-proxy: mechanical preserve #1702: pinned ${pinned.ids.length} identifier(s) to ${b.blockId}${pinned.truncated > 0 ? ` (${pinned.truncated} beyond cap dropped)` : ""}]`);
             }
         }
         const r = res.result;
