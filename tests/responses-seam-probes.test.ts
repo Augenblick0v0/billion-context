@@ -29,6 +29,17 @@
 //                   from introduction onward, every role-bearing item left typed
 //                   by the ingress stamp (#242), and every turn's user prompt got
 //                   its own kernel ref (a silently-dropped item would get none).
+//   RP4 plugin-dev— #1669: a PLUGIN-mode host that merely APPENDS dynamic
+//                   developer notifications to its replayed-history tail must
+//                   keep the outbound prefix intact: the head block (input[0])
+//                   stays byte-frozen across turns, the notifications ride the
+//                   trailing "[System context update]" note carrier (append-
+//                   only), and the spine (input minus trailing notes and the
+//                   ephemeral chain checkpoint) strictly extends element-wise.
+//                   Without the anchor the kernel hoists
+//                   the appended developer items into the head merge and
+//                   rewrites input[0] every turn — the provider prefix cache
+//                   invalidates from element 0 (the #1638 fingerprint).
 //
 // Estimate-grade by design: the fake upstream reports NO usage field — the regime
 // where token-count source disagreements surface (same rationale as the chat probes).
@@ -44,6 +55,8 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { UPDATE_MARKER } from "../src/system-anchor.ts";
+import { CHAIN_TAG } from "../src/chain-checkpoint.ts";
 
 type Item = Record<string, unknown>;
 
@@ -273,4 +286,145 @@ test("probe RP3: reasoning items byte-stable by id; ingress type stamp intact (#
     let mm: RegExpExecArray | null;
     while ((mm = refRe.exec(bodies[bodies.length - 1]!)) !== null) refs.add(mm[1]!);
     assert.ok(refs.size >= TURNS, `final body carries only ${refs.size} distinct refs (< ${TURNS}) — user prompts invisible to the kernel`);
+});
+
+// ---------------------------------------------------------------------------
+// RP4 (#1669): plugin mode + tail-appended developer notifications.
+//
+// The fixture is tuned against src/system-anchor.ts constants on purpose:
+//   * INSTRUCTIONS_RP4 has 30 lines so every consecutive append stays
+//     LOCALIZED (LCS/max(n,m) ≥ DIFF_MIN_SHARED=0.7 even at 7 appended
+//     notifications) — the note carrier, not the deliberate-miss path, is
+//     what is under test;
+//   * turns 1..7 append one notification each → 7 notes ≤ ANCHOR_MAX_NOTES=8,
+//     so the churn guard never trips mid-run;
+//   * injectNudge:false removes the nudge tail item so the only sanctioned
+//     tail volatility is the note carrier itself.
+const RP4_TURNS = 8;
+const INSTRUCTIONS_RP4 = ["You are a coding agent operating in a sandbox."]
+    .concat(Array.from({ length: 29 }, (_, i) => `Convention ${i + 1}: follow repo rules for area ${(i % 5) + 1}.`))
+    .join("\n");
+
+async function drivePluginDevAppend(sessionId: string): Promise<string[]> {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "respseam4-"));
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = tmp;
+    delete process.env.ACP_DUMP_BODY;
+    const captured: string[] = [];
+    const upstream = startUpstream(captured);
+    let proxy: http.Server | undefined;
+    try {
+        upstream.listen(0, "127.0.0.1");
+        await listen(upstream);
+        const upstreamPort = (upstream.address() as { port: number }).port;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        const options: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1",
+            routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 200_000 } } } },
+            modelContextLimit: 200_000,
+            kernelConfig: defaultConfig(200_000),
+            compress: { injectTool: true, injectNudge: false },
+            stableSystemAnchor: true,
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: false,
+            debug: false,
+            passthrough: false,
+            autoUpdate: false,
+            mitm: { enabled: false, domains: [] },
+        };
+        proxy = await startServer(options);
+        await listen(proxy);
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
+        const input: Item[] = [];
+        for (let t = 0; t < RP4_TURNS; t++) {
+            if (t > 0) {
+                // The host appends a dynamic developer notification to the tail
+                // of its replayed history (OMP todo-nudge / launch-completion
+                // shape): inbound growth is strictly append-only.
+                input.push({ type: "message", role: "developer", content: `mid-run todo reminder ${t}: next step is module ${t - 1} verification.` });
+            }
+            const userMsg: Item = { role: "user", content: `Turn ${t}: analyze module ${t}. ` + FILLER(t, 2) };
+            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId, "x-bili-plugin": "omp-e2e", "x-bili-plugin-conversation": sessionId }, body: JSON.stringify({ model: "gpt-test", stream: true, instructions: INSTRUCTIONS_RP4, tools: TOOLS, input: [...input, userMsg] }) });
+            if (!res.ok) throw new Error(`turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+            let reply = "";
+            for (const block of (await res.text()).split("\n\n")) {
+                const line = block.split("\n").find((l) => l.startsWith("data:"));
+                if (!line) continue;
+                const payload = line.slice(5).trim();
+                if (!payload) continue;
+                const d = JSON.parse(payload) as Item;
+                if (d.type === "response.output_text.delta" && typeof d.delta === "string") reply += d.delta;
+            }
+            assert.ok(reply.length > 0, `turn ${t}: empty SSE`);
+            input.push(userMsg);
+            input.push({ type: "reasoning", id: `rs_${t}`, encrypted_content: encBlob(t) });
+            input.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: reply });
+            input.push({ type: "function_call", id: `fc_t${t}`, call_id: `call_t${t}`, name: "shell", arguments: JSON.stringify({ command: `ls -la mod-${t}` }), status: "completed" });
+            input.push({ type: "function_call_output", id: `fco_t${t}`, call_id: `call_t${t}`, output: `total 8\ndrwxr-xr-x mod-${t}\n${FILLER(t, 1)}` });
+        }
+        return captured;
+    } finally {
+        await closeServer(proxy!);
+        await closeServer(upstream);
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
+}
+
+test("probe RP4: plugin-mode tail-appended developer notifications keep the outbound prefix intact (#1669)", { timeout: 90_000 }, async () => {
+    const bodies = await drivePluginDevAppend("resp-seam-rp4");
+    assert.ok(bodies.length >= RP4_TURNS, `expected >= ${RP4_TURNS} requests, got ${bodies.length}`);
+    const parsed = bodies.map((b) => inputsOf(JSON.parse(b) as Item));
+    // (a) THE regression: inbound was append-only, so NOTHING may rewrite
+    //     element 0 — the head block must be byte-identical across all bodies.
+    const head0 = JSON.stringify(parsed[0]![0]);
+    for (let i = 1; i < parsed.length; i++) {
+        assert.equal(JSON.stringify(parsed[i]![0]), head0, `body ${i}: outbound input[0] diverged from the frozen anchor — a tail-appended developer notification rewrote the head block (#1669)`);
+    }
+    // (b) spine stability: strip the sanctioned volatile slots — the trailing
+    //     note carrier and the ephemeral chain checkpoint (single-request
+    //     egress control data, #1542) — from each body; the remaining spine
+    //     must strictly extend element-wise.
+    const contentOf = (it: Item): string => typeof it.content === "string" ? it.content : JSON.stringify(it.content ?? "");
+    const notesOf = (items: Item[]): Item[] => items.filter((it) => it.role === "user" && contentOf(it).startsWith(UPDATE_MARKER));
+    const isVolatileSlot = (it: Item): boolean => {
+        const c = contentOf(it);
+        return c.startsWith(UPDATE_MARKER) || c.startsWith("\x3c" + CHAIN_TAG + " ");
+    };
+    const spine = (items: Item[]): Item[] => {
+        const vol = new Set(items.filter(isVolatileSlot));
+        return items.filter((it) => !vol.has(it));
+    };
+    for (let i = 1; i < parsed.length; i++) {
+        const sa = spine(parsed[i - 1]!);
+        const sb = spine(parsed[i]!);
+        assert.ok(sb.length > sa.length, `pair ${i}->${i + 1}: spine shrank or stalled (${sa.length} -> ${sb.length}) — burst growth must strictly extend`);
+        for (let k = 0; k < sa.length; k++) {
+            assert.deepEqual(sb[k], sa[k], `pair ${i}->${i + 1}: spine divergence at input[${k}] — unsanctioned cache seam behind the note carrier`);
+        }
+    }
+    // (c) the note carrier is append-only: later bodies carry every earlier
+    //     note, unchanged and in order.
+    for (let i = 1; i < parsed.length; i++) {
+        const na = notesOf(parsed[i - 1]!);
+        const nb = notesOf(parsed[i]!);
+        assert.ok(nb.length >= na.length, `pair ${i}->${i + 1}: note log shrank (${na.length} -> ${nb.length})`);
+        for (let k = 0; k < na.length; k++) {
+            assert.deepEqual(nb[k], na[k], `pair ${i}->${i + 1}: note ${k} mutated/reordered — the carrier must be append-only`);
+        }
+    }
+    // (d) byte-level floor so key-order drift OUTSIDE `input` cannot hide
+    //     behind the element walk (same rationale as RP2).
+    for (let i = 1; i < bodies.length; i++) {
+        const minBytes = Math.min(Buffer.byteLength(bodies[i - 1]!), Buffer.byteLength(bodies[i]!));
+        const lcpBytes = Buffer.byteLength(bodies[i - 1]!.slice(0, commonPrefixLen(bodies[i - 1]!, bodies[i]!)), "utf8");
+        const tailBudget = Buffer.byteLength(JSON.stringify(notesOf(parsed[i - 1]!))) + 512;
+        assert.ok(lcpBytes >= minBytes - tailBudget, `pair ${i}->${i + 1}: byte-prefix LCP ${lcpBytes}/${minBytes} (${((lcpBytes / minBytes) * 100).toFixed(1)}%) below the stable-spine floor (${minBytes - tailBudget}) — divergence inside the shared prefix`);
+    }
 });

@@ -6,7 +6,9 @@
 // whole cached prefix. Also covers the interop contract: a third-party client
 // that already implements its own version (constant system + in-history update
 // messages) must pass through with ZERO bili-side injection — and that
-// plugin-mode agents are never anchored at all (owner scope: plain-proxy only).
+// plugin-mode agents on the chat/anthropic/google wires are never anchored
+// (owner scope #1085); the Responses wire anchors in BOTH modes since #1669
+// (its kernel hoists any-position developer items into the head block).
 // Session D (anthropic wire): client-sent cache_control breakpoints must ride
 // on the SAME logical blocks across turns and never land on an injected note
 // (opencode#43507 class of regression: a breakpoint on a message that can
@@ -330,6 +332,41 @@ test("e2e #1085: changed head system stays anchored; updates ride as trailing no
         assert.ok(leadingSystem(e2!).includes("AND the e2e suite"), "plugin-mode head change must pass through verbatim (no anchoring)");
         assert.notEqual(leadingSystem(e2!), leadingSystem(e1!), "plugin-mode head must NOT be frozen to the first-seen bytes");
         assert.equal(markerMessages(e2!).length, 0, "plugin mode must get zero update notes");
+
+        // --- Session F: Responses wire, PLUGIN mode — #1669 re-scoped the
+        // anchor to this wire in BOTH modes: the kernel hoists any-position
+        // developer items into the head block, so a host that merely APPENDS
+        // a notification to its history tail would otherwise make the head
+        // merge rewrite outbound input[0] every turn (provider prefix cache
+        // invalidates from element 0). Head stays anchored; notifications
+        // ride the trailing diff-note carrier (same as proxy-mode C). The
+        // instructions block has 20 lines on purpose: each append must stay
+        // LOCALIZED (LCS/max(n,m) >= 0.7) to hit the note path, not the
+        // deliberate-miss replacement path. ---
+        const INST_F = ["You are a coding agent operating in a sandbox."]
+            .concat(Array.from({ length: 19 }, (_, i) => `Convention ${i + 1}: follow repo rules for area ${(i % 5) + 1}.`))
+            .join("\n");
+        const histF: Array<Record<string, unknown>> = [];
+        for (let t = 0; t < 3; t++) {
+            if (t > 0) histF.push({ type: "message", role: "developer", content: `mid-run todo reminder ${t}: verify module ${t - 1}.` });
+            const res = await fetch(respUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "responses-plugin-anchor-e2e", "x-bili-plugin": "e2e-agent" },
+                body: JSON.stringify({ model: "gpt-test", stream: true, instructions: INST_F, input: [...histF, { type: "message", role: "user", content: `f${t}` }] }),
+            });
+            if (!res.ok) throw new Error(`responses plugin turn failed: HTTP ${res.status}`);
+            await res.text();
+            histF.push({ type: "message", role: "assistant", content: "ok" }, { type: "message", role: "user", content: `f${t}` });
+        }
+        const [f1, f2, f3] = captured.slice(14, 17);
+        assert.ok(f1 && f2 && f3, "expected 3 captured responses plugin-mode requests");
+        assert.ok(devOf(f1!).includes("Convention 19"), "responses plugin-mode head must carry the stable instructions");
+        assert.equal(JSON.stringify(JSON.parse(f1!)["input"][0]), JSON.stringify(JSON.parse(f2!)["input"][0]), "#1669: tail-appended developer notification must NOT rewrite the frozen head block");
+        assert.equal(JSON.stringify(JSON.parse(f2!)["input"][0]), JSON.stringify(JSON.parse(f3!)["input"][0]), "#1669: head block must stay byte-frozen across all turns");
+        assert.equal(devOf(f2!), devOf(f1!), "head developer text must be byte-identical after an appended notification");
+        assert.equal(markerItems(f2!).length, 1, "exactly one diff note after the first appended notification");
+        assert.ok(markerItems(f2!)[0]!.includes("+mid-run todo reminder 1"), "note must carry the added line as a + hunk");
+        assert.equal(markerItems(f3!).length, 2, "note log must accumulate append-only across turns");
     } finally {
         await close(proxy);
         await close(upstream);

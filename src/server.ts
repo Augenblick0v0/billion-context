@@ -3988,7 +3988,14 @@ async function prepareResponses(
         responsesProjection = projection;
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
-        if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
+        // Responses anchors in BOTH modes (unlike the other wires' plain-proxy
+        // scope, #1085): the kernel hoists developer items from ANY position
+        // into systemParts, so even a host that merely APPENDS a notification
+        // to its history tail makes the head merge rewrite outbound input[0]
+        // every turn — breaking the provider prefix cache from element 0
+        // (#1669). Other wires keep non-leading developer messages in place,
+        // so they have no bili-caused head rewrite and stay proxy-only.
+        if (opts.stableSystemAnchor && !isCompactionTrigger) {
             const fresh = projection.systemParts.join("\n\n---\n\n");
             const outcome = reconcileSystemAnchor(session, "responses", fresh, sessionId, log);
             sysNotes = outcome.notes;

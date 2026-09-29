@@ -4,7 +4,9 @@
 // ambient instructions (AGENTS.md & co.) in the HEAD of every request; when
 // those files change mid-session the head bytes change and the provider's
 // prefix cache misses the ENTIRE conversation. When enabled (server.ts gates
-// this to plain-proxy mode only), the first-seen head text becomes a sticky
+// it per wire: plain-proxy mode only — EXCEPT the Responses wire, which
+// anchors in both modes because its kernel hoists developer items from any
+// position into the head block, #1669), the first-seen head text becomes a sticky
 // per-session anchor forwarded byte-stable; each LOCALIZED change appends one
 // trailing user note carrying a compact line diff against the version in
 // effect so far (each note composes sequentially onto the previous one).
