@@ -725,7 +725,7 @@ test("#1101 T9: BILI_CHAIN_CONTENT env parse — default OFF, 1 enables, env win
         assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "0" }).chainContentDetection, false, "env =0 wins over file true");
     } finally {
         if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
