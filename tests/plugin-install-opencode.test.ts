@@ -16,6 +16,7 @@ import {
     repinOpencodeEntryTo,
     selfPackageRoot,
 } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const NPM_ROOT = "/usr/local/lib/node_modules/billion-context";
 const V = "0.1.135";
@@ -149,8 +150,13 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", asy
     const prevState = process.env.XDG_STATE_HOME;
     const prevOpen = process.env.OPENCODE_CONFIG;
     const prevMcp = process.env.BILI_MCP_PROXY;
+    const prevBin = process.env.BILI_CLIENT_BIN;
     delete process.env.OPENCODE_CONFIG;
     delete process.env.BILI_MCP_PROXY;
+    // Hermetic probe: an unresolvable bin fails soft to major 1, so the test
+    // never depends on whatever `opencode` the host PATH (or an npm test
+    // node_modules/.bin walk) happens to shadow in.
+    process.env.BILI_CLIENT_BIN = "/nonexistent/bili-oc-probe-pin";
     const xdg = tempDir("bili-oc-xdg-");
     const state = tempDir("bili-oc-state-");
     process.env.XDG_CONFIG_HOME = xdg;
@@ -164,8 +170,10 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", asy
         else process.env.OPENCODE_CONFIG = prevOpen;
         if (prevMcp === undefined) delete process.env.BILI_MCP_PROXY;
         else process.env.BILI_MCP_PROXY = prevMcp;
-        fs.rmSync(xdg, { recursive: true, force: true });
-        fs.rmSync(state, { recursive: true, force: true });
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(xdg);
+        rmrf(state);
     });
 
     const file = path.join(xdg, "opencode", "opencode.json");
@@ -290,8 +298,8 @@ function withOcConfig(t: import("node:test").TestContext, initial: OcMcpCfg): { 
         else process.env.XDG_STATE_HOME = prevState;
         if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
         else process.env.OPENCODE_CONFIG = prevOpen;
-        fs.rmSync(xdg, { recursive: true, force: true });
-        fs.rmSync(state, { recursive: true, force: true });
+        rmrf(xdg);
+        rmrf(state);
     });
     const file = path.join(xdg, "opencode", "opencode.json");
     fs.mkdirSync(path.dirname(file), { recursive: true });

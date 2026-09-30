@@ -51,12 +51,13 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true, ccr: { enabled: true } },
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: true }, rules: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -117,11 +118,12 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.equal(forwarded.prompt_cache_key, undefined);
         assert.equal(forwarded.instructions, undefined);
         assert.deepEqual(forwarded.additional_tools, requestBody.additional_tools);
-        // CCR explicitly enabled in this test's compress config (#1207
-        // opt-in), so acp_retrieve joins the injected tool set.
+        // CCR and rules explicitly enabled in this test's compress config
+        // (#1207 / #1399 are both opt-in), so acp_retrieve and acp_rule join
+        // the injected tool set.
         assert.deepEqual(
             forwarded.tools.map((t: { name: string }) => t.name),
-            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_retrieve"],
+            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_rule", "acp_retrieve"],
         );
 
         const session = listSessions().find((candidate) => candidate.meta.label === sessionId);

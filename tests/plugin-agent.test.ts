@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -1267,6 +1268,89 @@ test("/acp-rule warns with an enablement hint when the proxy reports the feature
     }
 });
 
+test("/acp-rule forwards `remove <id>` as { delete } to acp_rule (#1399)", async () => {
+    const proxy = await startRuleProxy("Removed rule1: always run tests first");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-remove" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("remove rule1", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-remove", tool: "acp_rule", args: { delete: "rule1" } }], "`remove <id>` forwarded as { delete }");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.content, wrapRuleReport("Removed rule1: always run tests first"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule forwards bare `clear` as { clear: true } to acp_rule (#1399)", async () => {
+    const proxy = await startRuleProxy("Cleared 2 rule(s).");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-clear" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("clear", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear", tool: "acp_rule", args: { clear: true } }], "bare clear forwarded as { clear: true }");
+        assert.equal(sent[0]!.content, wrapRuleReport("Cleared 2 rule(s)."));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule bare `remove` warns with usage instead of forwarding (#1399)", async () => {
+    const proxy = await startRuleProxy("No rules recorded.");
+    try {
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-remove-usage" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("remove", ctx);
+        assert.equal(proxy.calls.length, 0, "nothing forwarded for a missing id");
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /Usage: \/acp-rule remove <rule-id>/);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule `clear <text>` records the text instead of wiping (#1399)", async () => {
+    const proxy = await startRuleProxy("Recorded rule3: clear all caches before deploys");
+    try {
+        const sent: Array<{ customType: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-clear-words" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("clear all caches before deploys", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear-words", tool: "acp_rule", args: { rule: "clear all caches before deploys" } }], "extra words after clear are recorded, never wiped");
+        assert.equal(sent.length, 1);
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -1436,12 +1520,16 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginInstall("codex"), /installed/);
         const toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.match(toml, /\[mcp_servers\.bili\]\ncommand = /);
-        assert.match(toml, /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        // #1660: no baked origin — the MCP shell discovers the live proxy at
+        // startup (env > instance file > 8787), so the block cannot go stale.
+        assert.doesNotMatch(toml, /BILI_MCP_PROXY/);
         fs.writeFileSync(path.join(home, "config.toml"), toml + "\n[mcp_servers.other]\ncommand = \"x\"\n");
         assert.match(pluginInstall("codex"), /already installed/);
-        fs.writeFileSync(path.join(home, "config.toml"), fs.readFileSync(path.join(home, "config.toml"), "utf8").replace("8787", "9999"));
+        // a user-tampered command (their own node path) is not canonical →
+        // refreshed back to the current canonical block
+        fs.writeFileSync(path.join(home, "config.toml"), fs.readFileSync(path.join(home, "config.toml"), "utf8").replace(JSON.stringify(process.execPath), JSON.stringify("/tampered/node")));
         assert.match(pluginInstall("codex"), /refreshed/);
-        assert.match(fs.readFileSync(path.join(home, "config.toml"), "utf8"), /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        assert.doesNotMatch(fs.readFileSync(path.join(home, "config.toml"), "utf8"), /tampered/);
         assert.match(pluginRemove("codex"), /removed/);
         const tomlAfter = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.doesNotMatch(tomlAfter, /mcp_servers\.bili/);
@@ -1458,8 +1546,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(tomlEdge, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
         // #638: a malformed block (args as string - legal TOML, invalid codex
-        // schema) with a matching origin must NOT short-circuit to "already
-        // installed"; reinstall must self-heal it to the canonical block.
+        // schema). Legacy blocks carried a baked env origin — the heal must
+        // drop it, not preserve it (#1660).
         const selfRoot = path.dirname(path.dirname(path.resolve("src/plugin-install.ts")));
         const malformed = `[mcp_servers.other]\ncommand = "x"\n[mcp_servers.bili]\ncommand = "node"\nargs = '[\"${path.join(selfRoot, "dist", "mcp.js")}\"]'\nenv = { BILI_MCP_PROXY = "http://127.0.0.1:8787" }\n`;
         fs.writeFileSync(path.join(home, "config.toml"), malformed);
@@ -1468,6 +1556,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         const tomlHealed = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.match(tomlHealed, /args = \[/);
         assert.doesNotMatch(tomlHealed, /args = '\[/);
+        assert.doesNotMatch(tomlHealed, /BILI_MCP_PROXY/, "legacy baked origin dropped on heal (#1660)");
         assert.match(tomlHealed, /\[mcp_servers\.other\]\ncommand = "x"\n/);
         // A now-canonical block stays "already installed" on rerun.
         assert.match(pluginInstall("codex"), /already installed/);
@@ -1520,7 +1609,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal(rows.length, 9);
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"]);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("plugin install opencode without a live proxy: MCP shell skipped, native plugin still installed (#820)", async () => {
@@ -1546,7 +1635,7 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
             assert.equal(after.compaction, undefined);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1596,7 +1685,7 @@ test("plugin install opencode replaces legacy opencode-acp entries — array and
             assert.equal(msg.includes("other-plugin"), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1622,7 +1711,7 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1695,7 +1784,7 @@ test("omp plugin: scoped matching, existence check, overlay redirect (issue #392
     } finally {
         if (createdOmpDist) fs.rmSync(ompDistFile, { force: true });
     }
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("resolveProxyOrigin discovers the running proxy via the state file", async () => {
@@ -1711,7 +1800,7 @@ test("resolveProxyOrigin discovers the running proxy via the state file", async 
     await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: "http://10.0.0.5:9000" }, () => {
         assert.equal(resolveProxyOrigin(), "http://10.0.0.5:9000");
     });
-    fs.rmSync(state, { recursive: true, force: true });
+    rmrf(state);
 });
 
 test("plugin install refuses to touch broken or non-object configs", async () => {
@@ -1734,7 +1823,7 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
         fs.writeFileSync(path.join(ocDir, "opencode.json"), "nope{");
         assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 // #836 (found in #809 N4): a non-object `mcp` (e.g. bare string) made
@@ -1769,7 +1858,7 @@ test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async (
         assert.deepEqual(data[ocKey], [path.join(ocDir, "plugins", "billion-context")]);
         assert.deepEqual(data.compaction, { auto: false });
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 // #839 (found while reviewing #837): same bug class as #836 on the claude side
@@ -1789,7 +1878,7 @@ test("plugin claude survives a non-object mcpServers (issue #839)", async () => 
         assert.equal(pluginStatusAll().find((r) => r.agent === "claude")!.status, "not installed");
         assert.equal(fs.readFileSync(cFile, "utf8"), malformed);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("plugin list survives a broken host config (per-row error, no crash)", async () => {
@@ -1807,7 +1896,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
         const pi = rows.find((r) => r.agent === "pi")!;
         assert.equal(pi.status, "not installed");
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("mcp forwardTool times out against a hanging proxy", async () => {
@@ -2121,13 +2210,17 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
         // the FIRST request (previously round 1 left before toolsReady flipped
         // and reported nothing — a race artifact, not a policy).
         await pi.events.get("before_provider_request")!({}, ctxA);
-        await waitForRuntimeInfoCount(proxy, 1);
+        // #1531: the handler AWAITs the report, so by the time it resolves
+        // (i.e. before the model request dispatches) the POST has landed —
+        // no polling needed, and the ordering is asserted directly.
+        assert.equal(proxy.runtimeInfos.length, 1, "report lands before the request dispatches (#1531)");
         assert.deepEqual(proxy.runtimeInfos[0], {
             agent: "omp",
             model: "omp-rt-model-a",
             contextWindow: 200000,
             maxOutput: 32768,
             baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
+            conversationId: "omp-rt-1",
             source: "client-config",
         });
         // same model again → deduped, no second POST
@@ -2143,6 +2236,7 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
             contextWindow: 128000,
             maxOutput: 16384,
             baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
+            conversationId: "omp-rt-1",
             source: "client-config",
         });
     } finally {
