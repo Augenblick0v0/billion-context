@@ -502,23 +502,75 @@ test("streaming filter still drops a ref echo whose open tag arrives alone in a 
     assert.ok(f.dropped());
 });
 
-test("long tag-like spans are prose, not tags (bounded open match)", () => {
-    const span = `${OPEN}${"x".repeat(300)}>`;
-    assert.equal(stripAcpTags(`before ${span} after`), `before ${span} after`);
-    const f = createTagEchoFilter();
-    assert.equal(f.push(`before ${span} after`) + f.flush(), `before ${span} after`);
-    const g = createTagEchoFilter();
-    assert.equal(g.push(`before ${OPEN}${"x".repeat(300)}`), "before ");
-    assert.ok(g.pending());
-    assert.equal(g.push(`> after`), `${span} after`);
-    assert.equal(g.flush(), "");
+// #1731 replaced the old open-side attr caps ({0,256}/{0,512}): a longer run
+// escaped every open-tag matcher while the loose close still went, leaving
+// orphan markup on the wire. [^<>] cannot cross a bracket, so the uncapped
+// matchers stay linear; a terminated open is now decided by body shape
+// (#1720), never by attr length. These tests supersede the former
+// "long attr run = prose" pins, which encoded the bypass itself.
+test("long-attr paired render tags are stripped, whole-text and at every split (#1731)", () => {
+    const attrs = "x".repeat(300);
+    const full = `before ${OPEN}${attrs}>m00155${CLOSE} after`;
+    const expected = stripAcpTags(full);
+    assert.equal(expected, "before  after");
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
 });
 
-test("prose with a tag-like opening beyond the attr bound survives intact", () => {
-    const prose = `${OPEN}${"word ".repeat(60)}end > kept`;
-    assert.equal(stripAcpTags(prose), prose);
+test("terminated long-attr open without a close is still a tag head (#1731)", () => {
+    const span = `${OPEN}${"x".repeat(300)}>`;
+    assert.equal(stripAcpTags(`before ${span} after`), "before  after");
     const f = createTagEchoFilter();
-    assert.equal(f.push(prose) + f.flush(), prose);
+    assert.equal(f.push(`before ${span}`), "before ");
+    assert.ok(f.pending());
+    assert.equal(f.flush(), "");
+});
+
+test("case-drifted render tags are stripped, whole-text and at every split (#1731)", () => {
+    const up = `\x3cACP tokens="1" type="text"\x3em00155\x3c/ACP\x3e`;
+    const mixed = `\x3cAcP tokens="1" type="text"\x3em00009\x3c/aCP\x3e`;
+    assert.equal(stripAcpTags(`pre ${up} post`), "pre  post");
+    assert.equal(stripAcpTags(mixed), "");
+    assert.equal(stripAcpTags(`pre \x3cACP tokens="1" type="text"\x3e post`), "pre  post");
+    assert.equal(stripAcpTags(`pre \x3c/ACP\x3e post`), "pre  post");
+    const full = `before ${up} after`;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+test("case-drifted tag heads engage the streaming gates (#1731)", () => {
+    assert.equal(containsRenderTagText(`\x3cACP tokens="1"\x3e`), true);
+    assert.equal(mayStartRenderTag(`chunk \x3cAC`), true);
+    assert.equal(mayStartRenderTag(`chunk \x3c/A`), true);
+});
+
+test("prose guards hold under case drift (#1731)", () => {
+    assert.equal(stripAcpTags(`see the \x3cCaption\x3ex\x3c/Caption\x3e here`), `see the \x3cCaption\x3ex\x3c/Caption\x3e here`);
+    assert.equal(stripAcpTags(`\x3capp id="1"\x3erun\x3c/app\x3e`), `\x3capp id="1"\x3erun\x3c/app\x3e`);
+    assert.equal(stripAcpTags(`per the ACPI spec and #include \x3cacpi/acpi.h\x3e`), `per the ACPI spec and #include \x3cacpi/acpi.h\x3e`);
+    assert.equal(stripAcpTags(`#include \x3cACPI/acpi.h\x3e`), `#include \x3cACPI/acpi.h\x3e`);
+    assert.equal(stripAcpTags(`\x3cCAPTION\x3etext\x3c/CAPTION\x3e`), `\x3cCAPTION\x3etext\x3c/CAPTION\x3e`);
+});
+
+test("uncapped attr runs stay linear (no ReDoS) (#1731)", () => {
+    const big = OPEN + "a".repeat(200_000) + ">m00155" + CLOSE;
+    const t0 = process.hrtime.bigint();
+    const out = stripAcpTags(big);
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.equal(out, "");
+    assert.ok(ms < 500, `single 200KB attr run took ${ms.toFixed(1)}ms`);
+    const heads = Array.from({ length: 500 }, () => OPEN + "b".repeat(400)).join(" prose ");
+    const t1 = process.hrtime.bigint();
+    stripAcpTags(heads);
+    const ms2 = Number(process.hrtime.bigint() - t1) / 1e6;
+    assert.ok(ms2 < 1000, `500 unterminated heads took ${ms2.toFixed(1)}ms`);
 });
 
 test("containsToolCallXmlFragment detects tool-call XML fragments, not prose", () => {
