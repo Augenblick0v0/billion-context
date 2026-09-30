@@ -2145,11 +2145,13 @@ export async function pipePluginResponsesWithStrip(
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         const st = tagFilter.stats();
+        // #673/#1781: outputChars must be what the client assembled — the fast
+        // path below never crosses tagFilter, so its stats undercount it.
         const msg = degenerateTurnWarning({
             reason: responseStatus,
             terminalReason: "completed",
             toolCalls: sawFunctionCall ? 1 : 0,
-            text: st,
+            text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped },
             sawThinking: sawReasoning,
             wire: "plugin-passthrough-responses",
         });
@@ -2471,6 +2473,10 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !tagFilter.pending()) {
+                            // #673/#1781: this path bypasses tagFilter, so account the
+                            // visible text here — the degenerate detector reads this,
+                            // not the filter stats.
+                            visibleTextChars += delta.length;
                             proseAcc += delta;
                             await write(rawEvent + "\n\n");
                             continue;
