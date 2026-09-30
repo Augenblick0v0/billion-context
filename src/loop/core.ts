@@ -5,12 +5,13 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { handleAcpStatus } from "../acp-status.js";
-import { handleAcpCache, recordCacheSample } from "../cache-ledger.js";
-import { lastCompressSuffix, withSessionLock, type Session } from "../session.js";
+import { handleAcpCache, noteForwardedBody, settleUsageReport } from "../cache-ledger.js";
+import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
     ABSORB_TOOL_NAME,
+    COMPRESS_TOOL_NAME,
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
@@ -29,6 +30,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -127,6 +129,11 @@ export interface LoopCtx {
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;
+    /** #1536: origin (scheme://host) of the LLM endpoint this loop forwards to
+     *  — part of the cache-invalidation target identity (rotating relays busts
+     *  the prefix even for the same model+wire). Distinct from proxyUrl, which
+     *  is the routing CONNECT-proxy, not the target. */
+    upstreamOrigin?: string;
     textProtocol?: boolean;
     debug?: boolean;
     /** #422: host hook that re-runs the kernel fold (processTurn) on the
@@ -221,9 +228,14 @@ export function executeProxyTool(
     args: Record<string, unknown>,
     ctx: LoopCtx,
     callId?: string,
+    rawArguments?: string,
 ): string {
     if (toolName === "compress") {
-        return applyRanges(parseCompressInput(args, callId), ctx);
+        // #1502: on strict-JSON.parse failure the caller passes the raw argument
+        // string here — the kernel's lenient parser salvages fence/trailing-
+        // comma/single-quote/truncated inputs that the degraded {} would drop.
+        const input = typeof rawArguments === "string" && rawArguments.length > 0 ? rawArguments : args;
+        return applyRanges(parseCompressInput(input, callId), ctx);
     }
     if (toolName === "decompress") {
         return resolveDecompress(args, ctx);
@@ -261,34 +273,22 @@ function recordUsage(
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
+    // #1536: normalize undefined (provider reports no cache tokens) to null so
+    // the ledger quarantines the sample instead of booking its whole billed
+    // prefix as an unexplained ttlRepay residual (which reads as a 0% hit rate).
+    const reportedCached: number | null = typeof cached === "number" ? cached : null;
     const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
-    if (total > 0) ctx.session.stats.inputTokens += total;
-    // Net out this turn's compress credit: the post-compress re-request
-    // re-sends the unfolded history, so its usage report over-reports the
-    // context the NEXT request will actually carry (see stream.ts applyRanges).
-    // #793: a zero-total sample (missing or placeholder input) must not
-    // clobber the last trusted value — mirrors applyUsageSample (plugin mode).
-    if (total > 0) {
-        ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
-        ctx.session.stats.lastInputTokensSource = "usage";
-        // #1110: a real usage report retires the one-shot overflow arm.
-        delete ctx.session.stats.overflowArmTokens;
-    }
-    if (typeof cached === "number" && total > 0) {
-        ctx.session.stats.cachedTokens += cached;
-        ctx.session.stats.cacheSamples += 1;
-    }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     const hitPct =
-        typeof cached === "number" && total > 0 ? Math.round((cached / total) * 100) : 0;
-    warnCacheCollapse(ctx.session, total, cached ?? 0);
+        reportedCached !== null && total > 0 ? Math.round((reportedCached / total) * 100) : 0;
+    if (reportedCached !== null) warnCacheCollapse(ctx.session, total, reportedCached);
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(ctx.session)}`,
+        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(ctx.session)}`,
     );
-    if (total > 0 || typeof cached === "number") {
-        recordCacheSample(ctx.session, { at: Date.now(), input: total, cached: cached ?? 0, output: out });
+    if (total > 0 || reportedCached !== null) {
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin });
     }
 }
 
@@ -320,8 +320,11 @@ export async function* runCompressLoop(
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
 
-    const fetchUpstream = (body: Record<string, unknown>) =>
-        fetchWithRetry(
+    const fetchUpstream = (body: Record<string, unknown>) => {
+        // #1592-family seam forensics: remember the body actually sent so the
+        // next usage settle can pair it with the previous one (LCP on miss).
+        noteForwardedBody(ctx.session, JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body));
+        return fetchWithRetry(
             requestOptions.url,
             {
                 method: "POST",
@@ -339,6 +342,7 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
+    };
 
     // #1455: single adoption point for every loop-originated upstream body so
     // the ACP_DUMP_SSE tee covers re-requests and retries, not just the first
@@ -568,14 +572,19 @@ export async function* runCompressLoop(
                 // the client can see. Gate keeps calls.length === 0 — a round
                 // with tool-call fragments falls through to the plain
                 // truncation error, since their semantics only survive a
-                // completed stream. OpenAI wire only: visible text means the
-                // stateful wires' identity framing (message_start /
-                // response.created) already reached the client, and a
-                // re-fetched response would duplicate it.
+                // completed stream. OpenAI and Anthropic wires only: openai
+                // has no per-message identity frame to duplicate, and
+                // anthropic's two re-fetch hazards are neutralized by the
+                // adapter — state-keyed message_start suppression (at most one
+                // start frame per logical response) and close-at-resume of
+                // the dead attempt's dangling blocks, with block indices
+                // continuing upward (#1455/#1464; #1470). responses/google
+                // stay excluded: their item-lifecycle identity frames have no
+                // dedup equivalent (#440 single-created invariant).
                 if (
                     (!sawDone || truncatedDone) &&
                     forwardedVisible &&
-                    ctx.protocol === "openai" &&
+                    (ctx.protocol === "openai" || ctx.protocol === "anthropic") &&
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
@@ -666,6 +675,8 @@ export async function* runCompressLoop(
                 usage.cachedTokens !== undefined
             ) {
                 recordUsage(ctx, usage, round);
+            } else {
+                diagnoseSuccessWithoutUsage(ctx.session, "acp-loop");
             }
             let resolvedText = assistantText;
             let allCalls = calls;
@@ -700,14 +711,17 @@ export async function* runCompressLoop(
                 }
                 if (isProxyToolFor(call.name, ctx.session, ctx.config)) {
                     let parsedArgs: Record<string, unknown>;
+                    let rawArgs: string | undefined;
                     try {
                         parsedArgs = call.arguments.length > 0 ? JSON.parse(call.arguments) : {};
                     } catch {
                         // #1306: an empty/truncated arguments string is wire-loss-shaped, bad JSON is model-shaped — log the shape so the two are separable in logs.
-                        ctx.log(`[acp-loop] proxy tool ${call.name}: arguments not parseable JSON (len=${call.arguments.length}${call.arguments.length > 0 ? `, head=${call.arguments.slice(0, 200)}` : ""}) — executing with {}`);
+                        // #1502: tail= alongside head= separates mid-string corruption from truncation; the raw string survives for the lenient parser.
+                        ctx.log(`[acp-loop] proxy tool ${call.name}: arguments not parseable JSON (len=${call.arguments.length}${call.arguments.length > 0 ? `, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)}` : ""}) — ${call.name === COMPRESS_TOOL_NAME ? "routing the raw string to the lenient parser" : "executing with {}"}`);
+                        rawArgs = call.arguments;
                         parsedArgs = {};
                     }
-                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));
+                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId, rawArgs));
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result}`;
