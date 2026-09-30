@@ -156,7 +156,10 @@ and a deliberate `bili start` daemon is attached by default. An
 upgrade-restart that finds the previous build still draining on the lane's
 port waits for it to release (up to 5s) and rebinds the SAME port instead of
 drifting (#1723); only a genuinely occupied port hops +1 — and that hop is
-now logged loudly.
+now logged loudly. Drift is not permanent: when the port a lane drifted to
+is free again, the next launch walks back to the zone base (#1751) — and an
+OS-ephemeral port reached after the ladder exhausts is never pinned sticky,
+so a squatted zone heals itself once the squatters leave.
 
 ### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 

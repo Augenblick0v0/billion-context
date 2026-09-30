@@ -129,11 +129,11 @@ export function writeZonePort(lane: string, port: number, file: string = portZon
     atomicWriteJson({ lanes: { ...(cur.lanes ?? {}), [lane]: port } }, file);
 }
 
-/** #1660: the port a lane'd launch should TRY to bind — the lane's sticky
- *  record (a past ladder drift this lane still points at), else the zone
- *  base (BILI_ZONE_PORT override). Explicit user overrides
- *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
- *  the lanes and imply strict-port launches. */
+/** #1660: the lane's sticky record (a past ladder drift this lane points
+ *  at), else the zone base (BILI_ZONE_PORT override) — the primitive behind
+ *  zoneSpawnPort. Explicit user overrides (BILI_CLAUDE_NATIVE_PORT /
+ *  BILI_ZCODE_PORT) are resolved separately by the lanes and imply
+ *  strict-port launches. */
 export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
     return readZonePort(lane, file) ?? resolveZonePortBase(env);
 }
@@ -163,6 +163,51 @@ export function findSameLanePredecessor(
         if (e.codeFingerprint !== ownFingerprint) return e;
     }
     return undefined;
+}
+
+/** #1751: the port a lane'd launch should SPAWN with. The sticky record's
+ *  authority presupposes its port is still live — when the lane has drifted
+ *  above the zone base AND no live instance holds the drifted port, this
+ *  spawn walks back to the base (soft re-pin): the child's +1 ladder still
+ *  covers bind races and other lanes' occupants, so the landing point is
+ *  never worse than today's and gravity pulls each lane home toward the
+ *  base. A sticky some live instance still holds keeps today's precedence —
+ *  that is exactly the #1723 upgrade-overlap case, where the child must
+ *  collide with the predecessor so its bounded wait can take over the SAME
+ *  port. `rePinnedFrom` reports the walked-back record for logging. */
+export function zoneSpawnPort(
+    lane: string,
+    livePorts: readonly number[],
+    env: NodeJS.ProcessEnv = process.env,
+    file: string = portZoneFilePath(),
+): { port: number; rePinnedFrom?: number } {
+    const sticky = readZonePort(lane, file);
+    const base = resolveZonePortBase(env);
+    if (sticky === undefined || sticky <= base) return { port: sticky ?? base };
+    if (livePorts.includes(sticky)) return { port: sticky };
+    return { port: base, rePinnedFrom: sticky };
+}
+
+/** #1751: the OS-assigned ephemeral range for a platform — where a child
+ *  lands when the zone ladder is exhausted (port-0 retry in server.ts).
+ *  Linux asks the kernel; darwin/win32 have static defaults. */
+export function osEphemeralRange(platform: NodeJS.Platform = process.platform): [number, number] {
+    if (platform === "linux") {
+        try {
+            const parts = fs.readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/).map(Number);
+            if (parts.length === 2 && parts.every((n) => Number.isInteger(n)) && parts[0] > 0 && parts[1] < 65536 && parts[0] < parts[1]) return [parts[0], parts[1]];
+        } catch {}
+    }
+    if (platform === "darwin" || platform === "win32") return [49152, 65535];
+    return [32768, 60999];
+}
+
+/** #1751: a port inside the OS ephemeral range is by definition unstable
+ *  across reboots (fresh assignment every boot) — pinning it sticky would
+ *  strand the lane outside the zone forever. Such ports never settle. */
+export function isOsEphemeralPort(port: number, platform: NodeJS.Platform = process.platform): boolean {
+    const [lo, hi] = osEphemeralRange(platform);
+    return Number.isInteger(port) && port >= lo && port <= hi;
 }
 
 /** #1225: content identity of a bili entry script (sha256 of its bytes).

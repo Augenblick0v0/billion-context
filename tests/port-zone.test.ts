@@ -5,17 +5,19 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { findSameLanePredecessor, lanePreferredPort, portZoneFilePath, readZonePort, writeZonePort } from "../src/instance.ts";
+import { findSameLanePredecessor, isOsEphemeralPort, lanePreferredPort, osEphemeralRange, portZoneFilePath, readZonePort, writeZonePort, zoneSpawnPort } from "../src/instance.ts";
 import type { ProxyInstanceFile, RegistryEntry } from "../src/instance.ts";
 import { ZONE_PORT_BASE, resolveZonePortBase } from "../src/config.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
-// #1660: the self-managed port zone. Every lane'd launch tries the lane's
-// sticky port first (a past +1-ladder drift it still points at), else the
-// zone base; the spawn path settles the actually-bound port back sticky so
-// later launches follow drift automatically. Pure file-backed functions —
-// always driven against an explicit temp file here so tests never touch the
-// developer's real state dir.
+// #1660/#1751: the self-managed port zone. Every lane'd launch spawns at the
+// lane's sticky port (a past +1-ladder drift it still points at) else the
+// zone base — walking back to the base when the drifted sticky is unheld —
+// and the spawn path settles the actually-bound port back sticky so later
+// launches follow drift automatically, EXCEPT OS-ephemeral ports, which are
+// never pinned (#1751). Pure file-backed functions — always driven against
+// an explicit temp file here so tests never touch the developer's real state
+// dir.
 
 function zoneFile(): string {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-port-zone-"));
@@ -159,9 +161,11 @@ function fakeZoneChild(pid: number): SpawnChild {
 /** A one-daemon world: `live` is the currently recorded instance, `squatted`
  *  holds ports dumb listeners occupy (the daemon's own port also blocks), and
  *  a spawn binds the requested port or ladders +1 past busy ones — the same
- *  EADDRINUSE walk the real server does (#1335). The zone file is REAL: the
- *  sim's zonePreferredPort/writeZonePort delegate to it, so the full
- *  write→read sticky loop runs on disk. */
+ *  EADDRINUSE walk the real server does (#1335) — capped at 17 attempts like
+ *  server.ts's MAX_LISTEN_ATTEMPTS, after which the child falls through to an
+ *  OS-ephemeral port (the real port-0 retry). The zone file is REAL: the
+ *  sim's zoneSpawnPort/liveInstancePorts/writeZonePort delegate to it, so the
+ *  full write→read sticky loop runs on disk. */
 function makeZoneSim(zoneFile: string, lane: string) {
     const sim = {
         live: undefined as ProxyInstanceFile | undefined,
@@ -169,12 +173,23 @@ function makeZoneSim(zoneFile: string, lane: string) {
         spawns: [] as Array<{ args: string[]; env: NodeJS.ProcessEnv }>,
         settles: [] as Array<[string, number]>,
         pidSeq: 42100,
+        ephemera: 0,
+        releaseOnSpawn: false,
     };
     const spawnImpl: SpawnFn = (_cmd, args, options) => {
         sim.spawns.push({ args: [...args], env: options.env ?? {} });
         const want = Number(args[args.indexOf("--port") + 1]);
+        if (sim.releaseOnSpawn) sim.live = undefined; // a predecessor that flushed out during the child's bounded wait (#1726)
         let bind = want;
-        while (sim.squatted.has(bind) || (sim.live !== undefined && bind === sim.live.port)) bind++;
+        let collisions = 0;
+        while (sim.squatted.has(bind) || (sim.live !== undefined && bind === sim.live.port)) {
+            collisions += 1;
+            if (collisions >= 17) {
+                bind = 32_768 + sim.ephemera++; // ladder exhausted → OS assigns
+                break;
+            }
+            bind += 1;
+        }
         const childPid = ++sim.pidSeq;
         const token = options.env?.BILI_LAUNCH_TOKEN ?? `sim-token-${childPid}`;
         // inst.pid must be a LIVE pid — probeLiveInstances drops records whose
@@ -201,7 +216,8 @@ function makeZoneSim(zoneFile: string, lane: string) {
         registerWatcher: async () => "ok" as const,
         sleep: () => Promise.resolve(),
         scriptPath: ZONE_FP_SCRIPT,
-        zonePreferredPort: (l: string) => lanePreferredPort(l, {}, zoneFile),
+        zoneSpawnPort: (l: string, livePorts: readonly number[]) => zoneSpawnPort(l, livePorts, {}, zoneFile),
+        liveInstancePorts: () => (sim.live !== undefined ? [sim.live.port] : []),
         writeZonePort: (l: string, port: number) => {
             sim.settles.push([l, port]);
             writeZonePort(l, port, zoneFile);
@@ -383,4 +399,153 @@ test("findSameLanePredecessor: unlane'd or fingerprint-less launches make no wai
     assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "", OWN_FP), undefined, "empty lane");
     assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "dsh", undefined), undefined, "no own fingerprint — cannot tell builds apart");
     assert.equal(findSameLanePredecessor([], ZONE_PORT_BASE, "dsh", OWN_FP), undefined, "no holders at all");
+});
+
+// ---------------------------------------------------------------------------
+// #1751: the sticky layer's two gaps — a drifted record that never walks
+// back to an unbound base, and an OS-ephemeral port getting pinned sticky
+// after the ladder exhausts.
+// ---------------------------------------------------------------------------
+
+test("zoneSpawnPort: decision table — walk back only past a drifted AND unheld sticky (#1751)", () => {
+    const file = zoneFile();
+    try {
+        assert.deepEqual(zoneSpawnPort("pi", [], {}, file), { port: ZONE_PORT_BASE }, "no record → base");
+        writeZonePort("pi", ZONE_PORT_BASE, file);
+        assert.deepEqual(zoneSpawnPort("pi", [], {}, file), { port: ZONE_PORT_BASE }, "sticky == base → base, no re-pin flag");
+        writeZonePort("pi", ZONE_PORT_BASE + 2, file);
+        assert.deepEqual(
+            zoneSpawnPort("pi", [], {}, file),
+            { port: ZONE_PORT_BASE, rePinnedFrom: ZONE_PORT_BASE + 2 },
+            "drifted + unheld → walk back to base",
+        );
+        assert.deepEqual(
+            zoneSpawnPort("pi", [ZONE_PORT_BASE + 2], {}, file),
+            { port: ZONE_PORT_BASE + 2 },
+            "drifted + HELD → keep the sticky (the #1723 overlap case)",
+        );
+        assert.deepEqual(
+            zoneSpawnPort("pi", [ZONE_PORT_BASE], {}, file),
+            { port: ZONE_PORT_BASE, rePinnedFrom: ZONE_PORT_BASE + 2 },
+            "holder sitting on the BASE → still walk back (the sticky itself is unheld)",
+        );
+        writeZonePort("omp", ZONE_PORT_BASE - 1, file);
+        assert.deepEqual(
+            zoneSpawnPort("omp", [], {}, file),
+            { port: ZONE_PORT_BASE - 1 },
+            "sticky BELOW the base (BILI_ZONE_PORT moved the zone) → parity with today's sticky-first",
+        );
+        writeZonePort("kimi", ZONE_PORT_BASE + 3, file);
+        assert.deepEqual(
+            zoneSpawnPort("kimi", [], { BILI_ZONE_PORT: "20000" }, file),
+            { port: ZONE_PORT_BASE + 3 },
+            "sticky below the overridden base → kept as-is",
+        );
+    } finally {
+        rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+});
+
+test("osEphemeralRange/isOsEphemeralPort: platform ranges with boundary discipline (#1751)", () => {
+    for (const platform of ["darwin", "win32", "linux"] as const) {
+        const [lo, hi] = osEphemeralRange(platform);
+        assert.ok(lo > 0 && hi < 65536 && lo < hi, `${platform}: sane range`);
+        assert.equal(isOsEphemeralPort(lo - 1, platform), false, `${platform}: just below is not ephemeral`);
+        assert.equal(isOsEphemeralPort(lo, platform), true, `${platform}: lo is ephemeral`);
+        assert.equal(isOsEphemeralPort(hi, platform), true, `${platform}: hi is ephemeral`);
+        assert.equal(isOsEphemeralPort(hi + 1, platform), false, `${platform}: just above is not ephemeral`);
+        assert.equal(isOsEphemeralPort(ZONE_PORT_BASE, platform), false, `${platform}: the zone base is never ephemeral`);
+    }
+    assert.deepEqual(osEphemeralRange("darwin"), [49152, 65535]);
+    assert.deepEqual(osEphemeralRange("win32"), [49152, 65535]);
+    assert.equal(isOsEphemeralPort(Number.NaN), false);
+    assert.equal(isOsEphemeralPort(0), false);
+    assert.equal(isOsEphemeralPort(18788.5), false);
+});
+
+test("zone sequence: a drifted UNHELD sticky walks back to the base at spawn and re-settles it (#1751 gap 1)", async () => {
+    const { dir, zoneFile } = zoneDir();
+    const { sim, deps } = makeZoneSim(zoneFile, "zcode");
+    try {
+        writeZonePort("zcode", ZONE_PORT_BASE + 2, zoneFile); // past drift; its holder long gone
+        const h = await ensureProxyRunning({ host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" }, deps);
+        assert.equal(sim.spawns.length, 1);
+        assert.equal(spawnPortArg(sim.spawns[0]), String(ZONE_PORT_BASE), "walk-back: the child is offered the base, not the drifted sticky");
+        assert.equal(h.port, ZONE_PORT_BASE, "the free base binds directly");
+        assert.deepEqual(sim.settles, [["zcode", ZONE_PORT_BASE]], "the settle rewrites the sticky to the base in the same step");
+        assert.equal(readZonePort("zcode", zoneFile), ZONE_PORT_BASE);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("zone sequence: walk-back lands CLOSER to the base than today's spawn-at-sticky even when the base is squatted (#1751 gap 1)", async () => {
+    const { dir, zoneFile } = zoneDir();
+    const { sim, deps } = makeZoneSim(zoneFile, "zcode");
+    try {
+        writeZonePort("zcode", ZONE_PORT_BASE + 2, zoneFile); // past drift
+        sim.squatted.add(ZONE_PORT_BASE); // someone squats the base meanwhile
+        const h = await ensureProxyRunning({ host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" }, deps);
+        assert.equal(spawnPortArg(sim.spawns[0]), String(ZONE_PORT_BASE), "the base is still offered first");
+        assert.equal(h.port, ZONE_PORT_BASE + 1, "the ladder lands base+1 — closer home than today's sticky base+2");
+        assert.deepEqual(sim.settles, [["zcode", ZONE_PORT_BASE + 1]]);
+        assert.equal(readZonePort("zcode", zoneFile), ZONE_PORT_BASE + 1);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("zone sequence: a drifted sticky STILL HELD by a live predecessor keeps precedence — no walk-back (#1751 gap 1 / #1723)", async () => {
+    const { dir, zoneFile } = zoneDir();
+    const { sim, deps } = makeZoneSim(zoneFile, "zcode");
+    try {
+        writeZonePort("zcode", ZONE_PORT_BASE + 2, zoneFile);
+        // same lane, DIFFERENT build → attach refused, exactly like an upgrade-restart overlap
+        sim.live = recordedZoneInstance({
+            port: ZONE_PORT_BASE + 2,
+            origin: `http://127.0.0.1:${ZONE_PORT_BASE + 2}`,
+            lane: "zcode",
+            launchToken: "predecessor-token",
+            codeFingerprint: "a-different-build",
+        });
+        sim.releaseOnSpawn = true; // the predecessor flushes out during the child's bounded wait
+        const h = await ensureProxyRunning({ host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" }, deps);
+        assert.equal(sim.spawns.length, 1, "the incompatible predecessor is never attached");
+        assert.equal(spawnPortArg(sim.spawns[0]), String(ZONE_PORT_BASE + 2), "walk-back suppressed while the sticky is held");
+        assert.equal(h.port, ZONE_PORT_BASE + 2, "the child takes over the SAME port once the predecessor releases");
+        assert.deepEqual(sim.settles, [["zcode", ZONE_PORT_BASE + 2]], "the sticky keeps its value");
+        assert.equal(readZonePort("zcode", zoneFile), ZONE_PORT_BASE + 2);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("zone sequence: an exhausted ladder onto an OS-ephemeral port is NEVER pinned sticky (#1751 gap 2)", async () => {
+    const { dir, zoneFile } = zoneDir();
+    const { sim, deps } = makeZoneSim(zoneFile, "zcode");
+    try {
+        for (let p = ZONE_PORT_BASE; p < ZONE_PORT_BASE + 17; p++) sim.squatted.add(p);
+        const h = await ensureProxyRunning({ host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" }, deps);
+        assert.equal(spawnPortArg(sim.spawns[0]), String(ZONE_PORT_BASE), "the spawn still targets the zone base");
+        assert.ok(h.port >= 32_768, `the child fell through to an OS-ephemeral port (${h.port})`);
+        assert.deepEqual(sim.settles, [], "the ephemeral port is NOT written sticky");
+        assert.equal(readZonePort("zcode", zoneFile), undefined, "no record created — the next launch retries the base");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("zone sequence: an existing sticky record SURVIVES an ephemeral fall-through (not overwritten with the temp port) (#1751 gap 2)", async () => {
+    const { dir, zoneFile } = zoneDir();
+    const { sim, deps } = makeZoneSim(zoneFile, "zcode");
+    try {
+        writeZonePort("zcode", ZONE_PORT_BASE + 5, zoneFile); // stale drift from a boot long ago
+        for (let p = ZONE_PORT_BASE; p < ZONE_PORT_BASE + 17; p++) sim.squatted.add(p);
+        const h = await ensureProxyRunning({ host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" }, deps);
+        assert.ok(h.port >= 32_768, `ephemeral fall-through (${h.port})`);
+        assert.deepEqual(sim.settles, [], "still no sticky write for an ephemeral bind");
+        assert.equal(readZonePort("zcode", zoneFile), ZONE_PORT_BASE + 5, "the prior record is preserved, not clobbered");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

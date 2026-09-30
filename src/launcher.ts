@@ -40,13 +40,14 @@ import {
     clearStartingMarker,
     discoverLiveInstances,
     entryScriptFingerprint,
+    isOsEphemeralPort,
     isPidAlive,
     isProxyInstanceFile,
-    lanePreferredPort,
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
     writeZonePort,
+    zoneSpawnPort,
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
@@ -254,12 +255,15 @@ export interface LauncherDeps {
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
     platform?: NodeJS.Platform;
-    /** #1660: zone-port seam for tests. The preferred port a lane'd launch
-     *  tries before the proxy child's +1 ladder (default: the lane's sticky
-     *  record > zone base, instance.ts), and the sticky-settle write
-     *  (default: stateDir()/port-zone.json). Tests inject pure sinks so a
-     *  lane'd fake launch never touches the developer's real zone record. */
-    zonePreferredPort?: (lane: string) => number;
+    /** #1660/#1751: zone-port seams for tests. The spawn-time port decision
+     *  per lane (default: instance.ts zoneSpawnPort — sticky record, walking
+     *  back to the zone base when it is unheld), the live-instance port view
+     *  that feeds the walk-back check (default: the instances registry), and
+     *  the sticky-settle write (default: stateDir()/port-zone.json). Tests
+     *  inject pure sinks so a lane'd fake launch never touches the
+     *  developer's real zone record or registry. */
+    zoneSpawnPort?: (lane: string, livePorts: readonly number[]) => { port: number; rePinnedFrom?: number };
+    liveInstancePorts?: () => readonly number[];
     writeZonePort?: (lane: string, port: number) => void;
 }
 
@@ -2690,6 +2694,13 @@ export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number>
     });
 }
 
+// #1751: the walk-back check's default view of what is actually bound —
+// registry markers of live instances (a dead pid is already filtered by
+// discoverLiveInstances).
+function defaultLiveInstancePorts(): readonly number[] {
+    return discoverLiveInstances().map((i) => i.port);
+}
+
 const INHERITED_PROXY_VARS = [
     "http_proxy",
     "https_proxy",
@@ -2914,15 +2925,36 @@ export async function ensureProxyRunning(
     // default. The child's EADDRINUSE +1 ladder covers the pick/spawn race
     // AND a squatted preferred port (zero-config resolution: the lane lands
     // on base+1 and records it sticky; #1660).
+    // #1751: soft re-pin — a drifted sticky record whose port NO live
+    // instance holds walks back to the zone base at spawn time (the record's
+    // authority presupposes its port is live; the child's ladder keeps the
+    // landing point from ever being worse than today's). A held sticky keeps
+    // today's precedence: that is the #1723 upgrade-overlap case, where the
+    // child must collide with the predecessor so its bounded wait can take
+    // over the SAME port.
     const zoneLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
-    const preferredPort = deps?.zonePreferredPort ?? lanePreferredPort;
+    const zoneDecision = zoneLane !== undefined
+        ? (deps?.zoneSpawnPort ?? zoneSpawnPort)(zoneLane, (deps?.liveInstancePorts ?? defaultLiveInstancePorts)())
+        : undefined;
     const port = opts.port > 0
         ? opts.port
-        : zoneLane !== undefined
-          ? preferredPort(zoneLane)
+        : zoneDecision !== undefined
+          ? zoneDecision.port
           : await pickEphemeralPort(opts.host);
+    if (zoneLane !== undefined && zoneDecision?.rePinnedFrom !== undefined) {
+        console.error(`bili: [zone] lane "${zoneLane}" re-pinned ${zoneDecision.rePinnedFrom} → ${port} — its drifted sticky port is unbound; walking back to the zone base (#1751)`);
+    }
     const settleZonePort = (settled: number): void => {
-        if (zoneLane !== undefined) (deps?.writeZonePort ?? writeZonePort)(zoneLane, settled);
+        if (zoneLane === undefined) return;
+        // #1751: an exhausted ladder lands the child on an OS-assigned
+        // ephemeral port. Pinning it would strand the lane outside the zone
+        // across reboots (the OS hands out a fresh one every boot) — refuse
+        // the write, keep whatever record exists (or none), say it loudly.
+        if (isOsEphemeralPort(settled)) {
+            console.error(`bili: [zone] lane "${zoneLane}" exhausted the zone ladder and bound OS-ephemeral port ${settled} — NOT pinning it sticky (#1751); the next launch retries the zone base. Free the squatters holding the zone to restore stable binding.`);
+            return;
+        }
+        (deps?.writeZonePort ?? writeZonePort)(zoneLane, settled);
     };
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);

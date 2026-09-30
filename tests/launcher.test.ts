@@ -1275,9 +1275,9 @@ test("ensureProxyRunning: a lane'd launch with port 0 binds the zone preference 
             spawnImpl,
             sleep: () => Promise.resolve(),
             readInstanceFile: () => undefined,
-            zonePreferredPort: (lane) => {
+            zoneSpawnPort: (lane, _livePorts) => {
                 preferred.push(lane);
-                return 18787;
+                return { port: 18787 };
             },
             writeZonePort: (lane, port) => {
                 settled.push([lane, port]);

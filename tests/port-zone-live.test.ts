@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning } from "../src/launcher.ts";
-import { portZoneFilePath, readZonePort } from "../src/instance.ts";
+import { osEphemeralRange, portZoneFilePath, readZonePort, writeZonePort } from "../src/instance.ts";
 import { ZONE_PORT_BASE } from "../src/config.ts";
 
 // #1660 live regression: the sticky-zone lifecycle against REAL proxy
@@ -327,6 +327,64 @@ test(
                 killNow(daemon1);
                 killNow(daemon2);
                 fs.rmSync(v2Script, { force: true });
+            }
+        });
+    },
+);
+
+// #1751: the two sticky-layer gaps against REAL processes — walk-back to an
+// unbound base (gap 1) and the refusal to pin an OS-ephemeral port after the
+// ladder exhausts (gap 2). The issue's own repros.
+
+test(
+    "zone live: a drifted UNHELD sticky walks back to the zone base at spawn (#1751 gap 1)",
+    { timeout: 180_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            writeZonePort("zcode", ZONE_PORT_BASE + 2); // past drift; its holder long gone
+            const h = await launch({ lane: "zcode" });
+            trackKill(h.child?.pid);
+            try {
+                assert.equal(h.port, ZONE_PORT_BASE, "walk-back: the child binds the free base, not the drifted sticky");
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "the settle rewrites the sticky back to the base");
+            } finally {
+                killNow(h.child?.pid);
+            }
+        });
+    },
+);
+
+test(
+    "zone live: an exhausted ladder onto an OS-ephemeral port NEVER pins sticky (#1751 gap 2)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            const ephemLo = osEphemeralRange(process.platform)[0];
+            const squatters: net.Server[] = [];
+            try {
+                for (let i = 0; i < 17; i++) squatters.push(await squatted(ZONE_PORT_BASE + i));
+                const h1 = await launch({ lane: "zcode" });
+                trackKill(h1.child?.pid);
+                try {
+                    assert.ok(h1.port >= ephemLo, `fresh lane falls through to an OS-ephemeral port (${h1.port})`);
+                    assert.equal(fs.existsSync(portZoneFilePath()), false, "the ephemeral port is NOT written sticky — no record at all");
+                } finally {
+                    killNow(h1.child?.pid);
+                    await new Promise((r) => setTimeout(r, 300)); // let the dead daemon's marker settle before the next probe
+                }
+                writeZonePort("zcode", ZONE_PORT_BASE + 5); // a stale record from a boot long ago
+                const h2 = await launch({ lane: "zcode" });
+                trackKill(h2.child?.pid);
+                try {
+                    assert.ok(h2.port >= ephemLo, `second fall-through also lands ephemeral (${h2.port})`);
+                    assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 5, "the prior record survives — never clobbered with the temp port");
+                } finally {
+                    killNow(h2.child?.pid);
+                }
+            } finally {
+                for (const s of squatters) s.close();
             }
         });
     },

@@ -132,7 +132,13 @@ exception to the ladder (#1723): when the holder of the lane's port is a
 same-lane instance running a **different build** (the upgrade-restart
 overlap — the old version still draining), the child waits for it to release
 (up to 5s) and rebinds the *same* port instead of drifting; a holder that
-never leaves exhausts the wait and gets the plain ladder as before. After the
+never leaves exhausts the wait and gets the plain ladder as before. Two
+further anti-ratchet rules (#1751): a drifted sticky record keeps precedence
+only while its port is actually held — an unbound record walks back to the
+zone base at spawn (and the settle writes it back down); and the OS-ephemeral
+range, reachable only when the 17-attempt ladder exhausts onto port 0, is
+never pinned sticky — such a fall-through leaves the prior record untouched
+(or none) and the next launch simply retries the base. After the
 proxy is up the hook re-pins the managed `ANTHROPIC_BASE_URL` to the live
 origin each session (`repinClaudeManagedBaseUrl`), so a hopped port
 self-heals on the next launch and the baked URL never stays desynced from
