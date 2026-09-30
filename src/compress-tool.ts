@@ -95,25 +95,18 @@ export {
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
-// #841: host-side conversation_id extension of search_context. Kernel constants
-// are shared and never mutated; ALL wire-mode injection points must use these
-// BILI_ arrays or the served schema drifts between wire mode and plugin mode
-// (the plugin manifest reuses SEARCH_CONTEXT_CONVERSATION_ID_PARAM below).
-export const SEARCH_CONTEXT_CONVERSATION_ID_PARAM = {
-    type: "string",
-    description: "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search.",
-};
-
+// #1685 zero-injection identity: search_context's host-side
+// conversation_id extension (#841/#760) is REMOVED — the model never sees a
+// conversation id anymore, so it cannot cite one. Cross-session search keeps
+// working for hosts that pass a target id out-of-band; the schema the model
+// sees is the kernel constant, verbatim. The BILI_ copies stay as the
+// served-shape anchor the wire-contract golden test pins.
 type JsonSchemaObject = { type: string; properties?: Record<string, unknown>; required?: string[] };
-
-function withConversationId(schema: JsonSchemaObject): JsonSchemaObject {
-    return { ...schema, properties: { ...schema.properties, conversation_id: SEARCH_CONTEXT_CONVERSATION_ID_PARAM } };
-}
 
 export const BILI_SEARCH_CONTEXT_TOOL = {
     name: SEARCH_CONTEXT_TOOL.name,
     description: SEARCH_CONTEXT_TOOL.description,
-    input_schema: withConversationId(SEARCH_CONTEXT_TOOL.input_schema),
+    input_schema: SEARCH_CONTEXT_TOOL.input_schema as JsonSchemaObject,
 };
 
 export const BILI_SEARCH_CONTEXT_TOOL_OPENAI = {
@@ -121,7 +114,7 @@ export const BILI_SEARCH_CONTEXT_TOOL_OPENAI = {
     function: {
         name: SEARCH_CONTEXT_TOOL_OPENAI.function.name,
         description: SEARCH_CONTEXT_TOOL_OPENAI.function.description,
-        parameters: withConversationId(SEARCH_CONTEXT_TOOL_OPENAI.function.parameters),
+        parameters: SEARCH_CONTEXT_TOOL_OPENAI.function.parameters as JsonSchemaObject,
     },
 };
 
@@ -129,13 +122,13 @@ export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
     type: "function" as const,
     name: SEARCH_CONTEXT_TOOL_RESPONSES.name,
     description: SEARCH_CONTEXT_TOOL_RESPONSES.description,
-    parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
+    parameters: SEARCH_CONTEXT_TOOL_RESPONSES.parameters as JsonSchemaObject,
 };
 
 export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
     name: SEARCH_CONTEXT_TOOL_GOOGLE.name,
     description: SEARCH_CONTEXT_TOOL_GOOGLE.description,
-    parameters: withConversationId(SEARCH_CONTEXT_TOOL_GOOGLE.parameters),
+    parameters: SEARCH_CONTEXT_TOOL_GOOGLE.parameters as JsonSchemaObject,
 };
 
 // #1179 CCR v2: host-side range-restore extension of decompress. Optional
@@ -412,16 +405,6 @@ const MARKER_SILENCE_CLAUSE =
  *  clause is dropped. */
 export function withMarkerIntegrityNote(text: string, visibilityMarkers = true): string {
     return text + MARKER_INTEGRITY_NOTE + (visibilityMarkers ? MARKER_SILENCE_CLAUSE : "");
-}
-
-// #760: per-call conversation_id for MCP tools. Hosts that share ONE MCP shim
-// process across several concurrent conversations (kimi web et al.) have no
-// env/meta session channel, so the proxy prints its own resolved session id
-// and the model echoes it back as the conversation_id argument of every
-// mcp__bili__ call. Session-stable, so it rides the static system-prompt part
-// (prefix-cache safe) next to MARKER_INTEGRITY_NOTE, in BOTH modes.
-export function withConversationIdNote(text: string, conversationId: string): string {
-    return text + `\n\n[Your bili conversation id: ${conversationId}. When calling the bili compression tools, pass this value as the conversation_id argument so a shared MCP process can route the call to THIS session.]`;
 }
 
 // #888 per-summary length budget. acp-kernel rejects a compress call atomically

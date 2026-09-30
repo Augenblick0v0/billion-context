@@ -2427,19 +2427,29 @@ async function probeHealth(
 export interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
+     *  fallback uses this to verify the healthy responder on the preferred
+     *  port is the child WE spawned (and not a foreign proxy squatting it). */
+    pid?: number;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
-     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed. */
-    watchdog?: { armed: boolean };
+     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed.
+     *  #1753 (shutdown side): `watchers` is the live watcher-pid set — the
+     *  launcher consults it at client exit so a spawned-but-SHARED instance
+     *  is spared for its remaining owners instead of group-killed. */
+    watchdog?: { armed: boolean; watchers?: number[] };
 }
 
 async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; pid?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (typeof data.pid === "number") info.pid = data.pid;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
-            info.watchdog = { armed: (data.watchdog as { armed: boolean }).armed };
+            const wd = data.watchdog as { armed: boolean; watchers?: unknown };
+            const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
+            info.watchdog = { armed: wd.armed, watchers };
         }
         return info;
     } catch {
@@ -3008,6 +3018,9 @@ export async function ensureProxyRunning(
         // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
         // that kills the host process; capture it so we fail fast with the cause.
         let childError: unknown;
+        // #1753: announce a healthy-but-foreign responder on the preferred port
+        // at most once — silence would hide exactly the misroute this fix closes.
+        let squatterAnnounced = false;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
@@ -3038,10 +3051,27 @@ export async function ensureProxyRunning(
             // origin when NO record vouches for it — a LIVE record's owner owns
             // the discovery surface and our child is retry-binding elsewhere.
             // A stale record (dead pid / legacy plain) cannot vouch for anything.
+            // #1753: "healthy on the preferred port" alone is NOT proof the
+            // responder is our child — a foreign proxy can be squatting exactly
+            // that port (which is WHY our child laddered away). Verify the
+            // responder's pid matches the spawned child before exporting its
+            // origin to the client; otherwise keep waiting for the launchToken
+            // handshake instead of pinning the client to an instance the attach
+            // gate (#1225) itself would have rejected.
             const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
-            if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
-                settleZonePort(port);
-                return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+            if (stale) {
+                const preferredOrigin = proxyOrigin(opts.host, port);
+                const info = await fetchHealthInfo(preferredOrigin);
+                if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
+                    settleZonePort(port);
+                    return { origin: preferredOrigin, port, child, logPath };
+                }
+                if (info?.ok && !squatterAnnounced) {
+                    squatterAnnounced = true;
+                    console.error(
+                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
+                    );
+                }
             }
         }
         if (childError !== undefined) {
@@ -3080,6 +3110,46 @@ export function stopProxy(handle: ProxyHandle): void {
     try {
         child.kill?.();
     } catch {}
+}
+
+/** #1753 (shutdown side): the wrapper's exit path used to kill the instance
+ *  it spawned unconditionally — taking down every ATTACHED session riding
+ *  that shared instance (live incident: exiting one `bili pi` killed the
+ *  proxy another live `bili pi` was watching; the client burned its 3
+ *  retries and died until some later wrapper re-spawned an instance on the
+ *  same port). The server's watcher-set watchdog (#7) already implements
+ *  the correct "die when the LAST owner exits" semantics; this guard defers
+ *  to it: if /__bili/health still lists watchers other than ourselves, the
+ *  instance is spared and the server retires it after its last watcher
+ *  leaves (WATCHER_IDLE_GRACE_MS). Health-parse failures degrade to the old
+ *  behavior (kill), which is safe: nothing else claims the instance. */
+export async function stopProxyGuarded(
+    handle: ProxyHandle,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+): Promise<void> {
+    if (handle.attached) return;
+    const child = handle.child;
+    if (!child || child.pid === undefined) return;
+    if (process.platform === "win32") {
+        // #414: POSIX-only kill path; win32 relies on the server-side
+        // parent-gone watchdog, which already honors the watcher set.
+        return;
+    }
+    let info: HealthInfo | undefined;
+    try {
+        info = await fetchHealthInfo(handle.origin);
+    } catch {
+        info = undefined;
+    }
+    const watchers = info?.ok ? (info.watchdog?.watchers ?? []) : [];
+    const others = watchers.filter((w) => w !== process.pid);
+    if (others.length > 0) {
+        console.error(
+            `bili: sparing the shared proxy at ${handle.origin} — ${others.length} other watcher${others.length === 1 ? "" : "s"} still attached; it will retire when the last one exits`,
+        );
+        return;
+    }
+    stopProxy(handle);
 }
 
 /** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
@@ -3812,7 +3882,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         console.error(`bili: failed to launch ${params.client}: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        stopProxy(handle);
+        await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
         if (gooseOverlay) {
             try {
                 finalizeGooseHome(gooseOverlay);
@@ -3881,7 +3951,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         console.error(`bili: pi test failed: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        stopProxy(handle);
+        await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
     }
     process.exit(code ?? 0);
 }

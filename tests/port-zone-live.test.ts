@@ -109,7 +109,7 @@ async function withSandbox<T>(fn: () => Promise<T>): Promise<T> {
     }
 }
 
-function launch(opts: { lane?: string; port?: number; strictPort?: boolean } = {}) {
+function launch(opts: { lane?: string; port?: number; strictPort?: boolean; script?: string } = {}) {
     return ensureProxyRunning(
         {
             host: "127.0.0.1",
@@ -119,8 +119,20 @@ function launch(opts: { lane?: string; port?: number; strictPort?: boolean } = {
             debug: false,
             lane: opts.lane,
         },
-        { scriptPath: distCli },
+        { scriptPath: opts.script ?? distCli },
     );
+}
+
+// #1723: a byte-different copy of the entry script = a DIFFERENT build — the
+// fingerprint hashes contents (entryScriptFingerprint), which is exactly what
+// an upgrade produces on disk. Written INSIDE the repo tree so the copy still
+// resolves the root package.json's "type": "module" (a /tmp copy would run as
+// CJS and die on the bundle's import statements before ever reaching listen).
+let v2Seq = 0;
+function makeV2Script(): string {
+    const p = path.join(root, `bili-zone-live-v2-${process.pid}-${++v2Seq}.js`);
+    fs.writeFileSync(p, fs.readFileSync(distCli, "utf8") + "\n// v2 marker\n");
+    return p;
 }
 
 test(
@@ -240,6 +252,81 @@ test(
                 assert.equal(fs.existsSync(portZoneFilePath()), false, "no sticky record without a lane");
             } finally {
                 killNow(h.child?.pid);
+            }
+        });
+    },
+);
+
+// ---------------------------------------------------------------------------
+// #1723 (#1660 follow-up): the upgrade-restart overlap. The old build's
+// instance still holds the lane's sticky port while the new build's child is
+// already trying to bind it — the exact window an auto-update restart opens.
+// The new child must WAIT for the predecessor to release and rebind the SAME
+// port (sticky stays put), and only fall back to the +1 ladder when the
+// holder never leaves (bounded wait → today's behavior as worst case).
+// ---------------------------------------------------------------------------
+
+test(
+    "zone live: upgrade-restart overlap — new build waits out the same-lane predecessor and rebinds the SAME port (#1723)",
+    { timeout: 240_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            const v2Script = makeV2Script();
+            const h1 = await launch({ lane: "zcode" });
+            const daemon1 = h1.child?.pid;
+            trackKill(daemon1);
+            let daemon2: number | undefined;
+            try {
+                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the old build holds the zone base");
+                const p2 = launch({ lane: "zcode", script: v2Script });
+                // Let the new child hit EADDRINUSE and enter its predecessor
+                // wait, then retire the old build the way an exiting host's
+                // parent-gone flush does — the listen socket frees at once.
+                await new Promise((r) => setTimeout(r, 1500));
+                killNow(daemon1);
+                const h2 = await p2;
+                daemon2 = h2.child?.pid;
+                trackKill(daemon2);
+                assert.equal(h2.attached, undefined, "different builds never attach to each other");
+                assert.equal(h2.port, ZONE_PORT_BASE, "waited out the predecessor and rebound the SAME port — no drift");
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "sticky did NOT ratchet up");
+            } finally {
+                killNow(daemon1);
+                killNow(daemon2);
+                fs.rmSync(v2Script, { force: true });
+            }
+        });
+    },
+);
+
+test(
+    "zone live: predecessor that never leaves — bounded wait exhausts and the +1 ladder takes over as before (#1723)",
+    { timeout: 300_000, skip: LIVE ? process.platform !== "linux" : liveSkip },
+    async () => {
+        await withSandbox(async () => {
+            ensureDistBuilt();
+            const v2Script = makeV2Script();
+            const h1 = await launch({ lane: "zcode" });
+            const daemon1 = h1.child?.pid;
+            trackKill(daemon1);
+            let daemon2: number | undefined;
+            try {
+                assert.equal(h1.port, ZONE_PORT_BASE, "precondition: the old build holds the zone base");
+                // daemon1's owner (this test process) stays alive — no
+                // parent-gone flush ever comes, so the holder never frees the
+                // port. The new child's bounded wait (~5s) must give up and
+                // fall back to the plain +1 ladder: worst case equals today's
+                // behavior plus a bounded delay, never a hung launch.
+                const h2 = await launch({ lane: "zcode", script: v2Script });
+                daemon2 = h2.child?.pid;
+                trackKill(daemon2);
+                assert.equal(h2.port, ZONE_PORT_BASE + 1, "budget exhausted → the +1 ladder still lands the launch");
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows (residual drift, now warned)");
+            } finally {
+                killNow(daemon1);
+                killNow(daemon2);
+                fs.rmSync(v2Script, { force: true });
             }
         });
     },

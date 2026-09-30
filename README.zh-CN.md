@@ -146,7 +146,7 @@ npm install -g billion-context
 
 三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
-端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。
+端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。升级重启时若旧版本还在该 lane 端口上排水,会最多等 5 秒让它释放并复用同一端口,而不是漂移(#1723);只有真正被占用的端口才 +1 跳口 —— 且这种跳口现在会大声打 warn。
 
 ### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 
@@ -174,7 +174,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
-- `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值),子代理会话按每次调用的 `conversation_id` 绑定。
+- `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
 - `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。

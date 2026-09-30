@@ -30,6 +30,45 @@ The hook probes each candidate's `/__bili/health` before attaching: armed → at
 
 Attach discovery is lane-aware across **all** live instances (#1232): the launcher probes every live entry in the instance registry, not just the single instance file (last-writer-wins — under concurrent multi-client use it can point at another client's proxy), and applies the gate above to every candidate. Among compatible candidates the newest instance with the launcher's own declared lane wins; an instance without a lane (a user-zone daemon) is wildcard-compatible on the lane axis and gate-exempt by default (#1660). The `another bili instance is running` warning (#394) is lane-aware too: it fires for same-lane or lane-less coexistence, but stays silent between two *different* declared lanes, whose session files are disjoint.
 
+## Shared state dir and multi-instance security boundary (#394, #1724)
+
+Every bili instance on a host reads and writes the **same** per-host
+storage: the XDG data dir (`~/.local/share/billion-context/` — session
+records, CCR content-store, prefix-affinity) plus the state dir
+(`~/.local/state/billion-context/` — log, instance registry). The control
+plane is lane-aware (#1232:
+attach discovery and the #394 coexistence warning both respect declared
+lanes), but the **data plane is not partitioned** — there is no per-session
+owner and no per-lane isolation on disk. Two consequences follow:
+
+- **Cross-instance session visibility.** Each instance's Web UI
+  (`__bili/sessions` list / detail / logs) re-scans the whole shared store, so
+  any instance reachable over loopback can enumerate and read *any* session —
+  raw messages, content-store payloads, compressed blocks — created by any
+  other instance/lane on that host.
+- **Restart drain race.** On a restart the new process hydrates the store
+  before the old one finishes flushing, so last-writer-wins can drop the old
+  process's final writes: lost tail updates and a provider prefix-cache bust
+   (the outbound body diverges from what the provider had cached). The #1724
+   mitigations: the #405 snapshot-counter guard (rejects stale session writes),
+   the prefix-affinity union-on-write guard (#1737: one instance's flush never
+   clobbers a sibling chain), and the self-restart ordering fix (#1742: durable
+   state is flushed to disk before the replacement spawns). Host-driven restarts
+  (dsh et al., #991) still rely on these data-layer guards, since their
+  kill/spawn order is not bili-controlled.
+
+**Security posture:** the shared-state surface is protected *only* by the admin
+endpoint's loopback gate (non-loopback source addresses are refused) plus
+filesystem permissions on the user's home tree (both dirs live under $HOME) —
+there is no per-session authorization. For a **single-user host** that is
+sufficient. On a **multi-user host** it is not: any local account able to reach
+the proxy's loopback port can read every session of every user. Such hosts must
+partition their per-host storage (per-user/per-lane subdirectories) — the root
+fix named in #1724
+(direction #1), still open as an architecture decision; Web UI scoping
+(#1724 direction #4) reduces cross-instance browsing but does not change this
+boundary.
+
 ## Runtime-info protocol (#955)
 
 A native plugin lives inside the client process, so it can read the model
@@ -88,7 +127,12 @@ request) resolves its port like every lane (#1660): an explicit pin
 **strict-port** on that exact port (a squatter is refused loudly, #964
 preserved); otherwise it rides the self-managed zone — the lane's sticky
 record else base `18787` — non-strict, with the child's EADDRINUSE +1
-ladder resolving collisions and the settled port recorded sticky. After the
+ladder resolving collisions and the settled port recorded sticky. One
+exception to the ladder (#1723): when the holder of the lane's port is a
+same-lane instance running a **different build** (the upgrade-restart
+overlap — the old version still draining), the child waits for it to release
+(up to 5s) and rebinds the *same* port instead of drifting; a holder that
+never leaves exhausts the wait and gets the plain ladder as before. After the
 proxy is up the hook re-pins the managed `ANTHROPIC_BASE_URL` to the live
 origin each session (`repinClaudeManagedBaseUrl`), so a hopped port
 self-heals on the next launch and the baked URL never stays desynced from

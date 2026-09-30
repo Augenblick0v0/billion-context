@@ -138,6 +138,33 @@ export function lanePreferredPort(lane: string, file: string = portZoneFilePath(
     return readZonePort(lane, file) ?? resolveZonePortBase();
 }
 
+/** #1723: identify the EADDRINUSE holder BEFORE laddering (#1660 follow-up).
+ *  Upgrade-restart overlap: the new build's child tries the lane's sticky
+ *  port while the OLD build's instance is still draining (its host is
+ *  exiting; the flush frees the port within seconds). The correct response
+ *  is to wait for the release and rebind the SAME port — not to drift +1
+ *  into the monotonic ratchet. Returns the live registry entry holding
+ *  `port` on `lane` when it runs DIFFERENT code than us (a predecessor being
+ *  replaced; missing fingerprints from pre-#1232 markers count as
+ *  "different build"). Never returns: no holder, a different/undeclared
+ *  lane (a manual `bili start` daemon can serve any client — waiting on it
+ *  would stall a launch behind a peer that may never leave), or a live peer
+ *  running OUR build (genuine contention — waiting cannot help). */
+export function findSameLanePredecessor(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+): RegistryEntry | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        if (e.codeFingerprint !== ownFingerprint) return e;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same

@@ -21,6 +21,15 @@ hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 w
 
 附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例(用户主权区守护进程)在 lane 轴上通配,且门禁默认豁免(#1660)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
 
+## 共享 state 目录与多实例安全边界(#394、#1724)
+
+同一台 host 上的每个 bili 实例读写的是**同一组** per-host 存储:XDG data 目录(`~/.local/share/billion-context/` —— 会话记录、CCR content-store、prefix-affinity)加 state 目录(`~/.local/state/billion-context/` —— 日志、实例注册表)。控制面是 lane 感知的(#1232:附着发现与 #394 共存告警都尊重已声明 lane),但**数据面没有分区** —— 既无按会话的属主,也无按 lane 的磁盘隔离。由此带来两个后果:
+
+- **跨实例会话可见。** 每个实例的 Web UI(`__bili/sessions` list / detail / logs)都会重新扫描整个共享存储,因此任何经回环可达的实例都能枚举并读取*任意*会话 —— 原始报文、content-store 载荷、压缩块 —— 无论它由该 host 上哪个其他实例/lane 创建。
+- **重启 drain 竞态。** 重启时新进程在旧进程完成 flush 之前就 hydrate 了存储,last-writer-wins 可能丢掉旧进程的最终写入:tail 更新丢失,以及 provider 前缀缓存击穿(出站 body 与 provider 已缓存的前缀分叉)。#1724 的缓解措施:#405 快照计数器守卫(拒绝陈旧会话写入)、prefix-affinity union-on-write 守卫(#1737:一个实例的 flush 永不覆盖兄弟 chain)、自重启顺序修复(#1742:durable state 在替换进程 spawn 之前落盘)。host 驱动的重启(dsh 等,#991)仍依赖这些数据层守卫,因为其 kill/spawn 顺序不受 bili 控制。
+
+**安全边界:** 共享 state 面目前**仅**由管理端点的回环门禁(非回环源地址被拒绝)+ 用户 home 树下这些目录的文件系统权限保护(两个目录都在 $HOME 下)—— 没有按会话的鉴权。对**单用户 host** 这已足够。对**多用户 host** 则不够:任何能触达代理回环端口的本地账户都能读取所有用户的所有会话。这类 host 必须给这组 per-host 存储分区(按用户/按 lane 子目录)—— 即 #1724 指出的根因修复(direction #1),目前仍作为架构决策开放;Web UI scoping(#1724 direction #4)能减少跨实例浏览,但不改变这一边界。
+
 ## Runtime-info 协议(#955)
 
 原生插件就在客户端进程里,因此能读到客户端自己将要使用的模型配置。它通过两个通道把真相推给代理,代理在上下文窗口解析链里优先采用它而不是 models.dev 注册表/内置表:
@@ -38,7 +47,7 @@ launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <c
 
 ## Claude 原生姿态(#964)
 
-Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样的用户级 MCP shell。hook 在首个模型请求前触发,端口解析与所有 lane 一致(#1660):显式钉死(`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort`)→ 该确切端口**严格端口**启动(占用者被大声拒绝,#964 保留);否则骑自管区 —— 该 lane 粘性记录优先,否则基准口 `18787` —— 非严格,子进程 EADDRINUSE +1 阶梯解决碰撞,落定端口粘性记录。代理就绪后 hook 每会话把受管 `ANTHROPIC_BASE_URL` 重钉到存活 origin(`repinClaudeManagedBaseUrl`),跳口后下次启动自愈,烘进 URL 永不与运行中代理失步。上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。install 不再持久化 `claude.nativePort`。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为在同一解析端口上拉起 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身代理覆盖静态 URL,hook 保持休眠。
+Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样的用户级 MCP shell。hook 在首个模型请求前触发,端口解析与所有 lane 一致(#1660):显式钉死(`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort`)→ 该确切端口**严格端口**启动(占用者被大声拒绝,#964 保留);否则骑自管区 —— 该 lane 粘性记录优先,否则基准口 `18787` —— 非严格,子进程 EADDRINUSE +1 阶梯解决碰撞,落定端口粘性记录。阶梯有一个例外(#1723):lane 端口的持有者是**不同构建**的同 lane 实例(升级重启重叠——旧版本还在排水)时,子进程等它释放(最多 5 秒)后复用*同一*端口,而不是漂移;持有者永不退出则等待预算耗尽,照旧走 +1 阶梯。代理就绪后 hook 每会话把受管 `ANTHROPIC_BASE_URL` 重钉到存活 origin(`repinClaudeManagedBaseUrl`),跳口后下次启动自愈,烘进 URL 永不与运行中代理失步。上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。install 不再持久化 `claude.nativePort`。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为在同一解析端口上拉起 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身代理覆盖静态 URL,hook 保持休眠。
 
 ## 注入优先级 —— 能不写文件就不写(#535)
 

@@ -48,7 +48,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL, configureMaxSessions } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL, configureMaxSessions } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -64,7 +64,7 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, commitRetrievalNotes, contentStoreOf, dropRetrievals, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, configureCcrRetrievalTtlMs, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, imageUsageSuffix, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
@@ -86,7 +86,7 @@ import { configurePersistDebounceMs, configurePersistEnabled, configurePersistEp
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, enterSessionContext } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, configureSessionsDir, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
@@ -701,6 +701,26 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
+    // #1723 (#1660 follow-up): the upgrade-restart overlap. The launcher spawns
+    // this child while the OLD build's instance of the same lane is still
+    // draining (its host is exiting; the flush frees the port within seconds).
+    // Laddering +1 there is what ratchets the sticky port up one slot per
+    // auto-update forever. When EADDRINUSE hits a port held by a same-lane
+    // predecessor running DIFFERENT code, rebind the SAME port on a tick until
+    // it releases — bounded, so a holder that never leaves falls through to
+    // the plain ladder (today's behavior) after the budget is spent.
+    const PREDECESSOR_WAIT_TICKS = 10;
+    const PREDECESSOR_WAIT_MS = 500;
+    let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
+    let predecessorWaitAnnounced = false;
+    const sameLanePredecessorHolds = (port: number): boolean => {
+        const pred = findSameLanePredecessor(listInstances(), port, launcherLane, ownFingerprint);
+        if (pred && !predecessorWaitAnnounced) {
+            predecessorWaitAnnounced = true;
+            log("warn", `port ${port} held by a same-lane predecessor (pid ${pred.pid}, different build) — waiting up to ${Math.round((PREDECESSOR_WAIT_TICKS * PREDECESSOR_WAIT_MS) / 1000)}s for it to release instead of drifting`);
+        }
+        return pred !== undefined;
+    };
     const announceListening = (): void => {
         const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
@@ -761,6 +781,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression.",
             );
         }
+        // #1723: residual zone drift is now an exception, not the norm — a
+        // lane'd launch landing ABOVE its preferred port means that port was
+        // held by something we must not wait on (foreign squatter, same-code
+        // peer). Clients pinned to the old port (lane wrappers, firewall
+        // rules, docs) point at air until they re-resolve; say so loudly.
+        if (launcherLane && actualPort > opts.port) {
+            log("warn", `[zone] lane "${launcherLane}" drifted ${opts.port} → ${actualPort} — the preferred port is still occupied by something else; anything pinned to ${opts.port} must re-resolve`);
+        }
         if (nonLoopbackBind) {
             log(
                 "warn",
@@ -783,6 +811,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
+            if (predecessorTicksLeft > 0 && sameLanePredecessorHolds(lastTriedPort)) {
+                predecessorTicksLeft -= 1;
+                setTimeout(() => attemptListen(lastTriedPort), PREDECESSOR_WAIT_MS);
+                return;
+            }
             listenAttempts += 1;
             const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
             log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
@@ -3456,7 +3489,7 @@ async function prepareAnthropic(
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers);
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
@@ -3684,7 +3717,7 @@ async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
@@ -3914,7 +3947,7 @@ async function prepareGoogle(
         // constants, so the system anchor stays identical across normal turns
         // and round-2 re-requests — skipping them here would fork the prefix
         // at every fold and collapse the upstream cache hit.
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
@@ -4204,7 +4237,7 @@ async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session));
+            const prompt = withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers);
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -4595,7 +4628,6 @@ function injectSystem(
     opts: ProxyOptions,
     prompts: Prompts = defaultPrompts,
     config: Config,
-    noteId: string,
     surface?: PackSurface,
     visibilityMarkers = true,
 ): string | AnthropicRequestBody["system"] {
@@ -4605,7 +4637,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -6267,7 +6299,7 @@ async function forward(
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
-            const systemPrompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers), ensureCanonicalId(prepared.session)) + absorbSection;
+            const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {

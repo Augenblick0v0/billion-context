@@ -149,7 +149,7 @@ test("#1712: with-range arrays expose optional startId/endId; NO_RANGE variants 
         assert.equal(nr.endId, undefined, "NO_RANGE drops endId");
         assert.deepEqual(namesOf(noRange as unknown[]), namesOf(withRange as unknown[]), "tool set otherwise identical");
         const sc = propsOf(noRange as unknown[], SEARCH_CONTEXT_TOOL_NAME);
-        assert.equal(sc?.conversation_id?.type, "string", "search_context keeps conversation_id");
+        assert.equal(sc?.conversation_id, undefined, "#1685 zero-injection: search_context carries no conversation_id");
     }
 });
 

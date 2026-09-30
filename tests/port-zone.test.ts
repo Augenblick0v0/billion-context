@@ -1,11 +1,12 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { lanePreferredPort, portZoneFilePath, readZonePort, writeZonePort } from "../src/instance.ts";
-import type { ProxyInstanceFile } from "../src/instance.ts";
+import { findSameLanePredecessor, lanePreferredPort, portZoneFilePath, readZonePort, writeZonePort } from "../src/instance.ts";
+import type { ProxyInstanceFile, RegistryEntry } from "../src/instance.ts";
 import { ZONE_PORT_BASE, resolveZonePortBase } from "../src/config.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
@@ -337,4 +338,74 @@ test("zone sequence: an unlane'd launch is ephemeral and never touches the zone 
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// ---------------------------------------------------------------------------
+// #1723: identify-before-ladder. findSameLanePredecessor decides whether an
+// EADDRINUSE on the lane's sticky port is a same-lane predecessor being
+// replaced by an upgrade (wait + rebind the SAME port) or something the plain
+// ladder must handle (foreign squatter / same-code peer / dead record).
+// ---------------------------------------------------------------------------
+
+const OWN_FP = "fp-new-build";
+const OLD_FP = "fp-old-build";
+
+function registryEntry(over: Partial<RegistryEntry> = {}): RegistryEntry {
+    return {
+        instanceId: over.instanceId ?? "pred-1",
+        pid: process.pid,
+        port: ZONE_PORT_BASE,
+        origin: `http://127.0.0.1:${ZONE_PORT_BASE}`,
+        startedAt: Date.now(),
+        lane: "dsh",
+        codeFingerprint: OLD_FP,
+        ...over,
+    };
+}
+
+function deadPid(): number {
+    const r = spawnSync(process.execPath, ["-e", ""]);
+    assert.ok(r.pid > 0, "spawnSync reports the child pid");
+    return r.pid;
+}
+
+test("findSameLanePredecessor: a live same-lane holder running different code IS the predecessor", () => {
+    const pred = registryEntry();
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "dsh", OWN_FP)?.instanceId, "pred-1");
+});
+
+test("findSameLanePredecessor: missing fingerprints (pre-#1232 markers) count as different code", () => {
+    const pred = registryEntry({ codeFingerprint: undefined });
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "dsh", OWN_FP)?.instanceId, "pred-1");
+});
+
+test("findSameLanePredecessor: a live peer running OUR build is contention, never a wait target", () => {
+    const peer = registryEntry({ instanceId: "peer-1", codeFingerprint: OWN_FP });
+    assert.equal(findSameLanePredecessor([peer], ZONE_PORT_BASE, "dsh", OWN_FP), undefined);
+});
+
+test("findSameLanePredecessor: mixed holders — the foreign-code entry wins the wait decision", () => {
+    const peer = registryEntry({ instanceId: "peer-1", codeFingerprint: OWN_FP });
+    const pred = registryEntry({ instanceId: "pred-1" });
+    assert.equal(findSameLanePredecessor([peer, pred], ZONE_PORT_BASE, "dsh", OWN_FP)?.instanceId, "pred-1");
+});
+
+test("findSameLanePredecessor: wrong port, wrong lane, or undeclared lane never match", () => {
+    const pred = registryEntry();
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE + 1, "dsh", OWN_FP), undefined, "different port");
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "kimi", OWN_FP), undefined, "different lane");
+    assert.equal(findSameLanePredecessor([registryEntry({ lane: undefined })], ZONE_PORT_BASE, "dsh", OWN_FP), undefined, "undeclared (wildcard) lane is a manual daemon — never waited on");
+});
+
+test("findSameLanePredecessor: a dead holder is not a predecessor (the port frees itself)", () => {
+    const dead = registryEntry({ pid: deadPid() });
+    assert.equal(findSameLanePredecessor([dead], ZONE_PORT_BASE, "dsh", OWN_FP), undefined);
+});
+
+test("findSameLanePredecessor: unlane'd or fingerprint-less launches make no wait decisions", () => {
+    const pred = registryEntry();
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, undefined, OWN_FP), undefined, "no lane of our own");
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "", OWN_FP), undefined, "empty lane");
+    assert.equal(findSameLanePredecessor([pred], ZONE_PORT_BASE, "dsh", undefined), undefined, "no own fingerprint — cannot tell builds apart");
+    assert.equal(findSameLanePredecessor([], ZONE_PORT_BASE, "dsh", OWN_FP), undefined, "no holders at all");
 });

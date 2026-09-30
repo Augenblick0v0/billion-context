@@ -164,10 +164,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -373,10 +369,6 @@
               "limit": {
                 "type": "number",
                 "description": "Max results (default 5)"
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
               }
             },
             "required": [
@@ -584,10 +576,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -714,10 +702,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -782,10 +766,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -836,10 +816,6 @@
           "limit": {
             "type": "number",
             "description": "Max results (default 5)"
-          },
-          "conversation_id": {
-            "type": "string",
-            "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
           }
         },
         "required": [
@@ -862,10 +838,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -888,10 +860,6 @@
           "limit": {
             "type": "number",
             "description": "Max results (default 5)"
-          },
-          "conversation_id": {
-            "type": "string",
-            "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
           }
         },
         "required": [
@@ -912,10 +880,6 @@
           "limit": {
             "type": "number",
             "description": "Max results (default 5)"
-          },
-          "conversation_id": {
-            "type": "string",
-            "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
           }
         },
         "required": [

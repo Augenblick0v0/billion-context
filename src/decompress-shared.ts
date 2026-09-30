@@ -355,7 +355,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     // duplicate full-text message or inflating rangeRestores.
     const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
     if (!ctx.session.pendingRetrievals.some((p) => p.ref === injId)) {
-        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "system", contentType: "text", text: injText } });
+        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "user", contentType: "text", text: injText } });
         ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
     }
     markDirty(ctx.session);

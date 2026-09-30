@@ -152,7 +152,11 @@ Ports, briefly (#1660): `bili start` (manual) owns `8787`. Everything a lane
 spawns for you (native hooks, launcher lanes) lives in a separate
 self-managed zone starting at `18787` — collisions hop +1 and each lane
 remembers its drift, so zero-config installs never fight you for a port,
-and a deliberate `bili start` daemon is attached by default.
+and a deliberate `bili start` daemon is attached by default. An
+upgrade-restart that finds the previous build still draining on the lane's
+port waits for it to release (up to 5s) and rebinds the SAME port instead of
+drifting (#1723); only a genuinely occupied port hops +1 — and that hop is
+now logged loudly.
 
 ### Option 1 — Native plugin (`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 
@@ -197,7 +201,7 @@ Notes:
 
 - Native mode is **mutually exclusive** with the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) — the installer swaps the entries and snapshots the original config (`.bili-bak`).
 - OpenCode legacy sessions, V1/V2 shapes and caveats: [OpenCode](CLIENTS.md#opencode).
-- `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values) and binds subagents by per-call `conversation_id`.
+- `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
 - `codex` is the one client a plugin install cannot make self-sufficient: codex routes model traffic via env only (no config-file routing seam for the default ChatGPT-login provider — a managed `model_providers` block would force API-key auth and drop subscription login), and an MCP server cannot inject env into its parent. `bili plugin install codex` writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml` (command = node, args = dist/mcp.js) exposing the four ACP tools; at session start the shell resolves a proxy — env `BILI_MCP_PROXY` > the live-instance record (any lane's proxy or a `bili start` daemon) > the 8787 user-zone default (#1660 removed the install-time origin bake, #403) — nothing reachable → `tools/list` fails with -32003. So: start bili first (`bili start` or any client's lane proxy), export HTTPS_PROXY yourself if you also want compression, or use `bili codex` for the zero-config full posture. Mechanics: [CLIENTS.md](CLIENTS.md#codex-openai-codex-cli).
 - `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).

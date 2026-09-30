@@ -248,6 +248,37 @@ test("performSelfRestart: handover succeeds at zero in-flight", { timeout: 30_00
     }
 });
 
+test("performSelfRestart: durable state flush runs before the replacement spawns (#1724)", { timeout: 30_000 }, async () => {
+    const { server, port } = await startServer();
+    const { log } = makeLog();
+    const record: SpawnRecord = {};
+    const events: string[] = [];
+    let finished = 0;
+    const innerSpawn = makeSpawn(makeReadyStub("stub-order.mjs"), port, record);
+    try {
+        const result = await performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            preSpawnFlush: () => { events.push("pre-flush"); },
+            spawnImpl: (execPath, args, options) => { events.push("spawn"); return innerSpawn(execPath, args, options); },
+            settleMs: 500, readyTimeoutMs: 5000,
+            finish: () => { finished++; },
+        });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        // Before #1724 the only flush happened in `finish`, AFTER the child had
+        // already booted and hydrated a stale snapshot. The durable-state flush
+        // must now strictly precede the spawn.
+        assert.deepEqual(events, ["pre-flush", "spawn"], "durable state must be flushed before the replacement is spawned (#1724)");
+        assert.equal(finished, 1, "finish seam called exactly once");
+    } finally {
+        record.child?.kill();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+});
+
 test("readLastRestart: tolerant of missing/corrupt markers", async () => {
     const { mkdir, writeFile, rm } = await import("node:fs/promises");
     const markerDir = path.join(process.env.XDG_CACHE_HOME ?? "", "billion-context");

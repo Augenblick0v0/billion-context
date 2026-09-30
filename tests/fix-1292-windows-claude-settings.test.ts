@@ -139,7 +139,7 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
     try {
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), platform: "win32" },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve(), platform: "win32" },
         );
         assert.equal(seen.length, 1, "exactly one client spawn through comspec");
         const cap = seen[0];
@@ -208,7 +208,7 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
     try {
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), platform: "linux" },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve(), platform: "linux" },
         );
         assert.equal(seen.length, 1, "exactly one direct client spawn");
         const { args, env } = seen[0];
