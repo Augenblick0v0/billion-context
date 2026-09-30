@@ -298,8 +298,11 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
         console.error(`bili-native-dsh: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
-        register.base = undefined;
-        register.toolsReady = false;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = undefined;
+            register.toolsReady = false;
+            register.retryAt = 0;
+        }
         return undefined;
     }
     persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
@@ -308,7 +311,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
-    state.origin = undefined;
+    if (state.origin === attachOrigin) state.origin = undefined;
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
@@ -319,12 +322,20 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     };
     const landed = start().then((origin) => {
         if (origin === undefined) {
-            register.base = undefined;
-            register.toolsReady = false;
+            if (landingOwnsRegister(attachOrigin)) {
+                register.base = undefined;
+                register.toolsReady = false;
+                // A back-off armed against the stale base must die with it:
+                // the unfreeze is a one-shot transition to a fresh base-less
+                // world and must not inherit the old base's 10s wall (#1783).
+                register.retryAt = 0;
+            }
             return undefined;
         }
-        register.base = origin;
-        state.origin = origin;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = origin;
+            state.origin = origin;
+        }
         return origin;
     });
     state.ready = landed;
@@ -356,6 +367,17 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
     };
 }
 
+/** Stale-landing guard (windows-22 CI #1783): async chains armed by
+ *  verifyAttachAndRecover resolve long after they started (probe + evidence
+ *  grace + spawn). While they were in flight, maybeRetry may have already
+ *  self-healed the register onto a NEW origin — a late landing must never
+ *  clobber that. A landing may only write the register while it still owns
+ *  it: base is undefined (nothing better established) or still the stale
+ *  origin this chain set out to replace. */
+function landingOwnsRegister(staleOrigin: string | undefined): boolean {
+    return register.base === undefined || register.base === staleOrigin;
+}
+
 async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.pending !== undefined) return register.pending;
     const base = register.base;
@@ -374,7 +396,12 @@ async function registerTools(ctx: PluginContext): Promise<void> {
                 register.dead = true;
                 return;
             }
-            register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            // Scope the back-off to the base that actually failed: if the
+            // register moved on while this manifest fetch was in flight (the
+            // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
+            // an armed retryAt would gate the NEXT base's first heal behind a
+            // 10s wall — exactly the windows-22 CI deadlock (#1783).
+            if (register.base === base) register.retryAt = Date.now() + RETRY_INTERVAL_MS;
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
