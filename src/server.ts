@@ -5972,7 +5972,7 @@ async function forward(
             // longer change, so deliver the upstream failure in-band (protocol error
             // event for streams; verbatim error body under 200 otherwise).
             if (prepared?.stream) {
-                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m));
+                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
             } else {
                 try { res.end(errBody ?? undefined); } catch { /* client gone */ }
             }
@@ -6335,7 +6335,7 @@ async function forward(
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode
                 ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
-                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes);
+                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -6428,7 +6428,7 @@ async function forward(
             }
             res.end();
         } catch (e) {
-            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
+            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;
