@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createCommandcodeAdapter } from "../src/loop/adapter-commandcode.ts";
-import { buildVisibilityMarker } from "../src/compress-loop.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 import type { ParsedStreamEvent } from "../src/loop/core.ts";
 
 const jsonl = (body: string): ReadableStream<Uint8Array> => new Response(body, { status: 200 }).body!;
