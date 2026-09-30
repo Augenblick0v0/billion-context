@@ -80,6 +80,14 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
+ - **Web-profile caveat (#1772):** when a profile's bundles include
+   `@deepseek-ai/dsh-web-app`, the running `compaction-basic` instance lives
+   inside an agent preset (`preset-standard.config.plugins`) that no patch
+   layer can reach by id — dsh's patch engine indexes only top-level rows and
+   true group children — so the bundled `auto: false` lands on web-app's
+   already-disabled host-plane row and the preset instance keeps
+   auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
+   boot in such profiles; ACP compression is unaffected.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
@@ -87,7 +95,8 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is off, so this is rare).
+kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
+this is rare; see the #1772 caveat above for web profiles).
 
 ## Kimi Code (Moonshot)
 

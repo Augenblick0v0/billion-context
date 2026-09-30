@@ -83,6 +83,10 @@ type PluginContext = {
     // builds or stripped hosts keep the plugin alive without model info).
     llm?: { resolveModelInfo?: (provider: string, model: string, signal?: AbortSignal) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> };
     agentDefaultModel?: { currentSelection?: () => { provider?: string; model?: string } | undefined };
+    // #1772: boot-provided profile diagnostics ({startedBundles, ...}) — lets
+    // the plugin warn when the active profile runs its compaction inside an
+    // agent preset where the bundle patch cannot reach it.
+    profileContext?: { startedBundles?: readonly string[] | undefined };
     inject?: (deps: readonly string[], callback: (sub: PluginContext) => void) => unknown;
     // #1590: host event bus (web-profile hosts only) — webserver/index-inject
     // gathers per-startup rows for the web index; we push the __BILI__ global
@@ -119,6 +123,10 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 type RegisterState = { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; pending: Promise<void> | undefined };
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
+
+// #1772: once-per-process — the web-profile compaction caveat is logged a
+// single time even though apply() may run again after context re-arming.
+let webProfileWarned = false;
 
 // Runtime-info cache (#955): the host's current model selection plus what
 // ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
@@ -738,6 +746,31 @@ export function apply(ctx: PluginContext): void {
         refreshModelInfo(register.base ?? state.origin);
     }
 
+    // #1772: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
+    // compaction-basic instance sits inside an agent preset (preset-standard's
+    // config.plugins), which no patch layer can reach by id — the bundled
+    // `auto: false` lands on web-app's already-disabled host-plane row and the
+    // preset instance keeps auto-compaction ON. Surface it once through the
+    // durable channel (GUI hosts swallow stderr); ACP compression is unaffected.
+    if (!webProfileWarned) {
+        let bundles: readonly string[] | undefined;
+        try {
+            if (typeof ctx.inject === "function") {
+                ctx.inject(["profileContext"], (sub) => {
+                    bundles = sub.profileContext?.startedBundles;
+                });
+            } else {
+                bundles = ctx.profileContext?.startedBundles;
+            }
+        } catch {
+            // older dsh builds without the service: diagnostic only
+        }
+        if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
+            webProfileWarned = true;
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected)");
+        }
+    }
+
     // #1677: forward the host-passed invocation — it carries the invoking agent's
     // session id, which the command path cannot recover from currentInitiator().
     ctx.commands.register({
@@ -800,4 +833,9 @@ export function _noteRoutedForTest(url: string): void {
 export function _resetRoutedForTest(): void {
     state.routedOrigin = undefined;
     state.onRoutedOriginObserved = undefined;
+}
+
+/** Test hook (#1772): reset the once-per-process web-profile warning flag. */
+export function _resetWebProfileWarningForTest(): void {
+    webProfileWarned = false;
 }

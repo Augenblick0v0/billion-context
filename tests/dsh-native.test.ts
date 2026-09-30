@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
@@ -428,6 +428,8 @@ function mockCtx() {
     // replay them through the same dynamic ctx.inject path production uses.
     let llm: { resolveModelInfo?: (provider: string, model: string) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> } | undefined = undefined;
     let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
+    // #1772 profile diagnostics: replayed through the same dynamic inject path.
+    let profileContext: { startedBundles?: readonly string[] } | undefined = undefined;
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
         commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
@@ -439,11 +441,15 @@ function mockCtx() {
             if (deps.includes("llm") && deps.includes("agentDefaultModel") && llm !== undefined && agentDefaultModel !== undefined) {
                 callback({ llm, agentDefaultModel });
             }
+            if (deps.includes("profileContext") && profileContext !== undefined) {
+                callback({ profileContext });
+            }
         },
         setModelServices: (l: typeof llm, a: typeof agentDefaultModel) => {
             llm = l;
             agentDefaultModel = a;
         },
+        setProfileContext: (pc: { startedBundles?: readonly string[] } | undefined) => (profileContext = pc),
     };
 }
 
@@ -754,6 +760,60 @@ test("apply() is a no-op under the kill switches", async () => {
         });
     } finally {
         rmrf(home);
+    }
+});
+
+test("#1772 apply(): web-profile compaction caveat warns once in the durable log", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const warnLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes("@deepseek-ai/dsh-web-app"))
+        : [];
+    const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            const ctx = mockCtx();
+            ctx.setProfileContext({ startedBundles: webBundles });
+            apply(ctx);
+            assert.equal(warnLines().length, 1);
+            assert.match(warnLines()[0], /#1772/);
+
+            // once-per-process: a later apply with the same profile adds nothing
+            const again = mockCtx();
+            again.setProfileContext({ startedBundles: webBundles });
+            apply(again);
+            assert.equal(warnLines().length, 1);
+
+            // non-web profile → no warning
+            fs.rmSync(logFile, { force: true });
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            const plain = mockCtx();
+            plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
+            apply(plain);
+            assert.equal(warnLines().length, 0);
+
+            // host shape without inject but with a direct profileContext field
+            _resetWebProfileWarningForTest();
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
+            };
+            apply(bare);
+            assert.equal(warnLines().length, 1);
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
     }
 });
 
