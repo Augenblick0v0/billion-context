@@ -92,6 +92,14 @@ export const WIRE_RULES: readonly WireRule[] = [
             "bili #1403 production 400 (opencode zen https://opencode.ai/zen/v1/messages: 'prompt_cache_key: Extra inputs are not permitted', 2026-09-26); Anthropic Messages API reference (no such field)",
     },
     {
+        id: "WC-011",
+        wire: "responses",
+        summary:
+            "consecutive configuration_update items are rejected (400 unsupported_value 'Consecutive configuration_update items are not allowed') — bili folds each adjacent run into one last-wins deep-merged item at every responses-input rebuild/forward boundary",
+        provenance:
+            "bili #1733 production 400 (OMP client via CLIProxyAPI): history compression prunes the messages separating two mid-history configuration_update items (untracked layout slots survive layout shrinkage verbatim) making them adjacent; hoistTrappedToolItems (#766) can also batch two trapped updates together without any compression; fix = mergeAdjacentConfigurationUpdates in src/responses-tool-output.ts applied at patchResponsesInputWithToolImages + all hoistTrappedToolItems call sites",
+    },
+    {
         id: "WC-010",
         wire: "anthropic",
         summary:
@@ -194,9 +202,19 @@ function validateGeminiSchema(schema: unknown, path: string, out: string[]): voi
     validateGeminiSchema(schema.items, `${path}.items`, out);
 }
 
-/** WC-005 on a Responses-API body (flat function entries). */
+/** WC-005, WC-009, WC-011 on a Responses-API body (flat function entries). */
 export function validateResponsesBody(body: unknown): string[] {
     const out: string[] = [];
+    // WC-011 (#1733): runs before the tools early-return — the adjacency ban
+    // applies to any array input, tools or not.
+    if (isPlainObject(body) && Array.isArray(body.input)) {
+        for (let i = 1; i < body.input.length; i++) {
+            const prev = body.input[i - 1];
+            const cur = body.input[i];
+            if (isPlainObject(prev) && prev.type === "configuration_update" && isPlainObject(cur) && cur.type === "configuration_update")
+                out.push(`WC-011 input[${i}]: consecutive configuration_update items are not allowed`);
+        }
+    }
     if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;

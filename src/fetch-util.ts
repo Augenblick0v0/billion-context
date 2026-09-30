@@ -23,6 +23,31 @@ export function _liveUpstreamTimersForTest(): number {
     return liveUpstreamTimers.size;
 }
 
+// Test seam (#1770): stretch the idle timer's WALL-CLOCK delay without
+// changing the logical budget. Asserting "a healthy stream longer than the
+// budget survives" against real-timer scheduling is nondeterministic under
+// host load — the fake upstream's pacing tick and the expired idle timer share
+// one event loop, and under CPU starvation the timers phase can fire the
+// abort before the next chunk is READ (it sits unread in the socket buffer),
+// cutting a healthy stream no matter how wide the nominal margin. null =
+// production behavior (inert by default).
+let idleTimerDelayOverrideMs: number | null = null;
+export function _setIdleTimerDelayForTest(ms: number | null): void {
+    idleTimerDelayOverrideMs = ms;
+}
+
+// Test seam (#1770): how many times rearm() has re-armed the idle timer since
+// the last reset — a deterministic observation of the re-arm-per-chunk wiring
+// that wall-clock assertions cannot pin reliably under load.
+let idleRearmCount = 0;
+export function _idleRearmCountForTest(): number {
+    return idleRearmCount;
+}
+export function _resetIdleTimerSeamsForTest(): void {
+    idleTimerDelayOverrideMs = null;
+    idleRearmCount = 0;
+}
+
 /** Idle-timeout budget for upstream requests; overridable via
  *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
  *  tune it live. Local-model deployments with very large contexts can need
@@ -103,7 +128,7 @@ export async function fetchWithTimeout(
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
             controller.abort();
-        }, effective);
+        }, idleTimerDelayOverrideMs ?? effective);
         liveUpstreamTimers.add(t);
         return t;
     };
@@ -116,6 +141,7 @@ export async function fetchWithTimeout(
         if (cleared) return;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
+        idleRearmCount += 1;
         timer = armTimer();
     };
     let onExternalAbort: (() => void) | null = null;
@@ -142,7 +168,11 @@ export async function fetchWithTimeout(
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
             ...opts,
             signal: controller.signal,
-            dispatcher: opts.dispatcher ?? directDispatcher(effective),
+            // #1770 seam: when the test stretches the watchdog delay, stretch
+            // the matching transport caps too — #551 requires the undici
+            // headers/body timeouts to track the watchdog, or the transport
+            // fires first and cuts the stream itself.
+            dispatcher: opts.dispatcher ?? directDispatcher(idleTimerDelayOverrideMs ?? effective),
             // Forward-proxy correctness: never silently follow a redirect.
             // undici's default (follow) downgrades POST→GET and drops the body
             // on 301/302/303, so a redirecting upstream (CDN/WAF) turns a valid

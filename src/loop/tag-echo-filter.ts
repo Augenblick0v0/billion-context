@@ -416,6 +416,16 @@ export function mayStartBiliInternal(s: string): boolean {
     return containsBiliInternalText(s) || CHAIN_PARTIAL_TAIL.test(s) || HEAD_PREFIX_TAIL.test(s);
 }
 
+// #1760: classify a tail the streaming filters RELEASED at stream end. A
+// released tail is content preservation — the filters never drop an undecidable
+// prefix — but a tail still shaped like orphan markup (partial render tag,
+// literal marker line, truncated internal-artifact open/header) is dead to the
+// host like an empty turn, so degenerate-turn detection counts it as residue;
+// plain prose (CJK leads included) is visible output, not residue.
+export function isOrphanMarkupText(s: string): boolean {
+    return mayStartRenderTag(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
+}
+
 function tailHoldLen(s: string): number {
     const m = CHAIN_PARTIAL_TAIL.exec(s);
     const h = HEAD_PREFIX_TAIL.exec(s);

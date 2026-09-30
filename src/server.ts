@@ -47,7 +47,7 @@ import {
     conversationSignalResponses,
     subagentNamespace,
 } from "acp-kernel/wire";
-import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
+import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -4152,7 +4152,7 @@ async function prepareResponses(
         // [#1095] arrival-time image downscale (see prepareAnthropic).
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
         rebuiltInput = patchResponsesInput(projection, processedMessages);
-        if (Array.isArray(rebuiltInput)) rebuiltInput = hoistTrappedToolItems(rebuiltInput);
+        if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // Fallback path: when the echo did NOT come back this turn (client
         // dropped it / restarted), the history-borne handoff is absent and the
         // forge-time captured summaries are re-injected into the developer
@@ -4473,7 +4473,7 @@ function prepareResponsesCompact(
             session.contentStoreDirty = prevStoreDirty;
             return base;
         }
-        output = hoistTrappedToolItems(output);
+        output = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(output));
         snapshotMessages(session, projection.msgs);
         markDirty(session);
         log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);

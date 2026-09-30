@@ -52,6 +52,7 @@ import {
     type ProxyStartingMarker,
 } from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
+import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -3569,6 +3570,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
         env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts, extNonHttpProviders);
         delete env.PI_CODING_AGENT_DIR;
+        // #1774: the child always rides bili's proxy here, so a long preflight can
+        // hold the first SSE event well past OMP's default 300s first-parsed-event
+        // watchdog — export a wider first-event budget unless the user pinned one.
+        applyOmpFirstEventTimeout(env);
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
             clientArgs = ["-e", ompExt, ...clientArgs];
