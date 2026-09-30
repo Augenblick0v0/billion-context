@@ -22,6 +22,7 @@ export function renderPage(origin: string, version: string): string {
 <div id="stale-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="toolrejects-banner" class="banner warn" hidden></div>
 <main>
 <section id="page-overview" class="page">
 <div class="page-head"><div><h1 data-i18n="ov.title">${zh("ov.title")}</h1><div class="sub" data-i18n="ov.sub">${zh("ov.sub")}</div></div></div>

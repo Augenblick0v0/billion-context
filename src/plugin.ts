@@ -181,6 +181,20 @@ const remembered = new Map<string, RememberedMessages>();
 const warnedNoModelRequests = new Set<string>();
 const WARNED_NO_MODEL_REQUESTS_CAP = 4096;
 
+// #1762: bounded ring of tool calls rejected before any session existed for
+// them — that failure class has no per-session trace, so the /__bili/ overview
+// surfaces these events instead.
+export type ToolRejectEvent = { at: number; tool: string; conversationId: string; reason: "no-entry" | "not-resident" };
+const TOOL_REJECT_CAP = 20;
+const toolRejectEvents: ToolRejectEvent[] = [];
+export function recordToolReject(tool: string, conversationId: string, reason: ToolRejectEvent["reason"]): void {
+    toolRejectEvents.push({ at: Date.now(), tool, conversationId, reason });
+    while (toolRejectEvents.length > TOOL_REJECT_CAP) toolRejectEvents.shift();
+}
+export function recentToolRejects(): readonly ToolRejectEvent[] {
+    return toolRejectEvents;
+}
+
 // The conversationId → session mapping is in-memory. Persist it so a resumed
 // or restarted proxy can still resolve /acp + tool calls to the (persisted)
 // session without waiting for a fresh model request. Best-effort: a crash
@@ -942,6 +956,7 @@ export async function handlePluginTool(
         } else {
             deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: id registered but session not resident in this proxy instance`);
         }
+        recordToolReject(tool, conversationId, entry ? "not-resident" : "no-entry");
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({
             ok: false,
@@ -2643,6 +2658,7 @@ export function _resetPluginStateForTest(): void {
     pluginRuntimeTable.clear();
     pluginRuntimeByConversation.clear();
     warnedNoModelRequests.clear();
+    toolRejectEvents.length = 0;
 }
 
 export function _rememberedForTest(): Map<string, RememberedMessages> {

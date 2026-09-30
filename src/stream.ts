@@ -3,6 +3,7 @@ import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
+import { noteCompressFailure, noteCompressSuccess } from "./compress-health.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
@@ -312,6 +313,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             !isEmptyCall &&
             argLen !== undefined &&
             (diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated");
+        noteCompressFailure(ctx.session, `parse:${diagnostics.kind}`);
         const guard = recordCompressFailure(
             ctx.session,
             `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`,
@@ -417,6 +419,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
             const dropped = droppedEntriesNote(diagnostics);
+            noteCompressFailure(ctx.session, String(errs));
             return `[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}${noViableAnywhere}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
         }
         clearCompressFailures(ctx.session);
@@ -429,6 +432,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const shrinkRatio = preContext > 0 ? r.tokensCompressed / preContext : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
+        noteCompressSuccess(ctx.session, preContext);
         ctx.session.stats.pendingFoldUsage = true;
         // #695: the next request materializes this fold — its prefix-cache hit
         // ceiling ≈ anchor / postFoldContext. sys length is unknown here, so
@@ -491,6 +495,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         return msg;
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
+        noteCompressFailure(ctx.session, String(err));
         return `[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`;
     }
 }

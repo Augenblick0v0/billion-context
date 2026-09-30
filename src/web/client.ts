@@ -123,7 +123,16 @@ export const WEB_CLIENT = `(function () {
         const href = "#/session/" + encodeURIComponent(s.id);
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
+            + outageBadge(s)
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
+    }
+    // #1762: red badge while a session's compression is stalled — present on list rows
+    // only when red (field absent otherwise), always on detail payloads (status field).
+    function outageBadge(x) {
+        const h = x && x.compressHealth;
+        if (!h || h.status !== "outage") return "";
+        const tip = t("ses.badge_outage_tip", { gap: fmtW(h.gap), interval: fmtW(h.nudgeInterval), rounds: h.roundsSinceSuccess });
+        return ' <span class="badge outage" title="' + escapeHtml(tip) + '">' + t("ses.badge_outage") + "</span>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
     // to the local tokensSaved estimate; neither present => honest dash, never fake 0.
@@ -272,6 +281,20 @@ export const WEB_CLIENT = `(function () {
                 ab.hidden = true;
                 ab.classList.remove("show");
                 ab.innerHTML = "";
+            }
+        }
+        const tb = $("toolrejects-banner");
+        if (tb) {
+            const tr = d.toolRejects;
+            if (tr && tr.length > 0) {
+                tb.hidden = false;
+                tb.classList.add("show");
+                const last = tr[tr.length - 1];
+                tb.innerHTML = '<strong>' + t("ov.tool_rejects") + '</strong> <span class="mono">' + tr.length + " · " + escapeHtml(last.tool) + " @" + escapeHtml(last.conversationId.slice(0, 12)) + " (" + last.reason + ") · " + timeAgo(last.at) + "</span>";
+            } else {
+                tb.hidden = true;
+                tb.classList.remove("show");
+                tb.innerHTML = "";
             }
         }
     }
@@ -450,6 +473,7 @@ export const WEB_CLIENT = `(function () {
         const live = d.live && !d.restored;
         let html = "";
         if (live) html = '<span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>";
+        html += outageBadge(d);
         if (d.protocol) html += (html ? " " : "") + protoBadge(d.protocol);
         return html;
     }
@@ -625,6 +649,19 @@ export const WEB_CLIENT = `(function () {
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
+        parts.push("</div></div>");
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.health") + '</span><span class="hint">' + t("det.health_hint") + '</span></div><div class="card-b">');
+        const ch = d.compressHealth || {};
+        const chOut = ch.status === "outage";
+        parts.push('<div class="grid cols-4">');
+        mini(parts, t("det.health_status"), chOut ? t("det.health_outage") : t("det.health_ok"), !chOut);
+        mini(parts, t("det.health_current"), ch.currentTokens != null ? fmtW(ch.currentTokens) : null);
+        mini(parts, t("det.health_interval"), ch.nudgeInterval != null ? fmtW(ch.nudgeInterval) : null);
+        mini(parts, t("det.health_gap"), ch.gap != null ? fmtW(ch.gap) : null);
+        parts.push("</div>");
+        kv(parts, t("det.health_rounds"), ch.roundsSinceSuccess != null ? t("det.health_rounds_val", { n: ch.roundsSinceSuccess }) : t("det.health_never"));
+        if (ch.lastSuccessAt) kv(parts, t("det.health_last_success"), timeAgo(ch.lastSuccessAt));
+        if ((ch.failCount || 0) > 0) kv(parts, t("det.health_fails"), String(ch.failCount) + (ch.lastFailReason ? " · " + String(ch.lastFailReason) : ""));
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];

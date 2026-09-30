@@ -144,6 +144,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .badge.proto { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
 .badge.warn { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .badge.ok { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.badge.outage { background: var(--red-soft); color: var(--red); border-color: var(--red); }
 
 .bar-track { height: 6px; border-radius: 3px; background: var(--bg-muted); overflow: hidden; min-width: 70px; }
 .bar-fill { height: 100%; border-radius: 3px; background: var(--accent); }

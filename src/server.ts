@@ -48,6 +48,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
 import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { noteRoundCompleted } from "./compress-health.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -3173,6 +3174,7 @@ async function prepareAnthropic(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    noteRoundCompleted(session);
     const injectTools = opts.compress.injectTool && !pluginMode;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
 
@@ -3436,6 +3438,7 @@ async function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    noteRoundCompleted(session);
     let openaiSystemText = "";
     let sysNotes: string[] = [];
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
@@ -3708,6 +3711,7 @@ async function prepareGoogle(
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
+    noteRoundCompleted(session);
     let googleClientSystem = "";
     let sysNotes: string[] = [];
     let googleOutboundSystem: string | undefined;
@@ -3907,6 +3911,7 @@ async function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    noteRoundCompleted(session);
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
@@ -4337,6 +4342,7 @@ function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    noteRoundCompleted(session);
     // A bili-forged compaction item is never for the upstream (it carries our
     // sentinel blob) — strip it on every forwarding path, same as the normal
     // /responses pipeline does.

@@ -312,7 +312,7 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
  *  The per-request config stamped by storeEffectiveConfig is the same object
  *  the kernel decided with this turn, so the margin matches the kernel's own
  *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
-function nudgeGrowthInterval(config?: Config): number {
+export function nudgeGrowthInterval(config?: Config): number {
     const c = config ?? defaultConfig(1);
     return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
 }
@@ -646,6 +646,10 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.lastUsageGradeTokens;
     session.stats.contextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
+    // #1762: rebase restarts the compression epoch — stale success/failure
+    // health records would misattribute across the rebuilt ref space.
+    delete session.metadata["compressHealth"];
+    delete session.metadata["compressOutage"];
     markDirty(session);
 }
 

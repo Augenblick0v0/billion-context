@@ -4,6 +4,8 @@ import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
+import { evaluateCompressHealth, type CompressHealthView } from "../compress-health.js";
+import { recentToolRejects, type ToolRejectEvent } from "../plugin.js";
 
 /** #1420: read-only session browsing for the web UI. Merges the LIVE in-memory
  *  pool (bounded — evicted sessions are gone) with the full on-disk store;
@@ -65,6 +67,9 @@ export interface WebSessionSummary {
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
     summaryCost?: number;
+    /** #1762: present ONLY while the session is in a compression outage (unfolded
+     *  growth ≥ nudge interval with zero successful compresses in the last N rounds). */
+    compressHealth?: CompressHealthView;
 }
 
 export interface WebOverview {
@@ -101,6 +106,9 @@ export interface WebOverview {
     hitPct: number | null;
     blocks: number;
     byProtocol: Array<{ protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; hitPct: number | null; missDropNew?: number; missDropComp?: number; missDropTtl?: number }>;
+    /** #1762: recent tool calls rejected before any session bound to their
+     *  conversation id — the MCP-routing failure class leaves no per-session trace. */
+    toolRejects?: ToolRejectEvent[];
     recent: WebSessionSummary[];
 }
 
@@ -226,6 +234,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    const health = evaluateCompressHealth(s);
     return {
         id: s.id,
         ...(s.meta.title ? { title: s.meta.title } : {}),
@@ -261,6 +270,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
             ? { modelSwitches: agg.agg.switches, switchMissedTokens: agg?.agg?.switchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
+        ...(health.status === "outage" ? { compressHealth: health } : {}),
     };
 }
 
@@ -343,6 +353,7 @@ export async function buildOverview(): Promise<WebOverview> {
             grossSavedTotal += s.tokensSaved;
         }
     }
+    const toolRejects = recentToolRejects();
     return {
         sessions: all.length,
         live,
@@ -378,6 +389,7 @@ export async function buildOverview(): Promise<WebOverview> {
                 ...(base > 0 ? { missDropNew: drop(r.missNew), missDropComp: drop(r.missComp), missDropTtl: drop(r.missTtl) } : {}),
             };
         }),
+        ...(toolRejects.length > 0 ? { toolRejects: [...toolRejects] } : {}),
         recent: all.slice(0, 8),
         hiddenEmpty: allAll.length - all.length,
     };
@@ -419,6 +431,7 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
 
     return {
         ...summaryOf(session, !!live),
+        compressHealth: evaluateCompressHealth(session),
         lastInputTokens: session.stats.lastInputTokens,
         compressCreditTokens: session.stats.compressCreditTokens,
         retrieveCalls: session.stats.retrieveCalls,
