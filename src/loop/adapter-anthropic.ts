@@ -1,7 +1,8 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
+import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import type {
@@ -150,7 +151,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol"): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -233,14 +234,19 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
 
     return {
         buildRequest(coreMessages, systemPrompt, body) {
-            const messages = coreToAnthropic(coreMessages);
+            // #1637: round-2 rebuilds apply the SAME cumulative cache_control
+            // marks through the SAME kernel applier as the steady path
+            // (coreToAnthropic) — a marker present on the trigger turn must be
+            // present here too or the byte prefix breaks at that element.
+            const messages = coreToAnthropic(coreMessages, cacheMarks);
             const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
             const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
             const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
+            const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
             const withNotes = notes && notes.length > 0
                 ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
                 : messages;
-            return { ...body, system, messages: withNotes };
+            return { ...body, system: stamped, messages: withNotes };
         },
 
         async *parseStream(upstream, round) {
@@ -258,11 +264,16 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // re-request rounds). Flush at the owning block's stop so held-back
             // fragments still emit while the block is open.
             const tagFilter = composeStreamFilters(
-                createTagEchoFilter((snippet) => {
-                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
-                createMarkerLineFilter((snippet) => {
-                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                composeStreamFilters(
+                    createTagEchoFilter((snippet) => {
+                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createMarkerLineFilter((snippet) => {
+                        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
+                createBiliArtifactFilter((snippet) => {
+                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
             let lastTextIndex: number | null = null;

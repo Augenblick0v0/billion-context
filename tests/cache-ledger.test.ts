@@ -419,3 +419,230 @@ test("corrupt stamped profile degrades to kernel defaults instead of poisoning t
         assert.equal(r.folds[0]!.oneTimeCostUnits, 3500, JSON.stringify(bad));
     }
 });
+
+test("model switch flags the first sample after a change and attributes its residual (#1535)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    recordCacheSample(session, { at: T0 + 2000, input: 10500, cached: 10000 });
+    session.metadata.lastModel = "claude-opus-4-6";
+    recordCacheSample(session, { at: T0 + 3000, input: 11000, cached: 0 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.count, 1);
+    // missed 11000 = growth 500 (new content) + 10500 re-billed stable prefix.
+    assert.equal(r.modelSwitches.missedTokens, 10500);
+    const ev = r.modelSwitches.events[0]!;
+    assert.equal(ev.seq, 3);
+    assert.equal(ev.from, "gpt-5");
+    assert.equal(ev.to, "claude-opus-4-6");
+    assert.equal(ev.attributed, 10500);
+    const l3 = r.lines.find((l) => l.seq === 3)!;
+    assert.equal(l3.newContent, 500);
+    assert.equal(l3.ttlRepay, 10500);
+    assert.equal(l3.compRepay, 0);
+    // Kernel buckets untouched — identity still closes exactly.
+    assert.equal(r.totals.residual, 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("unknown or missing models never flag a switch (#1535)", () => {
+    const session = makeSession();
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 2000, input: 10500, cached: 9500 });
+    delete session.metadata.lastModel;
+    recordCacheSample(session, { at: T0 + 3000, input: 11000, cached: 9500 });
+    session.metadata.lastModel = "";
+    recordCacheSample(session, { at: T0 + 4000, input: 11500, cached: 9500 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.count, 0);
+    assert.equal(r.modelSwitches.missedTokens, 0);
+    assert.deepEqual(r.modelSwitches.events, []);
+});
+
+test("round-trip A→B→A counts two switches (#1535)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "a";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    session.metadata.lastModel = "b";
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 0 });
+    session.metadata.lastModel = "a";
+    recordCacheSample(session, { at: T0 + 3000, input: 10000, cached: 0 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.count, 2);
+    assert.equal(r.modelSwitches.missedTokens, 20000);
+    assert.deepEqual(
+        r.modelSwitches.events.map((e) => [e.from, e.to]),
+        [
+            ["a", "b"],
+            ["b", "a"],
+        ],
+    );
+});
+
+test("switch aggregates stay exact across heavy sampling with a complete event list (#1535)", () => {
+    const flat = { at: 0, input: 10000, cached: 9000 };
+    const warm = { at: 0, input: 12000, cached: 12000 };
+    const session = makeSession();
+    session.metadata.lastModel = "m1";
+    for (let i = 0; i < 100; i++) recordCacheSample(session, { ...flat, at: T0 + i * 60_000 });
+    session.metadata.lastModel = "m2";
+    recordCacheSample(session, { at: T0 + 100 * 60_000, input: 12000, cached: 0 });
+    for (let i = 0; i < 512; i++) recordCacheSample(session, { ...warm, at: T0 + (101 + i) * 60_000 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.count, 1);
+    // missed 12000 − growth 2000 (new content) = 10000 re-billed stable prefix.
+    assert.equal(r.modelSwitches.missedTokens, 10000);
+    // Lines are kept in full (#1489), so the event list is complete: the
+    // switch line's predecessor survived and the from→to pair is intact.
+    assert.equal(r.modelSwitches.events.length, 1);
+    assert.deepEqual(r.modelSwitches.events[0]!, {
+        seq: 101,
+        at: T0 + 100 * 60_000,
+        from: "m1",
+        to: "m2",
+        input: 12000,
+        cached: 0,
+        hitPct: 0,
+        attributed: 10000,
+    });
+    assert.equal(r.totals.balanced, true);
+});
+
+test("pre-#1535 persisted ledgers normalize instead of NaN-ing (#1535)", () => {
+    const session = makeSession();
+    session.metadata["cacheLedger"] = {
+        v: 1,
+        lastBlockId: 0,
+        consumedFoldSeq: 0,
+        sampleSeq: 1,
+        foldSeqCounter: 0,
+        folds: [],
+        lines: [{ seq: 1, at: T0, input: 10000, cached: 9000, output: 0, hitPct: 90, missed: 1000, nc: 0, cr: 0, tr: 1000, foldSeq: null }],
+        agg: { requests: 1, input: 10000, cached: 9000, output: 0, nc: 0, cr: 0, tr: 1000 },
+    };
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10500, cached: 10000 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.count, 0, "old line without model cannot flag");
+    assert.doesNotMatch(JSON.stringify(r), /NaN/);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("handleAcpCache renders the model-switch section in both modes (#1535)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    session.metadata.lastModel = "claude-opus-4-6";
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
+    const text = handleAcpCache(session);
+    assert.match(text, /MODEL SWITCHES/);
+    assert.match(text, /1 switch\(es\)/);
+    assert.match(text, /gpt-5 → claude-opus-4-6/);
+    assert.match(text, /attributed 10\.0K/);
+    const full = handleAcpCache(session, { detail: "full" });
+    assert.match(full, /MODEL SWITCHES/);
+    const none = makeSession();
+    assert.match(handleAcpCache(none), /MODEL SWITCHES\n  none observed/);
+});
+
+test("unknown-cache sample is quarantined out of the closure, not booked as a miss (#1536)", () => {
+    const session = makeSession();
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    // provider reports no cache tokens -> cached null (unmeasurable, not a 0% miss)
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: null });
+    recordCacheSample(session, { at: T0 + 3000, input: 11500, cached: 11000 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.unmeasured.samples, 1);
+    assert.equal(r.unmeasured.inputTokens, 11000);
+    // the unknown line is dropped from the rendered set (it would be a bogus 0% row)
+    assert.equal(r.lines.length, 2);
+    assert.ok(!r.lines.some((l) => l.seq === 2));
+    // closure still closes exactly over the measurable subset
+    assert.equal(r.totals.residual, 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("unknown-cache sample must not eat a pending fold — the next measured sample still attributes compRepay (#1536)", () => {
+    // Regression pin for the consume-cursor known-gate: an unmeasured sample
+    // arriving between a fold and the next measured sample advances neither
+    // consumedFoldSeq nor the fold owner's T; the measured sample that follows
+    // still sees the fold as pending and charges its compRepay to the owner.
+    // (Mutation check: dropping the `known &&` on the cursor advance makes the
+    // unknown sample eat the fold — owner T stays 0 and line 3 loses foldSeq.)
+    const session = makeSession();
+    withView20(session);
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    // fold materializes between samples: covers m00001..m00010 (5000 tok)
+    recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 5000, 400, "m00001")]);
+    // unmeasured post-fold sample arrives FIRST — must not consume the fold
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: null });
+    // measured post-fold sample: re-sends the folded region → compRepay lands on the owner
+    recordCacheSample(session, { at: T0 + 3000, input: 10500, cached: 9000 });
+    const r = buildSessionCacheReport(session);
+    const l3 = r.lines.find((l) => l.seq === 3)!;
+    assert.ok(!r.lines.some((l) => l.seq === 2), "unknown line is quarantined out of the rendered set");
+    assert.equal(l3.foldSeq, 1, "measured sample owns the fold’s compRepay");
+    const fold = r.folds.find((f) => f.seq === 1)!;
+    assert.ok(fold && fold.T > 0, "owner T > 0 — the fold’s re-pay reached its owner through the measured sample");
+    assert.equal(r.unmeasured.samples, 1);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("wire-protocol switch is attributed as a distinct cause (#1536)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic" });
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai" });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.wireSwitches.count, 1);
+    assert.equal(r.wireSwitches.events[0]!.from, "anthropic");
+    assert.equal(r.wireSwitches.events[0]!.to, "openai");
+    assert.equal(r.modelSwitches.count, 0, "model did not change");
+    assert.ok(r.invalidation.wire > 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("upstream-origin switch is attributed as a distinct cause (#1536)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "openai", upstream: "https://api.openai.com" });
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.upstreamSwitches.count, 1);
+    assert.equal(r.upstreamSwitches.events[0]!.from, "https://api.openai.com");
+    assert.equal(r.upstreamSwitches.events[0]!.to, "https://relay.example.com");
+    assert.equal(r.wireSwitches.count, 0, "wire did not change");
+    assert.ok(r.invalidation.upstream > 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("first sample under a new daemon boot is attributed to restart/refork (#1536 #499)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    // simulate the ledger surviving a daemon restart: lastBoot points at another process
+    (session.metadata["cacheLedger"] as Record<string, unknown>).lastBoot = "previous-boot";
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
+    // next sample in the SAME boot must not re-flag
+    recordCacheSample(session, { at: T0 + 3000, input: 11500, cached: 11000 });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.restartDrops.count, 1);
+    assert.equal(r.restartDrops.events[0]!.to, "(restart)");
+    assert.ok(r.invalidation.restart > 0);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("handleAcpCache renders the CACHE INVALIDATION breakdown incl. unmeasured (#1536)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic", upstream: "https://api.openai.com" });
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
+    recordCacheSample(session, { at: T0 + 3000, input: 11500, cached: null });
+    const text = handleAcpCache(session);
+    assert.match(text, /CACHE INVALIDATION/);
+    assert.match(text, /wire switch:/);
+    assert.match(text, /upstream switch:/);
+    assert.match(text, /restart\/refork:/);
+    assert.match(text, /unmeasured .*excluded from hit rate/);
+});

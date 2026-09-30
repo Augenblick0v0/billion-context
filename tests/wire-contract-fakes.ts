@@ -91,6 +91,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "bili #1403 production 400 (opencode zen https://opencode.ai/zen/v1/messages: 'prompt_cache_key: Extra inputs are not permitted', 2026-09-26); Anthropic Messages API reference (no such field)",
     },
+    {
+        id: "WC-010",
+        wire: "anthropic",
+        summary:
+            "at most 4 cache_control breakpoints per request, counted across system blocks + tools entries + message content blocks COMBINED; a 5th is a 400",
+        provenance:
+            "Anthropic prompt-caching API reference ('you can define up to 4 cache breakpoints'); surfaced by the #1639 review — the #1637 stamping emits 1 system + 3 message marks and anthropicToCore harvests client marks from message blocks only, so a client marking only its tools array would have combined into a 5th breakpoint; repair = tools-mark detection suppresses bili's stamps (src/loop/cache-control.ts anthropicToolsCarryCacheControl)",
+    },
 ];
 
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -102,12 +110,26 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007, WC-010 on an Anthropic /v1/messages body. Returns violation strings. */
 export function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
+    // WC-010 runs before the tools early-return: breakpoints can live in
+    // system blocks and message content blocks with no tools array at all.
+    let breakpoints = 0;
+    if (Array.isArray(body.system))
+        for (const b of body.system) if (isPlainObject(b) && b.cache_control !== undefined) breakpoints++;
+    if (Array.isArray(body.tools))
+        for (const t of body.tools) if (isPlainObject(t) && t.cache_control !== undefined) breakpoints++;
+    if (Array.isArray(body.messages))
+        for (const m of body.messages) {
+            if (!isPlainObject(m) || !Array.isArray(m.content)) continue;
+            for (const b of m.content) if (isPlainObject(b) && b.cache_control !== undefined) breakpoints++;
+        }
+    if (breakpoints > 4)
+        out.push(`WC-010 ${breakpoints} cache_control breakpoints (system + tools + messages combined) — Anthropic allows at most 4`);
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) {
