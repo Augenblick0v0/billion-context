@@ -325,4 +325,22 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 /* Log view rows (filtered mode): actual hits vs context / time-window lines. */
 .lm-ctx { opacity: 0.55; }
 .lm-hit { background: rgba(94, 164, 255, 0.14); border-radius: 3px; }
+/* #1748: detailed config form */
+.qs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 14px; }
+.qs-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.qs-row .qs-name { flex: 0 0 auto; max-width: 52%; font-size: 12px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qs-row .qs-input { flex: 1 1 auto; min-width: 0; }
+.qs-row .switch { flex: 0 0 auto; margin-left: auto; }
+.qs-row.qs-wide { grid-column: 1 / -1; align-items: flex-start; flex-wrap: wrap; }
+.qs-row.qs-wide .qs-name { width: 100%; max-width: none; white-space: normal; margin-bottom: 2px; }
+.qs-row.qs-wide .qs-json { width: 100%; min-height: 72px; resize: vertical; }
+.switch { position: relative; width: 40px; height: 22px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg-muted); cursor: pointer; padding: 0; transition: background .15s ease, border-color .15s ease; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--text-faint); transition: transform .15s ease, background .15s ease; }
+.switch[aria-checked="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.switch[aria-checked="true"]::after { transform: translateX(18px); background: var(--accent); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.route-row { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; background: var(--bg-elev); }
+.route-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.route-head .mono { font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-add-row { margin-top: 4px; }
 `;

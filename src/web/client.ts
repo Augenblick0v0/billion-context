@@ -935,26 +935,15 @@ export const WEB_CLIENT = `(function () {
                     if (cfg.compress && typeof cfg.compress === "object" && Object.keys(cfg.compress).length) o.compress = cfg.compress;
                     val = JSON.stringify(o, null, 2);
                 }
+                const loaded = fe.getAttribute("data-loaded") || "";
+                if (fe.value && fe.value !== loaded && fe.value !== val) toast(t("toast.unsaved_refreshed"), "warn");
                 fe.value = val;
+                fe.setAttribute("data-loaded", val);
             }
             const broken = Boolean(cfg.parseError);
             ["cfg-file-edit", "save-file", "save-upstream"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
-            const ptState = $("pt-state");
-            const ptSource = $("pt-source");
-            const clearPt = $("clear-passthrough");
-            const pt = cfg.passthrough;
-            // #1426: passthrough shows where it came from; env-driven cannot be cleared from here
-            if (pt && pt.enabled) {
-                ptState.className = "badge ok";
-                ptState.textContent = t("cfg.pt_on");
-                ptSource.textContent = pt.source === "env" ? t("sys.pt_env") : t("sys.pt_file");
-                clearPt.hidden = pt.source !== "env";
-            } else {
-                ptState.className = "badge disk";
-                ptState.textContent = t("cfg.pt_off");
-                ptSource.textContent = pt && pt.source ? (pt.source === "env" ? t("sys.pt_env") : t("sys.pt_file")) : "";
-                clearPt.hidden = true;
-            }
+            if (cfgForm && cfgForm.dirty) toast(t("toast.unsaved_refreshed"), "warn");
+            renderConfigForm(cfg);
             loadUpstream(cfg);
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
@@ -1051,6 +1040,391 @@ export const WEB_CLIENT = `(function () {
     }
     window.addEventListener("hashchange", route);
 
+    // ── #1748: detailed visual config form ──────────────────────────────────
+    // One control per known config-file field, rendered over the same file the
+    // raw JSON box below edits. Saving deep-clones the current document and
+    // applies only the modeled controls, so unmodeled keys survive untouched.
+    let cfgForm = null;
+
+    function buildCfgSchema() {
+        return [
+            { sec: t("cfg.sec_server"), fields: [
+                { p: ["port"], k: "int", tip: t("qs.s_port"), ph: "8787" },
+                { p: ["host"], k: "text", tip: t("qs.s_host"), ph: "127.0.0.1" },
+                { p: ["upstream"], k: "text", tip: t("qs.s_upstream"), ph: "https://api.anthropic.com" },
+                { p: ["logFile"], k: "text", tip: t("qs.s_logFile") },
+                { p: ["sessionHeader"], k: "text", tip: t("qs.s_sessionHeader"), ph: "x-acp-session" },
+                { p: ["dumpSse"], k: "text", tip: t("qs.s_dumpSse") },
+                { p: ["log"], k: "bool", tip: t("qs.s_log") },
+            ]},
+            { sec: t("cfg.sec_compress"), fields: [
+                { p: ["compress", "injectTool"], k: "bool", tip: t("qs.c_injectTool") },
+                { p: ["compress", "injectNudge"], k: "bool", tip: t("qs.c_injectNudge") },
+                { p: ["compress", "modelContextLimit"], k: "pct", tip: t("qs.c_modelContextLimit"), ph: "200000 | 75%" },
+                { p: ["compress", "outputHeadroomMaxPct"], k: "pct", tip: t("qs.c_outputHeadroomMaxPct"), ph: "0.25 | 25%" },
+                { p: ["compress", "maxContextLimit"], k: "pct", tip: t("qs.c_maxContextLimit"), ph: "0.75 | 75%" },
+                { p: ["compress", "emergencyThresholdPercent"], k: "pct", tip: t("qs.c_emergencyThresholdPercent"), ph: "0.9 | 90%" },
+                { p: ["compress", "nudgeGrowthTokens"], k: "int", tip: t("qs.c_nudgeGrowthTokens"), ph: "50000" },
+                { p: ["compress", "preserveRecentMessages"], k: "int", tip: t("qs.c_preserveRecentMessages") },
+                { p: ["compress", "preserveRecentTokens"], k: "int", tip: t("qs.c_preserveRecentTokens") },
+                { p: ["compress", "minCompressRangeChars"], k: "int", tip: t("qs.c_minCompressRangeChars") },
+                { p: ["compress", "tiers"], k: "bool", tip: t("qs.c_tiers") },
+                { p: ["compress", "protectedLatestTools"], k: "int", tip: t("qs.c_protectedLatestTools") },
+                { p: ["compress", "protectedTools"], k: "list", tip: t("qs.c_protectedTools") },
+                { p: ["compress", "neverPreserveRecentTools"], k: "list", tip: t("qs.c_neverPreserveRecentTools") },
+                { p: ["compress", "preserveRecentTools"], k: "list", tip: t("qs.c_preserveRecentTools") },
+                { p: ["compress", "visibilityMarkers"], k: "bool", tip: t("qs.c_visibilityMarkers") },
+                { p: ["compress", "stripImages"], k: "bool", tip: t("qs.c_stripImages") },
+                { p: ["compress", "stripImagesKeepRecent"], k: "int", tip: t("qs.c_stripImagesKeepRecent") },
+                { p: ["compress", "rules"], k: "bool", tip: t("qs.c_rules") },
+                { p: ["compress", "promptPack"], k: "text", tip: t("qs.c_promptPack"), ph: "default | lean | custom" },
+                { p: ["compress", "acknowledgePromptsRisk"], k: "bool", tip: t("qs.c_acknowledgePromptsRisk") },
+                { p: ["compress", "prompts"], k: "json", tip: t("qs.c_prompts") },
+                { p: ["compress", "absorb"], k: "json", tip: t("qs.c_absorb") },
+                { p: ["compress", "ccr"], k: "json", tip: t("qs.c_ccr") },
+                { p: ["compress", "search"], k: "json", tip: t("qs.c_search") },
+                { p: ["compress", "imageCompression"], k: "json", tip: t("qs.c_imageCompression") },
+                { p: ["compress", "reasoning"], k: "json", tip: t("qs.c_reasoning") },
+                { p: ["compress", "reasoningGuard"], k: "json", tip: t("qs.c_reasoningGuard") },
+                { p: ["compress", "outputSteering"], k: "json", tip: t("qs.c_outputSteering") },
+                { p: ["compress", "priceProfile"], k: "json", tip: t("qs.c_priceProfile") },
+            ]},
+            { sec: t("cfg.sec_update"), fields: [
+                { p: ["autoUpdate"], k: "bool", tip: t("qs.u_autoUpdate") },
+                { p: ["autoRestartOnUpdate"], k: "bool", tip: t("qs.u_autoRestartOnUpdate") },
+                { p: ["updateTag"], k: "text", tip: t("qs.u_updateTag"), ph: "latest" },
+                { p: ["advisoryCheck"], k: "bool", tip: t("qs.u_advisoryCheck") },
+                { p: ["advisoryUrl"], k: "text", tip: t("qs.u_advisoryUrl") },
+            ]},
+            { sec: t("cfg.sec_behavior"), fields: [
+                { p: ["passthrough"], k: "bool", tip: t("cfg.passthrough_desc") },
+                { p: ["debug"], k: "bool", tip: t("qs.b_debug") },
+                { p: ["modelContextLimit"], k: "int", tip: t("qs.b_modelContextLimit") },
+                { p: ["maskHosts"], k: "bool", tip: t("qs.b_maskHosts") },
+                { p: ["subagentSplit"], k: "bool", tip: t("qs.b_subagentSplit") },
+                { p: ["forkAdoption"], k: "bool", tip: t("qs.b_forkAdoption") },
+                { p: ["resumeInheritance"], k: "bool", tip: t("qs.b_resumeInheritance") },
+                { p: ["chainContentDetection"], k: "bool", tip: t("qs.b_chainContentDetection") },
+                { p: ["stableSystemAnchor"], k: "bool", tip: t("qs.b_stableSystemAnchor") },
+                { p: ["imageBilling"], k: "enum", tip: t("qs.b_imageBilling"), opts: ["auto", "pixels", "bytes"] },
+            ]},
+            { sec: t("cfg.sec_advanced"), fields: [
+                { p: ["promptCache", "routing"], k: "enum", tip: t("qs.a_promptCacheRouting"), opts: ["auto", "enabled", "disabled"] },
+                { p: ["mitm", "enabled"], k: "bool", tip: t("qs.a_mitmEnabled") },
+                { p: ["mitm", "domains"], k: "list", tip: t("qs.a_mitmDomains") },
+                { p: ["compat", "roles"], k: "json", tip: t("qs.a_compatRoles") },
+                { p: ["compat", "streamErrorShape"], k: "enum", tip: t("qs.a_streamErrorShape"), opts: ["protocol", "completion"] },
+                { p: ["claude", "nativePort"], k: "int", tip: t("qs.a_claudeNativePort") },
+                { p: ["native", "attachExternal"], k: "bool", tip: t("qs.a_nativeAttachExternal") },
+            ]},
+        ];
+    }
+
+    function buildRouteFields() {
+        return [
+            { f: "models", k: "json", tip: t("qs.r_models") },
+            { f: "proxy", k: "text", tip: t("qs.r_proxy") },
+            { f: "compressProtocol", k: "enum", tip: t("qs.r_compprotocol"), opts: ["tools", "marker"] },
+            { f: "passthrough", k: "bool", tip: t("qs.r_passthrough") },
+            { f: "direct", k: "bool", tip: t("qs.r_direct") },
+            { f: "imageBilling", k: "enum", tip: t("qs.r_imagebilling"), opts: ["auto", "pixels", "bytes"] },
+            { f: "compress", k: "json", tip: t("qs.r_compress") },
+            { f: "compat", k: "json", tip: t("qs.r_compat") },
+        ];
+    }
+
+    function getAtPath(o, path) {
+        let cur = o;
+        for (let i = 0; i < path.length; i++) {
+            if (cur === null || cur === undefined || typeof cur !== "object") return undefined;
+            cur = cur[path[i]];
+        }
+        return cur;
+    }
+
+    function setOrDel(doc, path, value) {
+        let cur = doc;
+        for (let i = 0; i < path.length - 1; i++) {
+            if (cur[path[i]] === null || typeof cur[path[i]] !== "object") cur[path[i]] = {};
+            cur = cur[path[i]];
+        }
+        const last = path[path.length - 1];
+        if (value === undefined) delete cur[last]; else cur[last] = value;
+    }
+
+    function pruneEmpty(obj) {
+        for (const k of Object.keys(obj)) {
+            const v = obj[k];
+            if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+                pruneEmpty(v);
+                if (!Object.keys(v).length) delete obj[k];
+            }
+        }
+    }
+
+    function forcedVarsFor(dotPath) {
+        if (!cfgForm) return [];
+        const map = cfgForm.envForced;
+        return Object.prototype.hasOwnProperty.call(map, dotPath) ? map[dotPath] : [];
+    }
+
+    function ctrlId(p) { return "cf_" + p.join("_"); }
+
+    function renderControl(f, value, forceDot, idOverride) {
+        const id = idOverride || ctrlId(f.p);
+        const name = f.p[f.p.length - 1];
+        const label = '<span class="qs-name mono" title="' + escapeHtml(f.tip) + '">' + escapeHtml(name) + "</span>";
+        const fv = forcedVarsFor(forceDot);
+        let ctl;
+        if (fv.length > 0) {
+            ctl = '<span class="badge warn qs-forced-badge">' + escapeHtml(t("cfg.form_env_forced", { var: fv.join("/") })) + "</span>";
+        } else if (f.k === "bool") {
+            ctl = '<button type="button" class="switch" role="switch" aria-checked="' + (value === true) + '" id="' + id + '"></button>';
+        } else if (f.k === "enum") {
+            const opts = ['<option value="">' + escapeHtml(t("qs.opt_default")) + "</option>"];
+            for (const o of f.opts) opts.push('<option value="' + escapeHtml(o) + '"' + (value === o ? " selected" : "") + ">" + escapeHtml(o) + "</option>");
+            ctl = '<select class="field-input qs-input" id="' + id + '">' + opts.join("") + "</select>";
+        } else if (f.k === "json") {
+            const txt = value === undefined ? "" : JSON.stringify(value, null, 2);
+            ctl = '<textarea class="editor mono qs-json" id="' + id + '" rows="3">' + escapeHtml(txt) + "</textarea>";
+        } else {
+            let txt = "";
+            if (value !== undefined && value !== null) txt = Array.isArray(value) ? value.join(", ") : String(value);
+            ctl = '<input class="field-input qs-input" id="' + id + '" value="' + escapeHtml(txt) + '" placeholder="' + escapeHtml(f.ph || t("qs.opt_default")) + '">';
+        }
+        let extra = "";
+        if (forceDot === "passthrough" && value === true && cfgForm && cfgForm.ptSource) {
+            extra = '<span class="dim small">' + escapeHtml(t("sys.pt_on") + (cfgForm.ptSource === "env" ? t("sys.pt_env") : t("sys.pt_file"))) + "</span>";
+        }
+        const cls = f.k === "json" ? "qs-row qs-wide" : "qs-row";
+        return '<div class="' + cls + '">' + label + ctl + extra + "</div>";
+    }
+
+    function routesEditable() {
+        const base = cfgForm && cfgForm.base;
+        if (!base) return false;
+        if (typeof base.providersPath === "string" && base.providersPath.trim()) return false;
+        if (forcedVarsFor("providersPath").length > 0) return false;
+        return true;
+    }
+
+    function routeRowHtml(key, i) {
+        const entry = ((cfgForm.base.providers || {})[key]) || {};
+        const parts = [];
+        parts.push('<div class="route-row">');
+        parts.push('<div class="route-head"><span class="mono clip" title="' + escapeHtml(key) + '">' + escapeHtml(key) + '</span><button type="button" class="btn sm" data-route-del="' + i + '" title="' + escapeHtml(t("cfg.routes_remove")) + '">&#x2715;</button></div>');
+        parts.push('<div class="qs-grid">');
+        for (const f of buildRouteFields()) {
+            const forceDot = f.f === "imageBilling" ? "imageBilling" : "providers." + key + "." + f.f;
+            parts.push(renderControl({ p: [f.f], k: f.k, tip: f.tip, opts: f.opts, ph: f.ph }, entry[f.f], forceDot, "cf_r_" + i + "_" + f.f));
+        }
+        parts.push("</div></div>");
+        return parts.join("");
+    }
+
+    function renderRoutesSection() {
+        const out = [];
+        out.push('<div class="section-label">' + escapeHtml(t("cfg.sec_providers")) + "</div>");
+        if (!routesEditable()) {
+            const base = cfgForm.base || {};
+            const ext = (typeof base.providersPath === "string" && base.providersPath.trim()) ? base.providersPath : "ACP_PROVIDERS";
+            out.push('<p class="dim small">' + escapeHtml(t("cfg.routes_external", { path: ext })) + "</p>");
+            return out.join("");
+        }
+        if (!cfgForm.routeKeys.length) out.push('<p class="dim small">' + escapeHtml(t("cfg.routes_empty")) + "</p>");
+        cfgForm.routeKeys.forEach((key, i) => out.push(routeRowHtml(key, i)));
+        out.push('<div class="qs-row route-add-row"><input class="field-input qs-input" id="route-new-key" placeholder="https://api.example.com/v1"><button type="button" class="btn sm" id="route-add">' + escapeHtml(t("cfg.routes_add")) + "</button></div>");
+        return out.join("");
+    }
+
+    function markDirty() { if (cfgForm) cfgForm.dirty = true; }
+
+    function renderConfigForm(cfg) {
+        const host = $("cfg-form-host");
+        if (!host) return;
+        let broken = Boolean(cfg.parseError);
+        let base = null;
+        if (!broken) {
+            if (typeof cfg.raw === "string" && cfg.raw.trim()) {
+                try {
+                    const parsed = JSON.parse(cfg.raw);
+                    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) base = parsed; else broken = true;
+                } catch (e) { broken = true; }
+            } else {
+                base = {};
+                if (cfg.providers && typeof cfg.providers === "object" && Object.keys(cfg.providers).length) base.providers = cfg.providers;
+                if (cfg.upstreamProxyMode || cfg.upstreamProxy) { base.upstreamProxyMode = cfg.upstreamProxyMode || "auto"; if (cfg.upstreamProxy) base.upstreamProxy = cfg.upstreamProxy; }
+                if (cfg.compress && typeof cfg.compress === "object" && Object.keys(cfg.compress).length) base.compress = cfg.compress;
+            }
+        }
+        cfgForm = {
+            base,
+            broken,
+            envForced: (cfg.envForced && typeof cfg.envForced === "object") ? cfg.envForced : {},
+            routeKeys: Object.keys((base && base.providers) || {}).sort((a, b) => b.length - a.length),
+            otherKeys: [],
+            ptSource: (cfg.passthrough && cfg.passthrough.source) || "",
+            lastCfg: cfg,
+            dirty: false,
+        };
+        const saveBtn = $("save-config-form");
+        if (saveBtn) saveBtn.disabled = broken;
+        if (broken) { host.innerHTML = ""; return; }
+        const schema = buildCfgSchema();
+        const parts = [];
+        for (const sec of schema) {
+            parts.push('<div class="section-label">' + escapeHtml(sec.sec) + '</div><div class="qs-grid">');
+            for (const f of sec.fields) parts.push(renderControl(f, getAtPath(base, f.p), f.p.join(".")));
+            parts.push("</div>");
+        }
+        parts.push(renderRoutesSection());
+        const modeledRoots = new Set(["providers", "providersPath"]);
+        for (const sec of schema) for (const f of sec.fields) modeledRoots.add(f.p[0]);
+        cfgForm.otherKeys = Object.keys(base).filter((k) => !modeledRoots.has(k));
+        parts.push('<div class="section-label">' + escapeHtml(t("cfg.sec_other")) + "</div>");
+        if (!cfgForm.otherKeys.length) {
+            parts.push('<p class="dim small">' + escapeHtml(t("qs.other_hint")) + "</p>");
+        } else {
+            parts.push('<div class="qs-grid">');
+            cfgForm.otherKeys.forEach((k, i) => {
+                parts.push('<div class="qs-row qs-wide"><span class="qs-name mono" title="' + escapeHtml(k) + '">' + escapeHtml(k) + '</span><textarea class="editor mono qs-json" id="cf_other_' + i + '" rows="3">' + escapeHtml(JSON.stringify(base[k], null, 2)) + "</textarea></div>");
+            });
+            parts.push("</div>");
+        }
+        host.innerHTML = parts.join("");
+        host.querySelectorAll(".switch").forEach((sw) => sw.addEventListener("click", () => {
+            sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") === "true" ? "false" : "true");
+            markDirty();
+        }));
+        host.querySelectorAll(".qs-input, .qs-json").forEach((el) => el.addEventListener("input", markDirty));
+        host.querySelectorAll("[data-route-del]").forEach((b) => b.addEventListener("click", () => removeRoute(Number(b.getAttribute("data-route-del")))));
+        const addKey = $("route-new-key");
+        const addBtn = $("route-add");
+        if (addKey) addKey.addEventListener("keydown", (ev) => { if (ev.key === "Enter") addRoute(addKey.value.trim()); });
+        if (addBtn) addBtn.addEventListener("click", () => addRoute(addKey ? addKey.value.trim() : ""));
+    }
+
+    function snapshotControls() {
+        const m = {};
+        const host = $("cfg-form-host");
+        if (!host) return m;
+        host.querySelectorAll(".qs-input, .qs-json").forEach((el) => { m[el.id] = el.value; });
+        host.querySelectorAll(".switch").forEach((el) => { m[el.id] = el.getAttribute("aria-checked"); });
+        return m;
+    }
+
+    function restoreControls(m) {
+        for (const id of Object.keys(m)) {
+            const el = $(id);
+            if (!el) continue;
+            if (el.classList.contains("switch")) el.setAttribute("aria-checked", m[id]);
+            else el.value = m[id];
+        }
+    }
+
+    function refreshFormKeepInputs() {
+        if (!cfgForm || !cfgForm.lastCfg) return;
+        const snap = snapshotControls();
+        renderConfigForm(cfgForm.lastCfg);
+        restoreControls(snap);
+    }
+
+    function addRoute(key) {
+        if (!key || !cfgForm) return;
+        if (cfgForm.routeKeys.indexOf(key) >= 0) { toast(t("cfg.routes_dup"), "err"); return; }
+        cfgForm.routeKeys.push(key);
+        cfgForm.routeKeys.sort((a, b) => b.length - a.length);
+        refreshFormKeepInputs();
+        markDirty();
+    }
+
+    function removeRoute(i) {
+        if (!cfgForm) return;
+        if (!window.confirm(t("cfg.routes_confirm"))) return;
+        cfgForm.routeKeys.splice(i, 1);
+        refreshFormKeepInputs();
+        markDirty();
+    }
+
+    function collectValue(f, el, fieldName) {
+        if (f.k === "bool") return { del: el.getAttribute("aria-checked") !== "true" };
+        const raw = String(el.value == null ? "" : el.value).trim();
+        if (raw === "") return { del: true };
+        if (f.k === "int" || f.k === "num") {
+            const n = Number(raw);
+            if (!isFinite(n)) { toast(t("qs.invalid_number", { field: fieldName }), "err"); return null; }
+            return { val: n };
+        }
+        if (f.k === "pct") {
+            const isPct = raw.charAt(raw.length - 1) === "%";
+            const body = (isPct ? raw.slice(0, -1) : raw).trim();
+            const n = Number(body);
+            if (!isFinite(n) || n < 0) { toast(t("qs.invalid_pct", { field: fieldName }), "err"); return null; }
+            return { val: isPct ? body + "%" : n };
+        }
+        if (f.k === "list") return { val: raw.split(",").map((s) => s.trim()).filter(Boolean) };
+        if (f.k === "json") {
+            try {
+                const v = JSON.parse(raw);
+                if (v === null || typeof v !== "object" || Array.isArray(v)) throw new Error("not-an-object");
+                return { val: v };
+            } catch (e) {
+                toast(t("qs.invalid_json_box", { field: fieldName }), "err");
+                return null;
+            }
+        }
+        return { val: raw };
+    }
+
+    async function saveConfigForm(btn) {
+        if (!cfgForm || cfgForm.broken) return;
+        const doc = JSON.parse(JSON.stringify(cfgForm.base || {}));
+        let failed = false;
+        for (const sec of buildCfgSchema()) {
+            for (const f of sec.fields) {
+                const el = $(ctrlId(f.p));
+                if (!el) continue;
+                const r = collectValue(f, el, f.p[f.p.length - 1]);
+                if (!r) { failed = true; continue; }
+                setOrDel(doc, f.p, r.del ? undefined : r.val);
+            }
+        }
+        if (routesEditable()) {
+            const prov = {};
+            cfgForm.routeKeys.forEach((key, i) => {
+                const prev = (((cfgForm.base || {}).providers) || {})[key] || {};
+                const entry = JSON.parse(JSON.stringify(prev));
+                for (const f of buildRouteFields()) {
+                    const el = $("cf_r_" + i + "_" + f.f);
+                    if (!el) continue;
+                    const r = collectValue(f, el, key + "." + f.f);
+                    if (!r) { failed = true; continue; }
+                    if (r.del) delete entry[f.f]; else entry[f.f] = r.val;
+                }
+                if (Object.keys(entry).length) prov[key] = entry;
+            });
+            if (Object.keys(prov).length) doc.providers = prov; else delete doc.providers;
+        }
+        cfgForm.otherKeys.forEach((k, i) => {
+            const el = $("cf_other_" + i);
+            if (!el) return;
+            const raw = String(el.value == null ? "" : el.value).trim();
+            if (raw === "") { delete doc[k]; return; }
+            try {
+                const v = JSON.parse(raw);
+                if (v === null || typeof v !== "object" || Array.isArray(v)) throw new Error("not-an-object");
+                doc[k] = v;
+            } catch (e) {
+                toast(t("qs.invalid_json_box", { field: k }), "err");
+                failed = true;
+            }
+        });
+        if (failed) return;
+        pruneEmpty(doc);
+        cfgForm.dirty = false;
+        await putCfg(btn, { file: JSON.stringify(doc, null, 2) });
+    }
+
     function initStaticHandlers() {
         const tog = $("language-toggle");
         if (tog) tog.addEventListener("click", () => {
@@ -1145,19 +1519,10 @@ export const WEB_CLIENT = `(function () {
             if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
             await putCfg(sf, { file: raw });
         });
-        const cp = $("clear-passthrough");
-        if (cp) cp.addEventListener("click", async () => {
-            busy(cp, true);
-            try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
-                toast(t("toast.passthrough_cleared"), "ok");
-                loadConfig();
-            } catch (e) {
-                toast(e.message, "err");
-            } finally {
-                busy(cp, false);
-            }
-        });
+        // #1748: detailed visual form — applies modeled controls onto a clone of the
+        // current document, then saves through the same whole-file endpoint
+        const fc = $("save-config-form");
+        if (fc) fc.addEventListener("click", () => saveConfigForm(fc));
         document.addEventListener("click", (ev) => {
             const target = ev.target;
             if (!target || !target.closest) return;

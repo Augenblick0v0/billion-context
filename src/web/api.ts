@@ -40,6 +40,60 @@ function configParseError(): string | null {
     return `config file is not valid JSON: ${configFile()}`;
 }
 
+/** Config-file paths whose effective value an environment variable currently
+ *  overrides (#1748). The web form disables those controls instead of letting
+ *  a file write silently lose to the env var. Mirrors the resolution order in
+ *  src/config.ts loadConfig/loadRoutes — keep in sync when adding overrides. */
+export const ENV_OVERRIDES: Array<{ path: string; vars: string[] }> = [
+    { path: "port", vars: ["ACP_PORT", "PORT"] },
+    { path: "host", vars: ["ACP_HOST"] },
+    { path: "upstream", vars: ["ACP_UPSTREAM"] },
+    { path: "log", vars: ["ACP_LOG"] },
+    { path: "sessionHeader", vars: ["ACP_SESSION_HEADER"] },
+    { path: "providersPath", vars: ["ACP_PROVIDERS"] },
+    { path: "logFile", vars: ["ACP_LOG_FILE"] },
+    { path: "dumpSse", vars: ["ACP_DUMP_SSE"] },
+    { path: "modelContextLimit", vars: ["ACP_MODEL_CONTEXT_LIMIT"] },
+    { path: "updateTag", vars: ["ACP_UPDATE_TAG"] },
+    { path: "compress.injectTool", vars: ["ACP_COMPRESS_TOOL"] },
+    { path: "compress.injectNudge", vars: ["ACP_COMPRESS_NUDGE"] },
+    { path: "debug", vars: ["ACP_DEBUG"] },
+    { path: "passthrough", vars: ["ACP_PASSTHROUGH"] },
+    { path: "autoUpdate", vars: ["ACP_AUTO_UPDATE"] },
+    { path: "autoRestartOnUpdate", vars: ["ACP_AUTO_RESTART_ON_UPDATE"] },
+    { path: "advisoryCheck", vars: ["BILI_ADVISORY_CHECK"] },
+    { path: "advisoryUrl", vars: ["BILI_ADVISORY_URL"] },
+    { path: "compat.streamErrorShape", vars: ["BILI_STREAM_ERROR_SHAPE"] },
+    { path: "maskHosts", vars: ["BILI_LOG_MASK_HOSTS"] },
+    { path: "subagentSplit", vars: ["BILI_SUBAGENT_SPLIT"] },
+    { path: "forkAdoption", vars: ["BILI_FORK_ADOPTION"] },
+    { path: "resumeInheritance", vars: ["BILI_RESUME_INHERITANCE"] },
+    { path: "stableSystemAnchor", vars: ["BILI_STABLE_SYSTEM_ANCHOR"] },
+    { path: "chainContentDetection", vars: ["BILI_CHAIN_CONTENT"] },
+    // BILI_IMAGE_BILLING also beats every per-route imageBilling override; the
+    // web form locks those selects against this same entry.
+    { path: "imageBilling", vars: ["BILI_IMAGE_BILLING"] },
+    { path: "promptCache.routing", vars: ["ACP_PROMPT_CACHE_ROUTING"] },
+    { path: "mitm.enabled", vars: ["BILI_MITM"] },
+    { path: "claude.nativePort", vars: ["BILI_CLAUDE_NATIVE_PORT"] },
+    { path: "native.attachExternal", vars: ["BILI_NATIVE_ATTACH_EXTERNAL"] },
+];
+
+export function envForcedMap(env: NodeJS.ProcessEnv = process.env): Record<string, string[]> {
+    const map: Record<string, string[]> = {};
+    for (const { path, vars } of ENV_OVERRIDES) {
+        const set = vars.filter((v) => env[v] !== undefined);
+        if (set.length > 0) map[path] = set;
+    }
+    return map;
+}
+
+/** True when the given dot-path is covered by a currently-set env override.
+ *  Exact paths only — provider keys may contain dots, so no wildcard matching. */
+export function isEnvForcedPath(dotPath: string, forced: Record<string, string[]>): boolean {
+    return Object.prototype.hasOwnProperty.call(forced, dotPath);
+}
+
 export function readProviders(): ProviderRoutes {
     return loadRoutes();
 }
@@ -87,6 +141,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         passthrough: passthroughState(process.env),
+        envForced: envForcedMap(process.env),
         ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
