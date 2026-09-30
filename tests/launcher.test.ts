@@ -3215,7 +3215,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
         // The MITM whitelist carries the non-loopback https host.
         assert.ok(proxyEnvs.length > 0);
-        assert.ok(String(proxyEnvs[0].BILI_MITM_DOMAINS).split(",").includes("api.anthropic.com"));
+        assert.ok(String(proxyEnvs[0].BILI_LAUNCHER_MITM_DOMAINS).split(",").includes("api.anthropic.com"));
         // /acp command injection: --patch flag spliced before user args, and
         // the patch overlay file exists pointing at our bundled cordis plugin.
         const patchFile = path.join(overlay, ".bili-acp.patch.yml");
@@ -4351,7 +4351,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         assert.equal(seenEnv.QODER_MODEL_TRANSPORT, "http");
         assert.equal(seenEnv.QODER_AUTOCOMPACT_WINDOW, "200000", "budget aligned from built-in table");
         assert.ok(proxyEnvs.length > 0, "proxy child spawned");
-        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        const mitm = String(proxyEnvs[0]!.BILI_LAUNCHER_MITM_DOMAINS).split(",");
         for (const h of QODER_DEFAULT_MODEL_HOSTS) {
             assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
         }
@@ -4757,7 +4757,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
         assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
         assert.ok(proxyEnvs.length > 0, "proxy child spawned");
-        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        const mitm = String(proxyEnvs[0]!.BILI_LAUNCHER_MITM_DOMAINS).split(",");
         for (const h of TRAE_DEFAULT_MODEL_HOSTS) {
             assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
         }
@@ -4991,7 +4991,7 @@ test("runLaunch aider: nothing declared → default hosts whitelisted for cert-M
     assert.equal(client.HTTP_PROXY, undefined, "no plaintext-http route → HTTP_PROXY unset");
     assert.equal(client.NO_PROXY, "localhost,127.0.0.1,::1");
     assert.equal(client.no_proxy, "localhost,127.0.0.1,::1");
-    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    const mitm = String(proxy.BILI_LAUNCHER_MITM_DOMAINS).split(",");
     for (const h of AIDER_DEFAULT_MODEL_HOSTS) {
         assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
     }
@@ -5010,14 +5010,14 @@ test("runLaunch aider: env endpoints discovered — https MITM-whitelisted, http
     assert.equal(client.REQUESTS_CA_BUNDLE, client.SSL_CERT_FILE);
     assert.equal(client.HTTP_PROXY, origin, "plaintext-http route present → HTTP_PROXY set");
     assert.equal(client.http_proxy, undefined, "inherited http_proxy stripped");
-    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    const mitm = String(proxy.BILI_LAUNCHER_MITM_DOMAINS).split(",");
     assert.ok(mitm.includes("my-relay.example.com"), `whitelist has my-relay.example.com: ${mitm.join(",")}`);
     assert.ok(!mitm.includes("lan-gw.example"), "plaintext-http host rides the forward proxy, not MITM");
 });
 
 test("runLaunch aider: --openai-api-base passed through the launcher updates the whitelist (#1048)", async () => {
     const { proxy } = await runAiderLaunch(["--openai-api-base", "https://arg-relay.example.com/v1"]);
-    const mitm = String(proxy.BILI_MITM_DOMAINS).split(",");
+    const mitm = String(proxy.BILI_LAUNCHER_MITM_DOMAINS).split(",");
     assert.ok(mitm.includes("arg-relay.example.com"), `whitelist has arg-relay.example.com: ${mitm.join(",")}`);
 });
 
@@ -5207,7 +5207,7 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
         assert.equal(seenEnv.BILLION_CONTEXT_PROXY, undefined, "kimi has no agent-side plugin consumer");
         assert.ok(proxyEnvs.length > 0, "proxy child spawned");
-        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        const mitm = String(proxyEnvs[0]!.BILI_LAUNCHER_MITM_DOMAINS).split(",");
         assert.ok(mitm.includes("api.kimi.com"), `whitelist has api.kimi.com: ${mitm.join(",")}`);
         assert.ok(!mitm.includes("api.kimi.ai"), "explicit provider present → no managed fallback hosts");
         const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");
@@ -5428,7 +5428,7 @@ test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA
         assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
         assert.equal(seenEnv.BILLION_CONTEXT_PROXY, undefined, "mcode has no agent-side plugin consumer");
         assert.ok(proxyEnvs.length > 0, "proxy child spawned");
-        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        const mitm = String(proxyEnvs[0]!.BILI_LAUNCHER_MITM_DOMAINS).split(",");
         assert.ok(mitm.includes("agent.minimax.io"), `whitelist has agent.minimax.io: ${mitm.join(",")}`);
         assert.ok(mitm.includes("relay.example.com"), `whitelist has relay.example.com: ${mitm.join(",")}`);
         const windows = String(proxyEnvs[0]!.BILI_LAUNCHER_MODEL_WINDOWS ?? "");

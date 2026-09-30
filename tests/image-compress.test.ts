@@ -4,8 +4,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmrf } from "./tmp-rm.ts";
+import { configurePersistEnabled } from "../src/persist.ts";
 
-process.env.BILI_PERSIST = "0";
+configurePersistEnabled(false);
 
 import sharp from "sharp";
 import {

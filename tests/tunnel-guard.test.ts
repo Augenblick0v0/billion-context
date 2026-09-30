@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
+import { classifyIp, checkTunnelDestination, configureTunnelAllowedHosts, tunnelAllowlist, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #409: the /bili/<absolute-url> tunnel must not reach the proxy's own
@@ -203,10 +203,13 @@ test("checkTunnelDestination: default ports by scheme", async () => {
     assert.equal(httpsNoPort.code, "linkLocal", "scheme-default 443 still classified");
 });
 
-test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {
-    assert.deepEqual(tunnelAllowlistFromEnv({ BILI_TUNNEL_ALLOWED_HOSTS: "127.0.0.1:8199, LANRELAY.EXAMPLE , ,10.0.0.5" }), ["127.0.0.1:8199", "lanrelay.example", "10.0.0.5"]);
-    assert.deepEqual(tunnelAllowlistFromEnv({}), []);
-    assert.deepEqual(tunnelAllowlistFromEnv({ BILI_TUNNEL_ALLOWED_HOSTS: "  " }), []);
+test("configureTunnelAllowedHosts: case normalization, blanks dropped", () => {
+    configureTunnelAllowedHosts(["127.0.0.1:8199", " LANRELAY.EXAMPLE ", "", "10.0.0.5"]);
+    assert.deepEqual(tunnelAllowlist(), ["127.0.0.1:8199", "lanrelay.example", "10.0.0.5"]);
+    configureTunnelAllowedHosts();
+    assert.deepEqual(tunnelAllowlist(), []);
+    configureTunnelAllowedHosts(["  "]);
+    assert.deepEqual(tunnelAllowlist(), []);
 });
 
 // ---------------------------------------------------------------------------

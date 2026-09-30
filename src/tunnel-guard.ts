@@ -21,7 +21,7 @@ import { networkInterfaces } from "node:os";
  *     self-hosted-upstream case: sglang on 127.0.0.1:8199, ollama on
  *     11434, a LAN relay — the httpRewrites launcher flow DEPENDS on this),
  *     denied for remote clients unless the destination is on the explicit
- *     allowlist (BILI_TUNNEL_ALLOWED_HOSTS, "host" or "host:port" entries)
+ *     allowlist (configureTunnelAllowedHosts, "host" or "host:port" entries)
  *   - public destinations → allowed
  *
  * Hostnames are resolved before the verdict (an attacker must not bypass the
@@ -211,17 +211,21 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         return {
             ok: false,
             code: "privateRemote",
-            message: `tunnel destination ${host} resolves to a loopback/private address; remote clients may only reach it via BILI_TUNNEL_ALLOWED_HOSTS`,
+            message: `tunnel destination ${host} resolves to a loopback/private address; remote clients may only reach it via the tunnelAllowedHosts setting`,
         };
     }
     return { ok: true };
 }
 
-/** Parse BILI_TUNNEL_ALLOWED_HOSTS ("host" / "host:port", comma-separated). */
-export function tunnelAllowlistFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
-    const raw = env.BILI_TUNNEL_ALLOWED_HOSTS ?? "";
-    return raw
-        .split(",")
+// #1714 P1: allowlist moved from BILI_TUNNEL_ALLOWED_HOSTS to config.json
+// (`tunnelAllowedHosts`). The setter normalizes entries as the env parser
+// did (trim, lowercase, blanks dropped).
+let allowedHosts: string[] = [];
+export function configureTunnelAllowedHosts(list?: string[]): void {
+    allowedHosts = (list ?? [])
         .map((s) => s.trim().toLowerCase())
         .filter((s) => s.length > 0);
+}
+export function tunnelAllowlist(): string[] {
+    return allowedHosts;
 }

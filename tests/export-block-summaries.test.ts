@@ -5,7 +5,7 @@ import { createInitialState } from "acp-kernel";
 import { renderHandoff } from "../src/export.ts";
 
 // Regression #845: bili export on a session with a persisted folded snapshot
-// must include every active block's summary even when BILI_PERSIST_TAIL_TOKENS
+// must include every active block's summary even when persistTailTokens
 // truncated the summary out of the snapshot tail; --full must additionally
 // attach each block's original messages; a summary already rendered in the
 // conversation view must not be duplicated.

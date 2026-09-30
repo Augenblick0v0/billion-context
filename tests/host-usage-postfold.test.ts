@@ -11,15 +11,15 @@ import { listSessions, _resetSessionsForTest, type Session } from "../src/sessio
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, createAnthropicAdapter } from "../src/loop/index.ts";
 import { promptInputTotal, usageTotals } from "../src/util.ts";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip, pipePluginJson, _resetPluginStateForTest } from "../src/plugin.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistZstd } from "../src/persist.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // Some tests inspect raw on-disk session files directly (bypassing the store
-// codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
-process.env.BILI_PERSIST_ZSTD = "0";
+// codec), so pin the plain-JSON format explicitly (zstd is opt-in only).
+configurePersistZstd(false);
 
 function makeSession(id: string): Session {
     return {

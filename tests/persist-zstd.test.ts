@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, configurePersistZstd } from "../src/persist.ts";
 import { createStorageCodec, ENCRYPT_MAGIC, ZSTD_MAGIC, _setZstdAvailableForTest } from "../src/encrypt.ts";
 import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
@@ -51,7 +51,7 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
-            delete process.env.BILI_PERSIST_ZSTD;
+            configurePersistZstd(false);
             _setZstdAvailableForTest(null);
             rmrf(dir);
         }
@@ -131,8 +131,8 @@ test("fzstd fallback decodes node:zlib frames (static fixture)", () => {
     }
 });
 
-withTempDir("store: BILI_PERSIST_ZSTD=1 writes BILIZSTD1 and loads it back", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "1";
+withTempDir("store: zstd opt-in writes BILIZSTD1 and loads it back", async (h) => {
+    configurePersistZstd(true);
     const store = newStore(h);
     await store.writeNow(makeSession("s-z"));
     store.cancelAll();
@@ -156,14 +156,14 @@ withTempDir("store: default (env unset) writes bare JSON and loads it back", asy
 
 withTempDir("store: large session shrinks vs the default plain-JSON baseline", async (h) => {
     if (!NATIVE_ZSTD) return;
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     const big = makeSession("s-big", 20_000);
     big.blockContents.set("b1", "acp-block-summary-content ".repeat(20_000));
     const first = newStore(h);
     await first.writeNow(big);
     first.cancelAll();
     const compressedSize = statSync(filePath(h.dir, "s-big")).size;
-    process.env.BILI_PERSIST_ZSTD = "0";
+    configurePersistZstd(false);
     const second = newStore(h);
     await second.writeNow(big);
     second.cancelAll();
@@ -171,8 +171,8 @@ withTempDir("store: large session shrinks vs the default plain-JSON baseline", a
     assert.ok(compressedSize * 4 < plainSize, `zstd ${compressedSize}B must beat plain ${plainSize}B`);
 });
 
-withTempDir("store: BILI_PERSIST_ZSTD=0 keeps files as plain JSON", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "0";
+withTempDir("store: zstd opt-out keeps files as plain JSON", async (h) => {
+    configurePersistZstd(false);
     const store = newStore(h);
     await store.writeNow(makeSession("s-plain"));
     store.cancelAll();
@@ -184,7 +184,7 @@ withTempDir("store: BILI_PERSIST_ZSTD=0 keeps files as plain JSON", async (h) =>
 });
 
 withTempDir("store: opted-in runtime without native zstd falls back to unframed plain JSON", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     _setZstdAvailableForTest(false);
     const store = newStore(h);
     await store.writeNow(makeSession("s-oldrt"));
@@ -198,7 +198,7 @@ withTempDir("store: opted-in runtime without native zstd falls back to unframed 
 
 withTempDir("store: old runtime reads files written by a newer one (fzstd path)", async (h) => {
     if (!NATIVE_ZSTD) return;
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     const writer = newStore(h);
     await writer.writeNow(makeSession("s-new"));
     writer.cancelAll();
@@ -214,7 +214,7 @@ withTempDir("boot NEVER rewrites legacy plaintext files (downgrade safety, #1080
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     const before = h.logs.length;
     const store = newStore(h);
     const loaded = await store.boot();
@@ -237,7 +237,7 @@ withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", asy
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-old"));
     legacy.cancelAll();
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     const store = newStore(h);
     await store.writeNow(makeSession("s-new", 4_000));
     store.cancelAll();
@@ -248,7 +248,7 @@ withTempDir("mixed tree: legacy plaintext and BILIZSTD1 coexist until boot", asy
 });
 
 withTempDir("keyed boot leaves BILIZSTD1 files untouched and readable", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     const store = newStore(h);
     await store.writeNow(makeSession("s-z"));
     store.cancelAll();
@@ -260,7 +260,7 @@ withTempDir("keyed boot leaves BILIZSTD1 files untouched and readable", async (h
 });
 
 withTempDir("no-key boot reports BILIENC1 files as unreadable instead of corrupt garbage", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "1";
+    configurePersistZstd(true);
     process.env.BILI_ENCRYPTION_KEY = KEY;
     const writer = newStore(h);
     await writer.writeNow(makeSession("s-secret"));
@@ -276,9 +276,9 @@ withTempDir("no-key boot reports BILIENC1 files as unreadable instead of corrupt
     assert.ok(readFileSync(filePath(h.dir, "s-secret")).subarray(0, 8).equals(ENCRYPT_MAGIC), "file left untouched");
 });
 
-withTempDir("decoupling: key + BILI_PERSIST_ZSTD=0 keeps BILIENC1 with a raw body", async (h) => {
+withTempDir("decoupling: key + zstd opt-out keeps BILIENC1 with a raw body", async (h) => {
     process.env.BILI_ENCRYPTION_KEY = KEY;
-    process.env.BILI_PERSIST_ZSTD = "0";
+    configurePersistZstd(false);
     const store = newStore(h);
     await store.writeNow(makeSession("s-rawenc"));
     store.cancelAll();

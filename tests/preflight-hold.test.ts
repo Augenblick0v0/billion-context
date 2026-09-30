@@ -6,12 +6,10 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on the very first 429 instead of the default 3 attempts with
 // exponential backoff — the fail-fast tests below want the error immediately.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
-// Shrink the preflight hold grace so a 1.5s-slow summarization call reliably
-// outlives it (default is 30s — too slow for a test).
-process.env.BILI_PREFLIGHT_HOLD_MS = "300";
+configureReplayRetryMax(1);
 
 import { defaultConfig } from "acp-kernel";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -20,7 +18,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // clients with undici's default 300s headersTimeout aborted mid-compression,
 // the proxy logged "summarization aborted: client disconnected" and never
 // forwarded: a repeating 5-minute death loop. When preflight outlives the
-// hold grace (BILI_PREFLIGHT_HOLD_MS, default 30s) the proxy must commit the
+// hold grace (config.json preflightHoldMs, default 30s) the proxy must commit the
 // response early (stream: 200 + SSE comment keep-alives; non-stream: 200 +
 // whitespace) so the client's header timeout can never fire. Late failures
 // then arrive in-band (protocol error event / JSON body) instead of as a
@@ -101,6 +99,9 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
+        // Shrink the hold grace so a 1.5s-slow summarization call reliably
+        // outlives it (default is 30s).
+        preflightHoldMs: 300,
         log: false,
         debug: false,
         passthrough: false,

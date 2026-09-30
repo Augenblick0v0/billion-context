@@ -40,10 +40,15 @@ export function dataDir(): string {
     return path.join(xdg("XDG_DATA_HOME", ".local/share"), "billion-context");
 }
 
-/** Sessions dir: one JSON file per session. */
+/** Sessions dir: one JSON file per session. Override via configureSessionsDir
+ *  (config.json `sessionsDir`; env input BILI_SESSIONS_DIR retired in #1714). */
+let configuredSessionsDir: string | undefined;
+export function configureSessionsDir(dir?: string): void {
+    configuredSessionsDir = dir;
+}
 export function sessionsDir(): string {
-    const env = process.env.BILI_SESSIONS_DIR;
-    if (env && env.length > 0) return path.resolve(env);
+    const d = configuredSessionsDir?.trim();
+    if (d) return path.resolve(d);
     return path.join(dataDir(), "sessions");
 }
 

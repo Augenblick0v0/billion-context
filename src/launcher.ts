@@ -223,8 +223,8 @@ export interface ProxyHandle {
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
     fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
-    /** #1335: resolves the attach-gate escape hatch. Default reads env
-     *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
+    /** #1335: resolves the attach-gate escape hatch. Default reads config
+     *  `native.attachExternal` (file-only since #1714). */
     resolveAttachExternal?: () => boolean;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
@@ -2538,7 +2538,7 @@ async function probeLiveInstances(
 
 /** #1335: the attach gate — a listener may be attached to only when its
  *  health reports an ARMED session-lifecycle watchdog, or the user explicitly
- *  opted in via native.attachExternal / BILI_NATIVE_ATTACH_EXTERNAL. A missing
+ *  opted in via native.attachExternal (file-only since #1714). A missing
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
@@ -2561,7 +2561,7 @@ function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string
     const reason = health.watchdog && health.watchdog.armed === false
         ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
         : "it does not report watchdog state (older bili build) — its lifecycle is unverifiable";
-    return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
+    return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true in billion-context.json to attach anyway.`;
 }
 
 /** #1232: choose the attach target among healthy candidates. Must be
@@ -2868,7 +2868,7 @@ export async function ensureProxyRunning(
             throw new Error(
                 `bili: port ${opts.port} is held by a lifecycle-less bili proxy at ${squatter.inst.origin} (pid ${squatter.inst.pid}) — ` +
                     `the #1335 attach gate refuses it by default and this launch pins the port, so no session-owned proxy can bind it either. ` +
-                    `Kill that process (kill ${squatter.inst.pid}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it anyway.`,
+                    `Kill that process (kill ${squatter.inst.pid}) or set native.attachExternal=true in billion-context.json to attach to it anyway.`,
             );
         }
     }
@@ -2979,7 +2979,7 @@ export async function ensureProxyRunning(
                         BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
                         ...(opts.lane ? { BILI_LAUNCHER_LANE: opts.lane } : {}),
                         ...(opts.mitmDomains && opts.mitmDomains.length
-                            ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
+                            ? { BILI_LAUNCHER_MITM_DOMAINS: opts.mitmDomains.join(",") }
                             : {}),
                         ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
                             ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
@@ -3254,8 +3254,8 @@ function parsePort(raw: string | undefined): number {
 export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}): Promise<void> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
-    const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
-    const debug = params.overrides.ACP_DEBUG === "1";
+    const passthrough = params.overrides.cliPassthrough === "1";
+    const debug = params.overrides.cliDebug === "1";
 
     const base = baseClientName(params.client);
     // #535: for pi and omp, discovery must read the REAL home — a stale
@@ -3333,17 +3333,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
     // #1403: mirror the proxy's EXACT MITM whitelist (built-in defaults ∪
-    // config-file/BILI_MITM_DOMAINS tier as the spawned child will see it ∪
+    // config-file tier as the spawned child will see it ∪
     // launcher-discovered domains ∪ dynamic client-config discovery) so the
     // pi/omp extension stamps prompt_cache_key only for destinations the proxy
     // will decrypt and strip it from. Blind-tunnel destinations get no stamp —
     // strict-schema upstreams 400 the foreign top-level field otherwise.
-    const childMitmEnv: NodeJS.ProcessEnv =
-        domains.length > 0
-            ? { BILI_MITM_DOMAINS: domains.join(",") }
-            : { BILI_MITM_DOMAINS: process.env.BILI_MITM_DOMAINS };
     const extMitmHosts = base === "pi" || base === "omp"
-        ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
+        ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(), ...domains, ...discoverMitmDomains(discoveryEnv)])
         : [];
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
@@ -3844,8 +3840,8 @@ export interface RunTestPiParams {
 export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}): Promise<number> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
-    const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
-    const debug = params.overrides.ACP_DEBUG === "1";
+    const passthrough = params.overrides.cliPassthrough === "1";
+    const debug = params.overrides.cliDebug === "1";
 
     const config = loadClientConfig(process.env, process.cwd());
     const domains = dedupeInOrder([

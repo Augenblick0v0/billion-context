@@ -10,7 +10,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
-import { REMOTE_IMAGE_TOKENS, imageTokensInParsedBody, imageTokensInRawBody } from "../src/image-tokens.ts";
+import { REMOTE_IMAGE_TOKENS, configureImageTokenCap, imageTokensInParsedBody, imageTokensInRawBody } from "../src/image-tokens.ts";
 
 // Issue #488: (A) image bytes were invisible to every payload-size decision
 // while being forwarded verbatim, so multimodal payloads blew past the window
@@ -57,8 +57,8 @@ test("image-tokens: raw-body gate skips parsing when no image marker is present"
     assert.equal(imageTokensInRawBody("responses", '{"input_image": broken'), 0);
 });
 
-test("image-tokens: BILI_IMAGE_TOKEN_CAP clamps each image's cost", () => {
-    process.env.BILI_IMAGE_TOKEN_CAP = "500";
+test("image-tokens: the per-image token cap clamps each image's cost", () => {
+    configureImageTokenCap(500);
     try {
         assert.equal(
             imageTokensInParsedBody("responses", { input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: DATA_URL }, { type: "input_image", image_url: DATA_URL }] }] }),
@@ -67,7 +67,7 @@ test("image-tokens: BILI_IMAGE_TOKEN_CAP clamps each image's cost", () => {
             imageTokensInParsedBody("responses", { input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/a.png" }] }] }),
             500);
     } finally {
-        delete process.env.BILI_IMAGE_TOKEN_CAP;
+        configureImageTokenCap(undefined);
     }
 });
 

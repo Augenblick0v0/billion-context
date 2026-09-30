@@ -4,14 +4,14 @@ import { once } from "node:events";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
-// Fail fast on 4xx retries so the stream-learn path exercises immediately.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
-// Short dead-end cooldown so the expiry leg of the #726 test stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+
+// Fail fast on 4xx retries so the stream-learn path exercises immediately.
+configureReplayRetryMax(1);
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { diagnoseEmptySummary } from "../src/preflight.ts";
@@ -148,6 +148,8 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         kernelConfig: defaultConfig(10_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
+        // Short dead-end cooldown so the expiry leg of the #726 test stays fast.
+        preflightDeadEndCooldownMs: 400,
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,

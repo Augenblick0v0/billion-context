@@ -21,17 +21,28 @@ export const FAKE_COMPLETION_HINT =
 // the client sees it (a fake completion is only knowable at end-of-stream),
 // which defeats incremental streaming. That cost is only worth paying for the
 // low-frequency fake-completion case (small models via gateways), so it is
-// opt-in: set BILI_FAKE_COMPLETION_RETRIES=2 to enable. 0 = pre-#371 passthrough.
+// opt-in: set fakeCompletionRetries=2 in config.json to enable. 0 = pre-#371
+// passthrough. Configured via configureFakeCompletionRetries; env input
+// BILI_FAKE_COMPLETION_RETRIES retired in #1714.
+let configuredFakeCompletionRetries: number | undefined;
+export function configureFakeCompletionRetries(retries?: number): void {
+    configuredFakeCompletionRetries = retries;
+}
 export function maxFakeCompletionRetries(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_COMPLETION_RETRIES ?? "0", 10);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
+    const v = configuredFakeCompletionRetries;
+    return v != null && Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 // OOM guard for a pathological upstream; LLM responses are bounded by max_tokens
-// and normally well under 1 MiB.
+// and normally well under 1 MiB. Configured via configureFakeBufCap
+// (config.json `fakeBufCap`); env input BILI_FAKE_BUF_CAP retired in #1714.
+let configuredFakeBufCap: number | undefined;
+export function configureFakeBufCap(cap?: number): void {
+    configuredFakeBufCap = cap;
+}
 export function fakeBufCap(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_BUF_CAP ?? String(16 * 1024 * 1024), 10);
-    return Number.isFinite(n) && n > 0 ? n : 16 * 1024 * 1024;
+    const v = configuredFakeBufCap;
+    return v != null && Number.isFinite(v) && v > 0 ? v : 16 * 1024 * 1024;
 }
 
 // "Does this raw response (full SSE stream or JSON body) carry a REAL tool

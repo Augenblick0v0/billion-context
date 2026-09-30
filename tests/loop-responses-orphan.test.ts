@@ -5,6 +5,7 @@ import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 
 // #440: responses adapter must not emit response.failed with no preceding
 // response.created (orphan stream crashes codex; same class as #413).
@@ -90,7 +91,7 @@ function mockFetch(handler: () => Response): { calls: () => number; restore: () 
 }
 
 test("#440 T1: 0-event EOF → first event is response.created, failed preceded by created", async () => {
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    configureReplayRetryMax(1);
     const ctx = makeCtx("resp-orphan-t1");
     const mock = mockFetch(() => new Response('{"error":"boom"}', { status: 500, headers: { "content-type": "application/json" } }));
     try {
@@ -102,7 +103,7 @@ test("#440 T1: 0-event EOF → first event is response.created, failed preceded 
         assertCreatedBeforeFailed(events);
     } finally {
         mock.restore();
-        delete process.env.BILI_REPLAY_RETRY_MAX;
+        configureReplayRetryMax(undefined);
     }
 });
 

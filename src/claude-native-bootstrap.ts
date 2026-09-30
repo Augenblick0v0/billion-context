@@ -4,8 +4,8 @@
 // the native posture is a documented hybrid:
 //
 //   1. the installer pins env.ANTHROPIC_BASE_URL to a STABLE loopback port
-//      (resolveClaudeNativePort: BILI_CLAUDE_NATIVE_PORT > config
-//      claude.nativePort > 48787) with a /bili/-wrapped upstream — full
+//      (resolveClaudeNativePort: config claude.nativePort > 48787)
+//      with a /bili/-wrapped upstream — full
 //      traffic visibility without MITM;
 //   2. THIS hook (fired before the first model request) makes sure a proxy
 //      is listening there: attach to a healthy compatible one, else spawn one
@@ -56,13 +56,13 @@ function log(msg: string): void {
  *     BILLION_CONTEXT_PLUGIN=0) — serve the static URL verbatim-forward.
  *   - "start": bring up (or attach to) the compression proxy. */
 export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "exit" | "passthrough" | "start"; port: number; strict: boolean } {
-    // #1660 zone semantics: an EXPLICIT override (BILI_CLAUDE_NATIVE_PORT /
-    // claude.nativePort) keeps strict-port behavior (#964 — refuse a squatter
+    // #1660 zone semantics: an EXPLICIT override (claude.nativePort)
+    // keeps strict-port behavior (#964 — refuse a squatter
     // rather than serve through it); otherwise the claude lane's zone
     // preference (sticky record > 18787 base), with the proxy child's
     // EADDRINUSE +1 ladder resolving collisions zero-config.
-    const explicit = resolveClaudeNativePort(env);
-    const port = explicit ?? lanePreferredPort("claude", env);
+    const explicit = resolveClaudeNativePort();
+    const port = explicit ?? lanePreferredPort("claude");
     const strict = explicit !== undefined;
     if (proxyEnvOrigin(env) !== undefined) return { action: "exit", port, strict };
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_CLAUDE === "0") return { action: "passthrough", port, strict };
@@ -362,7 +362,7 @@ async function run(): Promise<void> {
     } catch (err) {
         log(
             `proxy bring-up failed on port ${plan.port} — ${err instanceof Error ? err.message : String(err)}` +
-                (plan.action === "start" ? ` — this port is NOT served by a session-managed proxy: model calls ride whatever answers there (an unmanaged or stale bili daemon has no lifecycle guarantees) or fail outright. Fix: kill the listener on this port or set BILI_CLAUDE_NATIVE_PORT, then reinstall (bili plugin install claude)` : ""),
+                (plan.action === "start" ? ` — this port is NOT served by a session-managed proxy: model calls ride whatever answers there (an unmanaged or stale bili daemon has no lifecycle guarantees) or fail outright. Fix: kill the listener on this port or set claude.nativePort in config.json, then reinstall (bili plugin install claude)` : ""),
         );
     }
 }

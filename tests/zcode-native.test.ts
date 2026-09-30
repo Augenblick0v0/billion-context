@@ -474,12 +474,26 @@ test('bootstrapZcodeNative respects zcode route:"none" without proxy bring-up (#
     }
 });
 
-test("resolveZcodeNativePort: env-only explicit override, undefined without one (#1622/#1660)", async () => {
+test("resolveZcodeNativePort: file-only explicit override, undefined without one (#1622/#1660)", async () => {
     const { resolveZcodeNativePort, zcodeDirectPrefixes } = await import("../src/config.ts");
-    assert.equal(resolveZcodeNativePort({ BILI_ZCODE_PORT: "41234" }), 41234);
-    assert.equal(resolveZcodeNativePort({ BILI_ZCODE_PORT: "not-a-port" }), undefined);
-    assert.equal(resolveZcodeNativePort({ BILI_ZCODE_PORT: "70000" }), undefined);
-    assert.equal(resolveZcodeNativePort({}), undefined, "#1660: no default — the zcode lane rides the zone preference");
+    const portDir = mkdtempSync(path.join(tmpdir(), "zcode-native-port-"));
+    const portCfg = path.join(portDir, "billion-context.json");
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    const probe = (value: unknown): number | undefined => {
+        writeFileSync(portCfg, JSON.stringify(value === undefined ? {} : { zcode: { nativePort: value } }));
+        return resolveZcodeNativePort();
+    };
+    try {
+        process.env.BILI_CONFIG_FILE = portCfg;
+        assert.equal(probe(41234), 41234);
+        assert.equal(probe("not-a-port"), undefined);
+        assert.equal(probe(70000), undefined);
+        assert.equal(probe(undefined), undefined, "#1660: no default — the zcode lane rides the zone preference");
+    } finally {
+        if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevCfg;
+        rmrf(portDir);
+    }
     const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-config-"));
     const cfg = path.join(dir, "providers.json");
     writeFileSync(cfg, JSON.stringify({

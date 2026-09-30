@@ -375,7 +375,14 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
 const sessions = new Map<string, Session>();
 
 // `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
-let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256);
+// Configured from config.json `maxSessions` via configureMaxSessions; env
+// input BILI_MAX_SESSIONS retired in #1714.
+let MAX_SESSIONS = 256;
+
+export function configureMaxSessions(v?: number): void {
+    const candidate = v != null && Number.isFinite(v) ? Math.floor(v) : NaN;
+    MAX_SESSIONS = Math.max(1, candidate || 256);
+}
 
 let initialized = false;
 

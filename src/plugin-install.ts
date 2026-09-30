@@ -482,7 +482,7 @@ export function isBiliClaudeBaseUrl(value: unknown): boolean {
 }
 
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
+    const origin = `http://127.0.0.1:${resolveClaudeNativePort() ?? lanePreferredPort("claude")}`;
     return claudeNativeBaseUrlForOrigin(origin, undefined, env);
 }
 
@@ -701,9 +701,9 @@ function claudeInstall(): string {
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
     // #964/#1660: the baked URL uses the explicit override
-    // (BILI_CLAUDE_NATIVE_PORT / claude.nativePort) when set — which also
+    // (claude.nativePort) when set — which also
     // makes every later hook launch strict-port — else the current zone
-    // preference (sticky record > 18787 base). An explicit env-driven port
+    // preference (sticky record > 18787 base). An explicit file-driven port
     // can no longer desync from the hook: both resolve through
     // resolveClaudeNativePort(), and the SessionStart hook's repin pass
     // rewrites the baked URL to the live origin anyway (#1660).

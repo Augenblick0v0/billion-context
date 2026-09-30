@@ -73,7 +73,7 @@ export type ProviderRoute = {
      *  (conservative, matches byte-counting relays); "pixels" = dimension-
      *  based tile estimate (matches first-party pixel-tile upstreams);
      *  "auto" (default) classifies known first-party pixel hosts. Wins over
-     *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
+     *  the global `imageBilling` (env BILI_IMAGE_BILLING retired in #1714). */
     imageBilling?: ImageBillingMode;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
@@ -566,7 +566,7 @@ export type ProxyOptions = {
      *  Empty string explicitly disables environment/system proxy fallback. */
     proxy?: string;
     proxyMode?: UpstreamProxyMode;
-    proxySource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
+    proxySource?: "web-manual" | "config" | "auto" | "direct";
     proxyFallback?: ProxyFallbackOptions;
     /** Auxiliary-egress fallback (#1012): same shape as proxyFallback but its
      *  env tier is filled from the launcher-forwarded BILI_INHERITED_* vars.
@@ -593,21 +593,23 @@ export type ProxyOptions = {
     /** #1455: how upstream stream failures are presented to the client on the
      *  anthropic/openai wire — "protocol" (default) = protocol-native error
      *  frames; "completion" = legacy synthesized-completion shape for hosts
-     *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
-     *  wins over the file's compat.streamErrorShape. */
+     *  whose SDK cannot surface in-band errors. File-only since #1714 — env
+     *  BILI_STREAM_ERROR_SHAPE is retired. */
     streamErrorShape: "protocol" | "completion";
     /** Global-level image billing mode (#767); per-provider route entries
-     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
+     *  override it. undefined = auto. (env BILI_IMAGE_BILLING retired in
+     *  #1714.) */
     imageBilling?: ImageBillingMode;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
     dumpSse?: string;
     passthrough: boolean;
-    /** Where `passthrough` came from: "env" (ACP_PASSTHROUGH or --passthrough
-     *  flag), "file" (config `passthrough: true`), or null (default off).
-     *  Drives the #405 boot warning and the web panel's source display. */
-    passthroughSource: "env" | "file" | null;
+    /** Where `passthrough` came from: "file" (config `passthrough: true`) or
+     *  null (default off; a --passthrough launch flag also enables it at
+     *  runtime while source stays null). Drives the #405 boot warning and the
+     *  web panel's source display. (#1714: env ACP_PASSTHROUGH retired.) */
+    passthroughSource: "file" | null;
     autoUpdate: boolean;
     /** Opt-in self-restart when a newer version is already installed on disk
      *  (#811): re-exec at zero in-flight requests. Default OFF. */
@@ -618,7 +620,8 @@ export type ProxyOptions = {
      *  autoUpdate and force-installs the owner-recommended version when the
      *  local version falls inside an affected range. Default ON. */
     advisoryCheck: boolean;
-    /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
+    /** Override for the advisory document URL (file-only since #1714 — env
+     *  BILI_ADVISORY_URL retired). */
     advisoryUrl?: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
@@ -628,18 +631,20 @@ export type ProxyOptions = {
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
     /** Mask non-public target hosts in proxy logs (#255, default on when
-     *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
-     *  or `maskHosts: false` (#897); credential masking stays on either way. */
+     *  omitted). Opt out for local debugging with `maskHosts: false` (#897);
+     *  credential masking stays on either way. (env BILI_LOG_MASK_HOSTS
+     *  retired in #1714.) */
     maskHosts?: boolean;
     /** Split Claude Code subagent requests (parent+agent header pair) into
      *  their own session id so they don't queue on the main session's lock
-     *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0 or
-     *  `subagentSplit: false` in the config file (env wins). */
+     *  (#970, default on). Opt out with `subagentSplit: false` in the config
+     *  file (env BILI_SUBAGENT_SPLIT retired in #1714). */
     subagentSplit?: boolean;
     /** Opt-in fork block-adoption (#629, default off). Anonymous clients
      *  (prefix-affinity) that fork their history inherit the parent's
      *  fully-present compression blocks instead of restarting at zero.
-     *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
+     *  Enable with `forkAdoption: true` (env BILI_FORK_ADOPTION retired in
+     *  #1714). */
     forkAdoption?: boolean;
     /** Resume-fork inheritance (#1486, default ON). Identified clients that
      *  resume a conversation under a NEW client-provided session id (Claude
@@ -649,8 +654,8 @@ export type ProxyOptions = {
      *  The proxy detects the resume by byte-exact full-history match against
      *  tracked chains and inherits the parent's ref assignments, its
      *  fully-present compression blocks (when forkAdoption is on), and the
-     *  derivedFrom lineage. Disable with `resumeInheritance: false` or env
-     *  BILI_RESUME_INHERITANCE=0. */
+     *  derivedFrom lineage. Disable with `resumeInheritance: false` (env
+     *  BILI_RESUME_INHERITANCE retired in #1714). */
     resumeInheritance?: boolean;
     /** Body-content detection of the bili→bili chain awareness: when an inbound
      *  request carries ACP artifacts / a `<bili-chain …/>` checkpoint in the
@@ -658,8 +663,8 @@ export type ProxyOptions = {
      *  first-processor-wins passthrough (#1086/#1421). OFF by default (#1683
      *  follow-up): scanning the body can false-positive on CCR/file-introduced
      *  text and model-echoed tags, so by default ONLY the x-bili-hop header drives
-     *  chain recognition. Re-enable via env BILI_CHAIN_CONTENT=1 or
-     *  `chainContentDetection: true` in the config file (env wins). The
+     *  chain recognition. Re-enable via `chainContentDetection: true` in the config
+     *  file (env BILI_CHAIN_CONTENT retired in #1714). The
      *  x-bili-hop signal is unaffected by this switch. */
     chainContentDetection?: boolean;
     /** Egress emission of the model-visible `<bili-chain …/>` checkpoint
@@ -670,8 +675,8 @@ export type ProxyOptions = {
      *  openai/responses; trailing text part on anthropic/google), so models
      *  treat it as phantom user input and burn tokens commenting on it — hence
      *  OFF by default. Enable it for the narrow multi-bili + hop-header-
-     *  stripped-middlebox case via env BILI_CHAIN_STAMP=1 or
-     *  `chainEgressStamp: true` in the config file (env wins). Independent of
+     *  stripped-middlebox case via `chainEgressStamp: true` in the config file
+     *  (env BILI_CHAIN_STAMP retired in #1714). Independent of
      *  chainContentDetection (inbound body-detection is also default OFF); the
      *  x-bili-hop passthrough is unaffected either way. */
     chainEgressStamp?: boolean;
@@ -679,9 +684,45 @@ export type ProxyOptions = {
      *  anchor and append detected changes to the conversation as trailing
      *  notes, keeping the forwarded prefix byte-stable for the provider's
      *  prefix cache when instruction files (AGENTS.md & co.) change mid-
-     *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
-     *  `stableSystemAnchor: true` in the config file (env wins). */
+     *  session. Default OFF; enable with `stableSystemAnchor: true` in the
+     *  config file (env BILI_STABLE_SYSTEM_ANCHOR retired in #1714). */
     stableSystemAnchor?: boolean;
+    // #1714: behavior knobs migrated from BILI_*/ACP_* env inputs to config.json.
+    upstreamTimeoutMs?: number;
+    streamKeepAliveMs?: number;
+    replayRetryMax?: number;
+    replayRetryBaseMs?: number;
+    maxShrinkPerCompress?: number;
+    exposureLogIntervalMs?: number;
+    preflightHoldMs?: number;
+    preflightDeadEndCooldownMs?: number;
+    requestWatchdogMs?: number;
+    keepAliveTimeoutMs?: number;
+    clientErrorBackstopMs?: number;
+    ccrRetrievalTtlMs?: number;
+    fakeCompletionRetries?: number;
+    fakeBufCap?: number;
+    maxSessions?: number;
+    sessionGc?: boolean;
+    sessionGcMaxAgeDays?: number;
+    sessionGcMaxTokens?: number;
+    sessionGcIntervalMs?: number;
+    persistEnabled?: boolean;
+    persistDebounceMs?: number;
+    persistTailTokens?: number;
+    persistZstd?: boolean;
+    persistEpermAlertThreshold?: number;
+    persistEpermAlertRepeatMs?: number;
+    mitmHandshakeTimeoutMs?: number;
+    proxyKeepAliveMaxMs?: number;
+    zonePort?: number;
+    zcodeNativePort?: number;
+    decompressTmpCap?: number;
+    imageTokenCap?: number;
+    dump4xx?: boolean;
+    dump4xxMaxBytes?: number;
+    sessionsDir?: string;
+    tunnelAllowedHosts?: string[];
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -716,10 +757,10 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
 }
 
 /** Resolved passthrough state shared by loadOptions and the web config API
- *  (single source of truth — the GET handler must not re-derive it). */
-export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
+ *  (single source of truth — the GET handler must not re-derive it).
+ *  File-only since #1714: the ACP_PASSTHROUGH env input is retired. */
+export function passthroughState(): { enabled: boolean; source: "file" | null } {
     const filePassthrough = loadConfigFile().passthrough === true;
-    if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
 }
 
@@ -837,32 +878,30 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const routes = loadRoutes(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
-    const passthrough = passthroughState(env);
-    const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
-    const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
+    const passthrough = passthroughState();
+    const modelContextLimit = parseInt(`${fileConfig.modelContextLimit ?? 200000}`, 10);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
-    const rawProxyMode = env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
+    // #1714: BILI_UPSTREAM_PROXY / BILI_UPSTREAM_PROXY_MODE retired — file fields only.
+    const rawProxyMode = fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
     // Unset mode means "direct" (matches the web UI's 直连（默认） and ZCode's
     // default), NOT auto-detect. To follow the system/env proxy, set mode "auto".
     const effectiveMode = rawProxyMode ?? "direct";
     const proxyMode = parseUpstreamProxyMode(effectiveMode);
     // explicitDirect short-circuits an EMPTY global proxy to "direct" (instead of
-    // env/system auto-detect). It is true for the unset-defaults-to-direct case and
-    // explicit "direct" mode, but false when an explicit proxy (BILI_UPSTREAM_PROXY)
-    // is set so that proxy still wins (globalProxy is non-empty, so the short-circuit
-    // is skipped regardless).
-    const explicitDirect = proxyMode === "direct" && !biliProxy;
-    const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
-    const proxySource: ProxyOptions["proxySource"] = biliProxy
-        ? "bili-env"
-        : proxyMode === "direct"
-          ? "direct"
-          : proxyMode === "manual" && webProxy
-            ? "web-manual"
-            : configProxy
-              ? "config"
-              : "auto";
+    // env/system auto-detect). True for the unset-defaults-to-direct case and
+    // explicit "direct" mode (#1714: the BILI_UPSTREAM_PROXY env override is gone,
+    // so an explicit file proxy no longer suppresses this short-circuit — with a
+    // non-empty globalProxy the short-circuit is skipped regardless).
+    const explicitDirect = proxyMode === "direct";
+    const proxy = proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy;
+    const proxySource: ProxyOptions["proxySource"] = proxyMode === "direct"
+        ? "direct"
+        : proxyMode === "manual" && webProxy
+          ? "web-manual"
+          : configProxy
+            ? "config"
+            : "auto";
     const httpProxy = nonEmpty(env.HTTP_PROXY ?? env.http_proxy);
     const httpsProxy = nonEmpty(env.HTTPS_PROXY ?? env.https_proxy);
     const allProxy = nonEmpty(env.ALL_PROXY ?? env.all_proxy);
@@ -891,9 +930,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // too (explicitDirect=true + empty global) which short-circuits
         // resolveProxyDecision BEFORE the env tier — killing the inherited
         // aux tier for every default-config user. Only an EXPLICIT "direct"
-        // mode (upstreamProxyMode / BILI_UPSTREAM_PROXY_MODE) opts aux egress
-        // out of the inherited tier; unset means "no preference".
-        explicitDirect: rawProxyMode === "direct" && !biliProxy,
+        // mode (config.json upstreamProxyMode; env input retired in #1714)
+        // opts aux egress out of the inherited tier; unset means "no preference".
+        explicitDirect: rawProxyMode === "direct",
         ...(httpProxy ? {} : inheritedHttpProxy ? { httpProxy: inheritedHttpProxy } : {}),
         ...(httpsProxy ? {} : inheritedHttpsProxy ? { httpsProxy: inheritedHttpsProxy } : {}),
         ...(allProxy ? {} : inheritedAllProxy ? { allProxy: inheritedAllProxy } : {}),
@@ -920,58 +959,103 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
         compress: {
-            ...(fileConfig.compress ?? {}),
-            injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
-            injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
+            ...fileConfig.compress,
+            // #429: global injection toggles (default ON; env inputs retired in #1714)
+            injectTool: fileConfig.compress?.injectTool !== false,
+            injectNudge: fileConfig.compress?.injectNudge !== false,
         },
         promptCache: {
-            routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
+            routing: parsePromptCacheRouting(fileConfig.promptCache?.routing),
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
-        streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
-        imageBilling: parseImageBilling(fileConfig.imageBilling),
-        sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
-        log: env.ACP_LOG !== "0" && fileConfig.log !== false,
-        debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
-        dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
+        streamErrorShape: parseStreamErrorShape(fileConfig.compat?.streamErrorShape),
+        sessionHeader: fileConfig.sessionHeader ?? "x-acp-session",
+        log: fileConfig.log !== false,
+        debug: fileConfig.debug === true,
+        dumpSse: fileConfig.dumpSse || undefined,
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
-        autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        autoUpdate: fileConfig.autoUpdate !== false,
         // Default OFF: unlike autoUpdate, self-restart touches process
-        // liveness, so it requires an explicit opt-in (#811).
-        autoRestartOnUpdate: (env.ACP_AUTO_RESTART_ON_UPDATE ?? (fileConfig.autoRestartOnUpdate === true ? "1" : "0")) !== "0",
-        updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
+        // liveness, so it requires an explicit opt-in (#811; env retired in #1714).
+        autoRestartOnUpdate: fileConfig.autoRestartOnUpdate === true,
+        updateTag: (fileConfig.updateTag ?? "latest").trim() || "latest",
         // Default ON: unlike autoRestartOnUpdate, this never touches process
-        // liveness — it only installs files and warns (#1481).
-        advisoryCheck: (env.BILI_ADVISORY_CHECK ?? (fileConfig.advisoryCheck === false ? "0" : "1")) !== "0",
-        advisoryUrl: env.BILI_ADVISORY_URL || fileConfig.advisoryUrl || undefined,
-        logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
+        // liveness — it only installs files and warns (#1481; env retired in #1714).
+        advisoryCheck: fileConfig.advisoryCheck !== false,
+        advisoryUrl: fileConfig.advisoryUrl || undefined,
+        logFile: fileConfig.logFile,
         mitm: {
-            enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
+            enabled: fileConfig.mitm?.enabled !== false,
             domains: dedupeDomains([
                 ...(fileConfig.mitm?.domains ?? []),
-                ...splitCsv(env.BILI_MITM_DOMAINS),
+                // Launcher→child pipeline handoff (#1714): dynamically discovered
+                // domains ride this dedicated var; the user-facing
+                // BILI_MITM_DOMAINS knob is retired (config file only).
+                ...splitCsv(env.BILI_LAUNCHER_MITM_DOMAINS),
             ]),
         },
-        maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
-        subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
-        forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
-        resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
-        chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
-        chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
-        stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        maskHosts: fileConfig.maskHosts !== false,
+        subagentSplit: fileConfig.subagentSplit !== false,
+        forkAdoption: fileConfig.forkAdoption === true,
+        resumeInheritance: fileConfig.resumeInheritance !== false,
+        chainContentDetection: fileConfig.chainContentDetection === true,
+        chainEgressStamp: fileConfig.chainEgressStamp === true,
+        stableSystemAnchor: fileConfig.stableSystemAnchor === true,
+        // #1714: remaining behavior knobs migrated from BILI_* env inputs to
+        // config.json. All lenient: a stray/malformed field falls back to the
+        // module's built-in default instead of aborting startup.
+        upstreamTimeoutMs: cfgNum(fileConfig.upstreamTimeoutMs),
+        streamKeepAliveMs: cfgNum(fileConfig.streamKeepAliveMs),
+        replayRetryMax: cfgNum(fileConfig.replayRetryMax),
+        replayRetryBaseMs: cfgNum(fileConfig.replayRetryBaseMs),
+        maxShrinkPerCompress: cfgNum(fileConfig.maxShrinkPerCompress),
+        exposureLogIntervalMs: cfgNum(fileConfig.exposureLogIntervalMs),
+        preflightHoldMs: cfgNum(fileConfig.preflightHoldMs),
+        preflightDeadEndCooldownMs: cfgNum(fileConfig.preflightDeadEndCooldownMs),
+        requestWatchdogMs: cfgNum(fileConfig.requestWatchdogMs),
+        keepAliveTimeoutMs: cfgNum(fileConfig.keepAliveTimeoutMs),
+        clientErrorBackstopMs: cfgNum(fileConfig.clientErrorBackstopMs),
+        ccrRetrievalTtlMs: cfgNum(fileConfig.ccrRetrievalTtlMs),
+        fakeCompletionRetries: cfgNum(fileConfig.fakeCompletionRetries),
+        fakeBufCap: cfgNum(fileConfig.fakeBufCap),
+        maxSessions: cfgNum(fileConfig.maxSessions),
+        sessionGc: fileConfig.sessionGc === true,
+        sessionGcMaxAgeDays: cfgNum(fileConfig.sessionGcMaxAgeDays),
+        sessionGcMaxTokens: cfgNum(fileConfig.sessionGcMaxTokens),
+        sessionGcIntervalMs: cfgNum(fileConfig.sessionGcIntervalMs),
+        persistEnabled: fileConfig.persistEnabled !== false,
+        persistDebounceMs: cfgNum(fileConfig.persistDebounceMs),
+        persistTailTokens: cfgNum(fileConfig.persistTailTokens),
+        persistZstd: fileConfig.persistZstd === true,
+        persistEpermAlertThreshold: cfgNum(fileConfig.persistEpermAlertThreshold),
+        persistEpermAlertRepeatMs: cfgNum(fileConfig.persistEpermAlertRepeatMs),
+        mitmHandshakeTimeoutMs: cfgNum(fileConfig.mitmHandshakeTimeoutMs),
+        proxyKeepAliveMaxMs: cfgNum(fileConfig.proxyKeepAliveMaxMs),
+        zonePort: cfgNum(fileConfig.zonePort),
+        zcodeNativePort: cfgNum(fileConfig.zcode?.nativePort),
+        decompressTmpCap: cfgNum(fileConfig.decompressTmpCap),
+        imageTokenCap: cfgNum(fileConfig.imageTokenCap),
+        dump4xx: fileConfig.dump4xx === true,
+        dump4xxMaxBytes: cfgNum(fileConfig.dump4xxMaxBytes),
+        sessionsDir: typeof fileConfig.sessionsDir === "string" && fileConfig.sessionsDir.trim() ? fileConfig.sessionsDir.trim() : undefined,
+        tunnelAllowedHosts: Array.isArray(fileConfig.tunnelAllowedHosts) ? fileConfig.tunnelAllowedHosts.filter((h): h is string => typeof h === "string" && h.trim().length > 0).map((h) => h.trim()) : undefined,
     };
 }
 
+/** Lenient numeric coercion for #1714 config fields: only finite numbers pass
+ *  through; anything else (strings, NaN, missing) resolves to undefined so the
+ *  consuming module keeps its built-in default. */
+function cfgNum(v: unknown): number | undefined {
+    return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
 /** The resolved mitm.domains tier exactly as loadOptions computes it (config
- *  file ∪ BILI_MITM_DOMAINS, deduped). Exported so launchers can mirror the
- *  precise whitelist their proxy child will use when deciding MITM vs blind
- *  tunnel (#1403) — pass the env the CHILD will see, not process.env. */
-export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
-    return dedupeDomains([
-        ...(loadConfigFile().mitm?.domains ?? []),
-        ...splitCsv(env.BILI_MITM_DOMAINS),
-    ]);
+ *  file, deduped). Exported so launchers can mirror the precise whitelist
+ *  their proxy child will use when deciding MITM vs blind tunnel (#1403).
+ *  File-only since #1714 — BILI_MITM_DOMAINS is retired. */
+export function resolveMitmDomains(): string[] {
+    return dedupeDomains(loadConfigFile().mitm?.domains ?? []);
 }
 
 /** Shape of the optional JSON config file. All fields optional — the file is a
@@ -998,10 +1082,11 @@ type FileConfig = {
     autoRestartOnUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
-    /** Set `false` to disable the critical-defect advisory watcher (#1481);
-     *  env BILI_ADVISORY_CHECK wins when set. */
+    /** Set `false` to disable the critical-defect advisory watcher (#1481;
+     *  env BILI_ADVISORY_CHECK retired in #1714). */
     advisoryCheck?: boolean;
-    /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
+    /** Override for the advisory document URL (env BILI_ADVISORY_URL retired
+     *  in #1714). */
     advisoryUrl?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
@@ -1014,58 +1099,102 @@ type FileConfig = {
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
     /** Set `false` to log real (non-public) target hosts instead of the
-     *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
+     *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS retired in
+     *  #1714). */
     maskHosts?: boolean;
     /** Set `false` to keep Claude Code subagents on the main session (#970;
-     *  env BILI_SUBAGENT_SPLIT=0 wins). */
+     *  env BILI_SUBAGENT_SPLIT retired in #1714). */
     subagentSplit?: boolean;
     /** Opt-in fork block-adoption (#629): when an anonymous (prefix-affinity)
-     *  client forks its history mid-conversation (edit / regenerate), the new
+     *  client forks their history mid-conversation (edit / regenerate), the new
      *  session inherits the parent's compression blocks whose source content
      *  is fully present in the forked request, instead of restarting with
-     *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
-     *  wins over the file. */
+     *  zero compression state. Default false (env BILI_FORK_ADOPTION retired
+     *  in #1714). */
     forkAdoption?: boolean;
     /** Set `false` to disable resume-fork inheritance (#1486, default ON;
-     *  env BILI_RESUME_INHERITANCE=0 wins over the file). */
+     *  env BILI_RESUME_INHERITANCE retired in #1714). */
     resumeInheritance?: boolean;
     /** Set `true` to enable body-content detection of the bili→bili chain
      *  awareness (#1086/#1421); OFF by default — by default only x-bili-hop drives
      *  chain recognition, since body scanning can false-positive on CCR/file-
-     *  introduced text and model-echoed tags (#1683). Env BILI_CHAIN_CONTENT=1
-     *  wins over the file. */
+     *  introduced text and model-echoed tags (#1683). Env BILI_CHAIN_CONTENT
+     *  retired in #1714. */
     chainContentDetection?: boolean;
     /** Set `true` to enable egress emission of the model-visible
      *  `<bili-chain …/>` checkpoint carrier (#1683, default OFF; env
-     *  BILI_CHAIN_STAMP=1 wins over the file). Independent of
+     *  BILI_CHAIN_STAMP retired in #1714). Independent of
      *  chainContentDetection. */
     chainEgressStamp?: boolean;
     /** Set `true` to enable the sticky head-system anchor (#1085, default
-     *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
+     *  OFF; env BILI_STABLE_SYSTEM_ANCHOR retired in #1714). */
     stableSystemAnchor?: boolean;
+    // #1714: behavior knobs migrated from BILI_*/ACP_* env inputs to config.json.
+    upstreamTimeoutMs?: number;
+    streamKeepAliveMs?: number;
+    replayRetryMax?: number;
+    replayRetryBaseMs?: number;
+    maxShrinkPerCompress?: number;
+    exposureLogIntervalMs?: number;
+    preflightHoldMs?: number;
+    preflightDeadEndCooldownMs?: number;
+    requestWatchdogMs?: number;
+    keepAliveTimeoutMs?: number;
+    clientErrorBackstopMs?: number;
+    ccrRetrievalTtlMs?: number;
+    fakeCompletionRetries?: number;
+    fakeBufCap?: number;
+    maxSessions?: number;
+    /** Set `true` to enable periodic session GC (default off). */
+    sessionGc?: boolean;
+    sessionGcMaxAgeDays?: number;
+    sessionGcMaxTokens?: number;
+    sessionGcIntervalMs?: number;
+    /** Set `false` to disable on-disk session persistence (default on). */
+    persistEnabled?: boolean;
+    persistDebounceMs?: number;
+    persistTailTokens?: number;
+    /** Set `true` to zstd-compress persisted sessions (default off). */
+    persistZstd?: boolean;
+    persistEpermAlertThreshold?: number;
+    persistEpermAlertRepeatMs?: number;
+    mitmHandshakeTimeoutMs?: number;
+    proxyKeepAliveMaxMs?: number;
+    zonePort?: number;
+    decompressTmpCap?: number;
+    imageTokenCap?: number;
+    /** Set `true` to dump 4xx error bodies for debugging (default off). */
+    dump4xx?: boolean;
+    dump4xxMaxBytes?: number;
+    sessionsDir?: string;
+    tunnelAllowedHosts?: string[];
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).
      *  `streamErrorShape` (#1455): "protocol" (default) presents upstream
      *  stream failures as protocol-native error frames; "completion" restores
      *  the legacy shape that delivered the failure text inside a synthesized
-     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file. */
+     *  successful completion. Env BILI_STREAM_ERROR_SHAPE retired in #1714. */
     compat?: { roles?: Record<string, string>; streamErrorShape?: string };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
-     *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
-     *  over both. See ProviderRoute.imageBilling. */
+     *  Per-provider `imageBilling` overrides it (env BILI_IMAGE_BILLING
+     *  retired in #1714). See ProviderRoute.imageBilling. */
     imageBilling?: string;
     /** Claude-native port override (#964/#1660): an explicit port for the
      *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
-     *  Env BILI_CLAUDE_NATIVE_PORT wins over the file. */
+     *  Env BILI_CLAUDE_NATIVE_PORT retired in #1714. */
     claude?: { nativePort?: number };
+    /** ZCode-native port override (#1660): strict-port semantics like
+     *  claude.nativePort; undefined = the lane's sticky zone port. Env
+     *  BILI_ZCODE_PORT retired in #1714. */
+    zcode?: { nativePort?: number };
     /** Native-hook attach policy (#1335): set `true` to let native hooks
      *  attach to lifecycle-less listeners (a manually started `bili start`
      *  daemon — no session-lifecycle watchdog, outlives every session, often
      *  an older code version). Default false: hooks self-manage and spawn
      *  their own armed session proxy instead (#1322). Env
-     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
+     *  BILI_NATIVE_ATTACH_EXTERNAL retired in #1714. */
     native?: { attachExternal?: boolean };
 };
 
@@ -1108,41 +1237,40 @@ function loadConfigFile(): FileConfig {
  *  (+1 per attempt) resolves collisions deterministically with a sticky
  *  record (instance.ts port-zone.json). 18787 sits below the Linux ephemeral
  *  range (32768–60999) so the ladder never lands on OS-assigned ports; 8787
- *  stays reserved as the USER zone (manual `bili start`). Env BILI_ZONE_PORT
- *  overrides the base for the whole zone. */
+ *  stays reserved as the USER zone (manual `bili start`). Config `zonePort`
+ *  overrides the base for the whole zone (#1714: BILI_ZONE_PORT retired). */
 export const ZONE_PORT_BASE = 18787;
 
-export function resolveZonePortBase(env: NodeJS.ProcessEnv = process.env): number {
-    const fromEnv = Number.parseInt(env.BILI_ZONE_PORT ?? "", 10);
-    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+export function resolveZonePortBase(): number {
+    const fromFile = loadConfigFile().zonePort;
+    if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return ZONE_PORT_BASE;
 }
 
-/** #1660: an explicit user override of the claude lane's port: env
- *  BILI_CLAUDE_NATIVE_PORT > config `claude.nativePort` > undefined. A
- *  DEFINED value means a strict-port launch (an EADDRINUSE at bind fails
- *  loud, #964); undefined means the lane's sticky zone port
- *  (instance.ts lanePreferredPort) with the +1 ladder absorbing collisions.
- *  The installer no longer persists this — zone drift is repaired by the
- *  SessionStart hook rewriting the managed block to the live origin every
- *  session. */
-export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): number | undefined {
-    const fromEnv = Number.parseInt(env.BILI_CLAUDE_NATIVE_PORT ?? "", 10);
-    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+/** #1660: an explicit user override of the claude lane's port via config
+ *  `claude.nativePort` (> undefined). File-only since #1714 — env
+ *  BILI_CLAUDE_NATIVE_PORT is retired. A DEFINED value means a strict-port
+ *  launch (an EADDRINUSE at bind fails loud, #964); undefined means the
+ *  lane's sticky zone port (instance.ts lanePreferredPort) with the +1
+ *  ladder absorbing collisions. The installer no longer persists this — zone
+ *  drift is repaired by the SessionStart hook rewriting the managed block to
+ *  the live origin every session. */
+export function resolveClaudeNativePort(): number | undefined {
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return undefined;
 }
 
-/** #1660: explicit override of the zcode lane's port (env only — the store
- *  is re-derived at every bootstrap, nothing is baked at install time).
- *  Defined means a strict-port launch; undefined means the lane's sticky
- *  zone port. Legacy wrappers pinned to the old 48789 default are migrated
- *  by the bootstrap's origin-drift repair (routeZcodeConfig rewrites the
- *  store to the live origin). */
-export function resolveZcodeNativePort(env: NodeJS.ProcessEnv = process.env): number | undefined {
-    const fromEnv = Number.parseInt(env.BILI_ZCODE_PORT ?? "", 10);
-    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+/** #1660: explicit override of the zcode lane's port via config
+ *  `zcode.nativePort` — the store is re-derived at every bootstrap, nothing
+ *  is baked at install time. File-only since #1714 — env BILI_ZCODE_PORT is
+ *  retired. Defined means a strict-port launch; undefined means the lane's
+ *  sticky zone port. Legacy wrappers pinned to the old 48789 default are
+ *  migrated by the bootstrap's origin-drift repair (routeZcodeConfig rewrites
+ *  the store to the live origin). */
+export function resolveZcodeNativePort(): number | undefined {
+    const fromFile = loadConfigFile().zcode?.nativePort;
+    if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return undefined;
 }
 
@@ -1157,13 +1285,10 @@ export function zcodeDirectPrefixes(env: NodeJS.ProcessEnv = process.env): strin
 
 /** #1335: the native-hook attach-gate escape hatch. True when the user
  *  deliberately runs lifecycle-less resident daemons for native hooks to ride:
- *  env BILI_NATIVE_ATTACH_EXTERNAL (1/true vs 0/false) wins over the file's
- *  `native.attachExternal`, which must be exactly `true` (any other value —
- *  including garbage — leaves the gate closed). Default false. */
-export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env): boolean {
-    const fromEnv = (env.BILI_NATIVE_ATTACH_EXTERNAL ?? "").trim().toLowerCase();
-    if (fromEnv === "1" || fromEnv === "true") return true;
-    if (fromEnv === "0" || fromEnv === "false") return false;
+ *  config `native.attachExternal` must be exactly `true` (any other value —
+ *  including garbage — leaves the gate closed). File-only since #1714 — env
+ *  BILI_NATIVE_ATTACH_EXTERNAL is retired. Default false. */
+export function resolveNativeAttachExternal(): boolean {
     return loadConfigFile().native?.attachExternal === true;
 }
 

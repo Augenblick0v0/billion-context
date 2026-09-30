@@ -21,7 +21,10 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 
 process.env.NODE_ENV = "test";
-process.env.BILI_PERSIST = "0";
+
+import { configurePersistEnabled } from "../src/persist.ts";
+
+configurePersistEnabled(false);
 
 const MODEL = "claude-sonnet-4-5";
 

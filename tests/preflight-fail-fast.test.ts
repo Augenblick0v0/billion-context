@@ -6,10 +6,11 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on the very first 429 instead of the default 3 attempts with
 // exponential backoff — these tests are about the post-retry behavior.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
+configureReplayRetryMax(1);
 
 import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { type CompressSettings } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";

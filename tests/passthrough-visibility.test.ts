@@ -16,28 +16,22 @@ function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-test("passthroughState resolves env over file over default", () => {
+test("passthroughState resolves file over default (#1714)", () => {
     const root = path.join(tmpdir(), `bili-passthrough-state-${process.pid}-${Date.now()}`);
     const biliConfig = path.join(root, "billion-context.json");
     mkdirSync(root, { recursive: true });
     const previous = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = biliConfig;
-    const previousEnv = process.env.ACP_PASSTHROUGH;
-    delete process.env.ACP_PASSTHROUGH;
     try {
         writeFileSync(biliConfig, "{}\n", "utf8");
-        assert.deepEqual(passthroughState(process.env), { enabled: false, source: null });
+        assert.deepEqual(passthroughState(), { enabled: false, source: null });
 
         writeFileSync(biliConfig, '{"passthrough":true}\n', "utf8");
-        assert.deepEqual(passthroughState(process.env), { enabled: true, source: "file" });
+        assert.deepEqual(passthroughState(), { enabled: true, source: "file" });
 
-        process.env.ACP_PASSTHROUGH = "1";
-        assert.deepEqual(passthroughState(process.env), { enabled: true, source: "env" });
-
-        process.env.ACP_PASSTHROUGH = "0";
-        assert.deepEqual(passthroughState(process.env), { enabled: false, source: "env" });
+        writeFileSync(biliConfig, '{"passthrough":false}\n', "utf8");
+        assert.deepEqual(passthroughState(), { enabled: false, source: null });
     } finally {
-        if (previousEnv === undefined) delete process.env.ACP_PASSTHROUGH; else process.env.ACP_PASSTHROUGH = previousEnv;
         if (previous === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous;
         rmrf(root);
     }
@@ -51,9 +45,8 @@ test("web config exposes and toggles passthrough (#405)", async () => {
     mkdirSync(root, { recursive: true });
     writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
 
-    const previous = { config: process.env.BILI_CONFIG_FILE, env: process.env.ACP_PASSTHROUGH };
+    const previous = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = biliConfig;
-    delete process.env.ACP_PASSTHROUGH;
     const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
@@ -113,22 +106,9 @@ test("web config exposes and toggles passthrough (#405)", async () => {
             body: JSON.stringify({ passthrough: "yes" }),
         });
         assert.equal(bad.status, 400);
-
-        // Env-forced: GET reports source "env"; PUT is refused with the way out.
-        process.env.ACP_PASSTHROUGH = "1";
-        assert.deepEqual((await getConfig()).passthrough, { enabled: true, source: "env" });
-        const forced = await fetch(`${base}/__bili/config`, {
-            method: "PUT",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ passthrough: null }),
-        });
-        assert.equal(forced.status, 409);
-        const errBody = await forced.json() as { error: string };
-        assert.match(errBody.error, /ACP_PASSTHROUGH/);
     } finally {
         await close(proxy);
-        if (previous.env === undefined) delete process.env.ACP_PASSTHROUGH; else process.env.ACP_PASSTHROUGH = previous.env;
-        if (previous.config === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous.config;
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous;
         rmrf(root);
     }
 });

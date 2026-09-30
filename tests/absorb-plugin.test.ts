@@ -11,11 +11,12 @@ import http from "node:http";
 import { once } from "node:events";
 
 process.env.NODE_ENV = "test";
-process.env.BILI_PERSIST = "0";
 
 import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistEnabled } from "../src/persist.ts";
+
+configurePersistEnabled(false);
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, getSession } from "../src/session.ts";
 import { handlePluginManifest } from "../src/plugin.ts";

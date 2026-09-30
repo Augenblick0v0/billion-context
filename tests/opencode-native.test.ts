@@ -9,10 +9,12 @@ import type { AddressInfo } from "node:net";
 process.env.NODE_TEST_CONTEXT = "1";
 // #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
 // default (same waitFor-cap race as dsh-native.test.ts). Pinned-path tests
-// override per-test.
-process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+// override per-test. (#1714: env input retired — setter seam instead.)
+configureAttachEvidenceGraceMs(30);
 
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { configureAttachEvidenceGraceMs } from "../src/agent/native-intercept.ts";
+import { configureAttachHealthDeadlineMs } from "../src/agent/shared.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
@@ -605,7 +607,7 @@ test("#1365 verifyAttachAndRecover: persistently dead pinned target — refuses 
             return "http://127.0.0.1:2";
         });
         process.env.BILLION_CONTEXT_PROXY = origin;
-        process.env.BILI_ATTACH_HEALTH_DEADLINE_MS = "150";
+        configureAttachHealthDeadlineMs(150);
         _noteRoutedForTest(`${origin}/bili/${MODEL_URL}`);
         const recovered = await verifyAttachAndRecover(origin);
         assert.equal(recovered, undefined);
@@ -613,7 +615,7 @@ test("#1365 verifyAttachAndRecover: persistently dead pinned target — refuses 
         assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the pinned target env must survive");
     } finally {
         delete process.env.BILLION_CONTEXT_PROXY;
-        delete process.env.BILI_ATTACH_HEALTH_DEADLINE_MS;
+        configureAttachHealthDeadlineMs(undefined);
         _setSpawnForTest(undefined);
         _resetNativeStateForTest();
     }

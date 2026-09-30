@@ -14,8 +14,9 @@ import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
+import { configurePersistEnabled } from "../src/persist.ts";
 
-process.env.BILI_PERSIST = "0";
+configurePersistEnabled(false);
 
 const pad = (n: number): string => String(n).padStart(5, "0");
 

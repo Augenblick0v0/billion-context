@@ -8,16 +8,17 @@ import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
 
 /**
- * Session-file garbage collection (#1082). OPT-IN: disabled unless
- * BILI_SESSION_GC is set to 1/true/on. Session files are user data
- * (exportable, resumable), so there is no silent deletion policy — the
- * kernel store never deletes, and this sweep only runs when asked to.
+ * Session-file garbage collection (#1082). OPT-IN: disabled unless enabled
+ * via configureSessionGc (config.json `sessionGc`; env input BILI_SESSION_GC
+ * retired in #1714). Session files are user data (exportable, resumable), so
+ * there is no silent deletion policy — the kernel store never deletes, and
+ * this sweep only runs when asked to.
  *
  * When enabled, the sweep deletes a file only when BOTH conditions hold
  * (owner requirement #1082: both are load-bearing, neither alone suffices):
  *
- *   1. AGE: last activity (envelope savedAt) older than
- *      BILI_SESSION_GC_MAX_AGE_DAYS (default 7d). The threshold must stay far
+ *   1. AGE: last activity (envelope savedAt) older than maxAgeDays
+ *      (default 7d). The threshold must stay far
  *      beyond any plausible resume window: after deletion a resumed session
  *      restarts numbering from m00001 while a resuming agent's transcript may
  *      still cite old numbers (kernel contract: ids are never reused), so a
@@ -26,7 +27,7 @@ import { dropSessionForGc, peekSession } from "./session.js";
  *      blocks, active or inactive, and no blockContents) AND its re-send size
  *      is bounded — deleting it loses no summaries, only bytes:
  *        2a. metadata.rawInputTokens known (recorded per turn since #1082):
- *            rawInputTokens <= BILI_SESSION_GC_MAX_TOKENS (default 1M);
+ *            rawInputTokens <= maxTokens (default 1M);
  *        2b. unknown (legacy/pre-upgrade file): stats.contextTokens <= the
  *            same threshold. A session WITH folds can read small in context
  *            yet carry huge raw history (compressed 300K → 20K) and its
@@ -79,23 +80,28 @@ const DEFAULT_MAX_TOKENS = 1_000_000;
 const DEFAULT_INTERVAL_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 
-export function gcConfigFromEnv(): GcConfig {
+// #1714 P1: GC policy moved from env vars (BILI_SESSION_GC*) to config.json
+// (`sessionGc`) — set once at startup via configureSessionGc; gcConfig
+// resolves the stored state with the same defaults/validation as before.
+type GcSettings = { enabled: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
+let gcSettings: GcSettings = { enabled: false };
+
+export function configureSessionGc(cfg: GcSettings): void {
+    gcSettings = { ...cfg };
+}
+
+export function gcConfig(): GcConfig {
     // Opt-in only (owner requirement #1082): unset means disabled.
-    const env = process.env.BILI_SESSION_GC?.toLowerCase();
-    const enabled = env === "1" || env === "true" || env === "on";
     return {
-        enabled,
-        maxAgeMs: intEnv("BILI_SESSION_GC_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS) * DAY_MS,
-        maxTokens: intEnv("BILI_SESSION_GC_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        intervalMs: intEnv("BILI_SESSION_GC_INTERVAL_MS", DEFAULT_INTERVAL_MS),
+        enabled: gcSettings.enabled,
+        maxAgeMs: positiveOr(DEFAULT_MAX_AGE_DAYS, gcSettings.maxAgeDays) * DAY_MS,
+        maxTokens: positiveOr(DEFAULT_MAX_TOKENS, gcSettings.maxTokens),
+        intervalMs: positiveOr(DEFAULT_INTERVAL_MS, gcSettings.intervalMs),
     };
 }
 
-function intEnv(name: string, fallback: number): number {
-    const v = process.env[name];
-    if (!v) return fallback;
-    const n = Number.parseInt(v, 10);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
+function positiveOr(fallback: number, v: number | undefined): number {
+    return v != null && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
 interface FileView {
@@ -195,7 +201,7 @@ export interface GcResult {
 
 export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number }): Promise<GcResult> {
     const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0 };
-    const cfg = gcConfigFromEnv();
+    const cfg = gcConfig();
     if (!cfg.enabled) return result;
     const store = opts?.store ?? getStore();
     if (!store.enabled) return result;

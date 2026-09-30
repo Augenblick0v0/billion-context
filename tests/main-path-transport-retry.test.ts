@@ -5,11 +5,11 @@ import { once } from "node:events";
 import { afterEach, test } from "node:test";
 
 process.env.NODE_ENV = "test";
-process.env.BILI_REPLAY_RETRY_MAX = "3";
-process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+configureReplayRetryMax(3);
+configureReplayRetryBaseMs(0);
 
 import { defaultConfig } from "acp-kernel";
-import { _liveUpstreamTimersForTest, _resetFetchUtilForTest, fetchWithTransportRetry, type ReplayRetryInfo } from "../src/fetch-util.ts";
+import { _liveUpstreamTimersForTest, _resetFetchUtilForTest, configureReplayRetryBaseMs, configureReplayRetryMax, fetchWithTransportRetry, type ReplayRetryInfo } from "../src/fetch-util.ts";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -18,14 +18,14 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // DNS/reset/refused blip killed the whole round while acp-loop/preflight
 // already replayed under fetchWithRetry. These tests pin the new contract:
 // fail-fast pre-response transport deaths are bounded-transparently replayed
-// (BILI_REPLAY_RETRY_MAX / BILI_REPLAY_RETRY_BASE_MS), HTTP verdicts stay
-// untouched (no replay, no UpstreamHttpError conversion), and BILI_REPLAY_RETRY_MAX=1
+// (config.json replayRetryMax / replayRetryBaseMs), HTTP verdicts stay
+// untouched (no replay, no UpstreamHttpError conversion), and replayRetryMax=1
 // restores the legacy single-attempt behavior exactly.
 
 afterEach(() => {
     assert.equal(_liveUpstreamTimersForTest(), 0, "each attempt releases its upstream idle timer");
     _resetFetchUtilForTest();
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+    configureReplayRetryBaseMs(0);
 });
 
 function errorChainText(err: unknown): string {
@@ -49,7 +49,7 @@ async function closedPort(): Promise<number> {
 }
 
 test("#1688 unit: connect-refused is replayed and the recovered response is returned", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "50";
+    configureReplayRetryBaseMs(50);
     const holder = net.createServer();
     holder.listen(0, "127.0.0.1");
     await once(holder, "listening");
@@ -152,8 +152,8 @@ test("#1688 unit: any HTTP verdict passes through untouched — never replayed, 
     assert.equal(hits, 1, "a 4xx verdict goes straight back to the caller");
 });
 
-test("#1688 unit: BILI_REPLAY_RETRY_MAX=1 restores the legacy single-attempt behavior", async () => {
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
+test("#1688 unit: replayRetryMax=1 restores the legacy single-attempt behavior", async () => {
+    configureReplayRetryMax(1);
     try {
         const port = await closedPort();
         let retries = 0;
@@ -167,12 +167,12 @@ test("#1688 unit: BILI_REPLAY_RETRY_MAX=1 restores the legacy single-attempt beh
         assert.match(errorChainText(thrown), /ECONNREFUSED/);
         assert.equal(retries, 0);
     } finally {
-        process.env.BILI_REPLAY_RETRY_MAX = "3";
+        configureReplayRetryMax(3);
     }
 });
 
 test("#1688 unit: replays honor the exponential backoff budget", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "50";
+    configureReplayRetryBaseMs(50);
     const port = await closedPort();
     const delays: number[] = [];
     const t0 = Date.now();
@@ -189,7 +189,7 @@ test("#1688 unit: replays honor the exponential backoff budget", async () => {
 });
 
 test("#1688 unit: a client disconnect during backoff kills the replay chain promptly", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "500";
+    configureReplayRetryBaseMs(500);
     const port = await closedPort();
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 20);
@@ -345,7 +345,7 @@ test("#1688 e2e: persistent transport failure exhausts the budget, then surfaces
         const text = await r.text();
         assert.match(text, /acp-proxy failure/);
         assert.match(text, /upstream request failed/);
-        assert.equal(relay.streamingCalls(), 3, "exactly BILI_REPLAY_RETRY_MAX attempts, no unbounded storm");
+        assert.equal(relay.streamingCalls(), 3, "exactly replayRetryMax attempts, no unbounded storm");
     } finally {
         proxy.close();
         await once(proxy, "close");

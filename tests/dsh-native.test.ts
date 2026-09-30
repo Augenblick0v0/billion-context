@@ -6,12 +6,14 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest } from "../src/agent/dsh-native.ts";
+import { configureAttachEvidenceGraceMs } from "../src/agent/native-intercept.ts";
+import { configureAttachHealthDeadlineMs } from "../src/agent/shared.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
 // default (waitFor below caps at 5s — a full grace would race it). Pinned-path
-// tests override per-test.
-process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+// tests override per-test. (#1714: env input retired — setter seam instead.)
+configureAttachEvidenceGraceMs(30);
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
@@ -1316,7 +1318,8 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
     };
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365b-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, BILI_ATTACH_HEALTH_DEADLINE_MS: "150" }, async () => {
+        configureAttachHealthDeadlineMs(150);
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin }, async () => {
             _resetRegisterForTest(origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -1347,6 +1350,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
+        configureAttachHealthDeadlineMs(undefined);
     }
 });
 

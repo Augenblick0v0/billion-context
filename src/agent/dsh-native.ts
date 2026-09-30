@@ -251,11 +251,11 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  this session still rides it). Probe before trusting it: healthy → attach
  *  as planned. DEAD + routed-channel evidence (#1365: /bili/-baked model
  *  traffic was observed at some origin) → the session's context lives at
- *  THAT origin, so wait for the pinned target to come back (bounded by
- *  BILI_ATTACH_HEALTH_DEADLINE_MS) instead of spawning — a second instance
+ *  THAT origin, so wait for the pinned target to come back (bounded by the
+ *  attach health deadline) instead of spawning — a second instance
  *  would serve tools while the model channel stays pinned elsewhere and
  *  every bili tool call 404s against it (unrecoverable split). DEAD with no
- *  evidence after the grace window (BILI_ATTACH_EVIDENCE_GRACE_MS) → unfreeze
+ *  evidence after the grace window (the evidence grace constant) → unfreeze
  *  the preset env and fall back to spawning our own proxy (instance
  *  discovery may find another healthy one first). Resolves to the origin the
  *  plugin should use — the (recovered) attach origin, the fallback origin,

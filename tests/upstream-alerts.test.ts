@@ -6,7 +6,7 @@ import vm from "node:vm";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistZstd } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import {
@@ -23,7 +23,7 @@ import {
 // through the proxy against a dead, then recovered, upstream), and the rendered
 // banner (real client IIFE in a VM, including dismiss-per-instance semantics).
 
-process.env.BILI_PERSIST_ZSTD = "0";
+configurePersistZstd(false);
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));

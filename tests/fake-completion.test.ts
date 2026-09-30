@@ -4,20 +4,20 @@ import { once } from "node:events";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
-// The fake-completion fallback is opt-in (disabled by default to preserve
-// incremental streaming); these tests exercise it, so enable it explicitly.
-process.env.BILI_FAKE_COMPLETION_RETRIES = "2";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import {
+    configureFakeCompletionRetries,
     isFakeCompletion,
     hasToolBlock,
     hasToolCallStructure,
     injectFakeCompletionHint,
 } from "../src/fake-completion.ts";
+
+configureFakeCompletionRetries(2);
 
 // Hex escapes so no literal tag sequence appears in this file's source.
 const LT = "\x3c";

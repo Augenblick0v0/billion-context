@@ -9,6 +9,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { configureFakeCompletionRetries } from "../src/fake-completion.ts";
 
 // Render-tag pieces are assembled from hex escapes so no literal tag sequence
 // appears in this file's source.
@@ -388,10 +389,10 @@ test("#468: openai SSE with the render OPEN tag split across chunks — stripped
 });
 
 test("#475 G3: fake-completion buffering + streaming request answered with JSON — stripped body still delivered", async () => {
-    // With BILI_FAKE_COMPLETION_RETRIES>0 and a streaming request, the #378
+    // With fakeCompletionRetries>0 and a streaming request, the #378
     // buffering block consumes upstream.body before the ladder; the G3 JSON
     // strip branch must read responseBody, not the drained upstream.body.
-    process.env.BILI_FAKE_COMPLETION_RETRIES = "1";
+    configureFakeCompletionRetries(1);
     const full = `title: ${TAG("m00009", 12)}summary ok`;
     const completion = { id: "chatcmpl_fc_json", object: "chat.completion", created: 1, model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: full }, finish_reason: "stop" }] };
     const h = await startHarness({ injectTool: false, injectNudge: false }, [[JSON.stringify(completion)]], true);
@@ -411,7 +412,7 @@ test("#475 G3: fake-completion buffering + streaming request answered with JSON 
         assert.equal(parsed.choices?.[0]?.message?.content, "title: summary ok", `unexpected body: ${JSON.stringify(bodyText)}`);
         assert.equal(bodyText.includes(OPEN_MARK), false, "client body leaked a render open tag");
     } finally {
-        delete process.env.BILI_FAKE_COMPLETION_RETRIES;
+        configureFakeCompletionRetries(undefined);
         await h.close();
     }
 });

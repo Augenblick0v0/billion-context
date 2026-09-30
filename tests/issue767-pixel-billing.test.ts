@@ -13,6 +13,7 @@ import { listSessions } from "../src/session.ts";
 import {
     PIXEL_IMAGE_FALLBACK_TOKENS,
     REMOTE_IMAGE_TOKENS,
+    configureImageTokenCap,
     decodeImageDims,
     imageTokensInParsedBody,
     imageTokensInRawBody,
@@ -27,7 +28,7 @@ import {
 // at once (#496 forward-once requires a sub-window baseline; #300 stale-baseline
 // fit requires payloadEstimate < limit) → a persistent 502 loop even though the
 // images bill only a few thousand tokens. Fix: per-provider `imageBilling`
-// ("pixels" | "bytes", env BILI_IMAGE_BILLING overrides both) charges by a
+// ("pixels" | "bytes", file imageBilling overrides both) charges by a
 // dimension-based tile model instead of raw bytes; bytes stays the conservative
 // default so byte-counting relays keep #488/#496 protection intact.
 
@@ -182,12 +183,12 @@ test("#767 unit: parsed-body costs — pixels vs bytes, fallback, remote URLs, c
     assert.equal(imageTokensInParsedBody("responses", unknownFmt, "pixels"), PIXEL_IMAGE_FALLBACK_TOKENS);
     assert.equal(imageTokensInParsedBody("responses", unknownFmt, "bytes"), 1000);
 
-    process.env.BILI_IMAGE_TOKEN_CAP = "500";
+    configureImageTokenCap(500);
     try {
         assert.equal(imageTokensInParsedBody("responses", body, "pixels"), 500, "cap clamps pixels mode too");
         assert.equal(imageTokensInParsedBody("responses", body, "bytes"), 500);
     } finally {
-        delete process.env.BILI_IMAGE_TOKEN_CAP;
+        configureImageTokenCap(undefined);
     }
 });
 
@@ -230,7 +231,7 @@ function startMockUpstream(onStream?: (raw: string) => void): Promise<{ server: 
     });
 }
 
-async function startProxy(upstreamPort: number, routeExtra: Record<string, unknown> = {}, routeKey?: string): Promise<{ proxy: http.Server; port: number }> {
+async function startProxy(upstreamPort: number, routeExtra: Record<string, unknown> = {}, globalOpts: Partial<ProxyOptions> = {}, routeKey?: string): Promise<{ proxy: http.Server; port: number }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -238,6 +239,7 @@ async function startProxy(upstreamPort: number, routeExtra: Record<string, unkno
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: { [routeKey ?? `http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-astra": { context: WINDOW } }, ...routeExtra } },
+        ...globalOpts,
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW),
         compress: { injectTool: true, injectNudge: true },
@@ -378,9 +380,9 @@ test("e2e #767: learned-limit-only variant also closes forward-once (bytes mode)
     }
 });
 
-test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async () => {
+test("e2e #767: per-provider route imageBilling beats the global setting (#1714)", async () => {
     const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
-    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "pixels" });
+    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "pixels" }, { imageBilling: "bytes" });
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
         const headers = { "content-type": "application/json" };
@@ -388,27 +390,22 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         const r1 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "gpt-astra", stream: true, store: false, session_id: "img-env-sess", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "hello there" }], max_output_tokens: 1024 }),
+            body: JSON.stringify({ model: "gpt-astra", stream: true, store: false, session_id: "img-route-sess", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: "hello there" }], max_output_tokens: 1024 }),
         });
         assert.equal(r1.status, 200);
         await r1.text();
 
-        const s = listSessions().find((x) => x.meta.label === "img-env-sess");
+        const s = listSessions().find((x) => x.meta.label === "img-route-sess");
         assert.ok(s);
         s!.stats.lastInputTokens = STALE_BASELINE;
 
-        process.env.BILI_IMAGE_BILLING = "bytes";
-        let r2: Response;
-        try {
-            r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-env-sess") });
-        } finally {
-            delete process.env.BILI_IMAGE_BILLING;
-        }
-        assert.equal(r2.status, 502, "env override downgrades the pixels route back to conservative byte billing");
-        const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
-        assert.equal(err2.error?.code, "preflight_compress_failed");
-        assert.equal(stats.streamingForwards, 1);
-        assert.equal(stats.imagesSeen, 0);
+        // The conservative global bytes mode must NOT downgrade a route that
+        // opted into pixels — route > global in imageBillingFor().
+        const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-route-sess") });
+        assert.equal(r2.status, 200, "route pixels billing survives a conservative global setting");
+        await r2.text();
+        assert.equal(stats.streamingForwards, 2, "the pixel-billed turn was forwarded");
+        assert.equal(stats.imagesSeen, 2, "both screenshots reached the upstream verbatim");
     } finally {
         proxy.close();
         await once(proxy, "close");
@@ -419,7 +416,7 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
 
 test("e2e #767: per-route imageBilling applies under a path-qualified provider key at every gate", async () => {
     const { server: upstream, port: upstreamPort, stats } = await startMockUpstream();
-    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "pixels" }, `http://127.0.0.1:${upstreamPort}/v1`);
+    const { proxy, port: proxyPort } = await startProxy(upstreamPort, { imageBilling: "pixels" }, {}, `http://127.0.0.1:${upstreamPort}/v1`);
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
         const headers = { "content-type": "application/json" };

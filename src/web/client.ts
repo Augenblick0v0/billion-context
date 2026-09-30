@@ -243,7 +243,7 @@ export const WEB_CLIENT = `(function () {
         if (d.passthrough && d.passthrough.enabled) {
             pt.hidden = false;
             pt.classList.add("show");
-            pt.textContent = t("sys.pt_on") + (d.passthrough.source === "env" ? t("sys.pt_env") : t("sys.pt_file"));
+            pt.textContent = t("sys.pt_on") + (d.passthrough.source === "file" ? t("sys.pt_file") : t("sys.pt_flag"));
         } else {
             pt.hidden = true;
             pt.classList.remove("show");
@@ -1082,16 +1082,17 @@ export const WEB_CLIENT = `(function () {
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
             const pt = cfg.passthrough;
-            // #1426: passthrough shows where it came from; env-driven cannot be cleared from here
+            // #1426/#1714: passthrough shows where it came from — the config file
+            // or the --passthrough launch flag; both are clearable from here now.
             if (pt && pt.enabled) {
                 ptState.className = "badge ok";
                 ptState.textContent = t("cfg.pt_on");
-                ptSource.textContent = pt.source === "env" ? t("sys.pt_env") : t("sys.pt_file");
-                clearPt.hidden = pt.source !== "env";
+                ptSource.textContent = pt.source === "file" ? t("sys.pt_file") : t("sys.pt_flag");
+                clearPt.hidden = false;
             } else {
                 ptState.className = "badge disk";
                 ptState.textContent = t("cfg.pt_off");
-                ptSource.textContent = pt && pt.source ? (pt.source === "env" ? t("sys.pt_env") : t("sys.pt_file")) : "";
+                ptSource.textContent = "";
                 clearPt.hidden = true;
             }
             loadUpstream(cfg);

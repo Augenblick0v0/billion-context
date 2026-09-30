@@ -7,8 +7,18 @@ import { log as loggerLog } from "./logger.js";
 // bytes that were sent so the rejection can be explained byte-for-byte. The
 // standing body dump (ACP_DUMP_BODY=1) must be armed BEFORE the incident; this
 // one fires on the failure itself. Still off by default — conversation bodies
-// leak to disk (#276) — enable with BILI_DUMP_4XX=1.
+// leak to disk (#276) — enable via configureDump4xx(true) (config.json
+// `dump4xx`; env input BILI_DUMP_4XX retired in #1714).
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+
+let configuredDump4xx = false;
+let configuredDump4xxMaxBytes: number | undefined;
+export function configureDump4xx(enabled: boolean): void {
+    configuredDump4xx = enabled;
+}
+export function configureDump4xxMaxBytes(bytes?: number): void {
+    configuredDump4xxMaxBytes = bytes;
+}
 
 let failCount = 0;
 let lastFailLog = 0;
@@ -24,13 +34,15 @@ function warnDumpFailure(err: unknown): void {
 }
 
 /** Write the rejected forwarded body to `<dumpDir>/err-<ts>-<sid>-<status>.json`
- *  when BILI_DUMP_4XX=1. Returns the file path, or null when disabled/skipped/failed. */
+ *  when enabled via configureDump4xx. Returns the file path, or null when
+ *  disabled/skipped/failed. */
 export function dumpRejectedBody(status: number, sessionId: string, body: string | Buffer): string | null {
-    if (process.env.BILI_DUMP_4XX !== "1") return null;
+    if (!configuredDump4xx) return null;
     const raw = typeof body === "string" ? body : body.toString("utf8");
     if (!raw) return null;
     try {
-        const cap = Math.max(1024, Number(process.env.BILI_DUMP_4XX_MAX_BYTES) || DEFAULT_MAX_BYTES);
+        const v = configuredDump4xxMaxBytes;
+        const cap = v != null && Number.isFinite(v) && v > 0 ? Math.max(1024, v) : DEFAULT_MAX_BYTES;
         let text: string;
         let marker = "";
         if (raw.length > cap) {

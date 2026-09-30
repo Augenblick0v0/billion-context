@@ -25,7 +25,7 @@ interface Harness {
     cleanup: () => void;
 }
 
-async function startProxy(upstream: http.Server | net.Server, debug: boolean): Promise<Harness> {
+async function startProxy(upstream: http.Server | net.Server, debug: boolean, extraOpts: Partial<ProxyOptions> = {}): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-issue1452-${process.pid}-${Date.now()}`);
@@ -57,6 +57,7 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
         passthroughSource: null,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        ...extraOpts,
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
@@ -237,11 +238,10 @@ test("lifecycle ledger + kat knob: idle keep-alive close classifies reason=idle-
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
-    const restoreKat = withEnv("BILI_KEEP_ALIVE_TIMEOUT_MS", "300");
     let harness: Harness | null = null;
     let sock: net.Socket | null = null;
     try {
-        const h = await startProxy(upstream, true);
+        const h = await startProxy(upstream, true, { keepAliveTimeoutMs: 300 });
         harness = h;
         const base = captured.length;
         const katLine = captured.find((c) => c.msg.includes("[conn] keepAliveTimeout=300ms"));
@@ -288,7 +288,6 @@ test("lifecycle ledger + kat knob: idle keep-alive close classifies reason=idle-
         }
         assert.ok(line, `expected reason=idle-timeout ledger line, got: ${captured.slice(base).filter((c) => c.msg.includes("closed reason=")).map((c) => c.msg).join(" | ")}`);
     } finally {
-        restoreKat();
         setLogCapture(null);
         if (sock && !sock.destroyed) sock.destroy();
         if (harness) { await harness.stop(); harness.cleanup(); }
@@ -302,17 +301,15 @@ test("exposure telemetry: periodic info line with liveConns breakdown (#1452)", 
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
-    const restoreExposure = withEnv("BILI_EXPOSURE_LOG_INTERVAL_MS", "100");
     let harness: Harness | null = null;
     try {
-        harness = await startProxy(upstream, false);
+        harness = await startProxy(upstream, false, { exposureLogIntervalMs: 100 });
         await new Promise((r) => setTimeout(r, 400));
         const line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
         assert.ok(line, `expected [exposure] telemetry line, got: ${captured.map((c) => c.msg).join(" | ")}`);
         assert.match(line!.msg, /liveConns=\d+ tcpHandles=\d+ handles=\d+ sessions=\d+ blindTunnels=\d+ inFlight=\d+/);
         assert.equal(line!.level, "info");
     } finally {
-        restoreExposure();
         setLogCapture(null);
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
@@ -331,12 +328,11 @@ test("retired stall guard: stale export ignored + named at startup; idle budget 
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const restoreStall = withEnv("BILI_STREAM_STALL_MS", "400");
-    const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "3000");
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     let harness: Harness | null = null;
     try {
-        harness = await startProxy(upstream, false);
+        harness = await startProxy(upstream, false, { upstreamTimeoutMs: 3000 });
         const retireWarn = captured.find((c) => c.level === "warn" && c.msg.includes("BILI_STREAM_STALL_MS=400") && c.msg.includes("no longer read"));
         assert.ok(retireWarn, `expected startup notice naming the stale export, got: ${captured.map((c) => c.msg).join(" | ").slice(0, 400)}`);
         const ac = new AbortController();
@@ -360,7 +356,6 @@ test("retired stall guard: stale export ignored + named at startup; idle budget 
         assert.ok(elapsed < 10_000, `idle budget took too long to fire (${elapsed}ms)`);
     } finally {
         restoreStall();
-        restoreIdle();
         setLogCapture(null);
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
@@ -379,10 +374,9 @@ test("retired stall guard: mid-stream silence survives any short window even wit
     // The stale-export shape from #1706: the retired var is set, and the
     // stream still goes silent far past its old 400ms window — nothing may cut it.
     const restoreStall = withEnv("BILI_STREAM_STALL_MS", "400");
-    const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
     let harness: Harness | null = null;
     try {
-        harness = await startProxy(upstream, false);
+        harness = await startProxy(upstream, false, { upstreamTimeoutMs: 60000 });
         const seen: string[] = [];
         const req = http.request(
             { host: "127.0.0.1", port: harness.port, path: "/v1/chat/completions", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(STREAM_BODY) } },
@@ -400,7 +394,6 @@ test("retired stall guard: mid-stream silence survives any short window even wit
         req.destroy();
     } finally {
         restoreStall();
-        restoreIdle();
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
         await close(upstream);
@@ -416,11 +409,10 @@ test("clientError backstop: silent peer after drain-end is terminated, reason=cl
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
-    const restoreBackstop = withEnv("BILI_CLIENT_ERROR_BACKSTOP_MS", "300");
     let harness: Harness | null = null;
     let sock: net.Socket | null = null;
     try {
-        const h = await startProxy(upstream, true);
+        const h = await startProxy(upstream, true, { clientErrorBackstopMs: 300 });
         harness = h;
         const base = captured.length;
         assert.ok(captured.some((c) => c.msg.includes("[conn] keepAliveTimeout=") && c.msg.includes("clientErrorBackstop=300ms")), "expected startup line pinning clientErrorBackstop=300ms (knob wired)");
@@ -451,7 +443,6 @@ test("clientError backstop: silent peer after drain-end is terminated, reason=cl
         assert.ok(marker, "expected the distinct backstop warn marker");
         assert.equal(sawError, null, `backstop destroy must carry no unread residual bytes (no RST to the peer), got ${sawError}`);
     } finally {
-        restoreBackstop();
         setLogCapture(null);
         if (sock && !sock.destroyed) sock.destroy();
         if (harness) { await harness.stop(); harness.cleanup(); }
@@ -465,12 +456,10 @@ test("clientError backstop: knob off restores hold-until-peer-FIN status quo (#1
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
-    const restoreBackstop = withEnv("BILI_CLIENT_ERROR_BACKSTOP_MS", "0");
-    const restoreExposure = withEnv("BILI_EXPOSURE_LOG_INTERVAL_MS", "100");
     let harness: Harness | null = null;
     let sock: net.Socket | null = null;
     try {
-        const h = await startProxy(upstream, true);
+        const h = await startProxy(upstream, true, { clientErrorBackstopMs: 0, exposureLogIntervalMs: 100 });
         harness = h;
         const base = captured.length;
         assert.ok(captured.some((c) => c.msg.includes("clientErrorBackstop=0ms")), "expected startup line pinning clientErrorBackstop=0ms (knob off)");
@@ -503,8 +492,6 @@ test("clientError backstop: knob off restores hold-until-peer-FIN status quo (#1
         }
         assert.ok(line, `expected reason=server-end after peer FIN, got: ${captured.slice(base).filter((c) => c.msg.includes("closed reason=")).map((c) => c.msg).join(" | ")}`);
     } finally {
-        restoreBackstop();
-        restoreExposure();
         setLogCapture(null);
         if (sock && !sock.destroyed) sock.destroy();
         if (harness) { await harness.stop(); harness.cleanup(); }
@@ -524,17 +511,12 @@ test("clientError backstop: knob parse — negative / non-numeric fall back to t
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     const bootLine = async (value: string | undefined): Promise<string> => {
-        const restore = withEnv("BILI_CLIENT_ERROR_BACKSTOP_MS", value);
+        const base = captured.length;
+        const h = await startProxy(upstream, true, { clientErrorBackstopMs: value === undefined ? undefined : Number(value) });
         try {
-            const base = captured.length;
-            const h = await startProxy(upstream, true);
-            try {
-                return (captured.slice(base).find((c) => c.msg.includes("clientErrorBackstop="))?.msg ?? "");
-            } finally {
-                await h.stop(); h.cleanup();
-            }
+            return (captured.slice(base).find((c) => c.msg.includes("clientErrorBackstop="))?.msg ?? "");
         } finally {
-            restore();
+            await h.stop(); h.cleanup();
         }
     };
     try {

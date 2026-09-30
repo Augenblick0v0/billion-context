@@ -44,7 +44,6 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
-            delete process.env.BILI_PERSIST_ZSTD;
             rmrf(dir);
         }
     });
@@ -111,13 +110,11 @@ await withTempDir("writes are encrypted on disk when the key is set", async (h) 
 });
 
 await withTempDir("boot never rewrites legacy plaintext files (downgrade safety)", async (h) => {
-    // Phase 1: pre-#1080 plaintext tree (zstd opt-out = what older bili wrote).
-    process.env.BILI_PERSIST_ZSTD = "0";
+    // Phase 1: pre-#1080 plaintext tree (plain JSON = what older bili wrote).
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-1"));
     await legacy.writeNow(makeSession("s-2"));
     legacy.cancelAll();
-    delete process.env.BILI_PERSIST_ZSTD;
 
     // Phase 2: boot with the key — files must load but stay byte-identical
     // plaintext. A boot-time mass rewrite (the #1083 draft) makes a
@@ -178,12 +175,10 @@ await withTempDir("boot leaves foreign and corrupt files alone (no rewrites, no 
 });
 
 await withTempDir("boot sweeps orphaned .tmp-enc-* temps left by a crashed write", async (h) => {
-    // Pre-#1080 plaintext file (zstd opt-out), same as what older bili wrote.
-    process.env.BILI_PERSIST_ZSTD = "0";
+    // Pre-#1080 plaintext file (plain JSON), same as what older bili wrote.
     const legacy = newStore(h);
     await legacy.writeNow(makeSession("s-crash"));
     legacy.cancelAll();
-    delete process.env.BILI_PERSIST_ZSTD;
 
     // Simulate a process death between the temp write and the rename: a
     // stale temp sits next to an unencoded legacy file.
@@ -225,8 +220,7 @@ await withTempDir("invalid key fails fast at construction", async (h) => {
     assert.throws(() => newStore(h), /BILI_ENCRYPTION_KEY.*exactly 32 bytes/);
 });
 
-await withTempDir("without a key and zstd opted out, files stay plaintext", async (h) => {
-    process.env.BILI_PERSIST_ZSTD = "0";
+await withTempDir("without a key, files stay plaintext", async (h) => {
     const store = newStore(h);
     try {
         await store.writeNow(makeSession("s-plain"));

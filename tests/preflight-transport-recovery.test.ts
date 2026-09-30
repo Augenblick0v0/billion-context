@@ -5,13 +5,13 @@ import { randomUUID } from "node:crypto";
 import { afterEach, test } from "node:test";
 import { createCore, defaultConfig, defaultPrompts, type CoreMessage } from "acp-kernel";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
-import { _liveUpstreamTimersForTest, _resetFetchUtilForTest } from "../src/fetch-util.ts";
+import { _liveUpstreamTimersForTest, _resetFetchUtilForTest, configureReplayRetryBaseMs, configureReplayRetryMax } from "../src/fetch-util.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 process.env.NODE_ENV = "test";
-process.env.BILI_REPLAY_RETRY_MAX = "3";
-process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+configureReplayRetryMax(3);
+configureReplayRetryBaseMs(0);
 _setStoreForTest(new SessionStore({ enabled: false }));
 
 const SUMMARY = "SUMMARY: keep the task goal, exact acceptance criteria and next step; the repeated fixture output is disposable.";
@@ -20,7 +20,7 @@ const PARTIAL = "PARTIAL_SUMMARY_MUST_NOT_BE_APPLIED";
 afterEach(() => {
     assert.equal(_liveUpstreamTimersForTest(), 0, "each attempt releases its upstream idle timer");
     _resetFetchUtilForTest();
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+    configureReplayRetryBaseMs(0);
 });
 
 function fixture(url: string, signal?: AbortSignal) {
@@ -151,7 +151,7 @@ test("preflight respects client cancellation during summary body reading", async
 });
 
 test("preflight cancellation during HTTP backoff does not make another request", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "1000";
+    configureReplayRetryBaseMs(1000);
     const controller = new AbortController();
     await withUpstream(res => {
         res.writeHead(503).end("temporary unavailable");

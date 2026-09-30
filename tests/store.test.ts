@@ -18,12 +18,12 @@ import { applyCompressSettings, mergeCompress } from "../src/compress-settings.t
 import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf, snapshotPendingRetrievals, commitRetrievals, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, snapshotRetrievalNotes, renderRetrievalNotes, commitRetrievalNotes } from "../src/store.ts";
 import { RETRIEVE_TOOL_NAME } from "../src/compress-tool.ts";
 import { getSession } from "../src/session.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistEnabled } from "../src/persist.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // Unit tests never touch the real data/state trees: persistence off by
 // default; the envelope round-trip builds its own throwaway SessionStore.
-process.env.BILI_PERSIST = "0";
+configurePersistEnabled(false);
 const PERSIST_TMP = mkdtempSync(path.join(tmpdir(), "bili-ccr-persist-"));
 
 const BIG_TEXT = "line of build output ".repeat(700);
@@ -264,7 +264,7 @@ test("flushAll retries a dirty content store after a transient write failure", a
 
 // [#1343] Delivery-lifecycle coverage: every ack→loss path is observable
 // (counter + corrective note), never silent. Sessions are in-memory
-// (BILI_PERSIST=0); the durable ledger lives in session.metadata.
+// (persistence disabled above); the durable ledger lives in session.metadata.
 function seedCCR() {
     const session = getSession(`t-win-${Math.random().toString(36).slice(2)}`);
     storeEffectiveCcr(session, { enabled: true, toolName: "lookup", minToolTokens: 50 });

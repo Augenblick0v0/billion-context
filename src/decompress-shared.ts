@@ -22,14 +22,20 @@ import { safePrefix } from "./text-safe.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
- *  BILI_DECOMPRESS_TMP_CAP (default 50) and beforeExit cleans all. */
+ *  the configured cap (default 50) and beforeExit cleans all. Configured from
+ *  config.json `decompressTmpCap` via configureDecompressTmpCap; env input
+ *  BILI_DECOMPRESS_TMP_CAP retired in #1714. */
 type TrackedTempFile = { path: string; mtimeMs: number };
 const trackedTempFiles: TrackedTempFile[] = [];
 
+let configuredDecompressTmpCap: number | undefined;
+export function configureDecompressTmpCap(cap?: number): void {
+    configuredDecompressTmpCap = cap;
+}
+
 function getDecompressTmpCap(): number {
-    const raw = process.env.BILI_DECOMPRESS_TMP_CAP;
-    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+    const v = configuredDecompressTmpCap;
+    return v != null && Number.isInteger(v) && v > 0 ? v : 50;
 }
 
 function reapTempFiles(): void {

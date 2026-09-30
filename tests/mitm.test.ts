@@ -7,7 +7,7 @@ import tls from "node:tls";
 import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest, recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest } from "../src/mitm.js";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest, recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest, configureMitmHandshakeTimeoutMs } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, mintHostCert, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 import { setMaskHostsEnabled } from "../src/log-mask.js";
@@ -247,7 +247,7 @@ await test("setupMitm e2e: idle tunnel after CONNECT is killed by the handshake 
         server.listen(0, "127.0.0.1");
         await once(server, "listening");
         const port = (server.address() as { port: number }).port;
-        process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS = "200";
+        configureMitmHandshakeTimeoutMs(200);
         try {
             const { statusLine, socket } = await rawConnect(port, "127.0.0.1", "api.anthropic.com:443");
             assert.match(statusLine, /^HTTP\/1\.1 200/);
@@ -262,7 +262,7 @@ await test("setupMitm e2e: idle tunnel after CONNECT is killed by the handshake 
             clearTimeout(bail);
             assert.equal(socket.destroyed, true, "socket must be destroyed by the handshake timeout");
         } finally {
-            delete process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS;
+            configureMitmHandshakeTimeoutMs(undefined);
             server.close();
             server.closeAllConnections?.();
         }
@@ -370,14 +370,13 @@ test("recordBlindTunnel: counts per host and warns exactly once per host (#897)"
     const warnings = logs.filter((l) => l.includes("BLIND TUNNEL WARNING"));
     assert.equal(warnings.length, 2, `one warning per distinct host, got ${warnings.length}`);
     assert.match(warnings[0], /"mitm"\.domains/, "warning must name the config fix");
-    assert.match(warnings[0], /BILI_MITM_DOMAINS/, "warning must name the env alternative");
     assert.match(warnings[0], /__bili\/stats/, "warning must point at the stats endpoint for exact hosts");
     // #255 default: non-public hosts stay masked in the log even in warnings.
     assert.ok(!warnings.some((l) => l.includes("copilot.tencent.com")), "non-public host must not appear verbatim by default");
     assert.match(warnings[0], /<private-host>/, "masked placeholder expected by default");
 });
 
-test("recordBlindTunnel: BILI_LOG_MASK_HOSTS=0 (setMaskHostsEnabled(false)) shows real hosts (#897)", () => {
+test("recordBlindTunnel: maskHosts=false (setMaskHostsEnabled(false)) shows real hosts (#897)", () => {
     _resetBlindTunnelStatsForTest();
     setMaskHostsEnabled(false);
     try {

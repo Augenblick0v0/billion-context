@@ -10,11 +10,11 @@ import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbS
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
-import { resetProxyCache } from "./upstream-proxy.js";
+import { configureProxyKeepAliveMaxMs, resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { configureMaxShrinkPerCompress, configureReplayRetryBaseMs, configureReplayRetryMax, configureUpstreamTimeoutMs, fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, recordUpstreamAlert } from "./upstream-alerts.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -48,7 +48,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL, configureMaxSessions } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -66,26 +66,26 @@ import {
 } from "acp-kernel/wire";
 import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, commitRetrievalNotes, contentStoreOf, dropRetrievals, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
+import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, commitRetrievalNotes, contentStoreOf, dropRetrievals, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, configureCcrRetrievalTtlMs, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, imageUsageSuffix, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
-import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
+import { configureDecompressTmpCap, storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, noteClientAbort, noteForwardedBody, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
-import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
-import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
+import { configureSessionGc, gcConfig, gcSessionFiles } from "./session-gc.js";
+import { configureImageTokenCap, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
-import { getStore } from "./persist.js";
+import { configurePersistDebounceMs, configurePersistEnabled, configurePersistEpermAlertRepeatMs, configurePersistEpermAlertThreshold, configurePersistTailTokens, configurePersistZstd, getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, enterSessionContext } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
-import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
+import { configFile, configureSessionsDir, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -95,7 +95,7 @@ import { reconcileSystemAnchor } from "./system-anchor.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
-import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { configureFakeBufCap, configureFakeCompletionRetries, fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "./fake-completion.js";
 import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
@@ -111,14 +111,14 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
+import { configureMitmHandshakeTimeoutMs, getBlindTunnelStats, liveBlindTunnels, readMitmUpstream, setupMitm } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
-import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
-import { dumpRejectedBody } from "./error-dump.js";
+import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, configureTunnelAllowedHosts, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlist } from "./tunnel-guard.js";
+import { configureDump4xx, configureDump4xxMaxBytes, dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
@@ -288,11 +288,16 @@ function registerRequestAbort(res: http.ServerResponse, ac: AbortController): vo
     requestAborts.set(res, ac);
 }
 
+// #1714: file-only (BILI_REQUEST_WATCHDOG_MS retired); set once by startServer,
+// re-set on config reload so web-UI edits apply without restart.
+let configuredWatchdogBudgetMs: number | undefined;
+export function configureRequestWatchdogBudget(ms: number | undefined): void {
+    configuredWatchdogBudgetMs = ms;
+}
+
 export function requestWatchdogBudgetMs(): number {
-    const raw = process.env.BILI_REQUEST_WATCHDOG_MS;
-    if (!raw) return 2 * upstreamTimeoutMs();
-    const v = Number(raw);
-    return Number.isFinite(v) ? Math.floor(v) : 2 * upstreamTimeoutMs();
+    if (configuredWatchdogBudgetMs === undefined) return 2 * upstreamTimeoutMs();
+    return Math.floor(configuredWatchdogBudgetMs);
 }
 
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
@@ -370,6 +375,41 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // #1714: forward config.json behavior knobs into the module-level
+    // resolvers (their env inputs are retired). Must run before the first
+    // getStore()/gcConfig() below so boot-time state reflects the file.
+    // Conditional on presence: loadOptions bakes every configured field into
+    // opts, so in production this always applies the file; direct startServer
+    // callers (tests/embedded) that pre-set a knob programmatically keep it.
+    if (opts.requestWatchdogMs !== undefined) configureRequestWatchdogBudget(opts.requestWatchdogMs);
+    if (opts.preflightHoldMs !== undefined) configurePreflightHoldMs(opts.preflightHoldMs);
+    if (opts.preflightDeadEndCooldownMs !== undefined) configurePreflightDeadEndCooldownMs(opts.preflightDeadEndCooldownMs);
+    if (opts.streamKeepAliveMs !== undefined) configureStreamKeepaliveMs(opts.streamKeepAliveMs);
+    if (opts.upstreamTimeoutMs !== undefined) configureUpstreamTimeoutMs(opts.upstreamTimeoutMs);
+    if (opts.replayRetryMax !== undefined) configureReplayRetryMax(opts.replayRetryMax);
+    if (opts.replayRetryBaseMs !== undefined) configureReplayRetryBaseMs(opts.replayRetryBaseMs);
+    if (opts.maxShrinkPerCompress !== undefined) configureMaxShrinkPerCompress(opts.maxShrinkPerCompress);
+    if (opts.ccrRetrievalTtlMs !== undefined) configureCcrRetrievalTtlMs(opts.ccrRetrievalTtlMs);
+    if (opts.fakeCompletionRetries !== undefined) configureFakeCompletionRetries(opts.fakeCompletionRetries);
+    if (opts.fakeBufCap !== undefined) configureFakeBufCap(opts.fakeBufCap);
+    if (opts.imageTokenCap !== undefined) configureImageTokenCap(opts.imageTokenCap);
+    if (opts.mitmHandshakeTimeoutMs !== undefined) configureMitmHandshakeTimeoutMs(opts.mitmHandshakeTimeoutMs);
+    if (opts.proxyKeepAliveMaxMs !== undefined) configureProxyKeepAliveMaxMs(opts.proxyKeepAliveMaxMs);
+    if (opts.decompressTmpCap !== undefined) configureDecompressTmpCap(opts.decompressTmpCap);
+    if (opts.dump4xx !== undefined) configureDump4xx(opts.dump4xx === true);
+    if (opts.dump4xxMaxBytes !== undefined) configureDump4xxMaxBytes(opts.dump4xxMaxBytes);
+    if (opts.persistEnabled !== undefined) configurePersistEnabled(opts.persistEnabled === true);
+    if (opts.persistDebounceMs !== undefined) configurePersistDebounceMs(opts.persistDebounceMs);
+    if (opts.persistTailTokens !== undefined) configurePersistTailTokens(opts.persistTailTokens);
+    if (opts.persistZstd !== undefined) configurePersistZstd(opts.persistZstd === true);
+    if (opts.persistEpermAlertThreshold !== undefined) configurePersistEpermAlertThreshold(opts.persistEpermAlertThreshold);
+    if (opts.persistEpermAlertRepeatMs !== undefined) configurePersistEpermAlertRepeatMs(opts.persistEpermAlertRepeatMs);
+    if (opts.maxSessions !== undefined) configureMaxSessions(opts.maxSessions);
+    if (opts.sessionGc !== undefined || opts.sessionGcMaxAgeDays !== undefined || opts.sessionGcMaxTokens !== undefined || opts.sessionGcIntervalMs !== undefined) {
+        configureSessionGc({ enabled: opts.sessionGc === true, maxAgeDays: opts.sessionGcMaxAgeDays, maxTokens: opts.sessionGcMaxTokens, intervalMs: opts.sessionGcIntervalMs });
+    }
+    if (opts.sessionsDir !== undefined) configureSessionsDir(opts.sessionsDir);
+    if (opts.tunnelAllowedHosts !== undefined) configureTunnelAllowedHosts(opts.tunnelAllowedHosts);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound
     // forwards. Per-server (not module-level) so two servers in one process
     // (tests) are distinct instances; a restart changing the id is harmless
@@ -396,7 +436,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #1082: sweep stale small session files — boot pass + periodic. Runs
     // against the disk tree, not the in-memory map: evicted/capped sessions
     // leave files behind that only a disk walk sees.
-    const gcCfg = gcConfigFromEnv();
+    const gcCfg = gcConfig();
     if (gcCfg.enabled && getStore().enabled) {
         void gcSessionFiles().catch((err) => log("warn", `[gc] sweep failed: ${String(err)}`));
         const gcTimer = setInterval(() => {
@@ -407,8 +447,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #405 (silent env knobs): the tunnel allowlist is security-relevant —
     // surface it at startup so a remote-client deployment shows WHY private
     // destinations pass or fail.
-    const tunnelAllowlist = tunnelAllowlistFromEnv();
-    if (tunnelAllowlist.length > 0) log("info", `[tunnel] remote-client allowlist: ${tunnelAllowlist.join(", ")}`);
+    const tunnelAllow = tunnelAllowlist();
+    if (tunnelAllow.length > 0) log("info", `[tunnel] remote-client allowlist: ${tunnelAllow.join(", ")}`);
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
     }
@@ -469,7 +509,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // 5000ms; the default here matches it exactly (zero behavior change), but
     // the knob exists so pooled clients can deliberately extend or shorten the
     // reuse window instead of guessing at Node internals.
-    const katRaw = Number(process.env.BILI_KEEP_ALIVE_TIMEOUT_MS);
+    const katRaw = Number(opts.keepAliveTimeoutMs);
     const keepAliveTimeoutMs = Number.isInteger(katRaw) && katRaw > 0 ? katRaw : 5000;
     server.keepAliveTimeout = keepAliveTimeoutMs;
     // #1529: terminal backstop for the clientError drain path. After the bail
@@ -479,7 +519,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // silence instead. Safe against the #1452 RST signature: resume() has
     // drained the recv buffer for the whole window, so no unread residual
     // bytes ride the destroy. 0 restores hold-until-peer-death (status quo).
-    const backstopRaw = Number(process.env.BILI_CLIENT_ERROR_BACKSTOP_MS);
+    const backstopRaw = Number(opts.clientErrorBackstopMs);
     const clientErrorBackstopMs = Number.isInteger(backstopRaw) && backstopRaw >= 0 ? backstopRaw : 30_000;
     log("info", `[conn] keepAliveTimeout=${keepAliveTimeoutMs}ms clientErrorBackstop=${clientErrorBackstopMs}ms`);
     // #1714: BILI_STREAM_STALL_MS is retired (#1706 incident: a stale 400ms
@@ -488,7 +528,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // announce themselves instead of silently dying.
     const retiredStallEnv = process.env.BILI_STREAM_STALL_MS;
     if (retiredStallEnv !== undefined && retiredStallEnv.trim() !== "") {
-        log("warn", `[config] BILI_STREAM_STALL_MS=${retiredStallEnv} is no longer read (#1714) — ignored; upstream silence is bounded by the ${Math.round(upstreamTimeoutMs() / 60000)}-minute idle budget (BILI_UPSTREAM_TIMEOUT_MS)`);
+        log("warn", `[config] BILI_STREAM_STALL_MS=${retiredStallEnv} is no longer read (#1714) — ignored; upstream silence is bounded by the ${Math.round(upstreamTimeoutMs() / 60000)}-minute idle budget (config.json upstreamTimeoutMs)`);
     }
     // #1452: per-connection lifecycle ledger — turns "which side closed this
     // socket, and why" from forensic inference into one debug line per
@@ -618,7 +658,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // inside one 36.7h process while fresh processes stayed clean under
     // higher load; fd/connection-table drift was unfalsifiable without
     // periodic ground truth. One info line per interval, zero payload.
-    const exposureRaw = Number(process.env.BILI_EXPOSURE_LOG_INTERVAL_MS);
+    const exposureRaw = Number(opts.exposureLogIntervalMs);
     const exposureIntervalMs = Number.isInteger(exposureRaw) ? Math.max(0, exposureRaw) : 3_600_000;
     if (exposureIntervalMs > 0) {
         const exposureStartedAt = Date.now();
@@ -715,20 +755,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             log(
                 "warn",
                 `[passthrough] compression is OFF — every request is forwarded verbatim, no tokens are saved ` +
-                    `(source: ${opts.passthroughSource === "env" ? "ACP_PASSTHROUGH env var or --passthrough flag" : `config file ${configFile()}`}). ` +
-                    (opts.passthroughSource === "env"
-                        ? "Unset ACP_PASSTHROUGH (or drop --passthrough) and restart to re-enable compression."
-                        : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
+                    `(source: ${opts.passthroughSource === "file" ? `config file ${configFile()}` : "--passthrough flag on the command line"}). ` +
+                    "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression.",
             );
-        }
-        const envKnobs: string[] = [];
-        if (process.env.ACP_PASSTHROUGH !== undefined) envKnobs.push(`ACP_PASSTHROUGH=${process.env.ACP_PASSTHROUGH}`);
-        if (process.env.ACP_MODEL_CONTEXT_LIMIT !== undefined) envKnobs.push(`ACP_MODEL_CONTEXT_LIMIT=${process.env.ACP_MODEL_CONTEXT_LIMIT}`);
-        if (process.env.ACP_COMPRESS_TOOL !== undefined) envKnobs.push(`ACP_COMPRESS_TOOL=${process.env.ACP_COMPRESS_TOOL}`);
-        if (process.env.ACP_COMPRESS_NUDGE !== undefined) envKnobs.push(`ACP_COMPRESS_NUDGE=${process.env.ACP_COMPRESS_NUDGE}`);
-        if (process.env.BILI_PERSIST !== undefined) envKnobs.push(`BILI_PERSIST=${process.env.BILI_PERSIST}`);
-        if (envKnobs.length > 0) {
-            log("info", `[config] env overrides active (win over the config file): ${envKnobs.join(", ")}`);
         }
         if (nonLoopbackBind) {
             log(
@@ -761,7 +790,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const hint =
             err.code === "EADDRINUSE"
                 ? strictPort
-                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                    ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. claude.nativePort in billion-context.json for the claude native posture).`
                     : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
                   ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
@@ -958,14 +987,13 @@ type Prepared = {
 };
 
 
-// #767: per-request image billing mode — env BILI_IMAGE_BILLING (live, like
-// BILI_IMAGE_TOKEN_CAP) wins over the per-provider route entry, which wins over
-// the global config level; "auto"/unset classifies known first-party pixel-tile
-// hosts by upstream URL. Every payload-size decision below consults this so one
-// over-estimate cannot block all of them at once.
+// #767: per-request image billing mode — the per-provider route entry wins over
+// the global config level (#1714: env BILI_IMAGE_BILLING retired; the file value
+// stays live via config reload); "auto"/unset classifies known first-party
+// pixel-tile hosts by upstream URL. Every payload-size decision below consults
+// this so one over-estimate cannot block all of them at once.
 function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResolvedImageBilling {
-    const env = process.env.BILI_IMAGE_BILLING;
-    const configured = env === "pixels" || env === "bytes" ? env : findRoute(opts.routes, upstreamUrl)?.imageBilling ?? opts.imageBilling ?? "auto";
+    const configured = findRoute(opts.routes, upstreamUrl)?.imageBilling ?? opts.imageBilling ?? "auto";
     return resolveImageBilling(configured, upstreamUrl);
 }
 
@@ -1147,6 +1175,61 @@ async function handle(
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            opts.imageBilling = fresh.imageBilling;
+            opts.debug = fresh.debug;
+            opts.requestWatchdogMs = fresh.requestWatchdogMs;
+            configureRequestWatchdogBudget(fresh.requestWatchdogMs);
+            opts.preflightHoldMs = fresh.preflightHoldMs;
+            configurePreflightHoldMs(fresh.preflightHoldMs);
+            opts.preflightDeadEndCooldownMs = fresh.preflightDeadEndCooldownMs;
+            configurePreflightDeadEndCooldownMs(fresh.preflightDeadEndCooldownMs);
+            opts.streamKeepAliveMs = fresh.streamKeepAliveMs;
+            configureStreamKeepaliveMs(fresh.streamKeepAliveMs);
+            opts.upstreamTimeoutMs = fresh.upstreamTimeoutMs;
+            configureUpstreamTimeoutMs(fresh.upstreamTimeoutMs);
+            opts.replayRetryMax = fresh.replayRetryMax;
+            configureReplayRetryMax(fresh.replayRetryMax);
+            opts.replayRetryBaseMs = fresh.replayRetryBaseMs;
+            configureReplayRetryBaseMs(fresh.replayRetryBaseMs);
+            opts.maxShrinkPerCompress = fresh.maxShrinkPerCompress;
+            configureMaxShrinkPerCompress(fresh.maxShrinkPerCompress);
+            opts.ccrRetrievalTtlMs = fresh.ccrRetrievalTtlMs;
+            configureCcrRetrievalTtlMs(fresh.ccrRetrievalTtlMs);
+            opts.fakeCompletionRetries = fresh.fakeCompletionRetries;
+            configureFakeCompletionRetries(fresh.fakeCompletionRetries);
+            opts.fakeBufCap = fresh.fakeBufCap;
+            configureFakeBufCap(fresh.fakeBufCap);
+            opts.imageTokenCap = fresh.imageTokenCap;
+            configureImageTokenCap(fresh.imageTokenCap);
+            opts.mitmHandshakeTimeoutMs = fresh.mitmHandshakeTimeoutMs;
+            configureMitmHandshakeTimeoutMs(fresh.mitmHandshakeTimeoutMs);
+            opts.proxyKeepAliveMaxMs = fresh.proxyKeepAliveMaxMs;
+            configureProxyKeepAliveMaxMs(fresh.proxyKeepAliveMaxMs);
+            opts.decompressTmpCap = fresh.decompressTmpCap;
+            configureDecompressTmpCap(fresh.decompressTmpCap);
+            opts.dump4xx = fresh.dump4xx;
+            configureDump4xx(fresh.dump4xx === true);
+            opts.dump4xxMaxBytes = fresh.dump4xxMaxBytes;
+            configureDump4xxMaxBytes(fresh.dump4xxMaxBytes);
+            opts.persistEnabled = fresh.persistEnabled;
+            configurePersistEnabled(fresh.persistEnabled !== false);
+            opts.persistDebounceMs = fresh.persistDebounceMs;
+            configurePersistDebounceMs(fresh.persistDebounceMs);
+            opts.persistTailTokens = fresh.persistTailTokens;
+            configurePersistTailTokens(fresh.persistTailTokens);
+            opts.persistZstd = fresh.persistZstd;
+            configurePersistZstd(fresh.persistZstd === true);
+            opts.persistEpermAlertThreshold = fresh.persistEpermAlertThreshold;
+            configurePersistEpermAlertThreshold(fresh.persistEpermAlertThreshold);
+            opts.persistEpermAlertRepeatMs = fresh.persistEpermAlertRepeatMs;
+            configurePersistEpermAlertRepeatMs(fresh.persistEpermAlertRepeatMs);
+            opts.maxSessions = fresh.maxSessions;
+            configureMaxSessions(fresh.maxSessions);
+            configureSessionGc({ enabled: fresh.sessionGc === true, maxAgeDays: fresh.sessionGcMaxAgeDays, maxTokens: fresh.sessionGcMaxTokens, intervalMs: fresh.sessionGcIntervalMs });
+            opts.sessionsDir = fresh.sessionsDir;
+            configureSessionsDir(fresh.sessionsDir);
+            opts.tunnelAllowedHosts = fresh.tunnelAllowedHosts;
+            configureTunnelAllowedHosts(fresh.tunnelAllowedHosts);
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -1347,7 +1430,7 @@ async function handle(
             const verdict = await checkTunnelDestination(route.upstream, {
                 selfPort: req.socket.localPort ?? undefined,
                 clientLoopback: isLoopbackAddress(req.socket.remoteAddress),
-                allowlist: tunnelAllowlistFromEnv(),
+                allowlist: tunnelAllowlist(),
             });
             if (!verdict.ok) {
                 log("warn", `[tunnel] denied ${maskUrlsInText(route.upstream)}: ${verdict.message}`);
@@ -4059,7 +4142,7 @@ async function prepareResponses(
         }
         const { msgs } = projection;
         originalMessages = msgs;
-        if (process.env.ACP_DEBUG) {
+        if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
@@ -4260,7 +4343,7 @@ async function prepareResponses(
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
     // namespace items (type:namespace/custom).
-    if (process.env.ACP_DEBUG) {
+    if (opts.debug) {
         const fwdTools = (Array.isArray(toolsOut) ? toolsOut : []).map((t) => {
             const r = t as Record<string, unknown>;
             const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
@@ -4747,22 +4830,30 @@ function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is 
 const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
 
+// #1714: file-only (BILI_PREFLIGHT_HOLD_MS retired); set by startServer + config reload.
+let configuredPreflightHoldMs: number | undefined;
+export function configurePreflightHoldMs(ms: number | undefined): void {
+    configuredPreflightHoldMs = ms;
+}
+
 function preflightHoldGraceMs(): number {
-    const raw = process.env.BILI_PREFLIGHT_HOLD_MS;
-    if (!raw) return PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+    if (configuredPreflightHoldMs === undefined || configuredPreflightHoldMs < 0) return PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+    return Math.floor(configuredPreflightHoldMs);
 }
 
 // Cache exhausted walks and non-transient HTTP rejections only for the same
 // forwarded body. Transport failures do not establish a content dead end.
 const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
 
+// #1714: file-only (BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS retired); set by startServer + config reload.
+let configuredPreflightDeadEndCooldownMs: number | undefined;
+export function configurePreflightDeadEndCooldownMs(ms: number | undefined): void {
+    configuredPreflightDeadEndCooldownMs = ms;
+}
+
 function preflightDeadEndCooldownMs(): number {
-    const raw = process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS;
-    if (!raw) return PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
+    if (configuredPreflightDeadEndCooldownMs === undefined || configuredPreflightDeadEndCooldownMs < 0) return PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
+    return Math.floor(configuredPreflightDeadEndCooldownMs);
 }
 
 /** #568: commit the response early so a long preflight cannot lose the client
@@ -4823,11 +4914,15 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
 // response is always chunked downstream.
 const STREAM_KEEPALIVE_DEFAULT_MS = 15_000;
 
+// #1714: file-only (BILI_STREAM_KEEPALIVE_MS retired); set by startServer + config reload.
+let configuredStreamKeepaliveMs: number | undefined;
+export function configureStreamKeepaliveMs(ms: number | undefined): void {
+    configuredStreamKeepaliveMs = ms;
+}
+
 function streamKeepaliveMs(): number {
-    const raw = process.env.BILI_STREAM_KEEPALIVE_MS;
-    if (!raw) return STREAM_KEEPALIVE_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : STREAM_KEEPALIVE_DEFAULT_MS;
+    if (configuredStreamKeepaliveMs === undefined || configuredStreamKeepaliveMs < 0) return STREAM_KEEPALIVE_DEFAULT_MS;
+    return Math.floor(configuredStreamKeepaliveMs);
 }
 
 export function beginStreamKeepalive(res: http.ServerResponse, sid: string, log: (level: string, msg: string) => void): void {
@@ -5364,7 +5459,7 @@ async function forward(
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
     log("info", `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
-    if (process.env.ACP_DEBUG && prepared) {
+    if (opts.debug && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
         log("info", `[${sid}] client headers: ${hdrKeys.join(",")}`);
@@ -6450,6 +6545,60 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;
     opts.imageBilling = reloaded.imageBilling;
+    opts.debug = reloaded.debug;
+    opts.requestWatchdogMs = reloaded.requestWatchdogMs;
+    configureRequestWatchdogBudget(reloaded.requestWatchdogMs);
+    opts.preflightHoldMs = reloaded.preflightHoldMs;
+    configurePreflightHoldMs(reloaded.preflightHoldMs);
+    opts.preflightDeadEndCooldownMs = reloaded.preflightDeadEndCooldownMs;
+    configurePreflightDeadEndCooldownMs(reloaded.preflightDeadEndCooldownMs);
+    opts.streamKeepAliveMs = reloaded.streamKeepAliveMs;
+    configureStreamKeepaliveMs(reloaded.streamKeepAliveMs);
+    opts.upstreamTimeoutMs = reloaded.upstreamTimeoutMs;
+    configureUpstreamTimeoutMs(reloaded.upstreamTimeoutMs);
+    opts.replayRetryMax = reloaded.replayRetryMax;
+    configureReplayRetryMax(reloaded.replayRetryMax);
+    opts.replayRetryBaseMs = reloaded.replayRetryBaseMs;
+    configureReplayRetryBaseMs(reloaded.replayRetryBaseMs);
+    opts.maxShrinkPerCompress = reloaded.maxShrinkPerCompress;
+    configureMaxShrinkPerCompress(reloaded.maxShrinkPerCompress);
+    opts.ccrRetrievalTtlMs = reloaded.ccrRetrievalTtlMs;
+    configureCcrRetrievalTtlMs(reloaded.ccrRetrievalTtlMs);
+    opts.fakeCompletionRetries = reloaded.fakeCompletionRetries;
+    configureFakeCompletionRetries(reloaded.fakeCompletionRetries);
+    opts.fakeBufCap = reloaded.fakeBufCap;
+    configureFakeBufCap(reloaded.fakeBufCap);
+    opts.imageTokenCap = reloaded.imageTokenCap;
+    configureImageTokenCap(reloaded.imageTokenCap);
+    opts.mitmHandshakeTimeoutMs = reloaded.mitmHandshakeTimeoutMs;
+    configureMitmHandshakeTimeoutMs(reloaded.mitmHandshakeTimeoutMs);
+    opts.proxyKeepAliveMaxMs = reloaded.proxyKeepAliveMaxMs;
+    configureProxyKeepAliveMaxMs(reloaded.proxyKeepAliveMaxMs);
+    opts.decompressTmpCap = reloaded.decompressTmpCap;
+    configureDecompressTmpCap(reloaded.decompressTmpCap);
+    opts.dump4xx = reloaded.dump4xx;
+    configureDump4xx(reloaded.dump4xx === true);
+    opts.dump4xxMaxBytes = reloaded.dump4xxMaxBytes;
+    configureDump4xxMaxBytes(reloaded.dump4xxMaxBytes);
+    opts.persistEnabled = reloaded.persistEnabled;
+    configurePersistEnabled(reloaded.persistEnabled !== false);
+    opts.persistDebounceMs = reloaded.persistDebounceMs;
+    configurePersistDebounceMs(reloaded.persistDebounceMs);
+    opts.persistTailTokens = reloaded.persistTailTokens;
+    configurePersistTailTokens(reloaded.persistTailTokens);
+    opts.persistZstd = reloaded.persistZstd;
+    configurePersistZstd(reloaded.persistZstd === true);
+    opts.persistEpermAlertThreshold = reloaded.persistEpermAlertThreshold;
+    configurePersistEpermAlertThreshold(reloaded.persistEpermAlertThreshold);
+    opts.persistEpermAlertRepeatMs = reloaded.persistEpermAlertRepeatMs;
+    configurePersistEpermAlertRepeatMs(reloaded.persistEpermAlertRepeatMs);
+    opts.maxSessions = reloaded.maxSessions;
+    configureMaxSessions(reloaded.maxSessions);
+    configureSessionGc({ enabled: reloaded.sessionGc === true, maxAgeDays: reloaded.sessionGcMaxAgeDays, maxTokens: reloaded.sessionGcMaxTokens, intervalMs: reloaded.sessionGcIntervalMs });
+    opts.sessionsDir = reloaded.sessionsDir;
+    configureSessionsDir(reloaded.sessionsDir);
+    opts.tunnelAllowedHosts = reloaded.tunnelAllowedHosts;
+    configureTunnelAllowedHosts(reloaded.tunnelAllowedHosts);
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().

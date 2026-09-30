@@ -525,12 +525,15 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.refused, [out!.origin], "unverifiable lifecycle is refused, matching pickAttachable");
     });
 
-    test("discover-external: BILI_NATIVE_ATTACH_EXTERNAL=1 restores attach-to-daemon (#1338 escape hatch)", () => {
+    test("discover-external: native.attachExternal=true restores attach-to-daemon (#1338 escape hatch)", () => {
         if (!PY) {
             console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
             return;
         }
-        const { out, err } = runDriver("discover-unarmed", { BC_HEALTH_WATCHDOG: "false", BILI_NATIVE_ATTACH_EXTERNAL: "1" });
+        const base = track(makeTmp("discover-external"));
+        const cfgPath = path.join(base, "config.json");
+        fs.writeFileSync(cfgPath, JSON.stringify({ native: { attachExternal: true } }));
+        const { out, err } = runDriver("discover-unarmed", { BC_HEALTH_WATCHDOG: "false", BILI_CONFIG_FILE: cfgPath });
         assert.ok(out, err);
         assert.equal(out!.env_https_proxy, out!.origin, "escape hatch attaches to the unarmed daemon");
         assert.equal(out!.watcher_calls.length, 1, "watcher registration still attempted (409-soft)");

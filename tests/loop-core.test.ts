@@ -6,7 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { WireProtocol } from "../src/util.ts";
-import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
+import { configureReplayRetryBaseMs, configureReplayRetryMax, isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
 
 function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
     core: ReturnType<typeof createCore>;
@@ -336,7 +336,7 @@ function compressRound(): string {
 }
 
 test("replay retry: transient 400 (captcha) then success → retried, no error surfaced", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    configureReplayRetryBaseMs(1);
     let fetchCalls = 0;
     const orig = globalThis.fetch;
     globalThis.fetch = (async () => {
@@ -355,13 +355,13 @@ test("replay retry: transient 400 (captcha) then success → retried, no error s
         assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
         assert.ok(/response\.completed/.test(out), "graceful completion after retry");
     } finally {
-        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        configureReplayRetryBaseMs(undefined);
         globalThis.fetch = orig;
     }
 });
 
 test("replay retry: persistent captcha 400 → bounded retries, error names attempt count", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    configureReplayRetryBaseMs(1);
     let fetchCalls = 0;
     const orig = globalThis.fetch;
     globalThis.fetch = (async () => {
@@ -379,7 +379,7 @@ test("replay retry: persistent captcha 400 → bounded retries, error names atte
         assert.ok(out.includes("upstream error 400"), "error surfaced to client");
         assert.ok(out.includes(`after ${REPLAY_MAX_ATTEMPTS} attempt(s)`), "attempt count in error message");
     } finally {
-        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        configureReplayRetryBaseMs(undefined);
         globalThis.fetch = orig;
     }
 });
@@ -407,7 +407,7 @@ test("replay retry: fatal 400 (invalid model) → NO retry, fail fast", async ()
 });
 
 test("replay retry: 429 then success → retried", async () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    configureReplayRetryBaseMs(1);
     let fetchCalls = 0;
     const orig = globalThis.fetch;
     globalThis.fetch = (async () => {
@@ -425,7 +425,7 @@ test("replay retry: 429 then success → retried", async () => {
         assert.equal(fetchCalls, 2, "429 retried");
         assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
     } finally {
-        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        configureReplayRetryBaseMs(undefined);
         globalThis.fetch = orig;
     }
 });
@@ -441,33 +441,32 @@ test("isTransientUpstreamError: classifier matrix", () => {
     assert.equal(REPLAY_MAX_ATTEMPTS, 3);
 });
 
-test("replayBackoffMs: exponential from env-tunable base", () => {
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "100";
+test("replayBackoffMs: exponential from config-tunable base (#1714)", () => {
+    configureReplayRetryBaseMs(100);
     try {
         assert.equal(replayBackoffMs(1), 100);
         assert.equal(replayBackoffMs(2), 200);
         assert.equal(replayBackoffMs(3), 400);
     } finally {
-        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        configureReplayRetryBaseMs(undefined);
     }
     assert.equal(replayBackoffMs(1), 1500, "default base is 1500ms");
 });
 
-test("replayMaxAttempts: env-tunable total attempts (1 = legacy no-retry)", () => {
-    for (const [value, expected] of [["1", 1], ["5", 5], ["0", REPLAY_MAX_ATTEMPTS], ["abc", REPLAY_MAX_ATTEMPTS], ["-2", REPLAY_MAX_ATTEMPTS]] as const) {
-        if (value === "abc") delete process.env.BILI_REPLAY_RETRY_MAX;
-        else process.env.BILI_REPLAY_RETRY_MAX = value;
+test("replayMaxAttempts: config-tunable total attempts (1 = legacy no-retry; #1714)", () => {
+    for (const [value, expected] of [[1, 1], [5, 5], [0, REPLAY_MAX_ATTEMPTS], [undefined, REPLAY_MAX_ATTEMPTS], [-2, REPLAY_MAX_ATTEMPTS]] as const) {
+        configureReplayRetryMax(value);
         try {
-            assert.equal(replayMaxAttempts(), expected, `BILI_REPLAY_RETRY_MAX=${value}`);
+            assert.equal(replayMaxAttempts(), expected, `replayRetryMax=${String(value)}`);
         } finally {
-            delete process.env.BILI_REPLAY_RETRY_MAX;
+            configureReplayRetryMax(undefined);
         }
     }
     assert.equal(replayMaxAttempts(), REPLAY_MAX_ATTEMPTS, "default is 3");
 });
 
-test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", async () => {
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
+test("replay retry: replayRetryMax=1 → legacy fail-fast (no retry)", async () => {
+    configureReplayRetryMax(1);
     let fetchCalls = 0;
     const orig = globalThis.fetch;
     globalThis.fetch = (async () => {
@@ -485,7 +484,7 @@ test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", as
         assert.ok(out.includes("upstream error 400"), "error surfaced to client");
         assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single attempt");
     } finally {
-        delete process.env.BILI_REPLAY_RETRY_MAX;
+        configureReplayRetryMax(undefined);
         globalThis.fetch = orig;
     }
 });

@@ -320,13 +320,21 @@ export function resolveProxy(
  *  Keep-Alive hints up to its 600s max, so a reused-just-recycled socket is
  *  the classic "first request after idle dies with ECONNRESET" pattern.
  *  Capping our reuse window BELOW the common recycle cadence trades a few
- *  reconnects for that failure mode. Default 55s; env-tunable; 0 = uncapped
- *  (undici defaults). Read per call so tests tune it live. */
+ *  reconnects for that failure mode. Default 55s; configured from config.json
+ *  `proxyKeepAliveMaxMs` via configureProxyKeepAliveMaxMs; 0 = uncapped
+ *  (undici defaults). Env input BILI_PROXY_KEEPALIVE_MAX_MS retired in #1714. */
 export const PROXY_KEEPALIVE_MAX_MS = 55_000;
 
+let configuredProxyKeepAliveMaxMs: number | undefined;
+export function configureProxyKeepAliveMaxMs(ms?: number): void {
+    configuredProxyKeepAliveMaxMs = ms;
+}
+
 export function proxyKeepAliveMaxMs(): number {
-    const raw = Number(process.env.BILI_PROXY_KEEPALIVE_MAX_MS);
-    return Number.isFinite(raw) && raw < 0 ? PROXY_KEEPALIVE_MAX_MS : raw === 0 ? 0 : Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : PROXY_KEEPALIVE_MAX_MS;
+    const raw = configuredProxyKeepAliveMaxMs;
+    if (raw == null || !Number.isFinite(raw) || raw < 0) return PROXY_KEEPALIVE_MAX_MS;
+    if (raw === 0) return 0;
+    return Math.floor(raw);
 }
 
 /** Proxy dispatchers carry the same timeout policy as direct ones (#551):
@@ -553,4 +561,5 @@ export function _resetUpstreamProxyForTest(): void {
     lastConnection = {};
     windowsProxyCache = undefined;
     warnedUnsupportedSchemes.clear();
+    configuredProxyKeepAliveMaxMs = undefined;
 }

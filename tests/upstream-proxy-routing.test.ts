@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { loadOptions, resolveConfiguredContextLimit, type ProxyOptions, type ProviderRoutes } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
@@ -22,6 +25,7 @@ import {
     unsupportedProxyScheme,
     validateHttpProxy,
 } from "../src/upstream-proxy.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function listen(server: http.Server, port: number = 0): Promise<void> {
     server.listen(port, "127.0.0.1");
@@ -203,33 +207,44 @@ test("proxy precedence, NO_PROXY, HTTPS proxies and self-loop detection are dete
     assert.equal(parseHttpProxy("https://proxy.example:9443")?.protocol, "https:");
 });
 
-test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", () => {
-    const opts = loadOptions({
-        ACP_PORT: "9100",
-        BILI_UPSTREAM_PROXY: "https://explicit.example:9443",
-        HTTPS_PROXY: "http://fallback.example:8080",
-        ALL_PROXY: "http://all.example:8080",
-        NO_PROXY: "localhost,127.0.0.1",
-    });
-    assert.equal(opts.proxy, "https://explicit.example:9443");
-    assert.equal(opts.proxySource, "bili-env");
-    assert.deepEqual(opts.proxyFallback, {
-        httpsProxy: "http://fallback.example:8080",
-        allProxy: "http://all.example:8080",
-        noProxy: "localhost,127.0.0.1",
-        biliPort: 9100,
-        globalSource: "bili-env",
-        explicitDirect: false,
-    });
+test("loadOptions keeps the file-config proxy above environment fallback (#1714)", () => {
+    const root = path.join(tmpdir(), `bili-proxy-routing-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const cfgFile = path.join(root, "billion-context.json");
+    const prevFile = process.env.BILI_CONFIG_FILE;
+    try {
+        process.env.BILI_CONFIG_FILE = cfgFile;
+        writeFileSync(cfgFile, JSON.stringify({ upstreamProxy: "https://explicit.example:9443" }), "utf8");
+        const opts = loadOptions({
+            ACP_PORT: "9100",
+            HTTPS_PROXY: "http://fallback.example:8080",
+            ALL_PROXY: "http://all.example:8080",
+            NO_PROXY: "localhost,127.0.0.1",
+        });
+        assert.equal(opts.proxy, "https://explicit.example:9443");
+        assert.equal(opts.proxySource, "web-manual");
+        assert.deepEqual(opts.proxyFallback, {
+            httpsProxy: "http://fallback.example:8080",
+            allProxy: "http://all.example:8080",
+            noProxy: "localhost,127.0.0.1",
+            biliPort: 9100,
+            globalSource: "web-manual",
+            explicitDirect: false,
+        });
+    } finally {
+        if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
+        rmrf(root);
+    }
 });
 
 test("default (unset mode) is direct, not env auto-detect (#346)", () => {
     const prevConfig = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
     try {
-        // No BILI_UPSTREAM_PROXY_MODE and no BILI_UPSTREAM_PROXY, but HTTPS_PROXY is
-        // set in the environment. Before the #346 fix, unset mode auto-detected the
-        // env proxy; now unset means "direct" (matches the web UI default + ZCode).
+        // No upstreamProxyMode and no upstreamProxy in the config file, but
+        // HTTPS_PROXY is set in the environment. Before the #346 fix, unset mode
+        // auto-detected the env proxy; now unset means "direct" (matches the web
+        // UI default + ZCode).
         const opts = loadOptions({
             ACP_PORT: "9101",
             HTTPS_PROXY: "http://fallback.example:8080",
@@ -246,12 +261,15 @@ test("default (unset mode) is direct, not env auto-detect (#346)", () => {
 });
 
 test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
+    const root = path.join(tmpdir(), `bili-proxy-auto-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const cfgFile = path.join(root, "billion-context.json");
     const prevConfig = process.env.BILI_CONFIG_FILE;
-    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
     try {
+        process.env.BILI_CONFIG_FILE = cfgFile;
+        writeFileSync(cfgFile, JSON.stringify({ upstreamProxyMode: "auto" }), "utf8");
         const opts = loadOptions({
             ACP_PORT: "9102",
-            BILI_UPSTREAM_PROXY_MODE: "auto",
             HTTPS_PROXY: "http://fallback.example:8080",
         });
         assert.equal(opts.proxySource, "auto");
@@ -261,6 +279,7 @@ test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmrf(root);
     }
 });
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, configurePersistZstd } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
@@ -11,8 +11,8 @@ import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
 // These tests inspect raw on-disk session files directly (bypassing the store
-// codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
-process.env.BILI_PERSIST_ZSTD = "0";
+// codec), so pin the plain-JSON format explicitly (zstd is opt-in only).
+configurePersistZstd(false);
 
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */

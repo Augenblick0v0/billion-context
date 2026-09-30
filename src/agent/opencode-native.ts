@@ -162,12 +162,12 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  it: healthy → keep attaching (a transient blip costs nothing — the session
  *  never migrates). DEAD + routed-channel evidence (#1365: /bili/-baked model
  *  traffic was observed at some origin) → the session's context lives at THAT
- *  origin, so wait for the pinned target to come back (bounded by
- *  BILI_ATTACH_HEALTH_DEADLINE_MS) instead of spawning — a second instance
+ *  origin, so wait for the pinned target to come back (bounded by the
+ *  attach health deadline) instead of spawning — a second instance
  *  would serve tools while the model channel stays pinned elsewhere and every
  *  bili tool call 404s against it (unrecoverable split); the env is preserved
  *  so the user's target stays declared. DEAD with no evidence after the grace
- *  window (BILI_ATTACH_EVIDENCE_GRACE_MS) → unfreeze the preset env and fall
+ *  window (the evidence grace constant) → unfreeze the preset env and fall
  *  back to spawning our own proxy (instance discovery may find another
  *  healthy one first), re-arming respawn as a pure spawn for subsequent
  *  deaths. Resolves to the origin the client should use — the (recovered)

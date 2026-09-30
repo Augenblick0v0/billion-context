@@ -72,31 +72,56 @@ test("writeZonePort: rejects invalid ports and never throws", () => {
     }
 });
 
-test("lanePreferredPort: sticky record beats the base; base honors BILI_ZONE_PORT", () => {
+function withZonePortConfig(zonePort: unknown, fn: () => void): void {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-zone-cfg-"));
+    const cfg = path.join(dir, "config.json");
+    writeFileSync(cfg, JSON.stringify(zonePort === undefined ? {} : { zonePort }), "utf8");
+    const previous = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = cfg;
+    try {
+        fn();
+    } finally {
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+test("lanePreferredPort: sticky record beats the base; base honors config zonePort (#1714)", () => {
     const file = zoneFile();
     try {
-        assert.equal(lanePreferredPort("zcode", { BILI_ZONE_PORT: "20000" }), 20000, "env override of the base");
+        withZonePortConfig(20000, () => {
+            assert.equal(lanePreferredPort("zcode", file), 20000, "config-file override of the base");
+        });
         writeZonePort("zcode", 18788, file);
-        // sticky lives in the DEFAULT state file — patch readZonePort's view by
-        // pointing the default path at the temp file via the module seam: the
-        // function reads portZoneFilePath() when no file is passed, so drive
-        // the two-arg forms directly for the composed semantics instead.
+        // sticky lives in the DEFAULT state file — the function reads
+        // portZoneFilePath() when no file is passed, so drive the two-arg
+        // forms directly for the composed semantics instead.
         assert.equal(readZonePort("zcode", file), 18788, "sticky present in the temp zone file");
-        assert.equal(lanePreferredPort("zcode", {}), ZONE_PORT_BASE, "default base without a sticky record (real state file untouched in tests)");
+        withZonePortConfig(undefined, () => {
+            assert.equal(lanePreferredPort("zcode", file), 18788, "sticky record wins over the default base");
+            const empty = zoneFile();
+            try {
+                assert.equal(lanePreferredPort("other", empty), ZONE_PORT_BASE, "no sticky → default base (real state file untouched in tests)");
+            } finally {
+                rmSync(path.dirname(empty), { recursive: true, force: true });
+            }
+        });
     } finally {
         rmSync(path.dirname(file), { recursive: true, force: true });
     }
 });
 
-test("resolveZonePortBase: BILI_ZONE_PORT validated 1..65535, junk falls back to the default", () => {
+test("resolveZonePortBase: config zonePort validated as integer 1..65535, junk falls back to the default (#1714)", () => {
     assert.equal(ZONE_PORT_BASE, 18787, "the zone base sits below the Linux ephemeral range (32768-60999)");
-    assert.equal(resolveZonePortBase({}), ZONE_PORT_BASE);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "20000" }), 20000);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "1" }), 1);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "65535" }), 65535);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "0" }), ZONE_PORT_BASE);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "65536" }), ZONE_PORT_BASE);
-    assert.equal(resolveZonePortBase({ BILI_ZONE_PORT: "not-a-port" }), ZONE_PORT_BASE);
+    withZonePortConfig(undefined, () => assert.equal(resolveZonePortBase(), ZONE_PORT_BASE));
+    withZonePortConfig(20000, () => assert.equal(resolveZonePortBase(), 20000));
+    withZonePortConfig(1, () => assert.equal(resolveZonePortBase(), 1));
+    withZonePortConfig(65535, () => assert.equal(resolveZonePortBase(), 65535));
+    withZonePortConfig(0, () => assert.equal(resolveZonePortBase(), ZONE_PORT_BASE));
+    withZonePortConfig(65536, () => assert.equal(resolveZonePortBase(), ZONE_PORT_BASE));
+    withZonePortConfig(1.5, () => assert.equal(resolveZonePortBase(), ZONE_PORT_BASE));
+    withZonePortConfig("20000", () => assert.equal(resolveZonePortBase(), ZONE_PORT_BASE));
 });
 
 test("portZoneFilePath: lives in the state dir", () => {
@@ -200,7 +225,7 @@ function makeZoneSim(zoneFile: string, lane: string) {
         registerWatcher: async () => "ok" as const,
         sleep: () => Promise.resolve(),
         scriptPath: ZONE_FP_SCRIPT,
-        zonePreferredPort: (l: string) => lanePreferredPort(l, {}, zoneFile),
+        zonePreferredPort: (l: string) => lanePreferredPort(l, zoneFile),
         writeZonePort: (l: string, port: number) => {
             sim.settles.push([l, port]);
             writeZonePort(l, port, zoneFile);

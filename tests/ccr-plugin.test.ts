@@ -19,11 +19,12 @@ import path from "node:path";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
-process.env.BILI_PERSIST = "0";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistEnabled } from "../src/persist.ts";
+
+configurePersistEnabled(false);
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";

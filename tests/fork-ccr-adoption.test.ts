@@ -30,13 +30,13 @@ import {
     storeEffectiveCcr,
 } from "../src/store.ts";
 import { dropSessionForGc, getSession, type Session } from "../src/session.ts";
-import { getStore, SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getStore, SessionStore, _setStoreForTest, configurePersistEnabled } from "../src/persist.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-process.env.BILI_PERSIST = "0";
+configurePersistEnabled(false);
 
 const LIMIT = 200_000;
 const META = { protocol: "openai" as const, upstreamOrigin: "http://upstream.example/v1" };

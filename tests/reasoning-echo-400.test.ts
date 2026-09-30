@@ -11,10 +11,11 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { configureDump4xx } from "../src/error-dump.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #762 e2e: a client-originated (main-path) 400 whose body mentions
-// reasoning_content must (a) be persisted when BILI_DUMP_4XX=1, (b) learn
+// reasoning_content must (a) be persisted when dump4xx is on, (b) learn
 // strictReasoningEcho on the session — the loop-only learner never sees these
 // — and (c) make the NEXT request forward a normalized body where every
 // assistant tool-call message carries a reasoning_content field. The relay
@@ -96,7 +97,7 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
     const seenBodies: string[] = [];
     let n = 0;
     try {
-        process.env.BILI_DUMP_4XX = "1";
+        configureDump4xx(true);
         process.env.ACP_DUMP_DIR = dumpDir;
         const { proxy, upstream, proxyPort, upstreamPort } = await startHarness(captured, (bodyText, res) => {
             seenBodies.push(bodyText);
@@ -165,7 +166,7 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
             await close(upstream);
         }
     } finally {
-        delete process.env.BILI_DUMP_4XX;
+        configureDump4xx(false);
         delete process.env.ACP_DUMP_DIR;
         setLogCapture(null);
         rmrf(dumpDir);
@@ -175,7 +176,7 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
 test("#762: dump stays off by default even on 4xx", async () => {
     const captured: Captured[] = [];
     const dumpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-re400-off-"));
-    delete process.env.BILI_DUMP_4XX;
+    configureDump4xx(false);
     try {
         process.env.ACP_DUMP_DIR = dumpDir;
         const { proxy, upstream, proxyPort, upstreamPort } = await startHarness(captured, (_bodyText, res) => {

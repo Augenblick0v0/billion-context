@@ -277,10 +277,16 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
 /** #1365: poll the attach liveness probe until it answers or the deadline
  *  passes. Returns the origin when it is (or comes back) healthy, undefined
  *  on timeout — callers must fail LOUDLY then, never spawn a replacement the
- *  pinned model channel cannot follow. BILI_ATTACH_HEALTH_DEADLINE_MS keeps
- *  slow lifeline restarts from tripping a hard-coded bound; unset = default. */
+ *  pinned model channel cannot follow. configureAttachHealthDeadlineMs()
+ *  keeps slow lifeline restarts from tripping a hard-coded bound; unset =
+ *  default (the env input was retired in #1714). */
+let healthDeadlineOverrideMs: number | undefined;
+export function configureAttachHealthDeadlineMs(ms: number | undefined): void {
+    healthDeadlineOverrideMs = ms;
+}
+
 export async function waitForProxyVersion(proxyBase: string): Promise<string | undefined> {
-    const limit = envMillis(process.env, "BILI_ATTACH_HEALTH_DEADLINE_MS", ATTACH_HEALTH_DEADLINE_MS);
+    const limit = healthDeadlineOverrideMs ?? ATTACH_HEALTH_DEADLINE_MS;
     const startedAt = Date.now();
     for (;;) {
         const version = await fetchProxyVersion(proxyBase).catch(() => undefined);

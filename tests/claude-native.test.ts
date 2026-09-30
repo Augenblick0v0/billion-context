@@ -147,12 +147,13 @@ test("isBiliClaudeBaseUrl: only loopback /bili/ wraps match", () => {
 
 test("claudeNativeBaseUrl: default wraps api.anthropic.com; BILI_CLAUDE_UPSTREAM wraps the relay", () => {
     const prev = process.env.BILI_CLAUDE_UPSTREAM;
-    const prevPort = process.env.BILI_CLAUDE_NATIVE_PORT;
+    const prevCfg = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nativeurl-"));
+    process.env.XDG_CONFIG_HOME = dir;
     try {
         delete process.env.BILI_CLAUDE_UPSTREAM;
-        delete process.env.BILI_CLAUDE_NATIVE_PORT;
-        // #1660: no explicit override → the claude lane's zone preference
-        // (sticky record > 18787 base) — readZonePort has no record in tests.
+        // #1660: no explicit override (empty config) → the claude lane's zone
+        // preference (sticky record > 18787 base) — readZonePort has no record in tests.
         assert.equal(claudeNativeBaseUrl().includes(`/bili/https://api.anthropic.com`), true);
         assert.equal(claudeNativeBaseUrl(), `http://127.0.0.1:${ZONE_PORT_BASE}/bili/https://api.anthropic.com`);
         process.env.BILI_CLAUDE_UPSTREAM = "https://relay.example/";
@@ -160,8 +161,9 @@ test("claudeNativeBaseUrl: default wraps api.anthropic.com; BILI_CLAUDE_UPSTREAM
     } finally {
         if (prev === undefined) delete process.env.BILI_CLAUDE_UPSTREAM;
         else process.env.BILI_CLAUDE_UPSTREAM = prev;
-        if (prevPort === undefined) delete process.env.BILI_CLAUDE_NATIVE_PORT;
-        else process.env.BILI_CLAUDE_NATIVE_PORT = prevPort;
+        if (prevCfg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevCfg;
+        rmrf(dir);
     }
 });
 
@@ -180,29 +182,21 @@ test("unwrapBiliBaseUrl: strips any loopback-port wrapper; foreign values untouc
     assert.equal(unwrapBiliBaseUrl("http://127.0.0.1:8787/v1"), undefined);
 });
 
-test("resolveClaudeNativePort: env only, undefined without an explicit override (#1660)", () => {
-    assert.equal(resolveClaudeNativePort({}), undefined);
-    assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "49999" }), 49999);
-    assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "0" }), undefined);
-    assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "not-a-number" }), undefined);
-});
-
-// #1335: the attach-gate escape hatch — env BILI_NATIVE_ATTACH_EXTERNAL wins
-// over the config file's native.attachExternal; the file value must be exactly
-// true (garbage leaves the gate closed); default false.
-test("resolveNativeAttachExternal: env parsing (1/true open, 0/false close, junk falls through)", () => {
+test("resolveClaudeNativePort: config claude.nativePort; undefined without an explicit override (#1660)", () => {
     const prev = process.env.XDG_CONFIG_HOME;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claudenatport-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
     process.env.XDG_CONFIG_HOME = dir;
     try {
-        assert.equal(resolveNativeAttachExternal({}), false, "no env, no file → gate closed");
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "" }), false, "blank env falls through to file");
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "1" }), true);
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "true" }), true);
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: " TRUE " }), true, "case-insensitive and trimmed");
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false);
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "false" }), false);
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "yes" }), false, "junk env is not a truthy answer");
+        assert.equal(resolveClaudeNativePort(), undefined, "absent file → undefined");
+        fs.writeFileSync(cfgFile, JSON.stringify({ claude: { nativePort: 49999 } }));
+        assert.equal(resolveClaudeNativePort(), 49999);
+        fs.writeFileSync(cfgFile, JSON.stringify({ claude: { nativePort: 0 } }));
+        assert.equal(resolveClaudeNativePort(), undefined, "0 out of range → undefined");
+        fs.writeFileSync(cfgFile, JSON.stringify({ claude: { nativePort: "not-a-number" } }));
+        assert.equal(resolveClaudeNativePort(), undefined, "non-integer value → undefined");
     } finally {
         if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prev;
@@ -210,7 +204,10 @@ test("resolveNativeAttachExternal: env parsing (1/true open, 0/false close, junk
     }
 });
 
-test("resolveNativeAttachExternal: file native.attachExternal requires exact true; env still wins", () => {
+// #1335/#1714: the attach-gate escape hatch is file-only now (the env input
+// was retired) — native.attachExternal must be exactly true (garbage leaves
+// the gate closed); default false.
+test("resolveNativeAttachExternal: config native.attachExternal opens only on exact boolean true", () => {
     const prev = process.env.XDG_CONFIG_HOME;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
     const cfgDir = path.join(dir, "billion-context");
@@ -218,18 +215,39 @@ test("resolveNativeAttachExternal: file native.attachExternal requires exact tru
     const cfgFile = path.join(cfgDir, "billion-context.json");
     process.env.XDG_CONFIG_HOME = dir;
     try {
+        assert.equal(resolveNativeAttachExternal(), false, "no file → gate closed");
         fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: true } }));
-        assert.equal(resolveNativeAttachExternal({}), true, "file opens the gate");
-        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false, "env 0 overrides a permissive file");
+        assert.equal(resolveNativeAttachExternal(), true, "boolean true opens the gate");
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: 1 } }));
+        assert.equal(resolveNativeAttachExternal(), false, "number 1 is not a boolean true");
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: "yes" } }));
+        assert.equal(resolveNativeAttachExternal(), false, "junk leaves the gate closed");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        rmrf(dir);
+    }
+});
+
+test("resolveNativeAttachExternal: file native.attachExternal requires exact true", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-file-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: true } }));
+        assert.equal(resolveNativeAttachExternal(), true, "file opens the gate");
 
         fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: "true" } }));
-        assert.equal(resolveNativeAttachExternal({}), false, "string 'true' in the file is not a boolean true");
+        assert.equal(resolveNativeAttachExternal(), false, "string 'true' in the file is not a boolean true");
 
         fs.writeFileSync(cfgFile, "{ not json");
-        assert.equal(resolveNativeAttachExternal({}), false, "malformed file degrades to gate-closed, never throws");
+        assert.equal(resolveNativeAttachExternal(), false, "malformed file degrades to gate-closed, never throws");
 
         fs.rmSync(cfgFile);
-        assert.equal(resolveNativeAttachExternal({}), false, "absent file → default false");
+        assert.equal(resolveNativeAttachExternal(), false, "absent file → default false");
     } finally {
         if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prev;
@@ -240,15 +258,28 @@ test("resolveNativeAttachExternal: file native.attachExternal requires exact tru
 // — hook planner ————————————————————————————————————————————
 
 test("planClaudeNativeBootstrap: launcher-owned / opt-out / start", () => {
-    assert.deepEqual(planClaudeNativeBootstrap({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:39000" }).action, "exit");
-    assert.deepEqual(planClaudeNativeBootstrap({ BILI_PROVIDER_REWRITES: "x" }).action, "exit");
-    assert.deepEqual(planClaudeNativeBootstrap({ BILI_NATIVE_CLAUDE: "0" }).action, "passthrough");
-    assert.deepEqual(planClaudeNativeBootstrap({ BILLION_CONTEXT_PLUGIN: "0" }).action, "passthrough");
-    // #1660: no explicit override → zone preference, non-strict launch.
-    const start = planClaudeNativeBootstrap({});
-    assert.deepEqual(start, { action: "start", port: ZONE_PORT_BASE, strict: false });
-    // explicit override → same port, strict-port (#964 preserved).
-    assert.deepEqual(planClaudeNativeBootstrap({ BILI_CLAUDE_NATIVE_PORT: "49999" }), { action: "start", port: 49999, strict: true });
+    const prevCfg = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-planstrict-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.deepEqual(planClaudeNativeBootstrap({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:39000" }).action, "exit");
+        assert.deepEqual(planClaudeNativeBootstrap({ BILI_PROVIDER_REWRITES: "x" }).action, "exit");
+        assert.deepEqual(planClaudeNativeBootstrap({ BILI_NATIVE_CLAUDE: "0" }).action, "passthrough");
+        assert.deepEqual(planClaudeNativeBootstrap({ BILLION_CONTEXT_PLUGIN: "0" }).action, "passthrough");
+        // #1660: no explicit override (empty config) → zone preference, non-strict launch.
+        const start = planClaudeNativeBootstrap({});
+        assert.deepEqual(start, { action: "start", port: ZONE_PORT_BASE, strict: false });
+        // explicit override (config claude.nativePort) → same port, strict-port (#964 preserved).
+        fs.writeFileSync(cfgFile, JSON.stringify({ claude: { nativePort: 49999 } }));
+        assert.deepEqual(planClaudeNativeBootstrap({}), { action: "start", port: 49999, strict: true });
+    } finally {
+        if (prevCfg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevCfg;
+        rmrf(dir);
+    }
 });
 
 // — claude host pid resolution (parent-gone regression) —————————————————
@@ -718,28 +749,31 @@ test("installer preserves foreign settings.json keys end-to-end", () => {
     }
 });
 
-test("install with an explicit port bakes it; without env the hook rides the zone (#1660)", () => {
+test("install with an explicit port bakes it; without config the hook rides the zone (#1660)", () => {
     const prevDir = process.env.CLAUDE_CONFIG_DIR;
     const prevCfg = process.env.BILI_CONFIG_FILE;
     const prevClaude = process.env.CLAUDE;
     const prevOpt = process.env.BILI_NATIVE_CLAUDE;
-    const prevPortEnv = process.env.BILI_CLAUDE_NATIVE_PORT;
     const box = sandbox();
     try {
         delete process.env.BILI_NATIVE_CLAUDE;
         process.env.CLAUDE = fakeClaude(box.dir);
         // Live failure shape (#964): install with an explicit port, then
-        // claude later runs the hook WITHOUT that env (claude does not inject
-        // its settings.env into hook children). #1660: there is no persisted
-        // copy anymore — without the env the hook resolves the zone
-        // preference (non-strict), and its SessionStart repin pass rewrites
-        // the baked URL to the live origin so the two can never stay desynced.
-        process.env.BILI_CLAUDE_NATIVE_PORT = "49999";
+        // claude later runs the hook WITHOUT that config (claude does not
+        // inject bili's config into hook children). #1660: there is no
+        // persisted copy anymore — without the config the hook resolves the
+        // zone preference (non-strict), and its SessionStart repin pass
+        // rewrites the baked URL to the live origin so the two can never
+        // stay desynced.
+        const portCfg = path.join(box.dir, "config.json");
+        fs.writeFileSync(portCfg, JSON.stringify({ claude: { nativePort: 49999 } }));
+        process.env.BILI_CONFIG_FILE = portCfg;
         pluginInstall("claude");
         const settings = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string> };
         assert.equal(settings.env?.ANTHROPIC_BASE_URL, baseUrlForPort(49999));
         assert.equal(fs.existsSync(box.biliConfig), false, "no claude.nativePort persisted anymore");
-        delete process.env.BILI_CLAUDE_NATIVE_PORT;
+        if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevCfg;
         // plan on a SANITIZED env copy: the dev/CI harness may itself run under
         // a bili proxy (BILLION_CONTEXT_PROXY / BILI_PROVIDER_REWRITES force
         // "exit"), and a fresh XDG_STATE_HOME keeps the zone preference at the
@@ -749,7 +783,7 @@ test("install with an explicit port bakes it; without env the hook rides the zon
         delete planEnv.BILI_PROVIDER_REWRITES;
         delete planEnv.BILI_NATIVE_CLAUDE;
         delete planEnv.BILLION_CONTEXT_PLUGIN;
-        assert.deepEqual(planClaudeNativeBootstrap(planEnv), { action: "start", port: ZONE_PORT_BASE, strict: false }, "hook (no env) rides the zone, non-strict");
+        assert.deepEqual(planClaudeNativeBootstrap(planEnv), { action: "start", port: ZONE_PORT_BASE, strict: false }, "hook (no config) rides the zone, non-strict");
         pluginRemove("claude");
         assert.equal(claudeNativeInstalled(), false);
     } finally {
@@ -758,8 +792,6 @@ test("install with an explicit port bakes it; without env the hook rides the zon
         else process.env.CLAUDE = prevClaude;
         if (prevOpt === undefined) delete process.env.BILI_NATIVE_CLAUDE;
         else process.env.BILI_NATIVE_CLAUDE = prevOpt;
-        if (prevPortEnv === undefined) delete process.env.BILI_CLAUDE_NATIVE_PORT;
-        else process.env.BILI_CLAUDE_NATIVE_PORT = prevPortEnv;
     }
 });
 
@@ -917,6 +949,8 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
     // covered without each one remembering to pass a tmp dir.
     const tmp = path.join(xdg.home, "tmp");
     fs.mkdirSync(tmp, { recursive: true });
+    fs.mkdirSync(xdg.config, { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [distScript], {
             env: {
@@ -926,7 +960,6 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
                 XDG_STATE_HOME: xdg.state,
                 XDG_CACHE_HOME: xdg.cache,
                 XDG_DATA_HOME: xdg.data,
-                BILI_CLAUDE_NATIVE_PORT: String(port),
                 NO_COLOR: "1",
                 TMPDIR: tmp,
                 TEMP: tmp,
@@ -1119,6 +1152,8 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
+    fs.mkdirSync(xdg.config, { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const claudeProc = spawn(claudeBin, [], {
         env: {
             PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -1127,7 +1162,6 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
             XDG_STATE_HOME: xdg.state,
             XDG_CACHE_HOME: xdg.cache,
             XDG_DATA_HOME: xdg.data,
-            BILI_CLAUDE_NATIVE_PORT: String(port),
             NO_COLOR: "1",
             TMPDIR: tmp,
             TEMP: tmp,
@@ -1288,6 +1322,8 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
     const port = await freePort();
+    fs.mkdirSync(xdg.config, { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1328,7 +1364,7 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
             { mode: 0o755 },
         );
         claudePid = spawn(claudeBin, [], {
-            env: { ...baseEnv, BILI_CLAUDE_NATIVE_PORT: String(port), HOOK_CMD: `"${process.execPath}" "${distScript}"`, HOOK_ERRFILE: errFile, HOOK_DONE: doneFile },
+            env: { ...baseEnv, HOOK_CMD: `"${process.execPath}" "${distScript}"`, HOOK_ERRFILE: errFile, HOOK_DONE: doneFile },
             detached: true,
             stdio: "ignore",
         }).pid ?? 0;
@@ -1386,6 +1422,8 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
+    fs.mkdirSync(xdg.config, { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const sessionEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1393,7 +1431,6 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
         XDG_STATE_HOME: xdg.state,
         XDG_CACHE_HOME: xdg.cache,
         XDG_DATA_HOME: xdg.data,
-        BILI_CLAUDE_NATIVE_PORT: String(port),
         NO_COLOR: "1",
         TMPDIR: tmp,
         TEMP: tmp,

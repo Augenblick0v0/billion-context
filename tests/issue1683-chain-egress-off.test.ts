@@ -14,9 +14,9 @@ import { evaluateChain, stampOutbound } from "../src/chain-checkpoint.ts";
  *  (trailing user message on openai/responses, trailing text part on
  *  anthropic/google), so models read it as phantom user input and burn tokens
  *  commenting on it. Fix: BOTH body-marker heuristics are OFF by default —
- *  egress stamping behind the `chainEgressStamp` opt-in (env BILI_CHAIN_STAMP)
- *  and inbound body-content detection behind `chainContentDetection` (env
- *  BILI_CHAIN_CONTENT); by default ONLY the x-bili-hop header drives chain
+ *  egress stamping behind the `chainEgressStamp` config.json opt-in and
+ *  inbound body-content detection behind the `chainContentDetection` field;
+ *  by default ONLY the x-bili-hop header drives chain
  *  recognition, since scanning the body can false-positive on CCR/file-introduced
  *  text and model-echoed tags. These tests pin the contract:
  *  - default opts → a processed outbound carries NO carrier (openai + google);

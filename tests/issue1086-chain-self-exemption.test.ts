@@ -410,8 +410,8 @@ test("#1086 T4: chainContentDetection=false disables the content fallback entire
     }
 });
 
-test("#1100 T6: BILI_PERSIST=0 + restart ⇒ replayed own session is processed, not permanently passed through", async () => {
-    // Post-restart shape: store disabled (BILI_PERSIST=0) and memory cleared, so this
+test("#1100 T6: persistence disabled + restart ⇒ replayed own session is processed, not permanently passed through", async () => {
+    // Post-restart shape: store disabled (persistence off) and memory cleared, so this
     // instance cannot prove ownership of the ACP artifacts the client re-sends. Pre-#1100
     // that read as "chain" → passthrough forever (#1086 symptom); it must be processed.
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -591,7 +591,7 @@ test("#1086 T5 liveness: plain-client chat session keeps compressing as it grows
 // #1101 (F2 of the #1090 deep review): three real paths were never exercised
 // by the tests above — the disk branch of hasProcessedState
 // (src/session.ts:342-343, "covers the auto-update restart"), the
-// BILI_CHAIN_CONTENT env parse (src/config.ts), and the warn-set FIFO
+// chainContentDetection file parse (src/config.ts), and the warn-set FIFO
 // eviction (src/server.ts). These close those gaps.
 
 test("#1101 T7: persisted own state survives a simulated restart — disk branch of hasProcessedState", async () => {
@@ -710,26 +710,25 @@ test("#1101 T8: warn-set FIFO evicts the oldest session once past the cap", asyn
     }
 });
 
-test("#1101 T9: BILI_CHAIN_CONTENT env parse — default OFF, 1 enables, env wins over file", async () => {
-    const root = path.join(tmpdir(), `bili-chain-env-${process.pid}-${Date.now()}`);
+test("#1101 T9: chainContentDetection file parse — default OFF, true enables (#1714: env retired)", async () => {
+    const root = path.join(tmpdir(), `bili-chain-content-${process.pid}-${Date.now()}`);
     mkdirSync(root, { recursive: true });
     const cfgFile = path.join(root, "billion-context.json");
     const prevFile = process.env.BILI_CONFIG_FILE;
     try {
         process.env.BILI_CONFIG_FILE = cfgFile;
         assert.equal(loadOptions({}).chainContentDetection, false, "default OFF when nothing is configured (#1683: header-only recognition)");
-        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "1" }).chainContentDetection, true, "BILI_CHAIN_CONTENT=1 enables body-content detection");
-        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "0" }).chainContentDetection, false, "BILI_CHAIN_CONTENT=0 keeps it off");
         writeFileSync(cfgFile, JSON.stringify({ chainContentDetection: true }), "utf8");
-        assert.equal(loadOptions({}).chainContentDetection, true, "file chainContentDetection=true enables it");
-        assert.equal(loadOptions({ BILI_CHAIN_CONTENT: "0" }).chainContentDetection, false, "env =0 wins over file true");
+        assert.equal(loadOptions({}).chainContentDetection, true, "file chainContentDetection=true enables body-content detection");
+        writeFileSync(cfgFile, JSON.stringify({ chainContentDetection: false }), "utf8");
+        assert.equal(loadOptions({}).chainContentDetection, false, "file chainContentDetection=false keeps it off");
     } finally {
         if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
         rmrf(root);
     }
 });
 
-test("#1683 T9b: BILI_CHAIN_STAMP env parse — default OFF, 1 enables, env wins over file", async () => {
+test("#1683 T9b: chainEgressStamp file parse — default OFF, true enables (#1714: env retired)", async () => {
     const root = path.join(tmpdir(), `bili-chain-stamp-${process.pid}-${Date.now()}`);
     mkdirSync(root, { recursive: true });
     const cfgFile = path.join(root, "billion-context.json");
@@ -737,11 +736,10 @@ test("#1683 T9b: BILI_CHAIN_STAMP env parse — default OFF, 1 enables, env wins
     try {
         process.env.BILI_CONFIG_FILE = cfgFile;
         assert.equal(loadOptions({}).chainEgressStamp, false, "default OFF when nothing is configured");
-        assert.equal(loadOptions({ BILI_CHAIN_STAMP: "1" }).chainEgressStamp, true, "BILI_CHAIN_STAMP=1 enables egress stamping");
-        assert.equal(loadOptions({ BILI_CHAIN_STAMP: "0" }).chainEgressStamp, false, "BILI_CHAIN_STAMP=0 keeps it off");
         writeFileSync(cfgFile, JSON.stringify({ chainEgressStamp: true }), "utf8");
-        assert.equal(loadOptions({}).chainEgressStamp, true, "file chainEgressStamp=true enables it");
-        assert.equal(loadOptions({ BILI_CHAIN_STAMP: "0" }).chainEgressStamp, false, "env =0 wins over file true");
+        assert.equal(loadOptions({}).chainEgressStamp, true, "file chainEgressStamp=true enables egress stamping");
+        writeFileSync(cfgFile, JSON.stringify({ chainEgressStamp: false }), "utf8");
+        assert.equal(loadOptions({}).chainEgressStamp, false, "file chainEgressStamp=false keeps it off");
     } finally {
         if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
         rmrf(root);

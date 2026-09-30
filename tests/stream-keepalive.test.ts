@@ -6,7 +6,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, beginStreamKeepalive, type ProxyOptions } from "../src/server.ts";
+import { startServer, beginStreamKeepalive, configureStreamKeepaliveMs, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -64,7 +64,7 @@ async function startUpstream(mode: "slow" | "fast", silenceMs: number): Promise<
     return { port: srv.address().port, server: srv };
 }
 
-async function startHarness(upstreamPort: number): Promise<Harness> {
+async function startHarness(upstreamPort: number, streamKeepAliveMs?: number): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -82,6 +82,7 @@ async function startHarness(upstreamPort: number): Promise<Harness> {
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        ...(streamKeepAliveMs !== undefined ? { streamKeepAliveMs } : {}),
     } as ProxyOptions);
     await once(proxy, "listening");
     return {
@@ -110,9 +111,8 @@ async function readStream(url: string, sessionId: string): Promise<{ status: num
 const countOccurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
 
 test("#1647 slow prefill: keep-alive comments hold the client through ping-only silence", async () => {
-    process.env.BILI_STREAM_KEEPALIVE_MS = "300";
     const up = await startUpstream("slow", 1000);
-    const h = await startHarness(up.port);
+    const h = await startHarness(up.port, 300);
     try {
         const { status, raw } = await readStream(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`, "keepalive-slow");
         assert.equal(status, 200);
@@ -127,7 +127,6 @@ test("#1647 slow prefill: keep-alive comments hold the client through ping-only 
         assert.ok(raw.includes('"finish_reason":"stop"'), "final chunk lost:\n" + raw);
         assert.ok(raw.includes("[DONE]"), "[DONE] missing:\n" + raw);
     } finally {
-        delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
         await once(up.server, "close");
@@ -136,9 +135,8 @@ test("#1647 slow prefill: keep-alive comments hold the client through ping-only 
 });
 
 test("#1647 fast stream: no spurious keep-alive injection", async () => {
-    process.env.BILI_STREAM_KEEPALIVE_MS = "300";
     const up = await startUpstream("fast", 0);
-    const h = await startHarness(up.port);
+    const h = await startHarness(up.port, 300);
     try {
         const { status, raw } = await readStream(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`, "keepalive-fast");
         assert.equal(status, 200);
@@ -146,7 +144,6 @@ test("#1647 fast stream: no spurious keep-alive injection", async () => {
         assert.ok(raw.includes("[DONE]"));
         assert.equal(countOccurrences(raw, KEEPALIVE_LINE), 0, "healthy fast stream received injected keep-alives:\n" + raw);
     } finally {
-        delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
         await once(up.server, "close");
@@ -154,17 +151,15 @@ test("#1647 fast stream: no spurious keep-alive injection", async () => {
     }
 });
 
-test("#1647 BILI_STREAM_KEEPALIVE_MS=0 disables the hold", async () => {
-    process.env.BILI_STREAM_KEEPALIVE_MS = "0";
+test("#1647 streamKeepAliveMs=0 disables the hold (#1714)", async () => {
     const up = await startUpstream("slow", 500);
-    const h = await startHarness(up.port);
+    const h = await startHarness(up.port, 0);
     try {
         const { status, raw } = await readStream(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`, "keepalive-off");
         assert.equal(status, 200);
         assert.ok(raw.includes("[DONE]"));
         assert.equal(countOccurrences(raw, KEEPALIVE_LINE), 0, "hold should be disabled with 0:\n" + raw);
     } finally {
-        delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
         await once(up.server, "close");
@@ -199,7 +194,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 
 test("#1647 line-boundary guard: keep-alive never splices into a partial SSE line", async () => {
-    process.env.BILI_STREAM_KEEPALIVE_MS = "60";
+    configureStreamKeepaliveMs(60);
     const { res, chunks } = makeStubRes();
     beginStreamKeepalive(res as unknown as import("node:http").ServerResponse, "unit-boundary", () => {});
     try {
@@ -238,7 +233,7 @@ test("#1647 line-boundary guard: keep-alive never splices into a partial SSE lin
             }
         }
     } finally {
-        delete process.env.BILI_STREAM_KEEPALIVE_MS;
+        configureStreamKeepaliveMs(undefined);
         (res as unknown as { emit(e: string): boolean }).emit("close");
     }
 });

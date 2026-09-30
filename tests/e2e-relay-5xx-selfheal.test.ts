@@ -7,9 +7,10 @@ process.env.NODE_ENV = "test";
 // #1688: these scenarios assert the single-attempt network-failure shape (first
 // socket drop → immediate 502 → arm); pin the legacy no-retry budget so the
 // first drop still surfaces as 502 instead of being transparently replayed.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
+configureReplayRetryMax(1);
 
 import { defaultConfig } from "acp-kernel";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";

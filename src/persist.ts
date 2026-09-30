@@ -35,10 +35,13 @@ import type { WireProtocol } from "./util.js";
  *    debounced writes keep the on-disk state within ~debounce of in-memory.
  *  - Forward-compat: `mergeState` fills any fields missing on a file written
  *    by an older version, so a schema change never breaks old files.
- *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
+ *  - Disable with configurePersistEnabled(false) (config.json `persistEnabled`;
+ *    env input BILI_PERSIST retired in #1714) for ephemeral/test runs.
  *  - Storage encoding at rest: via the kernel store's codec hook, every file
- *    is optionally zstd-compressed when BILI_PERSIST_ZSTD=1/true (default
- *    off — plain JSON; #1080, BILIZSTD1 envelope) and, independently,
+ *    is optionally zstd-compressed when configurePersistZstd(true) sets it
+ *    (config.json `persistZstd`; env input BILI_PERSIST_ZSTD retired in
+ *    #1714; default off — plain JSON; #1080, BILIZSTD1 envelope) and,
+ *    independently,
  *    AES-256-GCM-encrypted when
  *    BILI_ENCRYPTION_KEY (hex/base64, exactly 32 bytes) is set (#708,
  *    BILIENC1 envelope) — the body-mode byte records compression even inside
@@ -142,7 +145,9 @@ interface PersistedSession {
     blockContents: Record<string, BlockContent>;
     /** Latest folded-view conversation snapshot (v3+): prune() rendered
      *  summaries in place of folded ranges, then truncated to the newest
-     *  BILI_PERSIST_TAIL_TOKENS tokens (#401) — the raw full history is NOT
+     *  persistTailTokens() budget (#401; configurePersistTailTokens from
+     *  config.json — env input BILI_PERSIST_TAIL_TOKENS retired in #1714) —
+     *  the raw full history is NOT
      *  persisted (it duplicated 63% of the corpus; originals of folded
      *  ranges remain available offline via blockContents). Absent on v2
      *  files and when the tail budget is 0 — export falls back to
@@ -798,28 +803,36 @@ function defaultDir(): string {
     return sessionsDir();
 }
 
+// #1714 P1: these knobs moved from env vars to config.json — set once at
+// startup via the exported setters; the resolvers read module state.
+let configuredPersistDebounceMs: number | undefined;
+export function configurePersistDebounceMs(ms?: number): void {
+    configuredPersistDebounceMs = ms;
+}
 function defaultDebounce(): number {
-    const env = process.env.BILI_PERSIST_DEBOUNCE_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 500;
+    const v = configuredPersistDebounceMs;
+    return v != null && Number.isFinite(v) && v >= 0 ? v : 500;
 }
 
+let configuredPersistEnabled = true;
+export function configurePersistEnabled(enabled: boolean): void {
+    configuredPersistEnabled = enabled;
+}
 function persistEnabled(): boolean {
-    const env = process.env.BILI_PERSIST;
-    if (env === "0" || env === "false") return false;
-    return true;
+    return configuredPersistEnabled;
 }
 
 /** #1080 (owner decision): session files stay plain JSON by default —
  *  recoverability (jq/grep-debuggable, no downgrade tail risk) beats silent
- *  disk savings. Only BILI_PERSIST_ZSTD=1/true opts into zstd (BILIZSTD1);
- *  anything else (0/false/unset) keeps plain JSON. */
+ *  disk savings. Only configurePersistZstd(true) (config.json `persistZstd`)
+ *  opts into zstd (BILIZSTD1); anything else keeps plain JSON. Env input
+ *  BILI_PERSIST_ZSTD retired in #1714. */
+let configuredPersistZstd = false;
+export function configurePersistZstd(enabled: boolean): void {
+    configuredPersistZstd = enabled;
+}
 function persistZstdEnabled(): boolean {
-    const env = process.env.BILI_PERSIST_ZSTD;
-    return env === "1" || env === "true";
+    return configuredPersistZstd;
 }
 
 /** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
@@ -847,13 +860,13 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
  *  their summaries (exactly what `bili export` renders by default), then the
  *  OLDEST messages are dropped until the view fits. 0 disables message
  *  persistence entirely (block summaries + blockContents survive). */
+let configuredPersistTailTokens: number | undefined;
+export function configurePersistTailTokens(tokens?: number): void {
+    configuredPersistTailTokens = tokens;
+}
 function persistTailTokens(): number {
-    const env = process.env.BILI_PERSIST_TAIL_TOKENS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 16384;
+    const v = configuredPersistTailTokens;
+    return v != null && Number.isFinite(v) && v >= 0 ? v : 16384;
 }
 
 /** Bounded folded-view snapshot for the on-disk record (#401). See
@@ -883,22 +896,22 @@ function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
     return view;
 }
 
+let configuredEpermAlertThreshold: number | undefined;
+export function configurePersistEpermAlertThreshold(count?: number): void {
+    configuredEpermAlertThreshold = count;
+}
 function epermAlertThreshold(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_THRESHOLD;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n > 0) return n;
-    }
-    return 5;
+    const v = configuredEpermAlertThreshold;
+    return v != null && Number.isFinite(v) && v > 0 ? v : 5;
 }
 
+let configuredEpermAlertRepeatMs: number | undefined;
+export function configurePersistEpermAlertRepeatMs(ms?: number): void {
+    configuredEpermAlertRepeatMs = ms;
+}
 function epermAlertRepeatMs(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_REPEAT_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 0;
+    const v = configuredEpermAlertRepeatMs;
+    return v != null && Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 function defaultLogger(level: string, m: string): void {

@@ -10,10 +10,11 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { configureFakeCompletionRetries } from "../src/fake-completion.ts";
 import { listSessions } from "../src/session.ts";
 
-// #473: the #371 fake-completion detect+retry (opt-in via
-// BILI_FAKE_COMPLETION_RETRIES) sat AFTER the plugin-mode early return, so
+// #473: the #371 fake-completion detect+retry (opt-in via config.json
+// fakeCompletionRetries) sat AFTER the plugin-mode early return, so
 // plugin-mode clients (pi / omp — the original #361/#371 reporters) never got
 // the backstop. These tests drive a plugin session through the gate.
 
@@ -149,7 +150,7 @@ async function readAll(res: Response): Promise<string> {
 }
 
 test("#473 plugin openai chat: fake completion triggers the hinted retry and the client sees the recovered tool block", async () => {
-    process.env.BILI_FAKE_COMPLETION_RETRIES = "1";
+    configureFakeCompletionRetries(1);
     const rig = await startRig("openai");
     try {
         await register(rig, "i473-openai");
@@ -169,7 +170,7 @@ test("#473 plugin openai chat: fake completion triggers the hinted retry and the
         assert.ok(!text.includes(FAKE_MARK), "fake completion never reached the client");
         assert.ok(listSessions().some((s) => (s.metadata.fakeCompletionStreak as number | undefined) === 0), "session streak reset after the clean retry");
     } finally {
-        delete process.env.BILI_FAKE_COMPLETION_RETRIES;
+        configureFakeCompletionRetries(undefined);
         await rig.closeAll();
     }
 });
@@ -193,7 +194,7 @@ test("#473 default (retries=0): plugin mode stays verbatim passthrough — one u
 });
 
 test("#473 plugin anthropic: fake completion retried with the hint merged; recovered tool_use reaches the client", async () => {
-    process.env.BILI_FAKE_COMPLETION_RETRIES = "1";
+    configureFakeCompletionRetries(1);
     const rig = await startRig("anthropic");
     try {
         await register(rig, "i473-anthropic");
@@ -214,7 +215,7 @@ test("#473 plugin anthropic: fake completion retried with the hint merged; recov
         assert.ok(text.includes("real_tool_ok"), "client received the recovered tool_use block");
         assert.ok(!text.includes(FAKE_MARK), "fake completion never reached the client");
     } finally {
-        delete process.env.BILI_FAKE_COMPLETION_RETRIES;
+        configureFakeCompletionRetries(undefined);
         await rig.closeAll();
     }
 });

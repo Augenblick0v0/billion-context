@@ -6,10 +6,11 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so the #626 learn path exercises immediately
 // instead of burning the default replay attempts.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
+configureReplayRetryMax(1);
 
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";

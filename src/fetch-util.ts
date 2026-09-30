@@ -23,9 +23,10 @@ export function _liveUpstreamTimersForTest(): number {
     return liveUpstreamTimers.size;
 }
 
-/** Idle-timeout budget for upstream requests; overridable via
- *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
- *  tune it live. Local-model deployments with very large contexts can need
+/** Idle-timeout budget for upstream requests (milliseconds). Configured from
+ *  config.json `upstreamTimeoutMs` via configureUpstreamTimeoutMs; env input
+ *  BILI_UPSTREAM_TIMEOUT_MS retired in #1714. Local-model deployments with
+ *  very large contexts can need
  *  prefills longer than the 12-minute default before their first token.
  *
  *  This budget is the SOLE silence bound by design: there is deliberately no
@@ -34,9 +35,15 @@ export function _liveUpstreamTimersForTest(): number {
  *  deployments legitimately go silent for minutes mid-stream (thinking
  *  phases, long prefills), so any finite sub-budget false-positived healthy
  *  turns into truncations. Do not re-add a shorter timer here. */
+let configuredUpstreamTimeoutMs: number | undefined;
+
+export function configureUpstreamTimeoutMs(ms: number | undefined): void {
+    configuredUpstreamTimeoutMs = ms;
+}
+
 export function upstreamTimeoutMs(): number {
-    const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
-    return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
+    const v = configuredUpstreamTimeoutMs;
+    return v != null && Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
 // Direct (non-proxied) requests go through Node's hidden global agent, whose
@@ -60,6 +67,10 @@ export function _resetFetchUtilForTest(): void {
         try { void agent.close().catch(() => undefined); } catch { /* already closed */ }
     }
     directDispatchers.clear();
+    configuredUpstreamTimeoutMs = undefined;
+    configuredReplayRetryMax = undefined;
+    configuredReplayRetryBaseMs = undefined;
+    configuredMaxShrinkPerCompress = undefined;
 }
 
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
@@ -245,19 +256,32 @@ export function isTransientUpstreamError(status: number, body: string): boolean 
 /** Total requests per replay attempt (initial + retries). */
 export const REPLAY_MAX_ATTEMPTS = 3;
 
-/** Total requests per replay attempt; overridable via BILI_REPLAY_RETRY_MAX
- *  (1 = legacy fail-fast behavior, no retry). Read on each call so tests can
- *  tune it live. */
-export function replayMaxAttempts(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_MAX);
-    return Number.isInteger(raw) && raw >= 1 ? raw : REPLAY_MAX_ATTEMPTS;
+/** Total requests per replay attempt (1 = legacy fail-fast behavior, no
+ *  retry). Configured from config.json `replayRetryMax` via
+ *  configureReplayRetryMax; env input BILI_REPLAY_RETRY_MAX retired in #1714. */
+let configuredReplayRetryMax: number | undefined;
+
+export function configureReplayRetryMax(v?: number): void {
+    configuredReplayRetryMax = v;
 }
 
-/** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
- *  (0 disables the delay). Read on each call so tests can tune it live. */
+export function replayMaxAttempts(): number {
+    const v = configuredReplayRetryMax;
+    return v != null && Number.isInteger(v) && v >= 1 ? v : REPLAY_MAX_ATTEMPTS;
+}
+
+/** Base backoff delay in ms (0 disables the delay). Configured from
+ *  config.json `replayRetryBaseMs` via configureReplayRetryBaseMs; env input
+ *  BILI_REPLAY_RETRY_BASE_MS retired in #1714. */
+let configuredReplayRetryBaseMs: number | undefined;
+
+export function configureReplayRetryBaseMs(v?: number): void {
+    configuredReplayRetryBaseMs = v;
+}
+
 export function replayBaseDelayMs(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_BASE_MS);
-    return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+    const v = configuredReplayRetryBaseMs;
+    return v != null && Number.isFinite(v) && v >= 0 ? v : 1500;
 }
 
 /** Max shrink FRACTION (0,1] a single compress may remove before the proxy
@@ -265,10 +289,18 @@ export function replayBaseDelayMs(): number {
  *  compression). A rewrite larger than this is the request-shape change that
  *  trips provider risk-control (GLM 3007); capping it keeps each round's
  *  transition gentle and the prefix cache alive. Unset (or out of range) =
- *  no steering (legacy behavior). Read on each call so tests can tune it live. */
+ *  no steering (legacy behavior). Configured from config.json
+ *  `maxShrinkPerCompress` via configureMaxShrinkPerCompress; env input
+ *  BILI_MAX_SHRINK_PER_COMPRESS retired in #1714. */
+let configuredMaxShrinkPerCompress: number | undefined;
+
+export function configureMaxShrinkPerCompress(v?: number): void {
+    configuredMaxShrinkPerCompress = v;
+}
+
 export function maxShrinkPerCompress(): number | undefined {
-    const raw = Number(process.env.BILI_MAX_SHRINK_PER_COMPRESS);
-    return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : undefined;
+    const v = configuredMaxShrinkPerCompress;
+    return v != null && Number.isFinite(v) && v > 0 && v <= 1 ? v : undefined;
 }
 
 /** Exponential backoff for the given 1-based attempt: base * 2^(attempt-1). */

@@ -171,10 +171,12 @@ test("default config (unset mode) keeps the inherited aux tier reachable — exp
     });
 
     // EXPLICIT "direct" mode disables the inherited aux tier too
-    withSandboxEnv(() => {}, () => {
+    withSandboxEnv((env) => {
+        env.BILI_CONFIG_FILE = fs.mkdtempSync(path.join(os.tmpdir(), "bili-1012-cfg-XXXXXX")) + "/billion-context.json";
+        fs.writeFileSync(env.BILI_CONFIG_FILE, JSON.stringify({ upstreamProxyMode: "direct" }));
+    }, () => {
         const opts = loadOptions({
             ACP_PORT: "42422",
-            BILI_UPSTREAM_PROXY_MODE: "direct",
             BILI_INHERITED_HTTPS_PROXY: "http://127.0.0.1:7897",
         });
         const aux = resolveProxyDecision({}, opts.proxy, "https://chatgpt.com/backend-api/ps/mcp", opts.auxProxyFallback);

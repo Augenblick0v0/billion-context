@@ -6,17 +6,14 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on the very first 429 instead of the default 3 attempts with
 // exponential backoff — the in-band-error tests want the failure immediately.
-process.env.BILI_REPLAY_RETRY_MAX = "1";
-// Shrink the preflight hold grace so a 1.5s-slow summarization call reliably
-// outlives it (default is 30s — too slow for a test).
-process.env.BILI_PREFLIGHT_HOLD_MS = "300";
+configureReplayRetryMax(1);
 
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { emitPreflightError } from "../src/stream-error.ts";
-import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { _liveUpstreamTimersForTest, configureReplayRetryMax } from "../src/fetch-util.ts";
 
 // #588 gap cells for the exit-enumeration matrix (#608). Each test below fills
 // a cell that no other test asserted before this file:
@@ -210,6 +207,10 @@ async function startProxy(upstreamPort: number): Promise<http.Server> {
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
+        // Shrink the preflight hold grace so a 1.5s-slow summarization call reliably
+        // outlives it (default 30s - too slow for a test). Passed via opts: startServer
+        // re-applies these knobs from ProxyOptions on every boot.
+        preflightHoldMs: 300,
         log: false,
         debug: false,
         passthrough: false,

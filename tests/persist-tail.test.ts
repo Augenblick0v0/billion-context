@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, configurePersistTailTokens, configurePersistZstd } from "../src/persist.ts";
 import { Session, cacheBlockContent, snapshotMessages } from "../src/session.ts";
 import { renderHandoff } from "../src/export.ts";
 import { createInitialState, defaultCountTokens } from "acp-kernel";
@@ -11,11 +11,11 @@ import { rmrf } from "./tmp-rm.ts";
 
 // readRecord() inspects raw on-disk session files directly (bypassing the
 // store codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
-process.env.BILI_PERSIST_ZSTD = "0";
+configurePersistZstd(false);
 
 // #401: the persisted record stores a BOUNDED FOLDED-VIEW snapshot —
 // prune() renders summaries in place of folded ranges, then the oldest
-// messages are dropped until the view fits BILI_PERSIST_TAIL_TOKENS. The raw
+// messages are dropped until the view fits persistTailTokens. The raw
 // full history (63.2% of the 258MB corpus) is no longer duplicated on disk.
 
 function makeSession(id: string): Session {
@@ -55,20 +55,17 @@ function readRecord(dir: string): Record<string, unknown> {
     return envelope.payload;
 }
 
-async function withTailEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
-    const prev = process.env.BILI_PERSIST_TAIL_TOKENS;
-    if (value === undefined) delete process.env.BILI_PERSIST_TAIL_TOKENS;
-    else process.env.BILI_PERSIST_TAIL_TOKENS = value;
+async function withTailTokens<T>(value: number | undefined, fn: () => Promise<T>): Promise<T> {
+    configurePersistTailTokens(value);
     try {
         return await fn();
     } finally {
-        if (prev === undefined) delete process.env.BILI_PERSIST_TAIL_TOKENS;
-        else process.env.BILI_PERSIST_TAIL_TOKENS = prev;
+        configurePersistTailTokens(undefined);
     }
 }
 
 test("#401 persisted messages are a folded snapshot: covered originals dropped, summary + tail kept", async () => {
-    await withTailEnv(undefined, async () => {
+    await withTailTokens(undefined, async () => {
         const dir = mkdtempSync(path.join(tmpdir(), "bili-tail-"));
         try {
             const s = makeSession("tail-folded");
@@ -99,7 +96,7 @@ test("#401 persisted messages are a folded snapshot: covered originals dropped, 
 });
 
 test("#401 budget truncation keeps the newest whole messages and at least one survivor", async () => {
-    await withTailEnv("50", async () => {
+    await withTailTokens(50, async () => {
         const dir = mkdtempSync(path.join(tmpdir(), "bili-tail-"));
         try {
             const s = makeSession("tail-trunc");
@@ -127,8 +124,8 @@ test("#401 budget truncation keeps the newest whole messages and at least one su
     });
 });
 
-test("#401 BILI_PERSIST_TAIL_TOKENS=0 disables message persistence entirely (v2-style record)", async () => {
-    await withTailEnv("0", async () => {
+test("#401 persistTailTokens=0 disables message persistence entirely (v2-style record; #1714)", async () => {
+    await withTailTokens(0, async () => {
         const dir = mkdtempSync(path.join(tmpdir(), "bili-tail-"));
         try {
             const s = makeSession("tail-off");
@@ -157,7 +154,7 @@ test("#401 BILI_PERSIST_TAIL_TOKENS=0 disables message persistence entirely (v2-
 });
 
 test("#401 restore + export: folded snapshot renders as-is (--full recovers originals from blockContents)", async () => {
-    await withTailEnv(undefined, async () => {
+    await withTailTokens(undefined, async () => {
         const dir = mkdtempSync(path.join(tmpdir(), "bili-tail-"));
         try {
             const s = makeSession("tail-roundtrip");

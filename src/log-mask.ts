@@ -44,7 +44,7 @@ export const CREDENTIAL_HEADER_RE = /key|auth|token|cookie/i;
 
 // #897: host masking is ON by default (#255 — logs get pasted into public
 // issues). Operators who want the real target hosts in their local log can
-// opt out (env BILI_LOG_MASK_HOSTS=0 / config maskHosts:false); real hosts
+// opt out via config maskHosts:false (env retired in #1714); real hosts
 // stay visible on the loopback-only /__bili/stats endpoint regardless.
 // Credential masking is independent and always on.
 let maskHostsEnabled = true;

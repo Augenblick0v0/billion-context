@@ -38,6 +38,7 @@ export function noteMitmTlsError(host: string, port: number, message: string, lo
 
 export function _resetCertRejectionWarningForTest(): void {
     warnedCertRejected = false;
+    configuredMitmHandshakeTimeoutMs = undefined;
 }
 
 // #897: a client wired via http.proxy/CONNECT whose model host is NOT on the
@@ -66,7 +67,7 @@ export function recordBlindTunnel(host: string, log?: Logger): void {
     blindTunnelCounts.set(host, (blindTunnelCounts.get(host) ?? 0) + 1);
     if (!warnedBlindTunnels.has(host)) {
         warnedBlindTunnels.add(host);
-        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json (or BILI_MITM_DOMAINS), restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: GET /__bili/stats → blindTunnels (loopback only); set BILI_LOG_MASK_HOSTS=0 to show them in this log too.`);
+        log?.(`mitm ${maskHostForLog(host)} BLIND TUNNEL WARNING: this host is not in the MITM whitelist, so bili relays its TLS traffic opaquely and CANNOT see or compress this client's model requests. To compress it: add its domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA (${rootCaPath()}). Exact target hosts: GET /__bili/stats → blindTunnels (loopback only); set "maskHosts": false in the config file to show them in this log too.`);
     }
 }
 
@@ -84,16 +85,23 @@ export function _resetBlindTunnelStatsForTest(): void {
     blindTunnelCounts.clear();
     warnedBlindTunnels.clear();
     blindTunnelLive = 0;
+    configuredMitmHandshakeTimeoutMs = undefined;
 }
 
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
  *  opens the tunnel but never sends/trickle-feeds its ClientHello).
- *  Env-overridable so tests can exercise the timeout path quickly. */
+ *  Configured from config.json `mitmHandshakeTimeoutMs` via
+ *  configureMitmHandshakeTimeoutMs so tests can exercise the timeout path
+ *  quickly; env input BILI_MITM_HANDSHAKE_TIMEOUT_MS retired in #1714. */
 const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
+let configuredMitmHandshakeTimeoutMs: number | undefined;
+export function configureMitmHandshakeTimeoutMs(ms?: number): void {
+    configuredMitmHandshakeTimeoutMs = ms;
+}
 function mitmHandshakeTimeoutMs(): number {
-    const v = Number.parseInt(process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+    const v = configuredMitmHandshakeTimeoutMs;
+    return v != null && Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
 }
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a

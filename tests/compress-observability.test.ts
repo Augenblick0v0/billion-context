@@ -4,7 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session, LastCompressInfo } from "../src/session.ts";
 import { lastCompressSuffix } from "../src/session.ts";
-import { maxShrinkPerCompress } from "../src/fetch-util.ts";
+import { configureMaxShrinkPerCompress, maxShrinkPerCompress } from "../src/fetch-util.ts";
 import { withStagedCompressGuidance } from "../src/compress-tool.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
@@ -156,8 +156,7 @@ test("#1366/#362: shape drift ({ranges: …}) keeps the format lecture — re-is
 });
 
 test("#189: staged-compress steering note appended when shrink exceeds the configured max", () => {
-    const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-    process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.05";
+    configureMaxShrinkPerCompress(0.05);
     try {
         const ctx = makeCompressibleCtx();
         ctx.session.stats.lastInputTokens = 100000;
@@ -165,35 +164,31 @@ test("#189: staged-compress steering note appended when shrink exceeds the confi
         assert.ok(out.includes("[Staged-compress:"), `steering note present: ${out}`);
         assert.ok(out.includes("TAIL-biased"), "note steers toward tail-biased ranges");
     } finally {
-        if (prev === undefined) delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-        else process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+        configureMaxShrinkPerCompress(undefined);
     }
 });
 
 test("#189: no steering note when the switch is off (default)", () => {
-    const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-    delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
+    configureMaxShrinkPerCompress(undefined);
     try {
         const ctx = makeCompressibleCtx();
         ctx.session.stats.lastInputTokens = 100000;
         const out = runApply(ctx, COMPRESS_ARGS);
         assert.ok(!out.includes("[Staged-compress:"), `no note when switch off: ${out}`);
     } finally {
-        if (prev !== undefined) process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+        configureMaxShrinkPerCompress(undefined);
     }
 });
 
 test("#189: no steering note when shrink is under the configured max", () => {
-    const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-    process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.9";
+    configureMaxShrinkPerCompress(0.9);
     try {
         const ctx = makeCompressibleCtx();
         ctx.session.stats.lastInputTokens = 100000;
         const out = runApply(ctx, COMPRESS_ARGS);
         assert.ok(!out.includes("[Staged-compress:"), `no note when under max: ${out}`);
     } finally {
-        if (prev === undefined) delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-        else process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+        configureMaxShrinkPerCompress(undefined);
     }
 });
 
@@ -207,37 +202,33 @@ test("#189: lastCompressSuffix formats the correlation; empty when unset", () =>
     assert.ok(s.includes("~74000tok"), s);
 });
 
-test("#189: maxShrinkPerCompress parses the env fraction; rejects out-of-range", () => {
-    const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
+test("#189: maxShrinkPerCompress: config fraction; rejects out-of-range", () => {
     try {
-        delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
+        configureMaxShrinkPerCompress(undefined);
         assert.equal(maxShrinkPerCompress(), undefined, "unset → undefined");
-        process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.3";
+        configureMaxShrinkPerCompress(0.3);
         assert.equal(maxShrinkPerCompress(), 0.3, "valid fraction");
-        process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0";
+        configureMaxShrinkPerCompress(0);
         assert.equal(maxShrinkPerCompress(), undefined, "0 → undefined");
-        process.env.BILI_MAX_SHRINK_PER_COMPRESS = "1.5";
+        configureMaxShrinkPerCompress(1.5);
         assert.equal(maxShrinkPerCompress(), undefined, ">1 → undefined");
-        process.env.BILI_MAX_SHRINK_PER_COMPRESS = "abc";
-        assert.equal(maxShrinkPerCompress(), undefined, "non-numeric → undefined");
+        configureMaxShrinkPerCompress(Number.NaN);
+        assert.equal(maxShrinkPerCompress(), undefined, "non-finite → undefined");
     } finally {
-        if (prev === undefined) delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-        else process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+        configureMaxShrinkPerCompress(undefined);
     }
 });
 
 test("#189: withStagedCompressGuidance appends only when the switch is on", () => {
-    const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
     try {
-        delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
+        configureMaxShrinkPerCompress(undefined);
         assert.equal(withStagedCompressGuidance("NUDGE"), "NUDGE", "off → unchanged");
-        process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.3";
+        configureMaxShrinkPerCompress(0.3);
         const out = withStagedCompressGuidance("NUDGE");
         assert.ok(out.startsWith("NUDGE"), "keeps the original nudge");
         assert.ok(out.includes("Smooth-transition guidance"), "appends guidance");
         assert.ok(out.includes("TAIL-biased"), "steers toward tail-biased ranges");
     } finally {
-        if (prev === undefined) delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
-        else process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+        configureMaxShrinkPerCompress(undefined);
     }
 });

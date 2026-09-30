@@ -4,9 +4,9 @@
  * serve indefinitely, visible only as a log-line reminder), re-exec the
  * process so the new version actually takes over.
  *
- * Gated by --auto-restart-on-update / ACP_AUTO_RESTART_ON_UPDATE /
- * "autoRestartOnUpdate" in the config file — default OFF, where behavior stays
- * exactly the #808 warn-once reminder.
+ * Gated by --auto-restart-on-update / "autoRestartOnUpdate" in the config
+ * file (#1714: env ACP_AUTO_RESTART_ON_UPDATE retired) — default OFF, where
+ * behavior stays exactly the #808 warn-once reminder.
  *
  * Safety gates, all applied before the listener is touched:
  *  - zero in-flight requests (session inFlight counters) at decision time AND

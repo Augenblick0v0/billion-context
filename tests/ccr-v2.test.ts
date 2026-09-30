@@ -30,8 +30,9 @@ import { handleAcpStatus } from "../src/acp-status.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { configurePersistEnabled } from "../src/persist.ts";
 
-process.env.BILI_PERSIST = "0";
+configurePersistEnabled(false);
 
 const pad = (n: number): string => String(n).padStart(5, "0");
 

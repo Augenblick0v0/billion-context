@@ -357,9 +357,15 @@ const EVIDENCE_GRACE_POLL_MS = 100;
  *  channel shape declare itself. Returns the observed origin (pinned channel:
  *  never spawn) or undefined (no routed traffic within the window — the
  *  channel is presumed raw and may follow a replacement, legacy behavior).
- *  BILI_ATTACH_EVIDENCE_GRACE_MS overrides the default; unset = unchanged. */
+ *  configureAttachEvidenceGraceMs() overrides the default (test seam; the
+ *  env input was retired in #1714). */
+let evidenceGraceOverrideMs: number | undefined;
+export function configureAttachEvidenceGraceMs(ms: number | undefined): void {
+    evidenceGraceOverrideMs = ms;
+}
+
 export async function observeRoutedOrigin(state: NativeInterceptState): Promise<string | undefined> {
-    const limit = envMillis(process.env, "BILI_ATTACH_EVIDENCE_GRACE_MS", EVIDENCE_GRACE_DEFAULT_MS);
+    const limit = evidenceGraceOverrideMs ?? EVIDENCE_GRACE_DEFAULT_MS;
     const startedAt = Date.now();
     for (;;) {
         const observed = state.routedOrigin;

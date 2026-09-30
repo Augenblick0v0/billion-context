@@ -57,9 +57,14 @@ export function resolveImageBilling(mode: ImageBillingMode | undefined, upstream
     return "bytes";
 }
 
+let configuredImageTokenCap: number | undefined;
+export function configureImageTokenCap(cap?: number): void {
+    configuredImageTokenCap = cap;
+}
+
 function imageTokenCap(): number {
-    const v = Number(process.env.BILI_IMAGE_TOKEN_CAP ?? "");
-    return Number.isInteger(v) && v > 0 ? v : 0;
+    const v = configuredImageTokenCap;
+    return v != null && Number.isInteger(v) && v > 0 ? v : 0;
 }
 
 function applyCap(cost: number): number {

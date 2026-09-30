@@ -5,6 +5,7 @@ import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { configureReplayRetryMax } from "../src/fetch-util.ts";
 import { log as loggerLog, setLogCapture } from "../src/logger.ts";
 
 // #413: upstream truncation (200 + early SSE EOF) — zero-side-effect retry,
@@ -156,7 +157,7 @@ function assertAnthropicErrorStream(s: string): void {
 }
 
 test("#413 T1: 0-event EOF → retried once; failed retry → well-formed error stream, single log line", async () => {
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    configureReplayRetryMax(1);
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     const logSink: string[] = [];
@@ -174,7 +175,7 @@ test("#413 T1: 0-event EOF → retried once; failed retry → well-formed error 
     } finally {
         mock.restore();
         setLogCapture(null);
-        delete process.env.BILI_REPLAY_RETRY_MAX;
+        configureReplayRetryMax(undefined);
     }
 });
 

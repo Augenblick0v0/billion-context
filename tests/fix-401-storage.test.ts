@@ -5,14 +5,14 @@ import fsShared from "node:fs";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInitialState } from "acp-kernel";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, configurePersistZstd } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // These tests inspect raw on-disk session files directly (bypassing the store
-// codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
-process.env.BILI_PERSIST_ZSTD = "0";
+// codec), so pin the plain-JSON format explicitly (zstd is opt-in only).
+configurePersistZstd(false);
 
 function jsonFilesUnder(dir: string): string[] {
     const out: string[] = [];

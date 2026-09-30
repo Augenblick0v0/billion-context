@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS } from "../src/upstream-fail.ts";
-import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
+import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, configureReplayRetryBaseMs, configureReplayRetryMax, fetchWithRetry } from "../src/fetch-util.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
-import { proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
+import { configureProxyKeepAliveMaxMs, proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
 
 function listen(server: http.Server): Promise<void> {
     server.listen(0, "127.0.0.1");
@@ -127,10 +127,9 @@ test("fetchWithRetry: idle-budget timeout is NOT replayed (#1263 — never stack
     }
 });
 
-test("fetchWithRetry: BILI_REPLAY_RETRY_MAX=1 keeps legacy fail-fast for network failures (#1263)", async () => {
+test("fetchWithRetry: replay budget of 1 keeps legacy fail-fast for network failures (#1263)", async () => {
     _resetFetchUtilForTest();
-    const prev = process.env.BILI_REPLAY_RETRY_MAX;
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    configureReplayRetryMax(1);
     let hits = 0;
     const upstream = http.createServer((req, res) => {
         hits += 1;
@@ -152,8 +151,7 @@ test("fetchWithRetry: BILI_REPLAY_RETRY_MAX=1 keeps legacy fail-fast for network
         assert.equal(hits, 1, "legacy fail-fast: no replay when the retry budget is 1");
         assert.equal(retries.length, 0);
     } finally {
-        if (prev === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
-        else process.env.BILI_REPLAY_RETRY_MAX = prev;
+        _resetFetchUtilForTest();
         await close(upstream);
     }
 });
@@ -187,8 +185,7 @@ test("fetchWithRetry: external abort is never replayed", async () => {
 
 test("fetchWithRetry: connect-phase timeout and DNS failures are replayed within the budget (#1453)", async () => {
     _resetFetchUtilForTest();
-    const prevBase = process.env.BILI_REPLAY_RETRY_BASE_MS;
-    process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+    configureReplayRetryBaseMs(0);
     const origFetch = globalThis.fetch;
     try {
         for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["ENOTFOUND", "dns"]] as const) {
@@ -208,8 +205,7 @@ test("fetchWithRetry: connect-phase timeout and DNS failures are replayed within
         }
     } finally {
         globalThis.fetch = origFetch;
-        if (prevBase === undefined) delete process.env.BILI_REPLAY_RETRY_BASE_MS;
-        else process.env.BILI_REPLAY_RETRY_BASE_MS = prevBase;
+        _resetFetchUtilForTest();
     }
 });
 
@@ -224,20 +220,18 @@ test("formatUpstreamError: kind and hint lead/trail the line; masking intact", (
     assert.match(direct, /proxy=direct/);
 });
 
-test("proxyKeepAliveMaxMs: 55s default, env-tunable, 0 = uncapped", () => {
-    const prev = process.env.BILI_PROXY_KEEPALIVE_MAX_MS;
+test("proxyKeepAliveMaxMs: 55s default, config-tunable, 0 = uncapped", () => {
     try {
-        delete process.env.BILI_PROXY_KEEPALIVE_MAX_MS;
+        configureProxyKeepAliveMaxMs(undefined);
         assert.equal(proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
         assert.equal(PROXY_KEEPALIVE_MAX_MS, 55_000);
-        process.env.BILI_PROXY_KEEPALIVE_MAX_MS = "0";
+        configureProxyKeepAliveMaxMs(0);
         assert.equal(proxyKeepAliveMaxMs(), 0);
-        process.env.BILI_PROXY_KEEPALIVE_MAX_MS = "30000";
+        configureProxyKeepAliveMaxMs(30000);
         assert.equal(proxyKeepAliveMaxMs(), 30_000);
-        process.env.BILI_PROXY_KEEPALIVE_MAX_MS = "garbage";
+        configureProxyKeepAliveMaxMs(-1);
         assert.equal(proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
     } finally {
-        if (prev === undefined) delete process.env.BILI_PROXY_KEEPALIVE_MAX_MS;
-        else process.env.BILI_PROXY_KEEPALIVE_MAX_MS = prev;
+        configureProxyKeepAliveMaxMs(undefined);
     }
 });

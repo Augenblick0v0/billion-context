@@ -5,6 +5,7 @@ import { once } from "node:events";
 import {
     UPSTREAM_TIMEOUT_MS,
     _resetFetchUtilForTest,
+    configureUpstreamTimeoutMs,
     fetchWithTimeout,
     upstreamTimeoutMs,
 } from "../src/fetch-util.ts";
@@ -19,26 +20,18 @@ function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
 
-const TIMEOUT_ENV = "BILI_UPSTREAM_TIMEOUT_MS";
-
-function restoreEnv(prev: string | undefined): void {
-    if (prev === undefined) delete process.env[TIMEOUT_ENV];
-    else process.env[TIMEOUT_ENV] = prev;
-}
-
-test("upstreamTimeoutMs honors BILI_UPSTREAM_TIMEOUT_MS and falls back to the 12-minute default", () => {
-    const prev = process.env[TIMEOUT_ENV];
+test("upstreamTimeoutMs honors the configured value and falls back to the 12-minute default", () => {
     try {
-        delete process.env[TIMEOUT_ENV];
+        configureUpstreamTimeoutMs(undefined);
         assert.equal(upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
-        process.env[TIMEOUT_ENV] = "123456";
+        configureUpstreamTimeoutMs(123456);
         assert.equal(upstreamTimeoutMs(), 123456);
-        for (const bad of ["not-a-number", "0", "-5", "1.5"]) {
-            process.env[TIMEOUT_ENV] = bad;
+        for (const bad of [NaN, 0, -5, 1.5]) {
+            configureUpstreamTimeoutMs(bad);
             assert.equal(upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS, `bad value ${bad}`);
         }
     } finally {
-        restoreEnv(prev);
+        _resetFetchUtilForTest();
     }
 });
 
@@ -51,8 +44,7 @@ test("upstreamTimeoutMs honors BILI_UPSTREAM_TIMEOUT_MS and falls back to the 12
 // complete.
 test("#551: body silence longer than the configured budget is cut at the budget", async () => {
     const budgetMs = 1500;
-    const prev = process.env[TIMEOUT_ENV];
-    process.env[TIMEOUT_ENV] = String(budgetMs);
+    configureUpstreamTimeoutMs(budgetMs);
     const upstream = http.createServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.flushHeaders();
@@ -81,7 +73,6 @@ test("#551: body silence longer than the configured budget is cut at the budget"
         assert.ok(threw, "expected the silent body to be aborted within the budget");
         assert.ok(elapsed < 8000, `expected the abort near ${budgetMs}ms, took ${elapsed}ms`);
     } finally {
-        restoreEnv(prev);
         upstream.closeAllConnections();
         await close(upstream);
         _resetFetchUtilForTest();

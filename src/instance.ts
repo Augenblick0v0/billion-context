@@ -131,11 +131,11 @@ export function writeZonePort(lane: string, port: number, file: string = portZon
 
 /** #1660: the port a lane'd launch should TRY to bind — the lane's sticky
  *  record (a past ladder drift this lane still points at), else the zone
- *  base (BILI_ZONE_PORT override). Explicit user overrides
- *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
+ *  base (config.json `zonePort`). Explicit user overrides
+ *  (`claude.nativePort` / `zcode.nativePort`) are resolved separately by
  *  the lanes and imply strict-port launches. */
-export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
-    return readZonePort(lane, file) ?? resolveZonePortBase(env);
+export function lanePreferredPort(lane: string, file: string = portZoneFilePath()): number {
+    return readZonePort(lane, file) ?? resolveZonePortBase();
 }
 
 /** #1225: content identity of a bili entry script (sha256 of its bytes).

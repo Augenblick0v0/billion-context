@@ -201,11 +201,14 @@ function carrierOf(session: Session): PendingRetrieval[] {
     return session.pendingRetrievals ?? [];
 }
 
+let configuredCcrRetrievalTtlMs: number | undefined;
+export function configureCcrRetrievalTtlMs(ms?: number): void {
+    configuredCcrRetrievalTtlMs = ms;
+}
 function retrievalTtlMs(): number {
-    const raw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;
-    if (raw === undefined || raw === "") return DEFAULT_RETRIEVAL_TTL_MS;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_RETRIEVAL_TTL_MS;
+    const v = configuredCcrRetrievalTtlMs;
+    if (v == null) return DEFAULT_RETRIEVAL_TTL_MS;
+    return Number.isFinite(v) && v >= 0 ? v : DEFAULT_RETRIEVAL_TTL_MS;
 }
 
 function bufferDropNote(session: Session, refs: string[], reason: string): void {

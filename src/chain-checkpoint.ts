@@ -597,8 +597,8 @@ function envMs(name: string, fallback: number): number {
 
 export function evaluateChain(parsed: unknown, wire: WireProtocol, opts: ChainEvaluationOptions = {}): ChainCheckpointContext {
     const nowMs = opts.nowMs ?? Date.now();
-    const maxFutureSkewMs = opts.maxFutureSkewMs ?? envMs("BILI_CHAIN_MAX_FUTURE_SKEW_MS", DEFAULT_MAX_FUTURE_SKEW_MS);
-    const recentWindowMs = opts.recentWindowMs ?? envMs("BILI_CHAIN_RECENT_WINDOW_MS", DEFAULT_RECENT_CHECKPOINT_WINDOW_MS);
+    const maxFutureSkewMs = opts.maxFutureSkewMs ?? DEFAULT_MAX_FUTURE_SKEW_MS;
+    const recentWindowMs = opts.recentWindowMs ?? DEFAULT_RECENT_CHECKPOINT_WINDOW_MS;
     const { candidates, malformed, stripped } = extractChainCarriers(parsed, wire);
     if (candidates.length === 0) {
         return { candidates, malformed, verdict: malformed > 0 ? "invalid" : "none" };

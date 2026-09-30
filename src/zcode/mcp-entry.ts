@@ -56,7 +56,7 @@ function startWatchdog(
                     } else {
                         // #1660: same zone semantics as
                         // zcode/native.ts defaultEnsureProxy — explicit
-                        // BILI_ZCODE_PORT is strict; otherwise port 0 lets the
+                        // zcode.nativePort is strict; otherwise port 0 lets the
                         // launcher resolve the zone preference AND settle the
                         // actually-bound port sticky (#1660).
                         const explicit = resolveZcodeNativePort();

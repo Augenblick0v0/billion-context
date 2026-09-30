@@ -3,21 +3,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dumpRejectedBody } from "../src/error-dump.js";
+import { configureDump4xx, configureDump4xxMaxBytes, dumpRejectedBody } from "../src/error-dump.js";
 import { setLogCapture } from "../src/logger.js";
 import { rmrf } from "./tmp-rm.ts";
 
 // #762: failure-triggered dump of the exact forwarded body on upstream 4xx.
 
-const savedGate = process.env.BILI_DUMP_4XX;
-const savedCap = process.env.BILI_DUMP_4XX_MAX_BYTES;
 const savedDir = process.env.ACP_DUMP_DIR;
 
-function restoreDumpEnv(): void {
-    if (savedGate === undefined) delete process.env.BILI_DUMP_4XX;
-    else process.env.BILI_DUMP_4XX = savedGate;
-    if (savedCap === undefined) delete process.env.BILI_DUMP_4XX_MAX_BYTES;
-    else process.env.BILI_DUMP_4XX_MAX_BYTES = savedCap;
+function restoreDumpConfig(): void {
+    configureDump4xx(false);
+    configureDump4xxMaxBytes(undefined);
 }
 
 let dir: string;
@@ -29,7 +25,7 @@ before(() => {
 
 after(() => {
     setLogCapture(null);
-    restoreDumpEnv();
+    restoreDumpConfig();
     if (savedDir === undefined) delete process.env.ACP_DUMP_DIR;
     else process.env.ACP_DUMP_DIR = savedDir;
     rmrf(dir);
@@ -40,17 +36,13 @@ function errFiles(): string[] {
 }
 
 test("off by default: no file written", () => {
-    delete process.env.BILI_DUMP_4XX;
-    try {
-        assert.equal(dumpRejectedBody(400, "s1", '{"model":"m","messages":[]}'), null);
-        assert.deepEqual(errFiles(), []);
-    } finally {
-        restoreDumpEnv();
-    }
+    configureDump4xx(false);
+    assert.equal(dumpRejectedBody(400, "s1", '{"model":"m","messages":[]}'), null);
+    assert.deepEqual(errFiles(), []);
 });
 
 test("on: JSON body is pretty-printed and parseable", () => {
-    process.env.BILI_DUMP_4XX = "1";
+    configureDump4xx(true);
     try {
         const out = dumpRejectedBody(400, "s1", '{"model":"m","messages":[{"role":"user","content":"u"}]}');
         assert.ok(out && out.startsWith(dir));
@@ -61,26 +53,26 @@ test("on: JSON body is pretty-printed and parseable", () => {
         assert.equal(parsed.model, "m");
         assert.equal(parsed.messages.length, 1);
     } finally {
-        restoreDumpEnv();
+        restoreDumpConfig();
     }
 });
 
 test("on: non-JSON body passes through raw", () => {
-    process.env.BILI_DUMP_4XX = "1";
+    configureDump4xx(true);
     try {
         const out = dumpRejectedBody(400, "s1", "<html>bad gateway</html>");
         assert.ok(out);
         assert.equal(fs.readFileSync(out!, "utf8"), "<html>bad gateway</html>");
     } finally {
-        restoreDumpEnv();
+        restoreDumpConfig();
     }
 });
 
 test("on: oversized body is capped with a truncation marker", () => {
-    process.env.BILI_DUMP_4XX = "1";
-    process.env.BILI_DUMP_4XX_MAX_BYTES = "2048";
+    configureDump4xx(true);
+    configureDump4xxMaxBytes(2048);
     try {
-        const raw = `{"payload":"${"x".repeat(5000)}"}`;
+        const raw = `{"payload":"${"x".repeat(5000)}"`;
         const out = dumpRejectedBody(413, "s1", raw);
         assert.ok(out);
         const text = fs.readFileSync(out!, "utf8");
@@ -88,28 +80,28 @@ test("on: oversized body is capped with a truncation marker", () => {
         assert.match(text, /\[truncated: \d+ more character\(s\)\]/);
         assert.match(path.basename(out!), /^err-\d+-s1-413\.json$/);
     } finally {
-        restoreDumpEnv();
+        restoreDumpConfig();
     }
 });
 
 test("on: empty body is skipped", () => {
-    process.env.BILI_DUMP_4XX = "1";
-    const before = errFiles().length;
+    configureDump4xx(true);
     try {
+        const beforeCount = errFiles().length;
         assert.equal(dumpRejectedBody(400, "s1", ""), null);
-        assert.equal(errFiles().length, before);
+        assert.equal(errFiles().length, beforeCount);
     } finally {
-        restoreDumpEnv();
+        restoreDumpConfig();
     }
 });
 
 test("on: Buffer bodies work and session ids are sanitized", () => {
-    process.env.BILI_DUMP_4XX = "1";
+    configureDump4xx(true);
     try {
         const out = dumpRejectedBody(400, "a/b c", Buffer.from('{"a":1}', "utf8"));
         assert.ok(out);
         assert.match(path.basename(out!), /^err-\d+-a_b_c-400\.json$/);
     } finally {
-        restoreDumpEnv();
+        restoreDumpConfig();
     }
 });

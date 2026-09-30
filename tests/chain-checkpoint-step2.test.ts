@@ -235,27 +235,17 @@ test("verdict matrix: digest×timestamp quadrants, selection priority, version g
     assert.equal(malCtx.malformed, 1);
 });
 
-test("env overrides: BILI_CHAIN_MAX_FUTURE_SKEW_MS / BILI_CHAIN_RECENT_WINDOW_MS", () => {
+test("opts overrides: maxFutureSkewMs / recentWindowMs (#1714: env retired)", () => {
     const base = { model: "m", messages: [{ role: "user", content: "h" }] };
     const bogus = "sha256:" + "cd".repeat(32);
-    const futFields = { ...FIELDS, issuedAt: T0 + 20_000, requestId: "env-1" };
+    const futFields = { ...FIELDS, issuedAt: T0 + 20_000, requestId: "opts-1" };
     const futBody = insertCheckpointCarrier(base, "openai", renderChainCheckpoint({ ...futFields, digest: bogus }))!;
-    try {
-        process.env.BILI_CHAIN_MAX_FUTURE_SKEW_MS = "15000";
-        assert.equal(evaluateChain(futBody, "openai", { nowMs: T0 }).verdict, "invalid", "20s ahead exceeds tightened 15s skew — no usable candidate");
-    } finally {
-        delete process.env.BILI_CHAIN_MAX_FUTURE_SKEW_MS;
-    }
+    assert.equal(evaluateChain(futBody, "openai", { nowMs: T0, maxFutureSkewMs: 15_000 }).verdict, "invalid", "20s ahead exceeds tightened 15s skew — no usable candidate");
     assert.equal(evaluateChain(futBody, "openai", { nowMs: T0 }).verdict, "recent-mismatch", `default ${DEFAULT_MAX_FUTURE_SKEW_MS}ms skew keeps 20s ahead fresh`);
     // 590s old: inside the default 600s window, outside a tightened 580s one.
-    const pastFields = { ...FIELDS, issuedAt: T0 - 9 * MIN - 50_000, requestId: "env-2" };
+    const pastFields = { ...FIELDS, issuedAt: T0 - 9 * MIN - 50_000, requestId: "opts-2" };
     const pastBody = insertCheckpointCarrier(base, "openai", renderChainCheckpoint({ ...pastFields, digest: computeCheckpointDigest(base, "openai", pastFields)! }))!;
-    try {
-        process.env.BILI_CHAIN_RECENT_WINDOW_MS = String(DEFAULT_RECENT_CHECKPOINT_WINDOW_MS - 20_000);
-        assert.equal(evaluateChain(pastBody, "openai", { nowMs: T0 }).verdict, "stale", "tightened window (580s) ages a 590s-old match");
-    } finally {
-        delete process.env.BILI_CHAIN_RECENT_WINDOW_MS;
-    }
+    assert.equal(evaluateChain(pastBody, "openai", { nowMs: T0, recentWindowMs: DEFAULT_RECENT_CHECKPOINT_WINDOW_MS - 20_000 }).verdict, "stale", "tightened window (580s) ages a 590s-old match");
     assert.equal(evaluateChain(pastBody, "openai", { nowMs: T0 }).verdict, "valid", `default ${DEFAULT_RECENT_CHECKPOINT_WINDOW_MS}ms window keeps a 590s-old match fresh`);
 });
 

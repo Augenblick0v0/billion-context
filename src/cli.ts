@@ -36,6 +36,7 @@ import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME } from "./version.js";
+import { scanRetiredEnv } from "./retired-env.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -207,20 +208,23 @@ export function parseArgs(argv: string[]): Parsed {
             case "-V":
                 command = "version";
                 break;
+            // #1714: these flags no longer ride the retired ACP_* env vars —
+            // they are stored under dedicated keys and applied directly to the
+            // process options after loadOptions() (flag > file).
             case "--debug":
-                overrides.ACP_DEBUG = "1";
+                overrides.cliDebug = "1";
                 break;
             case "--no-auto-update":
-                overrides.ACP_AUTO_UPDATE = "0";
+                overrides.cliNoAutoUpdate = "1";
                 break;
             case "--auto-restart-on-update":
-                overrides.ACP_AUTO_RESTART_ON_UPDATE = "1";
+                overrides.cliAutoRestartOnUpdate = "1";
                 break;
             case "--passthrough":
-                overrides.ACP_PASSTHROUGH = "1";
+                overrides.cliPassthrough = "1";
                 break;
             case "--no-passthrough":
-                overrides.ACP_PASSTHROUGH = "0";
+                overrides.cliPassthrough = "0";
                 break;
             case "--mitm-domain": {
                 const val = argv[++i];
@@ -288,7 +292,7 @@ export function parseArgs(argv: string[]): Parsed {
                 else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
-                else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
+                else if (a === "-F") overrides.cliUpstreamProxy = val;
                 else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }
@@ -381,6 +385,7 @@ export function parseArgs(argv: string[]): Parsed {
 
 export async function main(): Promise<void> {
     const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    if (command !== "help" && command !== "version") scanRetiredEnv();
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -446,7 +451,9 @@ export async function main(): Promise<void> {
             // check downloads through the same proxy decision as model
             // traffic.
             for (const [k, v] of Object.entries(overrides)) {
-                if (v !== undefined) process.env[k] = v;
+                // Only valid env-var names reach process.env; dedicated CLI-flag
+                // keys (cli*) stay out of the environment (#1714).
+                if (v !== undefined && /^[A-Z][A-Z0-9_]*$/.test(k)) process.env[k] = v;
             }
             let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
             let updateTag: string | undefined;
@@ -505,12 +512,14 @@ export async function main(): Promise<void> {
         // Read-only lane audit (#1235). Same egress/channel wiring as `bili
         // update` so the registry freshness check honors -F and updateTag.
         for (const [k, v] of Object.entries(overrides)) {
-            if (v !== undefined) process.env[k] = v;
+            // #1714: only real env var names are exported; cli* flag markers stay local.
+            if (v !== undefined && /^[A-Z][A-Z0-9_]*$/.test(k)) process.env[k] = v;
         }
         let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
         let updateTag: string | undefined;
         try {
             const o = loadOptions();
+            if (overrides.cliUpstreamProxy !== undefined) o.proxy = overrides.cliUpstreamProxy;
             updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
             updateTag = o.updateTag;
         } catch {
@@ -526,19 +535,20 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "update") {
-        // Manual one-shot update — bypasses the throttle. Apply flag
-        // overrides first so `-F <proxy>` reaches loadOptions; the registry
-        // and tarball egress then honor the same upstream-proxy decision as
-        // model traffic (#609), and the configured channel (updateTag) so
-        // `bili update` follows the same dist-tag as the background
-        // auto-updater.
+        // Manual one-shot update — bypasses the throttle. `-F <proxy>` is
+        // applied to the loaded options; the registry and tarball egress then
+        // honor the same upstream-proxy decision as model traffic (#609), and
+        // the configured channel (updateTag) so `bili update` follows the same
+        // dist-tag as the background auto-updater.
         for (const [k, v] of Object.entries(overrides)) {
-            if (v !== undefined) process.env[k] = v;
+            // #1714: only real env var names are exported; cli* flag markers stay local.
+            if (v !== undefined && /^[A-Z][A-Z0-9_]*$/.test(k)) process.env[k] = v;
         }
         let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
         let updateTag: string | undefined;
         try {
             const o = loadOptions();
+            if (overrides.cliUpstreamProxy !== undefined) o.proxy = overrides.cliUpstreamProxy;
             updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
             updateTag = o.updateTag;
         } catch (e) {
@@ -564,15 +574,23 @@ export async function main(): Promise<void> {
     }
 
     for (const [k, v] of Object.entries(overrides)) {
-        if (v !== undefined) process.env[k] = v;
+        // #1714: only real env var names are exported; cli* flag markers stay local
+        // (behavior knobs are file-only; these are applied directly in the start path).
+        if (v !== undefined && /^[A-Z][A-Z0-9_]*$/.test(k)) process.env[k] = v;
     }
 
-    // CLI flags override env (which overrides the config file inside
-    // loadOptions). Merge into process.env so loadOptions picks them up.
     // First run: seed a template config so the user has a file to edit rather
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
+    // #1714: flags map onto the same options the config file sets (flag > file),
+    // applied directly — behavior knobs no longer ride through process.env.
+    if (overrides.cliUpstreamProxy !== undefined) opts.proxy = overrides.cliUpstreamProxy;
+    if (overrides.cliPassthrough === "1") opts.passthrough = true;
+    else if (overrides.cliPassthrough === "0") opts.passthrough = false;
+    if (overrides.cliDebug === "1") opts.debug = true;
+    if (overrides.cliNoAutoUpdate === "1") opts.autoUpdate = false;
+    if (overrides.cliAutoRestartOnUpdate === "1") opts.autoRestartOnUpdate = true;
     const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow

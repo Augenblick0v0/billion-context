@@ -9,7 +9,8 @@ import { createInitialState, defaultConfig } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, configurePersistZstd } from "../src/persist.ts";
+import { configureSessionsDir } from "../src/paths.ts";
 import type { Session } from "../src/session.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -20,7 +21,7 @@ import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
 // Plain JSON session files so seeds and round-trips stay deterministic (#1080)
-process.env.BILI_PERSIST_ZSTD = "0";
+configurePersistZstd(false);
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -63,7 +64,7 @@ function makeSession(id: string, meta: Session["meta"] = {}, patch: Partial<Stat
 }
 
 // Loaded sessions take lastSeen from the record's own savedAt (#404), so pin
-// it in the raw file (plain JSON under BILI_PERSIST_ZSTD=0) for deterministic order.
+// it in the raw file (plain JSON — zstd is opt-in only since #1714) for deterministic order.
 function setSavedAt(dir: string, id: string, ts: number): void {
     const files = readdirSync(dir, { recursive: true }) as string[];
     for (const f of files) {
@@ -83,12 +84,11 @@ function setSavedAt(dir: string, id: string, ts: number): void {
 function withSessionsDir<T>(name: string, fn: (dir: string) => Promise<T>): void {
     test(name, async () => {
         const dir = mkdtempSync(path.join(tmpdir(), "bili-web-sess-"));
-        const prev = process.env.BILI_SESSIONS_DIR;
-        process.env.BILI_SESSIONS_DIR = dir;
+        configureSessionsDir(dir);
         try {
             await fn(dir);
         } finally {
-            if (prev === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prev;
+            configureSessionsDir(undefined);
             _resetSessionsForTest();
             _resetDiskCacheForTest();
             rmrf(dir);
@@ -268,9 +268,9 @@ test("web endpoints serve overview, session list and per-session detail", async 
     const biliConfig = path.join(root, "billion-context.json");
     writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
     const prevConfig = process.env.BILI_CONFIG_FILE;
-    const prevSessions = process.env.BILI_SESSIONS_DIR;
+
     process.env.BILI_CONFIG_FILE = biliConfig;
-    process.env.BILI_SESSIONS_DIR = root;
+    configureSessionsDir(root);
 
     const store = new SessionStore({ dir: root, debounceMs: 0, enabled: true });
     await store.writeNow(makeSession("ep-1", { protocol: "openai", label: "ep" }, { requests: 2, inputTokens: 800, cachedTokens: 200, contextTokens: 300 }));
@@ -333,7 +333,7 @@ test("web endpoints serve overview, session list and per-session detail", async 
         assert.match(miss.error, /unknown session/);
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
-        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
+        configureSessionsDir(undefined);
         await close(proxy);
         _resetDiskCacheForTest();
         rmrf(root);
@@ -441,9 +441,9 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
     const biliConfig = path.join(root, "billion-context.json");
     writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
     const prevConfig = process.env.BILI_CONFIG_FILE;
-    const prevSessions = process.env.BILI_SESSIONS_DIR;
+
     process.env.BILI_CONFIG_FILE = biliConfig;
-    process.env.BILI_SESSIONS_DIR = root;
+    configureSessionsDir(root);
 
     const store = new SessionStore({ dir: root, debounceMs: 0, enabled: true });
     const T0 = Date.parse("2026-09-28T09:00:00Z");
@@ -535,7 +535,7 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
         assert.ok(!plainHtml!.includes("8.0K"), "plain session shows no switch data");
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
-        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
+        configureSessionsDir(undefined);
         await close(proxy);
         _resetDiskCacheForTest();
         rmrf(root);

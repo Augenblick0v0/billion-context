@@ -86,7 +86,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
-        passthrough: passthroughState(process.env),
+        passthrough: passthroughState(),
         ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
@@ -143,7 +143,6 @@ export async function handleConfigPut(
         if (next.upstreamProxyMode !== undefined && (typeof next.upstreamProxyMode !== "string" || !["auto", "manual", "direct"].includes(next.upstreamProxyMode))) return sendError(res, 400, "upstreamProxyMode must be auto, manual, or direct");
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
-        if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
         try {
             atomicWriteConfig(next);
             onChanged?.();
@@ -197,16 +196,12 @@ export async function handleConfigPut(
         if (compress === undefined) return sendError(res, 400, "invalid compress settings");
     }
 
-    // #405: the panel must be able to READ and CLEAR passthrough. An env
-    // ACP_PASSTHROUGH (or --passthrough flag, which lands in env) outranks
-    // the file on every reload — a file write would be a silent no-op, so
-    // refuse with the exact way out instead.
+    // #405: the panel must be able to READ and CLEAR passthrough. Since #1714
+    // the only source is the config file itself, so there is no higher-
+    // priority override to refuse against — writes always take effect.
     if (hasPassthrough) {
         if (body.passthrough !== null && typeof body.passthrough !== "boolean") {
             return sendError(res, 400, "passthrough must be a boolean or null");
-        }
-        if (passthroughState(process.env).source === "env") {
-            return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
         }
     }
 
