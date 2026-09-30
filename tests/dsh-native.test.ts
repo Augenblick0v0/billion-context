@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
@@ -541,6 +541,8 @@ test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator sess
                 const latest = await cacheCmd.handler();
                 assert.equal(latest.kind, "success");
                 assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -582,6 +584,8 @@ test("apply() /acp (#1677): resolves the invoking agent's session id from the ho
                 assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
                 assert.ok(statusUrls.some((u) => u.includes("conversationId=session-inv")), "status was queried for the invoking session");
                 assert.ok(!statusUrls.some((u) => u.includes("fallback=latest")), "no latest-fallback query for a resolvable session");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -613,6 +617,8 @@ test("apply() /acp-cache (#1677): binds acp_cache to the invoking agent's sessio
                 assert.equal(out.kind, "success");
                 assert.deepEqual(calls, [{ conversationId: "session-inv", tool: "acp_cache", args: {} }]);
                 assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -669,6 +675,8 @@ test("apply() /acp (#1677): invocation wins over ALS attribution; unresolvable s
                 assert.equal(none.kind, "success");
                 assert.ok(none.text.includes("PANEL-LATEST"));
                 assert.ok(none.text.includes("could not identify the current session"), "no-session fallback is explicitly flagged");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -772,6 +780,9 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes("@deepseek-ai/dsh-web-app"))
         : [];
     const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
+    // #1791: hermetic fallback seam — a deferred probe must never reach a real
+    // bootstrap child process after teardown; undefined keeps it base-less.
+    _setSpawnForTest(async () => undefined);
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
             _resetRegisterForTest(proxy.origin);
@@ -781,12 +792,19 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
+            // #1791: settle each apply's attach chain while the mock is still
+            // open — a deferred probe settling against a closed mock runs the
+            // spawn fallback mid-way through a LATER test and clobbers the
+            // shared register/state (#1117 pollution class, reds in #956/#983).
+            await _stateToolsReadyForTest();
 
             // once-per-process: a later apply with the same profile adds nothing
             const again = mockCtx();
             again.setProfileContext({ startedBundles: webBundles });
+            _resetRegisterForTest(proxy.origin);
             apply(again);
             assert.equal(warnLines().length, 1);
+            await _stateToolsReadyForTest();
 
             // non-web profile → no warning
             fs.rmSync(logFile, { force: true });
@@ -796,6 +814,7 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
             apply(plain);
             assert.equal(warnLines().length, 0);
+            await _stateToolsReadyForTest();
 
             // host shape without inject but with a direct profileContext field
             _resetWebProfileWarningForTest();
@@ -805,10 +824,13 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
                 agents: {},
                 profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
             };
+            _resetRegisterForTest(proxy.origin);
             apply(bare);
             assert.equal(warnLines().length, 1);
+            await _stateToolsReadyForTest();
         });
     } finally {
+        _setSpawnForTest(undefined);
         proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
         fs.rmSync(stateHome, { recursive: true, force: true });
@@ -930,6 +952,8 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
             assert.match(out.text, /window=262144/);
             assert.match(out.text, /maxOut=32768/);
             assert.match(out.text, /client-config/);
+            // #1791: settle the attach chain while the mock is still open
+            await _stateToolsReadyForTest();
         });
     } finally {
         proxy.close();
@@ -1011,7 +1035,11 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
     const forward = await startMockProxy(calls);
     const answers: Array<string | undefined> = [undefined, forward.origin];
-    _setSpawnForTest(async () => answers.shift());
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return answers.shift();
+    });
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983c-"));
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
@@ -1019,7 +1047,9 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
             const ctx = mockCtx();
             apply(ctx);
             // first spawn attempt fails → fallback leaves the register base-less
-            await new Promise((r) => setTimeout(r, 50));
+            // (#1791: settle-based — once the stub call is observable the base-less
+            // state has drained; a fixed sleep raced under load)
+            await waitFor(() => spawnCalls >= 1, "initial failed respawn settled");
             const headersFor = _stateHeadersForTest();
             assert.ok(headersFor !== undefined, "headersFor installed");
             // a later model request drives maybeRetry → respawn (2nd answer) → tools recover
