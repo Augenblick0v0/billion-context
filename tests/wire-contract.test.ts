@@ -56,6 +56,12 @@ import { WIRE_RULES, VALIDATORS, startFakeUpstream, type Wire } from "./wire-con
 
 type ToolShape = Record<string, unknown>;
 
+test("WC-012 validates compaction IDs without changing function-call ID rules", () => {
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "compaction", id: "cmp_real", encrypted_content: "opaque" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "function_call", id: "fc_real" }] }), []);
+    assert.match(VALIDATORS.responses({ input: [{ type: "compaction", id: "fc_bili_local" }] })[0], /WC-012/);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -104,6 +110,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
         ],
         responses: [
+            { input: [{ type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary" }] },
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "object", properties: {}, anyOf: [] } }] },
