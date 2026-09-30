@@ -1076,8 +1076,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
+            hydrateQuickConfig();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -1099,6 +1100,184 @@ export const WEB_CLIENT = `(function () {
             toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
+    function hydrateQuickConfig() {
+        const box = $("quick-fields");
+        if (!box) return;
+        box.innerHTML = "";
+        const fe = $("cfg-file-edit");
+        let draft = {};
+        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        const compress = (draft.compress && typeof draft.compress === "object" && !Array.isArray(draft.compress)) ? draft.compress : null;
+        function writeDraft() { if (fe) fe.value = JSON.stringify(draft, null, 2); }
+        function row(id, label) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            const ctl = document.createElement("div");
+            ctl.style.flex = "0 0 auto";
+            const inp = document.createElement("input");
+            inp.type = "checkbox";
+            inp.id = id;
+            lab.appendChild(inp);
+            lab.append(document.createTextNode(" \u2009" + label));
+            w.appendChild(lab);
+            w.appendChild(ctl);
+            box.appendChild(w);
+            return { inp, ctl };
+        }
+        function textRow(id, label, placeholder, value) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.htmlFor = id;
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            lab.textContent = label;
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.id = id;
+            inp.className = "field-input mono";
+            inp.style.flex = "1 1 320px";
+            inp.spellcheck = false;
+            if (placeholder) inp.placeholder = placeholder;
+            inp.value = value == null ? "" : value;
+            w.appendChild(lab);
+            w.appendChild(inp);
+            box.appendChild(w);
+            return inp;
+        }
+        const dbg = row("quick-debug", t("cfg.q_debug"));
+        dbg.inp.checked = draft.debug === true;
+        dbg.inp.addEventListener("change", () => { if (dbg.inp.checked) draft.debug = true; else delete draft.debug; writeDraft(); });
+        const ptRow = row("quick-pt", t("cfg.q_passthrough"));
+        ptRow.inp.checked = draft.passthrough === true;
+        ptRow.inp.addEventListener("change", () => { if (ptRow.inp.checked) draft.passthrough = true; else delete draft.passthrough; writeDraft(); });
+        const packVal = (compress && typeof compress.promptPack === "string") ? compress.promptPack : "default";
+        const packSel = document.createElement("select");
+        ["default", "lean"].forEach((name) => {
+            const o = document.createElement("option");
+            o.value = name;
+            o.textContent = name;
+            packSel.appendChild(o);
+        });
+        if (packVal !== "default" && packVal !== "lean") {
+            const o = document.createElement("option");
+            o.value = packVal;
+            o.textContent = packVal + " *";
+            packSel.appendChild(o);
+        }
+        packSel.value = packVal;
+        packSel.className = "field-input mono";
+        const pw = document.createElement("div");
+        pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const plab = document.createElement("label");
+        plab.htmlFor = "quick-pack";
+        plab.style.cssText = "flex:0 1 auto;max-width:520px";
+        plab.textContent = t("cfg.q_pack");
+        pw.appendChild(plab);
+        pw.appendChild(packSel);
+        box.appendChild(pw);
+        const packNote = document.createElement("div");
+        packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePackNote() {
+            if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
+            else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else packNote.textContent = t("cfg.q_pack_custom");
+        }
+        box.appendChild(packNote);
+        packSel.addEventListener("change", () => {
+            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
+            if (packSel.value === "default") delete draft.compress.promptPack; else draft.compress.promptPack = packSel.value;
+            writeDraft();
+            updatePackNote();
+        });
+        updatePackNote();
+        const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
+        const nudgeShown = (compress && typeof compress.nudgeGrowthTokens === "number") ? compress.nudgeGrowthTokens : NUDGE_DEFAULT;
+        const nudge = document.createElement("input");
+        nudge.type = "number";
+        nudge.id = "quick-nudge";
+        nudge.className = "field-input mono";
+        nudge.style.width = "140px";
+        nudge.min = "1";
+        nudge.step = "1000";
+        nudge.value = String(nudgeShown);
+        nudge.spellcheck = false;
+        const nnote = document.createElement("div");
+        nnote.style.cssText = "min-height:18px;font-size:12px;margin-top:2px";
+        function syncNudge() {
+            const v = parseInt(nudge.value, 10);
+            nnote.textContent = "";
+            nnote.style.color = "";
+            if (!isNaN(v)) {
+                if (v < NUDGE_LOW) { nnote.textContent = t("cfg.q_nudge_low"); nnote.style.color = "#cf222e"; }
+                else if (v > NUDGE_HIGH) { nnote.textContent = t("cfg.q_nudge_high"); nnote.style.color = "#bf8700"; }
+            }
+            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
+            if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) draft.compress.nudgeGrowthTokens = v; else delete draft.compress.nudgeGrowthTokens;
+            writeDraft();
+        }
+        function nudgeBtn(label, delta) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn sm";
+            b.textContent = label;
+            b.title = t("cfg.q_nudge_step");
+            b.addEventListener("click", () => { const cur = parseInt(nudge.value, 10); const base = isNaN(cur) ? NUDGE_DEFAULT : cur; nudge.value = String(Math.max(1, base + delta)); syncNudge(); });
+            return b;
+        }
+        const nrow = document.createElement("div");
+        nrow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const nlab = document.createElement("label");
+        nlab.htmlFor = "quick-nudge";
+        nlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        nlab.textContent = t("cfg.q_nudge");
+        const ng = document.createElement("div");
+        ng.style.cssText = "display:flex;gap:6px;align-items:center";
+        ng.appendChild(nudgeBtn("\u2212", -NUDGE_STEP));
+        ng.appendChild(nudge);
+        ng.appendChild(nudgeBtn("+", NUDGE_STEP));
+        nrow.appendChild(nlab);
+        nrow.appendChild(ng);
+        const nwrap = document.createElement("div");
+        nwrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+        nwrap.appendChild(nrow);
+        nwrap.appendChild(nnote);
+        box.appendChild(nwrap);
+        nudge.addEventListener("change", syncNudge);
+        syncNudge();
+        const PRM_KERNEL_DEFAULT = 5;
+        const prmVal = (compress && typeof compress.preserveRecentMessages === "number") ? compress.preserveRecentMessages : PRM_KERNEL_DEFAULT;
+        const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"), prmVal);
+        prm.type = "number";
+        prm.min = "1";
+        prm.style.flex = "0 0 140px";
+        prm.addEventListener("change", () => {
+            const v = parseInt(prm.value, 10);
+            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
+            if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) { draft.compress.preserveRecentMessages = v; } else { delete draft.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+            writeDraft();
+        });
+        const ptVal = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"), ptVal);
+        ptInp.addEventListener("change", () => {
+            const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (list.length === 0) { delete draft.protectedTools; } else { draft.protectedTools = list; }
+            writeDraft();
+        });
+        const mitm = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
+        const mitmList = (mitm && Array.isArray(mitm.domains)) ? mitm.domains.filter((d) => typeof d === "string").join(", ") : "";
+        const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"), mitmList);
+        mitmInp.addEventListener("change", () => {
+            const domains = mitmInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (domains.length === 0) { delete draft.mitm; return writeDraft(); }
+            if (!draft.mitm || typeof draft.mitm !== "object" || Array.isArray(draft.mitm)) draft.mitm = {};
+            draft.mitm.domains = domains;
+            writeDraft();
+        });
+        void ptRow.ctl;
+    }
+
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
@@ -1273,6 +1452,17 @@ export const WEB_CLIENT = `(function () {
             const pu = $("proxy-url");
             const val = pu ? pu.value.trim() : "";
             await putCfg(su, { upstreamProxyMode: mode, upstreamProxy: val || null });
+        });
+        // #1748: quick-config controls edit the same in-memory draft as the raw JSON
+        // editor; every change re-serializes into #cfg-file-edit, one Save writes once.
+        const sq = $("save-quick");
+        if (sq) sq.addEventListener("click", async () => {
+            const el = $("cfg-file-edit");
+            const raw = el ? el.value : "";
+            let parsed;
+            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
+            await putCfg(sq, { file: raw });
         });
         // #1426: single raw config-file editor — the server validates every known field
         const sf = $("save-file");
