@@ -8,9 +8,11 @@ import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-// #1365: legacy dead-attach suites must not pay the full routed-evidence grace
-// default (it would outlast the POLL_DEADLINE_MS cap and race it); pin the grace
-// tiny so the cap dominates. Pinned-path tests override per-test.
+// #1365: legacy dead-attach suites see no routed traffic, so without this pin
+// each would sit out the FULL routed-evidence grace window (default 5s,
+// native-intercept observeRoutedOrigin) before the spawn fallback — keep the
+// grace tiny so the POLL_DEADLINE_MS cap dominates timing. Pinned-path tests
+// override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
