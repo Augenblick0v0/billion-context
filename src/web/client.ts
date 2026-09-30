@@ -1044,6 +1044,9 @@ export const WEB_CLIENT = `(function () {
     // One control per known config-file field, rendered over the same file the
     // raw JSON box below edits. Saving deep-clones the current document and
     // applies only the modeled controls, so unmodeled keys survive untouched.
+    // Bool fields whose config default is ON (absent key = on) carry def: true —
+    // the switch renders checked for an absent key, and turning it off writes an
+    // explicit false — deleting the key would silently keep the feature on.
     let cfgForm = null;
 
     function buildCfgSchema() {
@@ -1055,11 +1058,11 @@ export const WEB_CLIENT = `(function () {
                 { p: ["logFile"], k: "text", tip: t("qs.s_logFile") },
                 { p: ["sessionHeader"], k: "text", tip: t("qs.s_sessionHeader"), ph: "x-acp-session" },
                 { p: ["dumpSse"], k: "text", tip: t("qs.s_dumpSse") },
-                { p: ["log"], k: "bool", tip: t("qs.s_log") },
+                { p: ["log"], k: "bool", def: true, tip: t("qs.s_log") },
             ]},
             { sec: t("cfg.sec_compress"), fields: [
-                { p: ["compress", "injectTool"], k: "bool", tip: t("qs.c_injectTool") },
-                { p: ["compress", "injectNudge"], k: "bool", tip: t("qs.c_injectNudge") },
+                { p: ["compress", "injectTool"], k: "bool", def: true, tip: t("qs.c_injectTool") },
+                { p: ["compress", "injectNudge"], k: "bool", def: true, tip: t("qs.c_injectNudge") },
                 { p: ["compress", "modelContextLimit"], k: "pct", tip: t("qs.c_modelContextLimit"), ph: "200000 | 75%" },
                 { p: ["compress", "outputHeadroomMaxPct"], k: "pct", tip: t("qs.c_outputHeadroomMaxPct"), ph: "0.25 | 25%" },
                 { p: ["compress", "maxContextLimit"], k: "pct", tip: t("qs.c_maxContextLimit"), ph: "0.75 | 75%" },
@@ -1068,12 +1071,12 @@ export const WEB_CLIENT = `(function () {
                 { p: ["compress", "preserveRecentMessages"], k: "int", tip: t("qs.c_preserveRecentMessages") },
                 { p: ["compress", "preserveRecentTokens"], k: "int", tip: t("qs.c_preserveRecentTokens") },
                 { p: ["compress", "minCompressRangeChars"], k: "int", tip: t("qs.c_minCompressRangeChars") },
-                { p: ["compress", "tiers"], k: "bool", tip: t("qs.c_tiers") },
+                { p: ["compress", "tiers"], k: "bool", def: true, tip: t("qs.c_tiers") },
                 { p: ["compress", "protectedLatestTools"], k: "int", tip: t("qs.c_protectedLatestTools") },
                 { p: ["compress", "protectedTools"], k: "list", tip: t("qs.c_protectedTools") },
                 { p: ["compress", "neverPreserveRecentTools"], k: "list", tip: t("qs.c_neverPreserveRecentTools") },
                 { p: ["compress", "preserveRecentTools"], k: "list", tip: t("qs.c_preserveRecentTools") },
-                { p: ["compress", "visibilityMarkers"], k: "bool", tip: t("qs.c_visibilityMarkers") },
+                { p: ["compress", "visibilityMarkers"], k: "bool", def: true, tip: t("qs.c_visibilityMarkers") },
                 { p: ["compress", "stripImages"], k: "bool", tip: t("qs.c_stripImages") },
                 { p: ["compress", "stripImagesKeepRecent"], k: "int", tip: t("qs.c_stripImagesKeepRecent") },
                 { p: ["compress", "rules"], k: "bool", tip: t("qs.c_rules") },
@@ -1090,27 +1093,27 @@ export const WEB_CLIENT = `(function () {
                 { p: ["compress", "priceProfile"], k: "json", tip: t("qs.c_priceProfile") },
             ]},
             { sec: t("cfg.sec_update"), fields: [
-                { p: ["autoUpdate"], k: "bool", tip: t("qs.u_autoUpdate") },
+                { p: ["autoUpdate"], k: "bool", def: true, tip: t("qs.u_autoUpdate") },
                 { p: ["autoRestartOnUpdate"], k: "bool", tip: t("qs.u_autoRestartOnUpdate") },
                 { p: ["updateTag"], k: "text", tip: t("qs.u_updateTag"), ph: "latest" },
-                { p: ["advisoryCheck"], k: "bool", tip: t("qs.u_advisoryCheck") },
+                { p: ["advisoryCheck"], k: "bool", def: true, tip: t("qs.u_advisoryCheck") },
                 { p: ["advisoryUrl"], k: "text", tip: t("qs.u_advisoryUrl") },
             ]},
             { sec: t("cfg.sec_behavior"), fields: [
                 { p: ["passthrough"], k: "bool", tip: t("cfg.passthrough_desc") },
                 { p: ["debug"], k: "bool", tip: t("qs.b_debug") },
                 { p: ["modelContextLimit"], k: "int", tip: t("qs.b_modelContextLimit") },
-                { p: ["maskHosts"], k: "bool", tip: t("qs.b_maskHosts") },
-                { p: ["subagentSplit"], k: "bool", tip: t("qs.b_subagentSplit") },
+                { p: ["maskHosts"], k: "bool", def: true, tip: t("qs.b_maskHosts") },
+                { p: ["subagentSplit"], k: "bool", def: true, tip: t("qs.b_subagentSplit") },
                 { p: ["forkAdoption"], k: "bool", tip: t("qs.b_forkAdoption") },
-                { p: ["resumeInheritance"], k: "bool", tip: t("qs.b_resumeInheritance") },
-                { p: ["chainContentDetection"], k: "bool", tip: t("qs.b_chainContentDetection") },
+                { p: ["resumeInheritance"], k: "bool", def: true, tip: t("qs.b_resumeInheritance") },
+                { p: ["chainContentDetection"], k: "bool", def: true, tip: t("qs.b_chainContentDetection") },
                 { p: ["stableSystemAnchor"], k: "bool", tip: t("qs.b_stableSystemAnchor") },
                 { p: ["imageBilling"], k: "enum", tip: t("qs.b_imageBilling"), opts: ["auto", "pixels", "bytes"] },
             ]},
             { sec: t("cfg.sec_advanced"), fields: [
                 { p: ["promptCache", "routing"], k: "enum", tip: t("qs.a_promptCacheRouting"), opts: ["auto", "enabled", "disabled"] },
-                { p: ["mitm", "enabled"], k: "bool", tip: t("qs.a_mitmEnabled") },
+                { p: ["mitm", "enabled"], k: "bool", def: true, tip: t("qs.a_mitmEnabled") },
                 { p: ["mitm", "domains"], k: "list", tip: t("qs.a_mitmDomains") },
                 { p: ["compat", "roles"], k: "json", tip: t("qs.a_compatRoles") },
                 { p: ["compat", "streamErrorShape"], k: "enum", tip: t("qs.a_streamErrorShape"), opts: ["protocol", "completion"] },
@@ -1170,6 +1173,10 @@ export const WEB_CLIENT = `(function () {
 
     function ctrlId(p) { return "cf_" + p.join("_"); }
 
+    // Key-stable (not index-based): addRoute/removeRoute re-sort/splice routeKeys
+    // before re-rendering, so index ids would shift unsaved edits to the wrong row.
+    function routeCtrlId(key, f) { return "cf_r_" + encodeURIComponent(key) + "_" + f; }
+
     function renderControl(f, value, forceDot, idOverride) {
         const id = idOverride || ctrlId(f.p);
         const name = f.p[f.p.length - 1];
@@ -1179,7 +1186,7 @@ export const WEB_CLIENT = `(function () {
         if (fv.length > 0) {
             ctl = '<span class="badge warn qs-forced-badge">' + escapeHtml(t("cfg.form_env_forced", { var: fv.join("/") })) + "</span>";
         } else if (f.k === "bool") {
-            ctl = '<button type="button" class="switch" role="switch" aria-checked="' + (value === true) + '" id="' + id + '"></button>';
+            ctl = '<button type="button" class="switch" role="switch" aria-checked="' + (value === undefined ? Boolean(f.def) : value === true) + '" id="' + id + '"></button>';
         } else if (f.k === "enum") {
             const opts = ['<option value="">' + escapeHtml(t("qs.opt_default")) + "</option>"];
             for (const o of f.opts) opts.push('<option value="' + escapeHtml(o) + '"' + (value === o ? " selected" : "") + ">" + escapeHtml(o) + "</option>");
@@ -1216,7 +1223,7 @@ export const WEB_CLIENT = `(function () {
         parts.push('<div class="qs-grid">');
         for (const f of buildRouteFields()) {
             const forceDot = f.f === "imageBilling" ? "imageBilling" : "providers." + key + "." + f.f;
-            parts.push(renderControl({ p: [f.f], k: f.k, tip: f.tip, opts: f.opts, ph: f.ph }, entry[f.f], forceDot, "cf_r_" + i + "_" + f.f));
+            parts.push(renderControl({ p: [f.f], k: f.k, tip: f.tip, opts: f.opts, ph: f.ph }, entry[f.f], forceDot, routeCtrlId(key, f.f)));
         }
         parts.push("</div></div>");
         return parts.join("");
@@ -1347,7 +1354,11 @@ export const WEB_CLIENT = `(function () {
     }
 
     function collectValue(f, el, fieldName) {
-        if (f.k === "bool") return { del: el.getAttribute("aria-checked") !== "true" };
+        if (f.k === "bool") {
+            const on = el.getAttribute("aria-checked") === "true";
+            if (!on && !f.def) return { del: true };
+            return { val: on };
+        }
         const raw = String(el.value == null ? "" : el.value).trim();
         if (raw === "") return { del: true };
         if (f.k === "int" || f.k === "num") {
@@ -1391,11 +1402,11 @@ export const WEB_CLIENT = `(function () {
         }
         if (routesEditable()) {
             const prov = {};
-            cfgForm.routeKeys.forEach((key, i) => {
+            cfgForm.routeKeys.forEach((key) => {
                 const prev = (((cfgForm.base || {}).providers) || {})[key] || {};
                 const entry = JSON.parse(JSON.stringify(prev));
                 for (const f of buildRouteFields()) {
-                    const el = $("cf_r_" + i + "_" + f.f);
+                    const el = $(routeCtrlId(key, f.f));
                     if (!el) continue;
                     const r = collectValue(f, el, key + "." + f.f);
                     if (!r) { failed = true; continue; }

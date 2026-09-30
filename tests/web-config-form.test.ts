@@ -140,6 +140,53 @@ test("#1748: embedded client ships the detailed form wiring", () => {
     }
 });
 
+test("#1748: default-on bool fields are marked def so off writes explicit false", () => {
+    // Fields whose config default is ON (absent key = on): the switch renders
+    // checked for an absent key and turning it off saves `false`. Deleting the
+    // key instead would silently keep the feature on (un-disableable via UI).
+    const defaultOn = [
+        '["log"], k: "bool", def: true',
+        '["compress", "injectTool"], k: "bool", def: true',
+        '["compress", "injectNudge"], k: "bool", def: true',
+        '["compress", "tiers"], k: "bool", def: true',
+        '["compress", "visibilityMarkers"], k: "bool", def: true',
+        '["autoUpdate"], k: "bool", def: true',
+        '["advisoryCheck"], k: "bool", def: true',
+        '["maskHosts"], k: "bool", def: true',
+        '["subagentSplit"], k: "bool", def: true',
+        '["resumeInheritance"], k: "bool", def: true',
+        '["chainContentDetection"], k: "bool", def: true',
+        '["mitm", "enabled"], k: "bool", def: true',
+    ];
+    for (const needle of defaultOn) assert.ok(WEB_CLIENT.includes(needle), needle);
+    // Default-off fields must NOT carry def: an absent key already means off,
+    // and marking them would render the switch checked for a feature that is off.
+    const defaultOff = [
+        '["debug"], k: "bool", tip:',
+        '["autoRestartOnUpdate"], k: "bool", tip:',
+        '["passthrough"], k: "bool", tip:',
+        '["forkAdoption"], k: "bool", tip:',
+        '["stableSystemAnchor"], k: "bool", tip:',
+        '["compress", "stripImages"], k: "bool", tip:',
+        '["compress", "rules"], k: "bool", tip:',
+        '["compress", "acknowledgePromptsRisk"], k: "bool", tip:',
+        '["native", "attachExternal"], k: "bool", tip:',
+        '{ f: "passthrough", k: "bool", tip:',
+        '{ f: "direct", k: "bool", tip:',
+    ];
+    for (const needle of defaultOff) assert.ok(WEB_CLIENT.includes(needle), needle);
+    assert.ok(WEB_CLIENT.includes("value === undefined ? Boolean(f.def) : value === true"));
+    assert.ok(WEB_CLIENT.includes("if (!on && !f.def) return { del: true };"));
+});
+
+test("#1748: route control ids are key-stable, never index-based", () => {
+    assert.ok(WEB_CLIENT.includes('function routeCtrlId(key, f) { return "cf_r_" + encodeURIComponent(key) + "_" + f; }'));
+    assert.equal((WEB_CLIENT.match(/routeCtrlId\(key, f\.f\)/g) || []).length, 2);
+    // Index-based ids shift unsaved edits to the wrong provider row whenever
+    // addRoute/removeRoute re-sort or splice routeKeys before re-rendering.
+    assert.doesNotMatch(WEB_CLIENT, /"cf_r_"\s*\+\s*i\s*\+/);
+});
+
 test("#1748: isEnvForcedPath is an exact-path lookup; BILI_IMAGE_BILLING reports imageBilling", () => {
     const map = envForcedMap({ BILI_IMAGE_BILLING: "anthropic", ACP_DEBUG: "1" } as NodeJS.ProcessEnv);
     assert.equal(isEnvForcedPath("debug", map), true);

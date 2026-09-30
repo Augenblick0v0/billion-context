@@ -651,7 +651,6 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "routing.codex_note_e": "from Windows (auto-forwarded); 127.0.0.1 will not work.",
         "toast.connect_ok": "Connection successful, HTTP {status}",
         "toast.upstream_reachable": "Reachable (HTTP {status}) — network OK; auth handled by the client",
-        "toast.passthrough_cleared": "Passthrough disabled ✓",
         "toast.failed": "Operation failed: {msg}",
     },
 };
