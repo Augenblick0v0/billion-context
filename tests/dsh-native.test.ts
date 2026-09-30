@@ -1588,3 +1588,54 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         _resetRegisterForTest(undefined);
     }
 });
+
+// — #1788: probe-healthy landing converges on the routed origin ————————
+// The two early landings in verifyAttachAndRecover (probe-healthy + pinned-
+// recovered) are deliberately ungated by landingOwnsRegister (see the source
+// boundary notes). This pins their SAFE direction: with routed evidence present
+// at startup, home === state.routedOrigin, so the probe-healthy write lands on
+// the SAME origin onRoutedOriginObserved rebinds to — it converges instead of
+// clobbering, never spawns over it, and outranks even a LIVE preset. Distinct
+// from the #1365 suite, whose targets are dead (you can't tell "honoured
+// routed" from "fell back"); here both origins are live, so binding to the
+// preset instead of the routed origin is observable and fails the assertions.
+test("#1788 startup attach: routed evidence to a live origin outranks the live preset — probe-healthy lands on the routed origin, no spawn", async () => {
+    const presetCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const routedCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const preset = await startMockProxy(presetCalls, () => ({ panel: "PANEL-PRESET" }));
+    const routed = await startMockProxy(routedCalls, () => ({ panel: "PANEL-ROUTED" }));
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1788-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: preset.origin }, async () => {
+            _resetRoutedForTest();
+            // Seed the routed-channel evidence BEFORE apply so the startup probe
+            // sees it: the settings overlay baked `routed` into the provider
+            // baseURL, not the launcher preset.
+            _noteRoutedForTest(`${routed.origin}/bili/${R1365_UPSTREAM}`);
+            _resetRegisterForTest(preset.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "attach tool registration");
+            assert.equal(spawnCalls, 0, "never spawns over a routed-evidence target");
+            // Status reads go to the ROUTED origin (where the models go), not the live preset.
+            const st = await ctx.registeredCommands[0].handler();
+            assert.ok(st.text.includes("PANEL-ROUTED"), `tools bound to the routed origin, got: ${st.text}`);
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1788" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(routedCalls, [{ conversationId: "s1788", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(presetCalls, [], "the live preset is never used once routed evidence points elsewhere");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        preset.close();
+        routed.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
