@@ -949,8 +949,8 @@ function runHook(distScript: string, port: number, xdg: Record<string, string>):
     // covered without each one remembering to pass a tmp dir.
     const tmp = path.join(xdg.home, "tmp");
     fs.mkdirSync(tmp, { recursive: true });
-    fs.mkdirSync(xdg.config, { recursive: true });
-    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
+    fs.mkdirSync(path.join(xdg.config, "billion-context"), { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [distScript], {
             env: {
@@ -1152,8 +1152,8 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
-    fs.mkdirSync(xdg.config, { recursive: true });
-    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
+    fs.mkdirSync(path.join(xdg.config, "billion-context"), { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const claudeProc = spawn(claudeBin, [], {
         env: {
             PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -1322,8 +1322,8 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
     const port = await freePort();
-    fs.mkdirSync(xdg.config, { recursive: true });
-    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
+    fs.mkdirSync(path.join(xdg.config, "billion-context"), { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1422,8 +1422,8 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
-    fs.mkdirSync(xdg.config, { recursive: true });
-    fs.writeFileSync(path.join(xdg.config, "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
+    fs.mkdirSync(path.join(xdg.config, "billion-context"), { recursive: true });
+    fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"), JSON.stringify({ claude: { nativePort: port } }));
     const sessionEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
