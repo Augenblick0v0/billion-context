@@ -711,6 +711,7 @@
 | `ACP_COMPRESS_TOOL` | 设为 `0` 禁用工具注入（等同 `"compress.injectTool": false`）。 |
 | `ACP_COMPRESS_NUDGE` | 设为 `0` 禁用 nudge 注入（等同 `"compress.injectNudge": false`）。 |
 | `ACP_MODEL_CONTEXT_LIMIT` | 全局覆盖上下文上限（绝对 token 数）。 |
+| `BILLION_CONTEXT_NODE` | 非 Node 宿主进程拉起代理时显式指定的 Node 可执行文件路径（#819/#1429）。宿主自身不是 Node 时的解析顺序:本覆盖项 → PATH 搜索 + GUI PATH 会遗漏的众所周知安装位置（`/opt/homebrew/bin`、`/usr/local/bin`、Volta 等）→ Electron 宿主自身二进制以纯 Node 运行（`ELECTRON_RUN_AS_NODE=1`，最后手段 —— 因此 deepseek-harness desktop 这类桌面应用零配置即可用）。用于强制指定某个 Node（如比宿主捆绑运行时更新的版本）；始终优先于上述回退。 |
 | `BILI_IMAGE_TOKEN_CAP` | 预检尺寸门与输出钳制用的单图 token 估算上限（#488/#496）。默认内联 `data:` 图片按 `base64 长度 / 4` 计 token、**无上限** —— 对字节计费 relay 正确，但对像素 tile 计费的官方上游（Anthropic/OpenAI）会严重高估（后者无论字节多少，每图约计 1.1K–1.6K token）。像素 tile 上游建议改用 [`imageBilling`](#imagebilling)（`"pixels"`，或 `BILI_IMAGE_BILLING=pixels`），按真实 tile 计费而非截断字节估算；该上限仍在两种计费模式之上作为统一天花板生效。不设置 = 无上限（默认）。 |
 | `BILI_IMAGE_BILLING` | 覆盖预检尺寸门与输出钳制的图片计费模式（#767）：`pixels` 或 `bytes`。每次请求实时读取（无需重启）；优先于全局 `imageBilling` 与所有按 provider 的 `providers.<url>.imageBilling`。在配置为 `"pixels"` 的路由上强制保守计费用 `bytes`（例如 OpenAI 同形 host 后面的字节计数 relay），或不想改配置文件就全进程启用 tile 计费用 `pixels`。详见 [`imageBilling`](#imagebilling)。 |
 | `BILI_PREFLIGHT_HOLD_MS` | 预压缩超过该宽限期（毫秒）后，代理提前提交响应并用保活字节挂住客户端（默认 `30000`；见 #568）。 |

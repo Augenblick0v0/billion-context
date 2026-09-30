@@ -42,6 +42,18 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Desktop app (Electron host):** the same plugin also runs inside the
+  deepseek-harness **desktop** app, installed through its in-app plugin
+  manager. There the bootstrap spawns its proxy from within the app process,
+  whose `process.execPath` is the Electron binary, not Node, and whose GUI
+  PATH omits normal install locations — `resolveNodeRuntime` (#819/#1429)
+  probes well-known locations first (`/opt/homebrew/bin`, `/usr/local/bin`,
+  Volta, …) and falls back to the app's own binary run as plain Node
+  (`ELECTRON_RUN_AS_NODE=1`, forced into the child env), so compression works
+  with zero configuration even without a standalone Node on PATH; set
+  `BILLION_CONTEXT_NODE` to force a specific Node (it beats both). Before
+  #1429 this path threw before spawning and every session silently degraded
+  to direct send (uncompressed), visible only in bili.log.
 - **Auto-update keeps profiles in lockstep:** the refresh has two triggers —
   after a global self-update, AND from the **profile copy's own proxy** when
   its periodic check sees a newer registry version (so dsh plugin-market
