@@ -67,6 +67,7 @@ const RETIRED_ENV: Record<string, string> = {
     BILI_STABLE_SYSTEM_ANCHOR: "stableSystemAnchor",
     BILI_STREAM_ERROR_SHAPE: "compat.streamErrorShape",
     BILI_STREAM_KEEPALIVE_MS: "streamKeepAliveMs",
+    BILI_STRICT_PORT: "no config field \u2014 set automatically by the claude launcher (#964)",
     BILI_SUBAGENT_SPLIT: "subagentSplit",
     BILI_TUNNEL_ALLOWED_HOSTS: "tunnelAllowedHosts",
     BILI_UPSTREAM_PROXY: "upstreamProxy",

@@ -2987,7 +2987,7 @@ export async function ensureProxyRunning(
                         ...(opts.modelMaxOutputs && Object.keys(opts.modelMaxOutputs).length > 0
                             ? { BILI_LAUNCHER_MODEL_MAX_OUTPUTS: JSON.stringify(opts.modelMaxOutputs) }
                             : {}),
-                        ...(opts.strictPort ? { BILI_STRICT_PORT: "1" } : {}),
+                        ...(opts.strictPort ? { BILI_LAUNCHER_STRICT_PORT: "1" } : {}),
                     },
                 },
             );

@@ -685,11 +685,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Launcher mode handshake (#407): the child self-binds and retries on
     // EADDRINUSE instead of dying, reporting the real origin via the instance
     // file (launchToken match). Manual `bili start` keeps fail-fast semantics.
-    // #964: BILI_STRICT_PORT (claude SessionStart hook) opts OUT of the retry
-    // — the native posture dials a static baked-in URL, so a port-hop
-    // "success" would strand every model request on the dead original port.
+    // #964: BILI_LAUNCHER_STRICT_PORT (claude SessionStart hook → launcher →
+    // child pipeline; user-facing BILI_STRICT_PORT retired in #1714) opts OUT
+    // of the retry — the native posture dials a static baked-in URL, so a
+    // port-hop "success" would strand every model request on the dead original
+    // port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
-    const strictPort = process.env.BILI_STRICT_PORT === "1";
+    const strictPort = process.env.BILI_LAUNCHER_STRICT_PORT === "1";
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after

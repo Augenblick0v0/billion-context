@@ -315,7 +315,7 @@ test("zone sequence: an explicit strictPort pin is exact and stays out of the st
         );
         assert.equal(sim.spawns.length, 1);
         assert.equal(spawnPortArg(sim.spawns[0]), String(pin), "the exact pin is the spawn port");
-        assert.equal(sim.spawns[0].env.BILI_STRICT_PORT, "1", "strictness crosses the process boundary");
+        assert.equal(sim.spawns[0].env.BILI_LAUNCHER_STRICT_PORT, "1", "strictness crosses the process boundary");
         assert.equal(h.port, pin);
         assert.deepEqual(sim.settles, [], "explicit pins never settle a zone record");
         assert.equal(readZonePort("zcode", zoneFile), undefined);
