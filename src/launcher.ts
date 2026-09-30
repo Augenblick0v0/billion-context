@@ -2427,6 +2427,9 @@ async function probeHealth(
 export interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** #1753: the responder's own pid from /__bili/health — the spawn-wait
+     *  fallback uses it to prove WHO answers on the preferred port. */
+    pid?: number;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
      *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed. */
     watchdog?: { armed: boolean };
@@ -2436,8 +2439,12 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; watchdog?: unknown };
-        const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; pid?: unknown; watchdog?: unknown };
+        const info: HealthInfo = {
+            ok: Boolean(data.ok),
+            instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined,
+            pid: typeof data.pid === "number" ? data.pid : undefined,
+        };
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
             info.watchdog = { armed: (data.watchdog as { armed: boolean }).armed };
         }
@@ -3018,6 +3025,14 @@ export async function ensureProxyRunning(
             childError = rest[0];
         });
 
+        // #1753: the pre-handshake fallback must prove WHO answers on the
+        // preferred port. A healthy FOREIGN instance there (an older build
+        // squatting the lane zone) is exactly why our child laddered off it —
+        // trusting its bare health response exports the client to the wrong
+        // origin, bypassing the #1225 fingerprint gate that just refused the
+        // same instance in the attach path above. /__bili/health carries the
+        // responder's pid; only child.pid makes the preferred port ours.
+        let squatterAnnounced = false;
         const deadline = now() + SPAWN_WAIT_MS;
         while (now() < deadline) {
             if (childExit || childError !== undefined) break;
@@ -3034,14 +3049,25 @@ export async function ensureProxyRunning(
                 continue;
             }
             // Fallback for a child that cannot write the instance file (broken
-            // state dir) or an old pre-handshake binary: only trust the preferred
-            // origin when NO record vouches for it — a LIVE record's owner owns
-            // the discovery surface and our child is retry-binding elsewhere.
-            // A stale record (dead pid / legacy plain) cannot vouch for anything.
+            // state dir): only trust the preferred origin when its responder
+            // identifies as OUR child (health pid === child.pid). A stale
+            // record (dead pid / legacy plain) cannot vouch for anything, and
+            // neither can a foreign healthy squatter or a non-bili listener
+            // (no pid to compare) — keep waiting for the launchToken handshake
+            // record on the child's real port instead.
             const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
-            if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
-                settleZonePort(port);
-                return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+            if (stale && typeof child.pid === "number") {
+                const info = await fetchHealthInfo(proxyOrigin(opts.host, port));
+                if (info?.ok) {
+                    if (info.pid === child.pid) {
+                        settleZonePort(port);
+                        return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+                    }
+                    if (!squatterAnnounced) {
+                        squatterAnnounced = true;
+                        attachDiag(`bili: preferred port ${port} is held by a healthy foreign instance (pid ${info.pid ?? "unknown"}) — waiting for our child to report its real origin via the launch-token handshake (#1753)`);
+                    }
+                }
             }
         }
         if (childError !== undefined) {
