@@ -6271,7 +6271,10 @@ async function preflightCompressIfNeeded(
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
     if (imageArbitration) {
-        const outText = estimateCoreMessages(outbound.processedMessages);
+        // Same fallback as the fit-gate measurement above: processedMessages
+        // empty ⇒ kernel transform failure ⇒ the raw body rides.
+        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const outText = estimateCoreMessages(outMsgs);
         if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
             log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
             return outbound;
