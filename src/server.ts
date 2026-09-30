@@ -1,6 +1,8 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import net from "node:net";
+import tls from "node:tls";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
@@ -12,9 +14,10 @@ import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { clearUpstreamAlertsForHost, getUpstreamAlerts, recordUpstreamAlert } from "./upstream-alerts.js";
+import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
 // "acp-kernel/wire" (kernel #215).
@@ -45,8 +48,9 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
+import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
     coreToGoogle,
@@ -60,15 +64,17 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, commitRetrievalNotes, contentStoreOf, dropRetrievals, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
-import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
+import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, imageUsageSuffix, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { buildSessionCacheReport, handleAcpCache } from "./cache-ledger.js";
+import { attachSubagentSessions } from "./subagent-sessions.js";
+import { buildSessionCacheReport, handleAcpCache, noteClientAbort, noteForwardedBody, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
@@ -77,12 +83,14 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, enterSessionContext } from "./logger.js";
+import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
+import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
@@ -102,12 +110,13 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
-import { evaluateChain, extractChainCarriers, stampOutbound } from "./chain-checkpoint.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
+import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import { handleWsUpgrade } from "./ws-passthrough.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -410,6 +419,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     void loadRegistry();
     const server = http.createServer(async (req, res) => {
         armRequestWatchdog(req, res, log);
+        const connRec = connRecords.get(req.socket);
+        if (connRec) {
+            connRec.requests++;
+            res.on("finish", () => { connRec.lastResponseEndAt = Date.now(); });
+        }
         try {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid);
         } catch (err) {
@@ -473,6 +487,170 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             if (!handled) rejectUpgrade426(req);
         });
     });
+    // #1452: explicit keep-alive idle budget. Node's implicit default is
+    // 5000ms; the default here matches it exactly (zero behavior change), but
+    // the knob exists so pooled clients can deliberately extend or shorten the
+    // reuse window instead of guessing at Node internals.
+    const katRaw = Number(process.env.BILI_KEEP_ALIVE_TIMEOUT_MS);
+    const keepAliveTimeoutMs = Number.isInteger(katRaw) && katRaw > 0 ? katRaw : 5000;
+    server.keepAliveTimeout = keepAliveTimeoutMs;
+    // #1529: terminal backstop for the clientError drain path. After the bail
+    // end(), a peer that never sends FIN holds the socket half-open on our
+    // side indefinitely (the kat reaper keys off completed responses; Node
+    // enables no SO_KEEPALIVE by default). Destroy after this much post-bail
+    // silence instead. Safe against the #1452 RST signature: resume() has
+    // drained the recv buffer for the whole window, so no unread residual
+    // bytes ride the destroy. 0 restores hold-until-peer-death (status quo).
+    const backstopRaw = Number(process.env.BILI_CLIENT_ERROR_BACKSTOP_MS);
+    const clientErrorBackstopMs = Number.isInteger(backstopRaw) && backstopRaw >= 0 ? backstopRaw : 30_000;
+    log("info", `[conn] keepAliveTimeout=${keepAliveTimeoutMs}ms clientErrorBackstop=${clientErrorBackstopMs}ms`);
+    // #1714: BILI_STREAM_STALL_MS is retired (#1706 incident: a stale 400ms
+    // export turned every thinking-phase silence into a false truncation).
+    // The value is now ignored; name it once at startup so stale shell exports
+    // announce themselves instead of silently dying.
+    const retiredStallEnv = process.env.BILI_STREAM_STALL_MS;
+    if (retiredStallEnv !== undefined && retiredStallEnv.trim() !== "") {
+        log("warn", `[config] BILI_STREAM_STALL_MS=${retiredStallEnv} is no longer read (#1714) — ignored; upstream silence is bounded by the ${Math.round(upstreamTimeoutMs() / 60000)}-minute idle budget (BILI_UPSTREAM_TIMEOUT_MS)`);
+    }
+    // #1452: per-connection lifecycle ledger — turns "which side closed this
+    // socket, and why" from forensic inference into one debug line per
+    // connection (zero payload content). reason=destroyed means nobody ended
+    // the socket deliberately: every intentional destroy path carries its own
+    // dedicated log marker to correlate against.
+    interface ConnRecord {
+        id: number;
+        kind: "tls" | "tcp";
+        openedAt: number;
+        requests: number;
+        lastResponseEndAt: number | null;
+        errored: string | null;
+        serverEndAt: number | null;
+        peerFinAt: number | null;
+        /** #1529: the clientError drain disposition owns this socket (idempotence guard). */
+        drainArmed: boolean;
+        /** #1529: performance.now() when the post-bail backstop destroyed the socket (peer never FINned). */
+        backstopAt: number | null;
+    }
+    const connRecords = new Map<net.Socket, ConnRecord>();
+    let connSeq = 0;
+    server.on("connection", (socket) => {
+        const rec: ConnRecord = {
+            id: ++connSeq,
+            kind: socket instanceof tls.TLSSocket ? "tls" : "tcp",
+            openedAt: Date.now(),
+            requests: 0,
+            lastResponseEndAt: null,
+            errored: null,
+            serverEndAt: null,
+            peerFinAt: null,
+            drainArmed: false,
+            backstopAt: null,
+        };
+        connRecords.set(socket, rec);
+        // prefinish fires when end() fully flushes — never on destroy(). That
+        // makes it the reliable "server-initiated close" marker without patching
+        // the socket object. performance.now() (µs) rather than Date.now():
+        // both sides routinely close within the same millisecond — the receiver
+        // of a FIN reacts by ending its own side — so only sub-ms resolution
+        // preserves the causal order that decides who initiated (#1452).
+        // Under load the clock's effective resolution can coarsen below the
+        // end→prefinish gap, so both markers may come out EQUAL. Every
+        // post-response prefinish producer is causally downstream of the peer
+        // FIN read (socketOnEnd → end()), so a tie means peer-fin-first or
+        // indistinguishable from it — classified as peer-fin via `<=` below
+        // (a strict `<` mislabeled these as server-end, #1562).
+        socket.on("prefinish", () => { rec.serverEndAt = performance.now(); });
+        socket.on("end", () => { rec.peerFinAt = performance.now(); });
+        socket.on("error", (err) => {
+            const code = (err as NodeJS.ErrnoException).code;
+            rec.errored = code ?? err.message;
+        });
+        socket.on("close", () => {
+            connRecords.delete(socket);
+            const now = Date.now();
+            // Node's keep-alive reaper destroys() idle sockets — no prefinish,
+            // no end (measured on v22: the server side sees only close, the
+            // peer gets a clean FIN). So idle-timeout keys off the response
+            // budget rather than the end marker; the requests>0 guard keeps
+            // request-less closes out (the reaper only arms post-response).
+            const idleForBudget = rec.requests > 0 && rec.lastResponseEndAt !== null && now - rec.lastResponseEndAt >= keepAliveTimeoutMs;
+            const reason = rec.backstopAt !== null
+                ? "clienterror-backstop"
+                : rec.errored
+                    ? `error(${rec.errored})`
+                    : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                        ? "peer-fin"
+                        : idleForBudget
+                            ? "idle-timeout"
+                            : rec.serverEndAt !== null
+                                ? "server-end"
+                                : "destroyed";
+            log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+        });
+    });
+    // #1452: Node's default client-error disposition (no listener) writes a
+    // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
+    // destroys the socket (measured Linux/Node 25). Depending on platform
+    // and residual kernel recv-buffer state, that destroy surfaces as RST
+    // (peer reads ECONNRESET — the #1452 incident signature) or strands the
+    // peer's pooled connection with neither FIN nor RST ever (verified
+    // matrix; Node 22/Linux measures as the strand case). We replace all of
+    // it with drain-then-end: an immediate clean FIN, never destroy a
+    // data-bearing socket. Wire delta vs Node default: a malformed request
+    // gets a FIN instead of a 400 — intentional (unparseable input; PR
+    // #1528 discloses it). One handler covers both plain TCP and MITM TLS
+    // legs: the MITM socket enters through this same server instance.
+    server.on("clientError", (err, socket) => {
+        if (socket.destroyed) return;
+        // Further parse failures on the same socket must not stack listeners
+        // or timers — the first disposition owns the socket (#1529).
+        const rec = socket instanceof net.Socket ? connRecords.get(socket) : undefined;
+        if (rec?.drainArmed) return;
+        if (rec) rec.drainArmed = true;
+        log("warn", `[conn] clientError: ${err.message} — draining then closing`);
+        socket.on("error", () => {});
+        socket.resume();
+        socket.once("end", () => socket.end());
+        const bail = setTimeout(() => {
+            if (socket.destroyed || socket.writableEnded) return;
+            socket.end();
+            // #1529: a peer that never FINs after our end() holds the socket
+            // half-open on our side indefinitely — the kat reaper keys off
+            // completed responses and Node enables no SO_KEEPALIVE. Terminal
+            // backstop: resume() has drained the recv buffer for the whole
+            // window, so the destroy carries no unread residual bytes and
+            // cannot surface as the #1452 RST signature.
+            if (clientErrorBackstopMs > 0) {
+                const backstop = setTimeout(() => {
+                    if (socket.destroyed || socket.readableEnded) return;
+                    if (rec) {
+                        rec.backstopAt = performance.now();
+                        log("warn", `[conn#${rec.id}] clientError backstop: no peer FIN ${clientErrorBackstopMs}ms after drain-end — destroying`);
+                    } else {
+                        log("warn", `[conn] clientError backstop: no peer FIN ${clientErrorBackstopMs}ms after drain-end — destroying`);
+                    }
+                    socket.destroy();
+                }, clientErrorBackstopMs);
+                backstop.unref?.();
+            }
+        }, 300);
+        bail.unref?.();
+    });
+    // #1452: long-lived-process exposure telemetry — both incidents died
+    // inside one 36.7h process while fresh processes stayed clean under
+    // higher load; fd/connection-table drift was unfalsifiable without
+    // periodic ground truth. One info line per interval, zero payload.
+    const exposureRaw = Number(process.env.BILI_EXPOSURE_LOG_INTERVAL_MS);
+    const exposureIntervalMs = Number.isInteger(exposureRaw) ? Math.max(0, exposureRaw) : 3_600_000;
+    if (exposureIntervalMs > 0) {
+        const exposureStartedAt = Date.now();
+        const exposureTimer = setInterval(() => {
+            const handles = process.getActiveResourcesInfo();
+            const tcpHandles = handles.reduce((n, h) => n + (h === "TCPWrap" || h === "TLSSocket" ? 1 : 0), 0);
+            log("info", `[exposure] uptime=${Math.round(((Date.now() - exposureStartedAt) / 3_600_000) * 10) / 10}h liveConns=${connRecords.size} tcpHandles=${tcpHandles} handles=${handles.length} sessions=${listSessions().length} blindTunnels=${liveBlindTunnels()} inFlight=${totalInFlight()}`);
+        }, exposureIntervalMs);
+        exposureTimer.unref?.();
+    }
     setMaskHostsEnabled(opts.maskHosts ?? true);
     if (opts.mitm.enabled) {
         // Non-loopback bind (--host 0.0.0.0 / LAN IP) opts into serving
@@ -503,6 +681,26 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
+    // #1723 (#1660 follow-up): the upgrade-restart overlap. The launcher spawns
+    // this child while the OLD build's instance of the same lane is still
+    // draining (its host is exiting; the flush frees the port within seconds).
+    // Laddering +1 there is what ratchets the sticky port up one slot per
+    // auto-update forever. When EADDRINUSE hits a port held by a same-lane
+    // predecessor running DIFFERENT code, rebind the SAME port on a tick until
+    // it releases — bounded, so a holder that never leaves falls through to
+    // the plain ladder (today's behavior) after the budget is spent.
+    const PREDECESSOR_WAIT_TICKS = 10;
+    const PREDECESSOR_WAIT_MS = 500;
+    let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
+    let predecessorWaitAnnounced = false;
+    const sameLanePredecessorHolds = (port: number): boolean => {
+        const pred = findSameLanePredecessor(listInstances(), port, launcherLane, ownFingerprint);
+        if (pred && !predecessorWaitAnnounced) {
+            predecessorWaitAnnounced = true;
+            log("warn", `port ${port} held by a same-lane predecessor (pid ${pred.pid}, different build) — waiting up to ${Math.round((PREDECESSOR_WAIT_TICKS * PREDECESSOR_WAIT_MS) / 1000)}s for it to release instead of drifting`);
+        }
+        return pred !== undefined;
+    };
     const announceListening = (): void => {
         const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
@@ -548,7 +746,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
-            `acp-proxy listening on http://${displayHost}:${actualPort}` +
+            `acp-proxy v${VERSION} listening on http://${displayHost}:${actualPort}` +
                 ` — web UI: http://${displayHost}:${actualPort}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
@@ -575,6 +773,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         ? "Unset ACP_PASSTHROUGH (or drop --passthrough) and restart to re-enable compression."
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
             );
+        }
+        // #1723: residual zone drift is now an exception, not the norm — a
+        // lane'd launch landing ABOVE its preferred port means that port was
+        // held by something we must not wait on (foreign squatter, same-code
+        // peer). Clients pinned to the old port (lane wrappers, firewall
+        // rules, docs) point at air until they re-resolve; say so loudly.
+        if (launcherLane && actualPort > opts.port) {
+            log("warn", `[zone] lane "${launcherLane}" drifted ${opts.port} → ${actualPort} — the preferred port is still occupied by something else; anything pinned to ${opts.port} must re-resolve`);
         }
         const envKnobs: string[] = [];
         if (process.env.ACP_PASSTHROUGH !== undefined) envKnobs.push(`ACP_PASSTHROUGH=${process.env.ACP_PASSTHROUGH}`);
@@ -608,6 +814,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE" && launchToken && !strictPort && listenAttempts < MAX_LISTEN_ATTEMPTS) {
+            if (predecessorTicksLeft > 0 && sameLanePredecessorHolds(lastTriedPort)) {
+                predecessorTicksLeft -= 1;
+                setTimeout(() => attemptListen(lastTriedPort), PREDECESSOR_WAIT_MS);
+                return;
+            }
             listenAttempts += 1;
             const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
             log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
@@ -681,7 +892,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // Hard fallback: if connections hang (client never closes), don't
         // block shutdown forever — force-exit after a grace window.
         setTimeout(() => {
-            log("warn", "shutdown grace window elapsed; forcing exit");
+            log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
             flushConversations();
             void flushAllSessions().finally(finishShutdown);
         }, 10_000).unref?.();
@@ -756,6 +967,7 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */
@@ -785,6 +997,13 @@ type Prepared = {
      *  forward() re-runs processTurn with the same strategy so the re-request
      *  renders tags exactly like the request that produced it. */
     renderTags?: "text-only" | "none";
+    /** [#1592] The exact reasoning-drop closure this wire's steady path applied
+     *  (prepareAnthropic/prepareOpenai/prepareResponses capture theirs; google
+     *  serializes thinking itself and leaves it unset). refreshFolded must
+     *  apply the SAME drop the steady path used, or the folded re-request and
+     *  the next client turn render one history with two shapes (mid-history
+     *  byte-prefix break on every fold). */
+    dropReasoning?: (msgs: BiliMessage[]) => BiliMessage[];
      /** Effective compression prompts for this request (three-level cascade,
       *  defaults to the kernel's defaultPrompts). Carried so the compress loop
       *  in forward() rebuilds the SAME system prompt the request was prepared
@@ -817,38 +1036,66 @@ function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): R
     return resolveImageBilling(configured, upstreamUrl);
 }
 
-function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
-    // Host must be one of OUR listen identities regardless of whether an
+// #1537: reduce a Host-header value or a URL hostname to its bare lowercase
+// name — strip a trailing :port and the [..] brackets around an IPv6 literal.
+// Returns undefined for empty/unparseable input. The admin-origin gate uses it
+// to match on the hostname alone (see isTrustedAdminOrigin).
+function normalizeAdminHostname(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    const v = value.trim().toLowerCase();
+    if (!v) return undefined;
+    if (v.startsWith("[")) {
+        const end = v.indexOf("]");
+        if (end === -1) return undefined;
+        return v.slice(1, end);
+    }
+    // Bare IPv6 literal (no brackets): more than one colon means there is no
+    // host:port split to perform — return it untouched.
+    if ((v.match(/:/g) ?? []).length > 1) return v;
+    const idx = v.lastIndexOf(":");
+    if (idx !== -1) return v.slice(0, idx);
+    return v;
+}
+
+function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHostnames: Set<string>): boolean {
+    // Host must name one of OUR loopback identities regardless of whether an
     // Origin header is present. A same-origin browser GET/fetch (the DNS
     // rebinding read path: evil.com → 127.0.0.1) often carries NO Origin
     // header, so gating on Origin alone would leave config reads exposed.
-    if (!host || !trustedHosts.has(host.toLowerCase())) return false;
+    // #1537: match on the bare hostname and IGNORE the port — an SSH forward
+    // (ssh -L 18787:127.0.0.1:8787) legitimately presents a different local
+    // port while still arriving from loopback. The anti-rebinding property is
+    // preserved because an attacker's rebound domain (evil.com) can never equal
+    // a loopback NAME; only the port is relaxed.
+    const hn = normalizeAdminHostname(host);
+    if (!hn || !trustedHostnames.has(hn)) return false;
     if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
-        return trustedHosts.has(parsed.host.toLowerCase());
+        const ohn = normalizeAdminHostname(parsed.hostname);
+        return ohn !== undefined && trustedHostnames.has(ohn);
     } catch {
         return false;
     }
 }
 
-/** The set of Host header values we accept on management endpoints. DNS
- *  rebinding (attacker resolves evil.com → 127.0.0.1) can make a browser
- *  request carry Origin == Host == evil.com:port and still reach loopback;
- *  only pinning Host to our own listen address defeats it. */
-function adminTrustedHosts(bindHost: string, port: number): Set<string> {
-    const p = String(port);
-    const names = ["localhost", "127.0.0.1", "[::1]"];
-    if (bindHost && bindHost !== "0.0.0.0" && bindHost !== "::" && !names.includes(bindHost)) {
-        names.push(bindHost);
+/** The set of hostnames we accept on management endpoints. DNS rebinding
+ *  (attacker resolves evil.com → 127.0.0.1) can make a browser request carry
+ *  Origin == Host == evil.com:port and still reach loopback; only pinning the
+ *  Host to a loopback NAME defeats it. #1537: the port is deliberately NOT part
+ *  of the identity — SSH port-forwarding (ssh -L <local>:127.0.0.1:<remote>)
+ *  changes the local port while the connection still arrives from loopback, so
+ *  matching the port would reject every forwarded session. Every previously
+ *  accepted Host carried a loopback hostname, so dropping the port admits no
+ *  non-loopback identity. */
+function adminTrustedHostnames(bindHost: string): Set<string> {
+    const names = ["localhost", "127.0.0.1", "::1"];
+    const bound = normalizeAdminHostname(bindHost);
+    if (bound && bound !== "0.0.0.0" && bound !== "::" && !names.includes(bound)) {
+        names.push(bound);
     }
-    const set = new Set<string>();
-    for (const n of names) {
-        set.add(`${n}:${p}`.toLowerCase());
-        if (p === "80") set.add(n.toLowerCase());
-    }
-    return set;
+    return new Set(names);
 }
 
 // #924: one-time-per-model log for the output-budget fallback (request carries
@@ -907,7 +1154,7 @@ async function handle(
     // localPort, not opts.port: when listening on port 0 (dynamic assignment,
     // programmatic embedding, tests) the real port differs from opts.port and
     // pinning to the configured value would 403 every admin request.
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, req.socket.localPort ?? opts.port))) {
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(opts.host))) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
@@ -1008,9 +1255,14 @@ async function handle(
             }, 15_000);
             result.clearTimer();
             recordUpstreamConnection(targetUrl, proxyUrl);
+            // #1682: a successful probe clears active alerts for this host so
+            // the banner reflects the fix immediately, without waiting for traffic.
+            clearUpstreamAlertsForHost(targetUrl);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, status: result.response.status, target: targetUrl, proxy: proxyUrl ?? null }));
         } catch (error) {
+            // #1682: probe failures deliberately do NOT feed the alert table —
+            // they are user-initiated diagnostics, not live-traffic evidence.
             recordUpstreamConnection(targetUrl, proxyUrl, error);
             res.writeHead(502, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: formatUpstreamError(error, targetUrl, proxyUrl) }));
@@ -1166,7 +1418,13 @@ async function handle(
             });
             if (!verdict.ok) {
                 log("warn", `[tunnel] denied ${maskUrlsInText(route.upstream)}: ${verdict.message}`);
-                res.writeHead(403, { "content-type": "application/json" });
+                // #1686: a resolution failure is transport-class (the resolver was
+                // momentarily unreachable; the name itself may be perfectly valid),
+                // not a permission decision — 403 tells clients "never will succeed"
+                // and kills their retry logic mid-outage. Policy denials stay 403;
+                // a malformed embedded URL is a client error (400).
+                const status = verdict.code === "unresolvable" ? 502 : verdict.code === "invalid" ? 400 : 403;
+                res.writeHead(status, { "content-type": "application/json" });
                 res.end(JSON.stringify({ error: verdict.message, code: "tunnel_destination_denied", detail: verdict.code }));
                 return;
             }
@@ -1204,7 +1462,7 @@ async function handle(
                 // ran and the content-encoding header stays intact) so the upstream
                 // applies its own decode - mirroring the JSON.parse path.
                 protocol = null;
-                log("warn", `decode body failed (${String(decErr)}) - forwarding raw body verbatim to ${upstreamOrigin}`);
+                log("warn", `decode body failed (${String(decErr)}) - forwarding raw body verbatim to ${maskUrlsInText(upstreamOrigin)}`);
             }
         }
     } catch (err) {
@@ -1451,10 +1709,18 @@ async function handle(
             const hasTierEvidence = betaWindow !== undefined || suffixWindow !== undefined;
             const pluginWindow = pluginHeadersMatchModel(req.headers, model) ? pluginReportedContextWindow(req.headers) : undefined;
             // Runtime-table fallback for the window (#955): only when this
-            // request's plugin sent no window header AND the agent's latest
+            // request's plugin sent no window header AND the latest
             // runtime-info entry matches THIS request's model — a stale
-            // post-switch entry must never size a different model.
-            const runtimeEntry = pluginRuntimeInfoFor(pluginAgentHeader(req.headers), model);
+            // post-switch entry must never size a different model. #1531:
+            // header-less plugin agents (omp native binds via identity
+            // register + prompt_cache_key stamping, never x-bili-plugin)
+            // resolve their report by conversation signal instead of the
+            // header — with the header present the agent table still wins
+            // exclusively (a plain client can only ever miss, not hit).
+            const runtimeAgent = pluginAgentHeader(req.headers);
+            const runtimeEntry = runtimeAgent !== undefined
+                ? pluginRuntimeInfoFor(runtimeAgent, model)
+                : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), model);
             const runtimeWindow = pluginWindow === undefined ? runtimeEntry?.contextWindow : undefined;
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
@@ -1485,6 +1751,14 @@ async function handle(
                 if (!windowSourceLogged.has(model)) {
                     windowSourceLogged.add(model);
                     log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} effective=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
+                    // #1569: a cooperating plugin is present but its configured
+                    // window never arrived — the host's own limit.context is not
+                    // reaching us, and nudge bands / emergency depth are being
+                    // sized against a guessed denominator. Say so once per model
+                    // instead of degrading silently into registry-peek.
+                    if (runtimeAgent !== undefined && pluginWindow === undefined && runtimeWindow === undefined) {
+                        log("warn", `[window] model=${model} agent=${runtimeAgent} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource}`);
+                    }
                 }
             }
             resolvedNativeWindow = native;
@@ -1742,7 +2016,7 @@ async function handle(
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
-                log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
+                log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify(protocol === "anthropic"
                     ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
@@ -1759,6 +2033,13 @@ async function handle(
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
+        // Tag every downstream log line of THIS request with the session id
+        // ([sess=<id>] via AsyncLocalStorage — zero call-site changes across the
+        // codebase): the web log view and plain grep can now pull process-level
+        // context around a session instead of only the few call sites that
+        // embed the id manually. One statement, runs in this request's own
+        // async context, so concurrent requests never cross-contaminate.
+        enterSessionContext(sessionId);
         // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
         // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the
@@ -2075,7 +2356,7 @@ async function handle(
             }
         }
         // Two compression modes, decided here per request and bound per session
-        // (see README "Two compression modes"):
+        // (see TECHNICAL-NOTES.md "Two compression modes"):
         //  - pluginMode (x-bili-plugin header / registered agent): the ACP-native
         //    agent (pi/omp) OWNS compression — it executes `compress` locally, the
         //    call+result live in its own re-sent history, and the summary carrier
@@ -2134,8 +2415,9 @@ async function handle(
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
-        // restoreOutputBudget for the starvation mechanism).
-        restoreOutputBudget(parsed, session, log);
+        // restoreOutputBudget for the starvation mechanism). #1665: the
+        // operator-declared model output limit floors the restore target.
+        restoreOutputBudget(parsed, session, log, resolveConfiguredOutputLimit(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model));
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
@@ -2147,7 +2429,11 @@ async function handle(
         // the #460 render-tag strip pipes still run (response hygiene), while
         // preflight / fake-completion retry / the loop / usage sniffing are all
         // skipped. processedMessages stays empty so the loop can never engage.
-        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed)) {
+        // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
+        // heuristic alone misses them. The host stamps its per-request persona id
+        // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
+        const requestAgent = pluginRequestAgentHeader(req.headers);
+        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed, requestAgent)) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2178,7 +2464,7 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
+            log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
             const sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
             const sidePrepared: Prepared = {
                 body: sideBody,
@@ -2240,7 +2526,14 @@ async function handle(
                 // actually ask the upstream for. Still only a fallback: a
                 // max_tokens on the wire beat it above.
                 const fbModel0 = (parsed as { model?: string }).model;
-                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined) ?? pluginRuntimeInfoFor(pluginAgentHeader(req.headers), fbModel0)?.maxOutput;
+                // #1531: same dual lookup as the window chain above — header
+                // agent wins exclusively, header-less agents resolve by
+                // conversation signal.
+                const fbAgent = pluginAgentHeader(req.headers);
+                const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
+                    ?? (fbAgent !== undefined
+                        ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
+                        : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
                 if (typeof runtimeMax === "number" && runtimeMax > 0) {
                     maxOutput = runtimeMax;
                     if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
@@ -2565,16 +2858,18 @@ const ACP_TAG_MARK = "\x3cacp ";
 // compression, src/preflight.ts — #247) have NO other carrier: their anchor is
 // the only place the summary reaches the model, so it must survive.
 //
-// Per mode (see README "Two compression modes"): in plugin/launcher mode the
+// Per mode (see TECHNICAL-NOTES.md "Two compression modes"): in plugin/launcher mode the
 // tool call is ALWAYS in the re-sent history (the agent owns compression), so
-// this strips every acp_summary and the carrier is the tool call; in proxy mode
+// this strips every acp_summary and the carrier is the tool call — recognized
+// by the plugin_<ts> callId minted at the tool API (#1567: an id-match alone
+// was unsatisfiable there); in proxy mode
 // the tool call is usually absent (ephemeral server-side execution) or
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
 /** [#651] Strip oversized reasoning from closed compress turns (see
  *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
-function withReasoningDrop(
+export function withReasoningDrop(
     msgs: BiliMessage[],
     reasoning: CompressReasoningConfig | undefined,
     log: (level: string, msg: string) => void,
@@ -2584,6 +2879,16 @@ function withReasoningDrop(
     // [#684] strict-echo upstreams: reasoning must round-trip with tool_calls,
     // so #651's drop must not fire. Learned/static strictness both land here.
     if (strictEcho) return msgs;
+    // [#1658] Anthropic-wire twin of that gate, detected from the payload
+    // itself: a reasoning message carrying a signature is a SIGNED thinking
+    // block on the wire (the kernel stamps thinkingSignature from the wire
+    // signature; only the Anthropic codec does), and signed thinking must
+    // round-trip with its tool_use sibling or the upstream rejects the pair
+    // (#684 invariant). Dropping the pre-compress run would orphan it, so
+    // any signed thinking in view disables the drop for this request.
+    // Presence-based and per-request: Claude sessions without extended
+    // thinking keep #651's savings.
+    if (msgs.some((m) => m.contentType === "reasoning" && typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0)) return msgs;
     const out = dropCompressReasoning(msgs, reasoning);
     if (out.length !== msgs.length) {
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
@@ -2623,10 +2928,12 @@ export function warnReasoningPairs(
  *  inbound assistant message WITH a thinking block now rides an outbound
  *  assistant message with none. Outbound-only asymmetry (some tool_use turns
  *  think, others don't) is ordinary Claude Code traffic: turns without
- *  extended thinking never carry a block, and #651's dropCompressReasoning
- *  creates the same shape by design — the old heuristic warned on every
- *  healthy multi-turn session. Turns match by stable tool_use id (the kernel
- *  codec round-trips it verbatim); benign asymmetry stays fully silent. */
+ *  extended thinking never carry a block. #651's dropCompressReasoning can no
+ *  longer create this shape either — since [#1658] the drop is gated out
+ *  whenever signed thinking is in view. Turns match by stable tool_use id
+ *  (the kernel codec round-trips it verbatim); benign asymmetry stays fully
+ *  silent. Any remaining fire means another path lost thinking (e.g. a fold
+ *  pruned the block while preserving the tool_use) — investigate. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
@@ -2716,11 +3023,54 @@ export function warnResponsesReasoningPairs(
     }
 }
 
+/** #1567 hardening: a plugin-fold block's in-place anchor is redundant ONLY
+ *  while the client's own compress pair for that exact fold actually rides
+ *  the (post-prepare) history. The pair is recognized by tool name plus the
+ *  folded range quoted in its call args — flat {startId,endId} or
+ *  {content:[{startId,endId}]}, both accepted by the plugin tool API. This
+ *  restores the self-verifying carrier handoff a raw prefix strip lost: a
+ *  pruned or contract-violating client (pair absent) keeps the anchor, so an
+ *  active fold never ends up with zero carriers. It also covers kernel-side
+ *  pruning: hideConsumedCompressCalls (KEEP_LAST_ORPHANED) runs in the
+ *  pipeline BEFORE this strip, so an older pair already hidden from the wire
+ *  is absent here and its anchor correctly survives. Unparseable args count
+ *  as no match (anchor kept — fail-safe direction). Blocks predating range
+ *  recording (no startRef/endRef) degrade to "any compress call present",
+ *  the pre-hardening prefix-strip behavior. */
+function inboundCompressPairPresent(messages: BiliMessage[], b: { startRef?: string; endRef?: string }): boolean {
+    const loose = !b.startRef || !b.endRef;
+    for (const m of messages) {
+        if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME) continue;
+        if (loose) return true;
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(m.text ?? "");
+        } catch {
+            continue;
+        }
+        const obj = parsed as { startId?: string; endId?: string; content?: unknown };
+        const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
+        for (const r of ranges) {
+            if (r?.startId === b.startRef && r?.endId === b.endRef) return true;
+        }
+    }
+    return false;
+}
+
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
-        if (messages.some((m) => m.contentType === "tool-call" && m.toolCallId === b.compressCallId)) {
+        // #1567: plugin tool API folds are minted a synthetic plugin_<ts> callId
+        // the client can never echo, so the plain id match is unsatisfiable for
+        // them — yet the client's own re-sent compress pair IS their carrier by
+        // contract, making the in-place anchor redundant. Strip it, but only
+        // while that pair actually rides the (post-prepare) history
+        // (inboundCompressPairPresent): a pruned or contract-violating client
+        // must never lose the summary outright (zero carriers).
+        // Preflight blocks (no compressCallId) keep skipping above: no tool
+        // call exists for them, so their anchor is the only carrier.
+        if (isPluginFoldCallId(b.compressCallId) ? inboundCompressPairPresent(messages, b) : messages.some((m) => m.contentType === "tool-call" && m.toolCallId === b.compressCallId)) {
             carried.add(`acp_summary_${b.blockId}`);
         }
     }
@@ -2847,6 +3197,19 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     if (session.metadata.anonymousPrefixAffinity) return raw;
     const est = session.stats.localInputEstimate ?? 0;
     if (est <= 0) return 0;
+    // #1569: while the latest baseline is estimate-grade (the transient window
+    // right after a failed turn), min(est, raw) sizes on the char-count upper
+    // bound — ~3.5× high on code/JSON-heavy tool results. That inflation lit
+    // spurious nudge bands whose kernel growth-reference pin then blocked
+    // GENUINE nudges until context regrew past the artifact (false T1 at 66%,
+    // false EMERGENCY at 120%, ~20-min dead zone in the #1569 log). Once a
+    // REAL usage report has landed (lastUsageGradeTokens > 0), billing proved
+    // the calibrated CJK-aware rate holds for this session's content class —
+    // size on the current view's calibrated estimate instead. Never-reporting
+    // upstreams (#553/#728) keep the fail-closed upper bound: their anchor
+    // stays absent. No cap by est: est bounds the PREVIOUS turn's outbound,
+    // not this view's growth.
+    if ((session.stats.lastUsageGradeTokens ?? 0) > 0) return estimateCoreMessages(msgs) + inboundImageTokens;
     return Math.min(est, raw);
 }
 
@@ -2916,6 +3279,7 @@ async function prepareAnthropic(
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
+    let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
@@ -2946,6 +3310,10 @@ async function prepareAnthropic(
     const strippedMarkerLines = stripAcpStatusMarkers(parsed.messages);
     if (strippedMarkerLines > 0) {
         log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
+    }
+    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "anthropic");
+    if (strippedCarriers > 0) {
+        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
     }
 
     try {
@@ -3016,6 +3384,7 @@ async function prepareAnthropic(
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
+        turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -3056,14 +3425,28 @@ async function prepareAnthropic(
             attachedRetrievals = snapshotPendingRetrievals(session);
             if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
         }
-        rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
+        // #1637: cumulative cache_control marks applied through the kernel's own
+        // applier (same machine the round-2 adapter uses); marks ride the last
+        // STABLE message — ephemeral tails (retrievals/sysNotes/nudge/id note)
+        // never carry a breakpoint. Client-managed controls (message blocks,
+        // tools entries — WC-010's combined budget) pass through untouched.
+        anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
+            ? undefined
+            : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
+        rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers);
+        // #1637: stamp the steady body's system. NOTE: parsed.system stays the
+        // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
+        // adapter consumes that frozen head and stamps its own rebuild, so NO
+        // write-back here (writing the full systemOut back would double-append
+        // the compress prompt on round-2, the exact F2 seam the matrix pins).
+        systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -3123,7 +3506,7 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin));
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 async function prepareOpenai(
@@ -3177,6 +3560,10 @@ async function prepareOpenai(
     if (strippedMarkerLines > 0) {
         log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
+    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "openai");
+    if (strippedCarriers > 0) {
+        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
 
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
@@ -3201,6 +3588,7 @@ async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
         const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
+
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). Title-gen requests skip ALL injection for
@@ -3228,6 +3616,7 @@ async function prepareOpenai(
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
+        turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -3277,7 +3666,7 @@ async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
@@ -3289,7 +3678,7 @@ async function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_OPENAI] : [])], surface?.toolPrompts);
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -3365,7 +3754,7 @@ async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
@@ -3432,6 +3821,11 @@ async function prepareGoogle(
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
 
+    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "google");
+    if (strippedCarriers > 0) {
+        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
+
     try {
         const { msgs, systemText } = googleToCore(parsed);
         googleClientSystem = systemText;
@@ -3471,6 +3865,7 @@ async function prepareGoogle(
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
+        turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them (the
         // kernel validates a compress batch atomically).
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
@@ -3496,7 +3891,12 @@ async function prepareGoogle(
         // trailing user content below (see prepareOpenai for the rationale).
         const sysParts: string[] = [];
         if (googleClientSystem) sysParts.push(googleClientSystem);
-        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections), visibilityMarkers));
+        // Same triple-wrap as every other wire (anthropic/responses/openai) and
+        // as the folded re-request view (below): the notes are byte-stable
+        // constants, so the system anchor stays identical across normal turns
+        // and round-2 re-requests — skipping them here would fork the prefix
+        // at every fold and collapse the upstream cache hit.
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
@@ -3505,7 +3905,7 @@ async function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_GOOGLE] : [])], surface?.toolPrompts);
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session));
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
@@ -3660,6 +4060,10 @@ async function prepareResponses(
     if (strippedMarkerLines > 0) {
         log("info", `[${sessionId}] stripped ${strippedMarkerLines} ACP status marker line(s) from incoming history (ephemeral proxy status, issue #1029)`);
     }
+    const strippedCarriers = stripEmbeddedChainCarriers(parsed, "responses");
+    if (strippedCarriers > 0) {
+        log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
@@ -3675,7 +4079,42 @@ async function prepareResponses(
     const renderTags: "text-only" | "none" = process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only";
 
     try {
+        // [#1638] Plugin mode: position-preserve mid-history system/developer
+        // items. Clients like OMP append custom_message-derived developer
+        // notifications mid-history and re-send them every turn; the kernel
+        // hoists system/developer content from ANY position into
+        // projection.systemParts, so the merged developer block injected at
+        // the front of the rebuilt input churns every turn and breaks the
+        // upstream prefix cache (sawtooth down to the instructions-only
+        // residual). Marking the non-head items with an unknown type just for
+        // the duration of responsesToCore keeps them out of systemParts and
+        // puts them in the projection layout as coreId-less slots, which
+        // patchResponsesInput re-emits verbatim in their original position —
+        // the position-preserved semantics the openai-chat wire already has
+        // (head-only hoist, kernel src/wire/openai.ts). Proxy mode (native
+        // codex) keeps the hoist-and-anchor behavior (#1085).
+        const inplaceSysDev: { item: { type?: string; role?: unknown }; type: string | undefined }[] = [];
+        if (pluginMode && Array.isArray(parsed.input)) {
+            let head = true;
+            for (const rawItem of parsed.input) {
+                const item = rawItem as { type?: string; role?: unknown };
+                const isSysDevMsg = (item.type === undefined || item.type === "message") &&
+                    (item.role === "system" || item.role === "developer");
+                if (isSysDevMsg) {
+                    if (head) continue;
+                    inplaceSysDev.push({ item, type: item.type });
+                    item.type = "__bili_inplace_sysdev";
+                    continue;
+                }
+                if (item.type === "additional_tools" || item.type === "mcp_list_tools") continue;
+                head = false;
+            }
+        }
         const projection = responsesToCore(parsed);
+        for (const { item, type } of inplaceSysDev) {
+            if (type === undefined) delete item.type;
+            else item.type = type;
+        }
         responsesProjection = projection;
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
@@ -3717,6 +4156,7 @@ async function prepareResponses(
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
+        turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -3746,21 +4186,26 @@ async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session));
+            const prompt = withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers);
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
+            if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
-                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_RESPONSES] : [])];
+                // #1712: decompress's startId/endId execute only on CCR-armed
+                // sessions (#1179) — serve the no-range schema otherwise.
+                const ccrOn = ccrEnabled(session);
+                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrOn ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_RESPONSES] : [])];
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, BILI_ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
-                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...BILI_ACP_TOOLS_RESPONSES, ...respExtra] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts);
+                    ? injectResponsesTool(parsed.tools, ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, surface?.toolPrompts)
+                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts);
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
             responsesDevContent = devContent;
+            if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
         }
         if (sysNotes.length > 0) {
@@ -3788,6 +4233,7 @@ async function prepareResponses(
                         : rebuiltInput;
                     inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) });
                     rebuiltInput = inputItems;
+                    log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                 }
             } catch {
             }
@@ -3803,6 +4249,7 @@ async function prepareResponses(
                 : rebuiltInput;
             inputItems.push({ type: "message", role: "user", content: imgNote });
             rebuiltInput = inputItems;
+            log("debug", `[${sessionId}] [inject] image-full restore note appended as trailing user turn (${imgNote.length} chars)`);
         }
         transformOk = true;
     } catch (err) {
@@ -3924,6 +4371,7 @@ async function prepareResponses(
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
+        dropReasoning: stripReasoning,
     };
 }
 
@@ -4129,7 +4577,6 @@ function injectSystem(
     opts: ProxyOptions,
     prompts: Prompts = defaultPrompts,
     config: Config,
-    noteId: string,
     surface?: PackSurface,
     visibilityMarkers = true,
 ): string | AnthropicRequestBody["system"] {
@@ -4139,7 +4586,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -4152,8 +4599,10 @@ function injectSystem(
 // cannot be filtered per request) are dropped here so the upstream sees
 // exactly one definition per name, and it is bili's (its arg schemas are what
 // the compress loop dispatches on). Plugin mode never calls these helpers.
-function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts): unknown[] {
-    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC, toolPrompts);
+function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false): unknown[] {
+    // #1712: decompress's startId/endId execute only on CCR-armed sessions
+    // (#1179), so serve the no-range schema when CCR is off.
+    const acp = applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts);
     const list = extras ?? [];
     if (!Array.isArray(tools)) return [...acp, ...list];
     const owned = new Set<string>(acp.map((t) => t.name));
@@ -4165,8 +4614,8 @@ function injectTool(tools: unknown[] | undefined, extras?: readonly { name: stri
     return [...kept, ...acp, ...list];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts): OpenAITool[] {
-    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
+function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, ccrOn = false): OpenAITool[] {
+    const acp = applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts) as OpenAITool[];
     const list = extras ?? [];
     if (!Array.isArray(tools)) return [...acp, ...list] as OpenAITool[];
     const owned = new Set<string>(acp.map((t) => t.function.name));
@@ -4182,8 +4631,8 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly Ope
  *  nests declarations one level deeper than the OpenAI shape
  *  (`tools[].functionDeclarations[]`), so presence is collected across every
  *  entry and the missing declarations are appended as one new entry. */
-function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts): GoogleTool[] {
-    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_GOOGLE, toolPrompts) as GoogleFunctionDeclaration[];
+function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false): GoogleTool[] {
+    const acp = applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, toolPrompts) as GoogleFunctionDeclaration[];
     const wanted: { name: string }[] = extra ? [...acp, ...extra] : [...acp];
     if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
     const present = new Set<string>();
@@ -4423,6 +4872,104 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
     return () => clearInterval(iv);
 }
 
+// #1647: sibling of the #568 hold, covering the STREAMING phase. After the 2xx
+// commit, bili keeps consuming upstream bytes that never reach the client — the
+// rewriter/strip pipes swallow SSE comment pings (`: ping`, which llama.cpp &
+// friends emit precisely to keep intermediate hops alive), and the
+// fake-completion backstop + compress loop buffer whole rounds before emitting.
+// The CLIENT-side undici default bodyTimeout (300s, inactivity-based; Node's
+// built-in fetch cannot override it per-request) then kills any prefill longer
+// than 300s even though leg 2 (#551/#556) survived it — and wrappers misread
+// that death as a dead proxy and silently re-send DIRECT (losing compression).
+// Hold the client exactly like #568 does: while zero bytes reach the socket,
+// emit one SSE comment line (a spec-mandated no-op for every SSE consumer).
+// Armed once per response at the 2xx commit point; self-clears on res close,
+// so no stop() needs threading through the pipe branches below. Safe under any
+// framing: content-length is a hop header stripped from respHeaders, so the
+// response is always chunked downstream.
+const STREAM_KEEPALIVE_DEFAULT_MS = 15_000;
+
+function streamKeepaliveMs(): number {
+    const raw = process.env.BILI_STREAM_KEEPALIVE_MS;
+    if (!raw) return STREAM_KEEPALIVE_DEFAULT_MS;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : STREAM_KEEPALIVE_DEFAULT_MS;
+}
+
+export function beginStreamKeepalive(res: http.ServerResponse, sid: string, log: (level: string, msg: string) => void): void {
+    const idleMs = streamKeepaliveMs();
+    if (idleMs <= 0 || res.destroyed || res.writableEnded) return;
+    const sock = res.socket;
+    if (!sock) return;
+    let baseline = sock.bytesWritten;
+    let warned = false;
+    let stopped = false;
+    // Line-boundary guard: an SSE comment is a no-op ONLY when it starts at a
+    // line boundary. Every processed pipe in this file re-emits whole events,
+    // but the raw pipeThrough lanes (title-gen, classifier bypass,
+    // ACP_NO_INJECT_TOOL — server.ts !useRewriter branch) forward upstream
+    // chunks verbatim, so a partial `data:` line can sit un-terminated on the
+    // wire when the interval fires. Injecting a comment there splices it into
+    // the client's JSON. Track the last byte written and skip the beat while
+    // mid-line; the 300s budget tolerates skips, corruption does not.
+    // `__biliKeepaliveBoundary` (on the res) is the live boundary state so a
+    // second arming on the same res shares one truth; undefined = not yet patched.
+    const anyRes = res as unknown as { __biliKeepaliveBoundary?: boolean };
+    let origWrite: typeof res.write;
+    if (anyRes.__biliKeepaliveBoundary === undefined) {
+        origWrite = res.write.bind(res);
+        anyRes.__biliKeepaliveBoundary = true; // headers just committed — at a boundary
+        res.write = ((...args: Parameters<typeof origWrite>) => {
+            const chunk = args[0];
+            try {
+                if (typeof chunk === "string") {
+                    if (chunk.length > 0) anyRes.__biliKeepaliveBoundary = chunk.endsWith("\n");
+                } else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+                    if (chunk.length > 0) anyRes.__biliKeepaliveBoundary = chunk[chunk.length - 1] === 0x0a;
+                }
+            } catch { /* observation must never break the write */ }
+            return origWrite(...args);
+        }) as typeof res.write;
+    }
+    const stop = (): void => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(iv);
+        res.removeListener("close", stop);
+    };
+    res.once("close", stop);
+    // Check cadence: idleMs/3 keeps worst-case gap-to-first-keepalive well
+    // inside the threshold even with timer drift; the 50ms floor only matters
+    // for tiny opt-in values (tests / exotic setups).
+    const iv = setInterval(() => {
+        try {
+            if (res.destroyed || res.writableEnded || !res.socket) {
+                stop();
+                return;
+            }
+            const written = res.socket.bytesWritten;
+            if (written > baseline) {
+                baseline = written;
+                return;
+            }
+            // Mid-line: skip this beat. No baseline mutation, so the next tick
+            // re-checks; when the pending line completes, its own write flips
+            // the flag and keep-alives resume. (Note: a keep-alive write itself
+            // bumps bytesWritten, so the following tick sees "progress" and
+            // skips — effective cadence ≈ 2×interval. Harmless vs the 300s
+            // budget; noted here so the 2× isn't mistaken for a bug.)
+            if (anyRes.__biliKeepaliveBoundary === false) return;
+            res.write(": bili-keepalive\n\n");
+            if (!warned) {
+                warned = true;
+                log("info", `[${sid}] stream silent ${idleMs}ms — holding client with SSE keep-alive comments past its undici body timeout (#1647)`);
+            }
+        } catch {
+            stop();
+        }
+    }, Math.max(50, Math.floor(idleMs / 3)));
+}
+
 /** #1493: the OUTBOUND payload size (what would actually be sent upstream):
  *  post-fold message content + wire overhead + images. Single source of truth —
  *  BOTH preflightCompressIfNeeded (trigger floor + fit gates) and armFailureShrink
@@ -4629,7 +5176,10 @@ async function preflightCompressIfNeeded(
     const clientAbort = new AbortController();
     registerRequestAbort(res, clientAbort);
     res.on("close", () => {
-        if (!res.writableEnded) clientAbort.abort();
+        if (!res.writableEnded) {
+            clientAbort.abort();
+            noteClientAbort(session);
+        }
     });
     const started = Date.now();
     let stopHold: (() => void) | undefined;
@@ -4767,6 +5317,7 @@ async function forward(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<string | Buffer | null>,
 ): Promise<void> {
+    const forwardStartedAt = Date.now();
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
@@ -4839,18 +5390,25 @@ async function forward(
             }
         }
     }
-    // #1421: outbound chain checkpoint — every request THIS instance actually
+    // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
+    // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
-    // first-processor-wins even when x-bili-hop was stripped in transit. Lands
+    // first-processor-wins even when x-bili-hop was stripped in transit. The
+    // carrier is model-visible (insertCheckpointCarrier), which is why this is
+    // opt-in: models read it as phantom user input and burn tokens on it. Lands
     // AFTER compat roles + output steering: the digest must cover the exact
     // bytes forwarded. Best-effort — a stamp failure never breaks the forward.
     // Passthrough/side/forge/classifier forwards carry no stamp: only a real
     // kernel pass (processedMessages non-empty — side/classifier Prepareds are
-    // empty) claims processing, per the first-processor-wins contract.
-    if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainContentDetection !== false) {
+    // empty) claims processing, per the first-processor-wins contract. Inbound
+    // recognition + hop passthrough are unaffected by this switch.
+    if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
             const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
-            if (stamped !== null) wireBody = JSON.stringify(stamped);
+            if (stamped !== null) {
+                wireBody = JSON.stringify(stamped);
+                log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
+            }
         } catch (err) {
             log("debug", `[${prepared.session.id}] [chain] outbound stamping failed (${String(err)}); forwarding unstamped`);
         }
@@ -4883,7 +5441,7 @@ async function forward(
                 // Mask all but a short prefix so the header NAME is visible
                 // (so we know the key is sent and roughly how) without leaking
                 // the credential into the log.
-                const masked = /key|auth|token/i.test(k) ? s.slice(0, 8) + "..." + s.slice(-4) + ` (${s.length} chars)` : s.slice(0, 60);
+                const masked = CREDENTIAL_HEADER_RE.test(k) ? safePrefix(s, 8) + "..." + safeSuffix(s, 4) + ` (${s.length} chars)` : safePrefix(s, 60);
                 log("info", `[${sid}] client hdr ${k}=${masked}`);
             }
         }
@@ -4971,14 +5529,28 @@ async function forward(
     const clientAbort = new AbortController();
     registerRequestAbort(res, clientAbort);
     res.on("close", () => {
-        if (!res.writableEnded) clientAbort.abort();
+        if (!res.writableEnded) {
+            // #1647: without this, a client killed by its own undici bodyTimeout
+            // (starved by upstream-caused silence) is indistinguishable in the log
+            // from a user cancel. Elapsed + bytes-to-client separates the two.
+            const ageMs = Date.now() - forwardStartedAt;
+            const clientBytes = res.socket?.bytesWritten ?? 0;
+            log("info", `[${prepared?.session.id ?? "passthrough"}] client disconnected mid-stream after ${ageMs}ms (${clientBytes} bytes written to client)`);
+            clientAbort.abort();
+            if (prepared?.session) noteClientAbort(prepared.session);
+        }
     });
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
-        upstreamResult = await fetchWithTimeout(upstreamUrl, init, undefined, clientAbort.signal);
+        upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+            log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
+        });
         recordUpstreamConnection(upstreamUrl, proxyUrl);
+        // #1682: any resolved response proves the host is reachable again.
+        clearUpstreamAlertsForHost(upstreamUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
+        recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined);
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
@@ -5042,7 +5614,7 @@ async function forward(
                     // Same-request re-sends (compress-retry loops) carry the
                     // rewrite too — wireTransform reads compatRoles at call time.
                     compatRoles = { ...compatRoles, [rejection.role]: target };
-                    const providerKey = new URL(upstreamUrl).origin;
+                    const providerKey = maskUrlForLog(new URL(upstreamUrl).origin);
                     log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] upstream rejected role "${rejection.role}" — auto-rewrote ${rewritten} message role(s) to "${target}", retry OK (remembered for this session only). To make permanent, add: {"providers":{"${providerKey}":{"compat":{"roles":{"${rejection.role}":"${target}"}}}}`);
                 };
                 type HopOutcome = "ok" | "placement-400" | "other";
@@ -5362,6 +5934,22 @@ async function forward(
         }
         return;
     }
+    // #1647: hold the client across streaming-phase silence — upstream pings
+    // swallowed by the rewrite/strip pipes, buffered rounds (see
+    // beginStreamKeepalive). SSE only: comment injection is framing-safe only
+    // where the body is an event stream. Self-clears on res close.
+    if (
+        prepared?.stream === true &&
+        (upstream.headers.get("content-type") ?? "").includes("text/event-stream")
+    ) {
+        beginStreamKeepalive(res, prepared.session.id, log);
+    }
+    // #1536: origin of the URL fetched for THIS request — cache-invalidation
+    // attribution identity shared by the plugin pipes below and the compress
+    // loop further down (proxyUrl is the routing CONNECT-proxy, not the
+    // endpoint; the outer upstreamOrigin is the configured route target).
+    let targetOrigin: string | undefined;
+    try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -5409,6 +5997,7 @@ async function forward(
                             log,
                             label: prepared.session.id,
                         }),
+                        targetOrigin,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -5432,10 +6021,11 @@ async function forward(
                             log,
                             label: prepared.session.id,
                         }),
+                        targetOrigin,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin);
             }
         } finally {
             clearUpstreamTimer();
@@ -5635,12 +6225,19 @@ async function forward(
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+            // Cache-seam: the compress<->absorb join must be byte-identical to
+            // the steady prepare* paths. Every steady wire joins the absorb
+            // section with a plain "\n\n" (sysParts.join / injectSystem parts
+            // join); the historical "---" divider here existed ONLY on round-2
+            // and broke the system-element prefix on every fold while absorb
+            // was armed (probe: cache-seam-probes P1+P2, chat wire diverged at
+            // the absorb boundary char).
             const absorbSection = absorbActive
-                ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
-            const systemPrompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers), ensureCanonicalId(prepared.session)) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape);
+            const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -5651,28 +6248,62 @@ async function forward(
                         messages: prepared.originalMessages,
                         state: prepared.session.state,
                         config: loopConfig,
-                        tokenCount: prepared.session.stats.lastInputTokens,
+                        // #1492 doctrine (secondary processTurn feeds): the round-2
+                        // re-render must never light the kernel's emergency bands on
+                        // an estimate-grade poison — e.g. a fake/zeroed usage report
+                        // (lastInput=0 after the compress credit nets out) falls
+                        // through to the inflated pre-fold estimate, arms
+                        // emergency-truncate against a context the fold just
+                        // shrank, and the truncation marker oscillates per fold
+                        // cycle (round-2 truncated, next steady full) — a
+                        // mid-history cache break on every fold (#1592 family).
+                        // Usage-grade baselines pass through; estimate-grade reads
+                        // as 0 ("unknown") and leaves the bands dark.
+                        tokenCount: usageGradeInputBaseline(prepared.session),
                         renderTags: prepared.renderTags ?? "text-only",
                         contentStore: contentStoreOf(prepared.session),
                     });
                     prepared.session.state = turn.state;
                     adoptContentStore(prepared.session, turn.contentStore);
-                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
+                    // #1592-family seam: the absorb view must be fed by the SAME
+                    // token-count source the steady prepare* paths use. Feeding
+                    // raw lastInputTokens here made round-2 and the neighboring
+                    // steady requests disagree across absorb.contextThresholdPct
+                    // crossings — absorb prompts appeared/disappeared mid-history
+                    // and broke the prefix cache on every fold while the
+                    // threshold was being straddled (probe: cache-seam-probes).
+                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages));
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                    const out = stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state);
+                    // #1548: strip only when the compress call rides INBOUND history (client persists
+                    // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
+                    // against them drops the only cross-turn summary carrier and breaks the byte-prefix
+                    // at the fold anchor (post-fold cache floor reset to the stable head).
+                    const out = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
+                    // the reasoning drop each prepare* applied, and — only on the
+                    // Responses wire — the run-ordering repair (#564). Applying the
+                    // repair on chat/anthropic/google round-2s injected acp_turn_sep_*
+                    // user messages and split assistant runs that the steady paths
+                    // never emit, so the folded re-request and the very next client
+                    // turn rendered one history with two different shapes and the
+                    // byte prefix broke mid-history on every fold.
+                    const dropped = prepared.dropReasoning ? prepared.dropReasoning(out) : out;
+                    const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
                     // [#1095] the folded re-request must carry the SAME bytes the
-                    // model saw (deterministic encode + per-fingerprint cache).
-                    await applyImageCompressionPass(prepared.session, out, { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), log: ctx.log });
+                    // model saw (deterministic encode + per-fingerprint cache) —
+                    // applied after the ordering repair, matching the steady
+                    // paths' sequence.
+                    await applyImageCompressionPass(prepared.session, ordered as BiliMessage[], { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), log: ctx.log });
                     const imgNote = imageFullTrailingNote(prepared.session);
-                    if (imgNote) out.push({ id: "bili_image_full_note", role: "user", contentType: "text", text: imgNote });
-                    return repairResponsesAssistantOrdering(out, prepared.originalMessages);
+                    if (imgNote) (ordered as BiliMessage[]).push({ id: "bili_image_full_note", role: "user", contentType: "text", text: imgNote });
+                    return ordered;
                 });
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
             const loopDumpDir = opts.dumpSse;
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform },
                 adapter,
@@ -5746,25 +6377,24 @@ async function forward(
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
                 const { total, cached } = usageTotals(prepared.protocol, u);
-                if (typeof total === "number") {
-                    prepared.session.stats.inputTokens += total;
-                    // lastInputTokens = true TOTAL context (protocol-correct),
-                    // net of this turn's compress savings (see stream.ts
-                    // applyRanges — the fold lands on the NEXT request).
-                    prepared.session.stats.lastInputTokens = Math.max(
-                        0,
-                        total - (prepared.session.stats.compressCreditTokens ?? 0),
-                    );
-                    prepared.session.stats.lastInputTokensSource = "usage";
-                    // #1110: a real usage report retires the one-shot overflow arm.
-                    delete prepared.session.stats.overflowArmTokens;
-                    if (typeof cached === "number") {
-                        prepared.session.stats.cachedTokens += cached;
-                        prepared.session.stats.cacheSamples += 1;
-                    }
-                    const out = usageOutputTotal(prepared.protocol, u);
-                    if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                const out = usageOutputTotal(prepared.protocol, u);
+                // #1547: settle through the shared path — stats AND the cache
+                // ledger. Before this, this branch updated stats only, so
+                // stream:false sessions produced zero ledger lines and were
+                // invisible to /acp-cache, __bili/cache-report and the
+                // invalidation attribution built on them (#1536).
+                const reportedCached: number | null = typeof cached === "number" ? cached : null;
+                const billed = typeof total === "number" ? total : 0;
+                if (billed > 0 || reportedCached !== null) {
+                    noteForwardedBody(prepared.session, typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
+                    const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
+                    loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(prepared.session)}`);
+                } else {
+                    diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
+                if (typeof out === "number") prepared.session.stats.outputTokens += out;
                 if (prepared.protocol === "openai") {
                     await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponse(json, ctx));
                 } else if (prepared.protocol === "responses") {
@@ -5929,26 +6559,32 @@ function reapOrphansLogged(session: Session, msgs: CoreMessage[], log: (level: s
 
 function sendStats(res: http.ServerResponse): void {
     const all = listSessions();
-    const sessions = all.map((s) => ({
-        id: s.id,
-        protocol: s.meta.protocol,
-        upstream: s.meta.upstreamOrigin,
-        label: s.meta.label,
-        title: s.meta.title,
-        requests: s.stats.requests,
-        contextTokens: s.stats.contextTokens,
-        inputTokens: s.stats.inputTokens,
-        cachedTokens: s.stats.cachedTokens,
-        outputTokens: s.stats.outputTokens,
-        cacheSamples: s.stats.cacheSamples,
-        cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
-        // #901: window credibility — trusted (configured/registry) window vs the
-        // largest input recent successful turns actually got through. A wide gap
-        // means the provider overstates its window.
-        contextWindow: typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : undefined,
-        lastSeen: new Date(s.lastSeen).toISOString(),
-        restored: s.restored === true,
-    }));
+    const sessions = all.map((s) => {
+        const sw = readModelSwitchStats(s);
+        return {
+            id: s.id,
+            protocol: s.meta.protocol,
+            upstream: s.meta.upstreamOrigin,
+            label: s.meta.label,
+            title: s.meta.title,
+            requests: s.stats.requests,
+            contextTokens: s.stats.contextTokens,
+            inputTokens: s.stats.inputTokens,
+            cachedTokens: s.stats.cachedTokens,
+            outputTokens: s.stats.outputTokens,
+            cacheSamples: s.stats.cacheSamples,
+            cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
+            lastModel: typeof s.metadata.lastModel === "string" ? s.metadata.lastModel : undefined,
+            modelSwitches: sw?.count ?? 0,
+            switchMissedTokens: sw?.missedTokens ?? 0,
+            // #901: window credibility — trusted (configured/registry) window vs the
+            // largest input recent successful turns actually got through. A wide gap
+            // means the provider overstates its window.
+            contextWindow: typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : undefined,
+            lastSeen: new Date(s.lastSeen).toISOString(),
+            restored: s.restored === true,
+        };
+    });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
@@ -5965,7 +6601,9 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    const adv = getAdvisoryState();
+    const advisory = adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -5988,6 +6626,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
+        alerts: getUpstreamAlerts(),
     }, null, 2));
 }
 
@@ -6002,12 +6641,26 @@ async function sendWebSessions(res: http.ServerResponse): Promise<void> {
  *  ?lines= caps the tail at 2000; ?raw=1 streams the same tail as a .txt download. */
 async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/logs", "http://localhost");
-    const q = (u.searchParams.get("q") ?? "").trim().toLowerCase();
+    const q = (u.searchParams.get("q") ?? "").trim();
+    const fullDownload = u.searchParams.get("raw") === "1" && u.searchParams.get("all") === "1";
     let n = Number(u.searchParams.get("lines") ?? "500");
     if (!Number.isFinite(n) || n <= 0) n = 500;
-    n = Math.min(Math.floor(n), 2000);
+    // Full download is the forensic escape hatch: ignore `lines`, capped only
+    // by the memory guard below so users can export the whole .old + cur pair.
+    n = fullDownload ? 100_000 : Math.min(Math.floor(n), 2000);
+    // Context expansion (ctx=N rows around each hit) and time window (win=Ss
+    // around [firstHit, lastHit]) — selection logic lives in web/logs-query.ts
+    // (unit-tested pure function); win wins over ctx when both are given.
+    let ctx = Number(u.searchParams.get("ctx") ?? "0");
+    if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
+    ctx = Math.min(Math.floor(ctx), 50);
+    let win = Number(u.searchParams.get("win") ?? "0");
+    if (!Number.isFinite(win) || win < 0) win = 0;
+    win = Math.min(Math.floor(win), 3600);
     const logFile = getLogPath() ?? defaultLogFile();
-    const dir = logFile && logFile.includes("/") ? logFile.slice(0, logFile.lastIndexOf("/") + 1) : "";
+    // Cross-platform dir extraction: a naive "/" split yields "" on Windows
+    // paths and the candidates would silently resolve against cwd.
+    const dir = logFile ? path.dirname(logFile) + path.sep : "";
     const candidates = [dir + "bili.log.old", dir + "bili.log"];
     const existing = candidates.filter((f) => {
         try { return fs.statSync(f).isFile(); } catch { return false; }
@@ -6016,21 +6669,26 @@ async function sendWebLogs(res: http.ServerResponse, req: http.IncomingMessage):
     for (const f of existing) {
         let text: string;
         try { text = fs.readFileSync(f, "utf8"); } catch { continue; }
-        const ls = text.split("\n").filter((l) => l.length > 0);
-        all = all.concat(q ? ls.filter((l) => l.toLowerCase().includes(q)) : ls);
+        all = all.concat(text.split("\n").filter((l) => l.length > 0));
     }
-    const total = all.length;
-    const tail = all.slice(-n);
+    const r = queryLogLines(all, q, { ctx, winSec: win, n });
     if (u.searchParams.get("raw") === "1") {
         res.writeHead(200, {
             "content-type": "text/plain; charset=utf-8",
-            "content-disposition": 'attachment; filename="billion-context-log.txt"',
+            "content-disposition": `attachment; filename="${fullDownload ? "billion-context-full-log.txt" : "billion-context-log.txt"}"`,
         });
-        res.end(tail.join("\n"));
+        res.end(r.lines.join("\n"));
         return;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ path: logFile, total, lines: tail }, null, 2));
+    res.end(JSON.stringify({
+        path: logFile,
+        total: r.total,
+        shown: r.shown,
+        omitted: r.omitted,
+        lines: r.lines,
+        ...(r.isMatch ? { isMatch: r.isMatch } : {}),
+    }, null, 2));
 }
 
 async function sendWebSessionDetail(res: http.ServerResponse, url: string): Promise<void> {

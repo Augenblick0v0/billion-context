@@ -62,7 +62,7 @@ export const DEFAULT_RECENT_CHECKPOINT_WINDOW_MS = 10 * 60 * 1000;
 // ≤~120 with short ids); the cap only bounds malformed-tag scanning cost.
 const MAX_CHECKPOINT_CHARS = 512;
 
-const TAG_OPEN = "\x3cbili-chain ";
+export const TAG_OPEN = "\x3cbili-chain ";
 const TAG_CLOSE = "/\x3e";
 
 export interface ChainCheckpoint {
@@ -289,6 +289,122 @@ export function extractChainCarriers(parsed: unknown, wire: WireProtocol): Chain
         }
     }
     return result;
+}
+
+// #1542: defense against carriers that LEAKED INTO A CLIENT TRANSCRIPT and come
+// back on every resend. extractChainCarriers above only sees the trailing user
+// run — a carrier that sank into mid-history (the client keeps appending turns
+// after it) is invisible to it, rides the rebuild to the model as an ordinary
+// message, and stacks monotonically forever. This strip removes well-formed
+// whole-part carriers from ANY position in the body, on the normal-processing
+// path only (the verbatim-forward verdicts never reach it — chained-bili
+// bodies are untouched). Same strictness as recognition: whole-PART exact
+// match via parseChainCheckpoint; tag-shaped text embedded inside prose is NOT
+// a carrier and is left alone (#1039/#1395 boundary). Roles: user + assistant
+// (model echoes land in assistant content) per wire; tool/system content is
+// user data and never touched. In place; returns the count removed.
+export function stripEmbeddedChainCarriers(parsed: unknown, wire: WireProtocol): number {
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return 0;
+    const body = parsed as Record<string, unknown>;
+    let stripped = 0;
+    if (wire === "google") {
+        const contents = body.contents;
+        if (!Array.isArray(contents)) return 0;
+        for (let i = contents.length - 1; i >= 0; i--) {
+            const c = contents[i];
+            if (!c || typeof c !== "object" || Array.isArray(c)) continue;
+            const ct = c as Record<string, unknown>;
+            const role = typeof ct.role === "string" ? ct.role : "user";
+            if (role !== "user" && role !== "model") continue;
+            const parts = ct.parts;
+            if (!Array.isArray(parts)) continue;
+            let removed = 0;
+            for (let j = parts.length - 1; j >= 0; j--) {
+                const p = parts[j];
+                if (p && typeof p === "object" && !Array.isArray(p) && Object.keys(p).length === 1 && typeof (p as Record<string, unknown>).text === "string") {
+                    if (parseChainCheckpoint((p as Record<string, unknown>).text)) {
+                        parts.splice(j, 1);
+                        removed++;
+                    }
+                }
+            }
+            if (removed > 0) {
+                if (parts.length === 0) contents.splice(i, 1);
+                stripped += removed;
+            }
+        }
+        return stripped;
+    }
+    if (wire === "responses") {
+        const input = body.input;
+        if (!Array.isArray(input)) return 0;
+        for (let i = input.length - 1; i >= 0; i--) {
+            const item = input[i];
+            if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+            const it = item as Record<string, unknown>;
+            if (it.type !== "message") continue;
+            const role = typeof it.role === "string" ? it.role : "";
+            if (role !== "user" && role !== "assistant") continue;
+            const content = it.content;
+            if (typeof content === "string") {
+                if (parseChainCheckpoint(content)) {
+                    input.splice(i, 1);
+                    stripped++;
+                }
+                continue;
+            }
+            if (!Array.isArray(content)) continue;
+            let removed = 0;
+            for (let j = content.length - 1; j >= 0; j--) {
+                const p = content[j];
+                if (p && typeof p === "object" && !Array.isArray(p)) {
+                    const po = p as Record<string, unknown>;
+                    if (po.type === "input_text" && typeof po.text === "string" && Object.keys(po).length === 2 && parseChainCheckpoint(po.text)) {
+                        content.splice(j, 1);
+                        removed++;
+                    }
+                }
+            }
+            if (removed > 0) {
+                if (content.length === 0) input.splice(i, 1);
+                stripped += removed;
+            }
+        }
+        return stripped;
+    }
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const rec = messages[i];
+        if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
+        const m = rec as Record<string, unknown>;
+        if (m.role !== "user" && m.role !== "assistant") continue;
+        const content = m.content;
+        if (typeof content === "string") {
+            if (parseChainCheckpoint(content)) {
+                messages.splice(i, 1);
+                stripped++;
+            }
+            continue;
+        }
+        if (!Array.isArray(content)) continue;
+        let removed = 0;
+        for (let j = content.length - 1; j >= 0; j--) {
+            const p = content[j];
+            if (p && typeof p === "object" && !Array.isArray(p)) {
+                const po = p as Record<string, unknown>;
+                if (po.type === "text" && typeof po.text === "string" && Object.keys(po).length === 2 && parseChainCheckpoint(po.text)) {
+                    content.splice(j, 1);
+                    removed++;
+                }
+            }
+        }
+        if (removed > 0) {
+            if (content.length === 0) messages.splice(i, 1);
+            stripped += removed;
+        }
+    }
+    return stripped;
 }
 
 function singleText(content: unknown, partType: string): string | undefined {

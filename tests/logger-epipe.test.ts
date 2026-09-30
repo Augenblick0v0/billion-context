@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isStreamWriteError } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -87,18 +88,18 @@ test("closed stderr pipe: no uncaughtException storm, file-only logging, one war
 
     const content = fs.readFileSync(logFile, "utf8");
     const lines = content.split("\n").filter(Boolean);
-    const ticks = lines.filter((l) => l.includes("[info] tick"));
+    const ticks = lines.filter((l) => l.includes("[info]") && / tick \d+$/.test(l));
     const uncaught = lines.filter((l) => l.includes("uncaughtException"));
     const warns = lines.filter((l) => l.includes("[warn]"));
 
     try { child.kill(); } catch { /* already exited */ }
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
 
     assert.equal(code, 0, `child must exit cleanly, got ${code}; stderr: ${earlyErr.slice(0, 500)}`);
     assert.match(out, /FIRED 0/, "the uncaughtException handler must never fire");
     // Exactly the 25 ticks, in order — the count is fixed by construction
     // above, so this cannot drift with runner load (#1445).
-    const nums = ticks.map((l) => l.match(/\[info\] tick (\d+)/)?.[1]).filter((x): x is string => x !== undefined);
+    const nums = ticks.map((l) => l.match(/ tick (\d+)$/)?.[1]).filter((x): x is string => x !== undefined);
     assert.deepEqual(nums, Array.from({ length: 25 }, (_, i) => String(i + 1)), `file-only logging must keep the complete durable record (got ${ticks.length} tick lines)`);
     assert.equal(uncaught.length, 0, `no uncaughtException spam may reach the log file: ${JSON.stringify(uncaught.slice(0, 3))}`);
     assert.equal(warns.length, 1, `exactly one degradation [warn], got ${JSON.stringify(warns)}`);

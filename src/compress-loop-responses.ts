@@ -13,6 +13,7 @@ import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { safePrefix, safeSuffix } from "./text-safe.js";
 
 interface CompressLoopResponsesCtx {
     core: CompressionCore;
@@ -103,7 +104,7 @@ async function surfaceProxyJson(
         } catch {
             // #1502: same root cause as loop/core.ts — keep the raw string so corrupt compress arguments reach the kernel's lenient salvage ladder instead of {}.
             rawArgs = call.arguments;
-            loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed (len=${call.arguments.length}, head=${call.arguments.slice(0, 200)}, tail=${call.arguments.slice(-200)})`);
+            loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
         }
         let result: string;
         try {
@@ -170,7 +171,7 @@ export async function compressLoopResponsesJson(
                 args = JSON.parse(call.arguments) as Record<string, unknown>;
             } catch (error) {
                 // #1502: keep the raw string so corrupt compress arguments reach the kernel's lenient salvage ladder instead of {}.
-                loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${call.arguments.slice(0, 200)}, tail=${call.arguments.slice(-200)})`);
+                loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
                 rawArgs = call.arguments;
             }
             const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs));
