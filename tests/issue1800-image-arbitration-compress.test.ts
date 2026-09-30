@@ -44,10 +44,10 @@ function pngB64(w: number, h: number, padChars: number): string {
     return b.toString("base64") + "A".repeat(padChars);
 }
 
-interface MockStats { streamingForwards: number; imagesSeen: number; summaryCalls: number }
+interface MockStats { streamingForwards: number; imagesSeen: number; markersSeen: number; summaryCalls: number }
 
 function startMockUpstream(): Promise<{ server: http.Server; port: number; stats: MockStats }> {
-    const stats: MockStats = { streamingForwards: 0, imagesSeen: 0, summaryCalls: 0 };
+    const stats: MockStats = { streamingForwards: 0, imagesSeen: 0, markersSeen: 0, summaryCalls: 0 };
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -58,11 +58,15 @@ function startMockUpstream(): Promise<{ server: http.Server; port: number; stats
             if (parsed.stream === false) {
                 stats.summaryCalls += 1;
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({ output_text: "PREFLIGHT SUMMARY: folded segment." }));
+                // >= MIN_SUMMARY_CHARS (50): a shorter reply is rejected as
+                // "summary too short", the fold never applies, and this test
+                // would only prove preflight RAN — not that it FOLDED.
+                res.end(JSON.stringify({ output_text: "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. Key decisions: chose the preflight approach over lossy truncation because the payload must stay coherent. Files touched: src/a.ts:10, src/b.ts:20. Outcome: fixed and verified by tests." }));
                 return;
             }
             stats.streamingForwards += 1;
             stats.imagesSeen += (raw.match(/"input_image"/g) ?? []).length;
+            stats.markersSeen += (raw.match(/MARKER_\d+/g) ?? []).length;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(`event: response.completed\ndata: ${JSON.stringify({ response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 1000, output_tokens: 5, total_tokens: 1005 } } })}\n\n`);
             res.end();
@@ -136,6 +140,11 @@ test("#1800: image-dominated estimate with compressible text still folds the tex
         // branch returned `prepared` before reaching preflightCompress, so
         // summaryCalls was 0 and auto-compression stayed permanently disabled.
         assert.ok(stats.summaryCalls >= 1, `preflight folded the compressible text portion (got ${stats.summaryCalls} summarization calls)`);
+        // SECOND TOOTH: the payload that actually went upstream is the REBUILT
+        // (folded) one — folded ranges are replaced, so strictly fewer filler
+        // markers reach the mock than were sent. Catches a regression that folds
+        // but forwards the stale unfolded `prepared`.
+        assert.ok(stats.markersSeen < 60, `upstream saw ${stats.markersSeen}/60 filler markers — the forwarded payload must be the rebuilt/folded one`);
         assert.ok(stats.imagesSeen >= 1, "the screenshot rode along byte-exact through the folded forward");
     } finally {
         upstream.close();
