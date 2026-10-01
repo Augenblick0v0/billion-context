@@ -282,6 +282,19 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         // #1130: restore the interceptor's readyOrigin short-circuit — a
         // runtime recovery clears state.origin before re-probing, and a
         // transient blip must not leave it dangling.
+        // #1788 boundary: deliberately UNGATED by landingOwnsRegister (unlike
+        // the slow-path landings below). Converges rather than clobbers: with
+        // routed evidence present, home === state.routedOrigin — the SAME
+        // origin onRoutedOriginObserved rebinds to — and maybeRetry's respawn()
+        // joins this very single-flight, so no independent writer can move
+        // base mid-flight. Residual (narrow): base holding a different LIVE
+        // origin set up OUTSIDE routed evidence (exotic multi-lifecycle
+        // interleave) → tools bind briefly to that other live proxy; the next
+        // model request's routed evidence rebinds back. Transient, self-
+        // correcting, no data loss or deadlock — accepted per the #1039
+        // "document the boundary" discipline. Do NOT force the predicate here:
+        // the unconditional `return home` below would then desync from
+        // register.base (return says X, base stays elsewhere).
         state.origin = home;
         register.base = home;
         return home;
@@ -290,6 +303,10 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
+            // #1788 boundary: ungated like the probe-healthy landing above —
+            // back IS the routed-evidence origin (pinned), so it agrees with
+            // onRoutedOriginObserved by construction; same convergence +
+            // narrow-residual reasoning applies (see #1788).
             state.origin = back;
             register.base = back;
             persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
