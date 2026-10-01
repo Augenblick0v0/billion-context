@@ -572,15 +572,14 @@ export function createGoogleAdapter(
                         // A finish chunk that also carried the functionCall was
                         // already replayed by settleToolCalls; re-sending it
                         // verbatim would duplicate the call on the wire.
-                        // #1881: rebuild from the STORED copy when the finish
-                        // chunk carried calls — it holds the cleaned prose
-                        // parts that were withheld from immediate forwarding.
+                        // #1881: settle already delivered this chunk's parts in
+                        // every classification ("keep" replays the stored/cleaned
+                        // json, a filtered rewrite keeps the non-call parts, and
+                        // a dropped proxy-only chunk delivers its withheld prose),
+                        // so the stub carries NO parts — resending them duplicates
+                        // the prose on the wire.
                         const finishHasCall = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
-                        const src = finishHasCall ? rawCallChunks[rawCallChunks.length - 1]?.parsed ?? parsed : parsed;
-                        const keepParts = finishHasCall ? prosePartsOf(src) : [];
-                        const finishChunk = finishHasCall
-                            ? sseFrame(cloneChunk(src, { parts: keepParts }))
-                            : rawBuf;
+                        const finishChunk = finishHasCall ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
                         yield { kind: "meta", chunk: finishChunk } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     } else {

@@ -4,6 +4,8 @@
 //   B. per-adapter reasoning/thinking/thought/reasoning-summary deltas
 //   C. openai dual-field frames and tool-frame replays carrying cleaned bytes
 //   D. google all-proxy call chunks still delivering their sibling prose
+//   E. openai dropped proxy-only frames still delivering their sibling prose
+//   F. google finish-stub chunks never duplicating already-settled prose
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter, createGoogleAdapter } from "../src/loop/index.ts";
@@ -131,4 +133,24 @@ test("#1881 google: an all-proxy call chunk still delivers its UNEDITED sibling 
     const out = clientBytes(events);
     assert.equal((out.match(/plain prose/g) ?? []).length, 1, `sibling text arrives once, got: ${out}`);
     assert.ok(!out.includes("bili_absorb"), `the proxy call must not ride along: ${out}`);
+});
+
+test("#1881 google: a terminal chunk carrying a REAL call sends its sibling prose exactly once", async () => {
+    const adapter = createGoogleAdapter({ model: "gemini-3-pro-preview" }, undefined, "bili_absorb", "gemini-3-pro-preview");
+    const events = await collect(
+        adapter,
+        sse({ candidates: [{ content: { role: "model", parts: [{ text: "Done reading." }, { functionCall: { name: "read_file", args: { path: "x" } } }] }, index: 0, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } }),
+    );
+    const out = clientBytes(events);
+    assert.equal((out.match(/Done reading\./g) ?? []).length, 1, `prose must not be duplicated by the finish stub, got: ${out}`);
+});
+test("#1881 google: a proxy-only finish chunk sends its sibling prose exactly once", async () => {
+    const adapter = createGoogleAdapter({ model: "gemini-3-pro-preview" }, undefined, "bili_absorb", "gemini-3-pro-preview");
+    const events = await collect(
+        adapter,
+        sse({ candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "read_file", args: {} } }] }, index: 0 }] }) +
+            sse({ candidates: [{ content: { role: "model", parts: [{ text: "Bye now." }, { functionCall: { name: "bili_absorb", args: {} } }] }, index: 0, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } }),
+    );
+    const out = clientBytes(events);
+    assert.equal((out.match(/Bye now\./g) ?? []).length, 1, `settle delivery plus finish stub must total one copy, got: ${out}`);
 });
