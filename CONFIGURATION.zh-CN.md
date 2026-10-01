@@ -726,6 +726,7 @@
 | `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。滚动 `pr` tag 指向所有 PR 中最新的测试构建；旧版按 PR 划分的 `pr-N` tag 已冻结在该 PR 的最后一个构建，仅在显式配置时才会被跟随。 |
 | `BILI_UPDATE_REGISTRY` | 自动更新与 `bili update` 使用的 npm registry base URL 覆盖（默认 `https://registry.npmjs.org`）。仅供 hermetic 测试指向回环 registry（`ACP_TEST_REGISTRY` e2e 套件自带的 verdaccio 实例）；生产环境请勿设置（#1153）。 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | 自动更新检查周期（毫秒，默认 `180000` 即 3 分钟；≤ 0 的值被忽略，回退默认）。hermetic e2e 套件用它缩短周期，避免等待完整间隔（#1153）。 |
+| `BILI_MODEL_INFO_RETRY_MS` | dsh 原生模型窗口解析失败（或解析结果不带窗口）后的重试冷却（毫秒，#1812/#1836）：匹配的缓存条目没有 context window 时不视为最终结果 —— 不再让整个进程生命周期 latching 成无 header 状态，而是该冷却过期后由下一个请求触发重新解析。默认 `30000`；非数字或负值回退 `30000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
 | `BILI_ADVISORY_CHECK` | 设为 `0` 禁用严重缺陷公告监视器（#1481）。默认开启 —— 它独立于 `ACP_AUTO_UPDATE` 运行，确保关闭了自动更新的安装也能被强制移出已知缺陷版本范围。fail-open：公告源不可达/格式错误只告警，绝不阻断模型流量。文件配置键：`advisoryCheck`。 |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖。默认：已配置 registry（感知 `BILI_UPDATE_REGISTRY`）上的伴生包 `billion-context-advisories`。文件配置键：`advisoryUrl`。 |
 | ~~`BILI_HOST_USAGE_CREDIT`~~ / ~~`hostUsageCredit`~~ | **#660 已移除。** 曾用于选择宿主可见的用量模式。#408 的未折叠基线回补（backfill）已整体删除 —— 所有宿主现在统一上报“实际转发（后折叠）请求”的 provider 实测用量，与 `[acp-usage] input=` 一致。遗留该环境变量 / 配置键的旧值会被忽略，请删除。教训详见 PR #691 的 “Bug 历史教训” 一节。 |
@@ -966,7 +967,7 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | hermes | `HTTPS_PROXY`（明文 http 走 absolute-form 正向代理请求） | `SSL_CERT_FILE` → `combined-ca.pem`（另设旧版 `HERMES_CA_BUNDLE` → `root-ca.pem`） |
 | dsh | `HTTPS_PROXY`（明文 http 另加 `HTTP_PROXY`）+ `DEEPSEEK_BASE_URL`；**仅回环**隔离 `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
-`NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**系统/Node 公共根 —— 保证子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任）。
+`NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**操作系统信任库与 Node 公共根。合并 OS 信任库很关键：部分被启动的客户端把这个文件当作**整个**信任池（codex 的 rustls HTTP 栈是替换而非追加，#1807），它们的直连（不经代理）连接只能靠这个文件校验，因此文件必须是 OS 自身信任集合的超集（Windows 经 PowerShell 读证书库、macOS 经 `security(1)` 读钥匙串；Linux 本就直读文件系统 bundle；最多每 24 小时重建一次）。最初引入该 bundle 是为了让子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任；OS 信任库合并自 #1807 起）。
 
 Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay —— 一律改走 `/bili/` URL 形式的 `ANTHROPIC_BASE_URL`；无需任何 CA 信任。
 
@@ -990,13 +991,14 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 - **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向，客户端退出时删除），明文 `baseURL` 重写为 `/bili/` 形式，**并追加了薄插件**（`/acp` + `/acp-cache` 命令）。OpenCode 1.x 下 `opencode-acp` 条目会从副本中移除（主机不得以激活状态加载它），改由薄插件把同一个包作为库导入、仅对 legacy 会话生效；首个被移除的 spec 经 `BILI_OPENCODE_ACP_SPEC` 传递，保证 bridge 导入的正是主机本会加载的那份拷贝（#920）。
 - **hermes** —— 不写任何文件（#535）：其 httpx 栈走 `HTTPS_PROXY`（+ `SSL_CERT_FILE` → `combined-ca.pem`；旧版 `HERMES_CA_BUNDLE` 保留设置，#1375）—— https 经 CONNECT 证书 MITM，明文 http 经 absolute-form 正向代理请求。若没配置任何 provider，启动器打印警告，hermes 将**不经代理**运行（无压缩）。
 - **dsh** —— 按目的地分流（#535）：dsh 的 fetch 栈尊重代理 env，但对回环目标无条件绕过，所以**非回环**上游走 `HTTPS_PROXY`（证书 MITM）/ `HTTP_PROXY`（absolute-form 正向代理请求），`SSL_CERT_FILE` → `combined-ca.pem`；仅**回环**上游保留持久 overlay `DSH_HOME`（`~/.dsh-bili`），重写后的 `settings.yaml` 让它们走 `/bili/`。`profiles/`、凭据、会话符号链接共享；真实 `~/.dsh` 绝不触碰。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
+- **codex** —— 持久 overlay `CODEX_HOME`（`~/.codex-bili`，或 `<CODEX_HOME>-bili`），其余条目（凭据、会话、模型设置）保持指向真实主目录的共享链接。两个生成文件：(a) MCP 注入开启时，合并后的 `config.toml` —— 真实内容加上每次启动的 `[mcp_servers.bili]` 块（内联 `-c` 值在 Windows cmd.exe 引号处理下无法存活，#681）；(b) #1802 起，生成的 `.env`（权限 0600），把**本次启动**的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` / `SSL_CERT_FILE` / `BILLION_CONTEXT_PROXY` 重新钉死：codex 自己的 `load_dotenv()` 会在启动**之后**用 `$CODEX_HOME/.env` 覆盖启动器注入的环境变量，否则用户 `.env` 里指向 socks5h 之类的代理会悄悄把 codex 重新路由出 bili（且 codex 自定义 CA 的 rustls HTTP 栈根本不支持 SOCKS）。你 `.env` 里的其他变量逐行原样保留；既有的共享 `.env` 链接会迁移为自有文件；真实主目录的 `.env` 及其他所有文件绝不触碰。direct-URL 模式（`BILI_LAUNCHER_DIRECT=1`）不生成 `.env`（没有需要保护的注入代理），且未开 MCP 时连 overlay 都不建。
 
 ### 启动器里的原生工具
 
 - **pi** —— 未安装插件时，启动器借用 pi 的 `-e <file>` 参数为本次运行加载 `dist/agent/pi.js`（不写任何东西）：开箱即原生工具 + `/acp`、`/acp-cache` 与 `/acp-rule` 命令（`/acp-cache` 默认总账摘要 —— 总计、判定、异常行；追加 `full`（或 `--full`）看全量明细，等价于 `acp_cache` 工具传 `detail: "full"`）。已安装则符号链接的 `settings.json` 已加载它 —— 不再加 `-e`。
 - **omp** —— 发行版不自带插件；启动器在配置里没有可加载的 bili 条目时自动注入 `-e dist/agent/omp.js`（与 pi 相同的零配置搭车）。两个 omp 专属机制让插件在那里完全原生：omp 17.x 会把未声明 `loadMode` 的扩展工具挂到 `xd://` 设备 URL 下（模型主回合看不到），插件因此用 `loadMode: "essential"` 注册 —— 模型直接拿到四个 ACP 原生工具；omp 分叉不发 `before_provider_headers`，插件改走启动器身份注册（`POST /__bili/plugin/register`，以 omp 会话 id = `prompt_cache_key`/`x-session-id` 为键）绑定会话 —— 绑定后的会话进入插件模式（抑制 wire 注入）并带有原生 `/acp`、`/acp-cache` 与 `/acp-rule` 命令。
 - **opencode** —— 临时配置自动追加薄插件。
-- **claude / codex** —— 默认开启：启动器注入单个 `bili` MCP 服务器（claude 用 `--mcp-config`，codex 用 `-c mcp_servers.bili.*` —— 都是临时生效，不写宿主配置），开箱即原生工具（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 退回纯 wire 模式 —— 适用于早于已验证版本、未针对注入参数测试的宿主。
+- **claude / codex** —— 默认开启：启动器注入单个 `bili` MCP 服务器（claude 用临时 `--mcp-config` 文件；codex 的定义写在 overlay 生成的 `config.toml` 里，见[生成文件](#生成文件写了什么----最后手段--535) —— 两种情况都不写真实宿主配置），开箱即原生工具（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 退回纯 wire 模式 —— 适用于早于已验证版本、未针对注入参数测试的宿主。
 - **codex + 自建上游自动回退** —— codex 0.147 把 MCP 工具以 `namespace` 工具类型发给模型；自建推理服务（sglang/vllm/ollama/llama.cpp）不解析该类型，工具会静默失明。当 codex 上游主机是环回/私网地址（`127.0.0.1`、RFC1918、ULA、`.local` 等）且未设置 `BILI_LAUNCHER_PLUGIN` 时，bili 自动改用 wire 模式（扁平工具，所有服务都认识）并在 stderr 说明。`BILI_LAUNCHER_PLUGIN=1` 可强制插件模式。
 - **hermes** —— 无插件 API；永远 wire 模式。
 - **dsh** —— 启动器始终在 dsh 的 argv 里拼接 `--patch <file>`（写入 `~/.dsh-bili/.bili-acp.patch.yml`），把 `dist/agent/dsh-acp.js` 插进 profile 的加载树：原生 `/acp` 与 `/acp-cache` 命令，与 dsh 自带 `/compact` 同一形态（`/acp-cache` 显示默认总账摘要 —— dsh 的命令 API 不传参数，因此没有 `full`）。在任何组合了 commands 服务的 profile（web/tui 交互表面）都可用；`headless` 一次性驱动器把任务直接发给模型、不解析命令（原生 `/compact` 在那里同样不可用）。子命令形态已处理：`dsh web` 的 flag 插在 `web` 之后，`dsh plugin`/`--dump-default-config` 不注入。

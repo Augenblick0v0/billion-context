@@ -27,6 +27,12 @@ export interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-012",
+        wire: "responses",
+        summary: "a supplied compaction input item id must begin with cmp",
+        provenance: "#1763: user-reported upstream rejection for an fc_bili_ compaction item, Expected an ID that begins with 'cmp'; reproduced with a strict loopback upstream in tests/codex-compact-e2e.test.ts.",
+    },
+    {
         id: "WC-009",
         wire: "responses",
         summary: "thinking-mode providers require prior-turn reasoning items echoed in resent history — an assistant run of calls/messages with no reasoning item gets 400 code 11155 reasoning_content_missing",
@@ -202,20 +208,26 @@ function validateGeminiSchema(schema: unknown, path: string, out: string[]): voi
     validateGeminiSchema(schema.items, `${path}.items`, out);
 }
 
-/** WC-005, WC-009, WC-011 on a Responses-API body (flat function entries). */
+/** WC-005, WC-009, WC-011, WC-012 on a Responses-API body (flat function entries). */
 export function validateResponsesBody(body: unknown): string[] {
     const out: string[] = [];
+    if (!isPlainObject(body)) return out;
     // WC-011 (#1733): runs before the tools early-return — the adjacency ban
     // applies to any array input, tools or not.
-    if (isPlainObject(body) && Array.isArray(body.input)) {
+    if (Array.isArray(body.input)) {
         for (let i = 1; i < body.input.length; i++) {
             const prev = body.input[i - 1];
             const cur = body.input[i];
             if (isPlainObject(prev) && prev.type === "configuration_update" && isPlainObject(cur) && cur.type === "configuration_update")
                 out.push(`WC-011 input[${i}]: consecutive configuration_update items are not allowed`);
         }
+        body.input.forEach((item, i) => {
+            if (isPlainObject(item) && item.type === "compaction" && item.id !== undefined
+                && (typeof item.id !== "string" || !item.id.startsWith("cmp")))
+                out.push(`WC-012 input[${i}].id: expected an ID that begins with 'cmp'`);
+        });
     }
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
         if (t.type !== "function") return;

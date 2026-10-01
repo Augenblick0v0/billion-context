@@ -127,6 +127,7 @@ import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDum
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
+import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
@@ -2400,6 +2401,28 @@ async function handle(
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
         const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
+        // #1729: dsh native compaction guard — a compaction summarize call
+        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
+        // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
+        // state untouched. Unconditional by design — auto pressure, overflow
+        // recovery, and manual /compact share one envelope, and a landed
+        // checkpoint durably shadows the raw history (irreversible), while every
+        // cost of refusing is dsh-side, caught, and recoverable. Runs before the
+        // #388 side-request lane: the compaction call is a full-budget request,
+        // so only this guard can catch it.
+        if (protocol !== null && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
+            if (session.metadata.dshCompactionRefused !== true) {
+                session.metadata.dshCompactionRefused = true;
+                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
+            }
+            const refusal = dshCompactionRefusal(protocol);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                res.writeHead(refusal.status, { "content-type": "application/json" });
+                res.end(JSON.stringify(refusal.body));
+            }
+            logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
+            return;
+        }
         // #388: side requests (title-gen etc.) share the main session key but
         // must not touch kernel state (processTurn/snapshot/usage would pollute
         // the main view). Forward with a minimal prepared marked sidePassthrough:
@@ -2442,7 +2465,15 @@ async function handle(
                 return;
             }
             log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
-            const sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            let sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            const sideInput = (parsed as ResponsesRequestBody).input;
+            if (protocol === "responses" && Array.isArray(sideInput)) {
+                const { items, replaced, dropped } = replaceBiliCompactionItems(sideInput);
+                if (replaced + dropped > 0) {
+                    sideBody = Buffer.from(JSON.stringify({ ...parsed, input: items }));
+                    log("info", `[${session.id}] side request normalized bili compaction handoffs (replaced=${replaced}, dropped=${dropped})`);
+                }
+            }
             const sidePrepared: Prepared = {
                 body: sideBody,
                 session,
@@ -5055,8 +5086,19 @@ async function preflightCompressIfNeeded(
     // hatch on pixel-billing upstreams). With evidence present we trust the
     // estimate and fall through to fold / fail-fast below.
     const noOverflowEvidence = session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage";
-    if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
-        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
+    // #1800: images are the sole over-window component and we hold no overflow
+    // evidence → the base64/4 (or pixels-fallback) image cost clears the window on
+    // ESTIMATE alone while the real bill is far smaller, so we let the upstream
+    // arbitrate billing instead of fail-fast'ing. But do NOT unconditionally
+    // short-circuit here: that permanently disabled auto-compression — preflight
+    // never ran while the inflated estimate sat over-window, so a growing text
+    // payload was folded 0× for the whole session (#1800). Only take the immediate
+    // forward when there is literally NOTHING compressible; otherwise remember the
+    // arbitration and let preflightCompress fold the text portion first, re-applying
+    // this same forward-instead-of-fail-fast decision after compression (below).
+    const imageArbitration = imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence;
+    if (imageArbitration && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
+        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
     }
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
@@ -5202,12 +5244,14 @@ async function preflightCompressIfNeeded(
     // would look "fitting" on its text estimate alone. Unknown-baseline
     // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
+    let outbound: Prepared = prepared;
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
         const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
+        outbound = rebuilt;
         const fits = unknownBaseline
             ? result.fitsWindow
             : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
@@ -5218,13 +5262,25 @@ async function preflightCompressIfNeeded(
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
-    // The payload still overflows the window: fail fast with a diagnostic
-    // error instead of forwarding a guaranteed-400 payload (#301).
     const f = result.failure;
     if (f?.kind === "aborted") {
         log("warn", `[${session.id}] preflight aborted (${f.detail}); not forwarding`);
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
+    // #1800: still over-window after compression, but the residual excess is carried
+    // ENTIRELY by the image estimate (text+overhead fits on its own) and we hold no
+    // upstream overflow evidence. Forward for the upstream to arbitrate billing
+    // instead of fail-fasting a payload whose real bill likely fits (#496). The text
+    // portion was already folded above when foldable; we do NOT re-loop.
+    if (imageArbitration) {
+        const outText = estimateCoreMessages(outbound.processedMessages);
+        if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
+            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
+            return outbound;
+        }
+    }
+    // The payload still overflows the window: fail fast with a diagnostic
+    // error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
     const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);

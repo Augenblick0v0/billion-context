@@ -88,10 +88,24 @@ type PluginContext = {
     // agent preset where the bundle patch cannot reach it.
     profileContext?: { startedBundles?: readonly string[] | undefined };
     inject?: (deps: readonly string[], callback: (sub: PluginContext) => void) => unknown;
+    // #1809: lifecycle disposal for registrations made inside an injected
+    // callback (cordis Context.effect); optional so non-cordis hosts skip it.
+    effect?: (fn: () => void | (() => void), label?: string) => void;
     // #1590: host event bus (web-profile hosts only) — webserver/index-inject
     // gathers per-startup rows for the web index; we push the __BILI__ global
     // the dsh-native-client.js settings entry reads.
     on?: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => void;
+    // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
+    // /bili/origin route the settings entry polls. Optional like llm/
+    // profileContext above: TUI/headless profiles lack it.
+    webServer?: {
+        // returns the disposer (cordis WebServer.register contract)
+        register: (route: {
+            kind: "exact" | "prefix";
+            path: string;
+            handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }) => void | Promise<void>;
+        }) => (() => void) | undefined;
+    };
 };
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -124,9 +138,30 @@ type RegisterState = { base: string | undefined; toolsReady: boolean; dead: bool
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
 
+// #1797: attach/recovery chains still in flight after apply() returned — a late
+// chain would clobber the shared register mid-run of whatever executes next.
+const pendingChains = new Set<Promise<unknown>>();
+
+function trackChain<T>(p: Promise<T>): Promise<T> {
+    pendingChains.add(p);
+    void p.then(
+        () => { pendingChains.delete(p); },
+        () => { pendingChains.delete(p); },
+    );
+    return p;
+}
+
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+
+/** #1590/#1809: origin of the proxy as currently reachable — register.base
+ *  once bound (attach synchronously, spawn after bootstrap), else the preset
+ *  env origin. Shared by the index-inject row and the live /bili/origin route. */
+function currentOrigin(): string | undefined {
+    const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
+    return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+}
 
 // Runtime-info cache (#955): the host's current model selection plus what
 // ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
@@ -134,7 +169,21 @@ let webProfileWarned = false;
 // Stale entries never leak across a model switch: refresh() keys off the
 // LIVE selection, and a changed selection re-resolves before overwriting.
 type ModelInfoCache = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
-const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean } = { refreshing: false };
+// #1812: retry cadence for window resolves that failed (or resolved without a
+// window). The pre-#1812 code cached {provider, model} on failure and the
+// early-return below then NEVER re-resolved — one boot-time race (catalog
+// still loading) silently stripped x-bili-plugin-context-window from every
+// request of the whole process lifetime, and the proxy sized the session
+// against its unconfigured fallback. A failed resolve now retries after this
+// cooldown instead of latching.
+const MODEL_INFO_RETRY_COOLDOWN_MS = 30_000;
+function modelInfoRetryCooldownMs(): number {
+    // BILI_MODEL_INFO_RETRY_MS: test hook to exercise the retry cadence without wall-clock waits.
+    const raw = process.env.BILI_MODEL_INFO_RETRY_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : MODEL_INFO_RETRY_COOLDOWN_MS;
+}
+const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean; retryAt?: number } = { refreshing: false };
 
 function selectionStillCurrent(svc: { agentDefaultModel?: PluginContext["agentDefaultModel"] }, provider: string, model: string): boolean {
     try {
@@ -157,13 +206,20 @@ function refreshModelInfo(origin: string | undefined): void {
     const provider = selection?.provider;
     const model = selection?.model;
     if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) return;
-    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) return;
+    // #1812: a matching cached entry is final only when it actually carries a
+    // window (or the service has no resolver at all). A failure-shaped cache
+    // ({provider, model}, no contextWindow) retries after the cooldown.
+    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) {
+        if (modelInfo.cached.contextWindow !== undefined) return;
+        if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
+    }
     const resolve = svc.llm?.resolveModelInfo;
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;
     }
     modelInfo.refreshing = true;
+    modelInfo.retryAt = Date.now() + modelInfoRetryCooldownMs();
     void Promise.resolve()
         .then(() => resolve(provider, model))
         .then((info) => {
@@ -178,6 +234,7 @@ function refreshModelInfo(origin: string | undefined): void {
                 contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
             };
+            if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
         })
         .catch(() => {
             if (!selectionStillCurrent(svc, provider, model)) return;
@@ -298,8 +355,11 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
         console.error(`bili-native-dsh: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
-        register.base = undefined;
-        register.toolsReady = false;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = undefined;
+            register.toolsReady = false;
+            register.retryAt = 0;
+        }
         return undefined;
     }
     persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
@@ -308,7 +368,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
-    state.origin = undefined;
+    if (state.origin === attachOrigin) state.origin = undefined;
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
@@ -319,12 +379,20 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     };
     const landed = start().then((origin) => {
         if (origin === undefined) {
-            register.base = undefined;
-            register.toolsReady = false;
+            if (landingOwnsRegister(attachOrigin)) {
+                register.base = undefined;
+                register.toolsReady = false;
+                // A back-off armed against the stale base must die with it:
+                // the unfreeze is a one-shot transition to a fresh base-less
+                // world and must not inherit the old base's 10s wall (#1783).
+                register.retryAt = 0;
+            }
             return undefined;
         }
-        register.base = origin;
-        state.origin = origin;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = origin;
+            state.origin = origin;
+        }
         return origin;
     });
     state.ready = landed;
@@ -356,6 +424,17 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
     };
 }
 
+/** Stale-landing guard (windows-22 CI #1783): async chains armed by
+ *  verifyAttachAndRecover resolve long after they started (probe + evidence
+ *  grace + spawn). While they were in flight, maybeRetry may have already
+ *  self-healed the register onto a NEW origin — a late landing must never
+ *  clobber that. A landing may only write the register while it still owns
+ *  it: base is undefined (nothing better established) or still the stale
+ *  origin this chain set out to replace. */
+function landingOwnsRegister(staleOrigin: string | undefined): boolean {
+    return register.base === undefined || register.base === staleOrigin;
+}
+
 async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.pending !== undefined) return register.pending;
     const base = register.base;
@@ -374,7 +453,12 @@ async function registerTools(ctx: PluginContext): Promise<void> {
                 register.dead = true;
                 return;
             }
-            register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            // Scope the back-off to the base that actually failed: if the
+            // register moved on while this manifest fetch was in flight (the
+            // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
+            // an armed retryAt would gate the NEXT base's first heal behind a
+            // 10s wall — exactly the windows-22 CI deadlock (#1783).
+            if (register.base === base) register.retryAt = Date.now() + RETRY_INTERVAL_MS;
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
@@ -395,7 +479,7 @@ function maybeRetry(ctx: PluginContext): void {
         const respawn = state.respawn;
         if (respawn === undefined) return;
         register.retryAt = Date.now() + RETRY_INTERVAL_MS;
-        void respawn()
+        void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
                 register.base = origin;
@@ -575,10 +659,41 @@ export function apply(ctx: PluginContext): void {
     // startup-time index collection that entry degrades to a hint instead of
     // a stale link.
     ctx.on?.("webserver/index-inject", (table) => {
-        const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
-        const origin = register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+        const origin = currentOrigin();
         if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
     });
+
+    // #1809: the row above is a snapshot taken at index render — spawn mode
+    // binds register.base only AFTER bootstrap, so an already-loaded page (a
+    // web tab opened at launch) never sees the origin, and desktop is worse:
+    // its boot payload is captured once per app launch, leaving the settings
+    // entry degraded for the whole session even after the proxy is up. Serve
+    // the origin live on a named route instead; the client half polls it
+    // while unresolved. Missing webServer (TUI/headless profiles) keeps the
+    // snapshot row as the only source.
+    const originRoute = {
+        kind: "exact" as const,
+        path: "/bili/origin",
+        handler: (_req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
+            const body = JSON.stringify({ origin: currentOrigin() ?? null });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(body);
+        },
+    };
+    if (typeof ctx.inject === "function") {
+        // Cordis inject: fires once the service is available, re-runs on
+        // change; the effect disposes the prior registration on each re-run
+        // (same lifecycle as dsh's own bundle route). Profiles without a
+        // webserver never fire the callback — the snapshot row alone stands.
+        ctx.inject(["webServer"], (sub) => {
+            const ws = sub.webServer;
+            if (ws === undefined) return;
+            if (typeof sub.effect === "function") sub.effect(() => ws.register(originRoute), "bili: /bili/origin route");
+            else ws.register(originRoute);
+        });
+    } else if (ctx.webServer !== undefined) {
+        ctx.webServer.register(originRoute);
+    }
 
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
@@ -615,7 +730,7 @@ export function apply(ctx: PluginContext): void {
                     console.warn(line);
                 });
             };
-            state.ready = start();
+            state.ready = trackChain(start());
         } else {
             state.ready = Promise.resolve(undefined);
         }
@@ -628,7 +743,7 @@ export function apply(ctx: PluginContext): void {
             register.base = undefined;
             register.toolsReady = false;
         };
-        state.ready = start();
+        state.ready = trackChain(start());
     }
 
     // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
@@ -800,6 +915,13 @@ export function _resetRegisterForTest(base: string | undefined): void {
     modelInfo.cached = undefined;
     modelInfo.services = undefined;
     modelInfo.refreshing = false;
+}
+
+/** Test hook (#1797): resolve once every in-flight attach/recovery chain has
+ *  settled, plus one macrotask so their .then state-writes have run. */
+export function _settleNativeForTest(): Promise<void> {
+    const all = [...pendingChains];
+    return Promise.all(all).catch(() => undefined).then(() => new Promise((resolve) => setTimeout(resolve, 0)));
 }
 
 export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {

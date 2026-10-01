@@ -3,11 +3,17 @@
 // two load-bearing invariants invisible from this file alone: the id MUST
 // equal the loader entry name the scanner keys its graph row by ("loaded
 // without registering" otherwise), and the factory's `require` resolves only
-// through dsh's module system, so react is the sole permitted external. The
-// host half (dsh-native.ts) injects globalThis.__BILI__ = {origin} into the
-// web index; when absent the entry degrades to a hint instead of a dead link.
+// through dsh's module system, so react is the sole permitted external.
+// Origin discovery has two paths (#1809): the host half (dsh-native.ts)
+// injects globalThis.__BILI__ = {origin} into the web index at render time —
+// a boot-time snapshot that a page loaded before spawn-mode bootstrap (or a
+// desktop boot payload, captured once per app launch) never carries — and it
+// serves the live origin at GET /bili/origin on the dsh webserver; this
+// section polls that route while unresolved so the entry upgrades without a
+// reload or app restart. Neither source known ⇒ degrade to a hint instead of
+// a dead link.
 
-import { createElement } from "react";
+import { createElement, useEffect, useState } from "react";
 
 type Dict = Record<string, string>;
 
@@ -28,6 +34,13 @@ type ClientContext = {
 export const inject = ["slots", "locale"];
 
 const NS = "bili";
+
+// #1809: live-origin probe cadence — first attempt immediate, then a retry
+// every POLL_INTERVAL_MS up to POLL_MAX_ATTEMPTS total (~30s of coverage for
+// a slow spawn-mode bootstrap, bounded so an absent host costs no more).
+const ORIGIN_PATH = "/bili/origin";
+const POLL_INTERVAL_MS = 3000;
+const POLL_MAX_ATTEMPTS = 10;
 
 const zh: Dict = {
     "nav": "bili设置",
@@ -56,6 +69,39 @@ function openExternal(url: string): void {
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
 }
 
+/** #1809: poll the host's live origin route until one arrives; returns the
+ *  cancel used as the effect cleanup (no fetch ⇒ no-op, older hosts without
+ *  the route simply stay degraded after the attempts are exhausted). */
+function probeOrigin(onOrigin: (origin: string) => void): () => void {
+    if (typeof fetch !== "function") return () => {};
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const poll = async (): Promise<void> => {
+        let resolved = false;
+        try {
+            const res = await fetch(ORIGIN_PATH);
+            if (res.ok) {
+                const data = (await res.json()) as { origin?: unknown };
+                if (typeof data.origin === "string" && data.origin.length > 0 && !cancelled) {
+                    onOrigin(data.origin);
+                    resolved = true;
+                }
+            }
+        } catch {
+            // host without the route (older builds) or transient error: retry below
+        }
+        if (resolved) return;
+        attempts += 1;
+        if (!cancelled && attempts < POLL_MAX_ATTEMPTS) timer = setTimeout(() => void poll(), POLL_INTERVAL_MS);
+    };
+    void poll();
+    return () => {
+        cancelled = true;
+        if (timer !== undefined) clearTimeout(timer);
+    };
+}
+
 export function apply(ctx: ClientContext): void {
     const zhDict = zh;
     const enDict = en;
@@ -65,7 +111,11 @@ export function apply(ctx: ClientContext): void {
     );
     const t = ctx.locale.bind(NS);
     const section = (): unknown => {
-        const origin = readOrigin();
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        useEffect(() => {
+            if (origin !== undefined) return;
+            return probeOrigin(setOrigin);
+        }, [origin]);
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },

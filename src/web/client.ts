@@ -19,6 +19,37 @@ export const WEB_CLIENT = `(function () {
     function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, (c) => c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === \'"\' ? "&quot;" : "&#39;");
     }
+    // #1206 ledger detail carries per-event identity (client/entry/source); the
+    // banner used to show counts only and force users into acp_status — surface
+    // the named entries here instead.
+    function shortConflictDetail(e) {
+        if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") return "";
+        let s = e.detail;
+        const suspected = s.indexOf("[suspected]") >= 0;
+        const si = s.lastIndexOf("[suspected]");
+        if (si >= 0) s = s.slice(0, si);
+        const pi = s.lastIndexOf(" (");
+        if (pi > 0) s = s.slice(0, pi);
+        return s.trim() + (suspected ? " [suspected]" : "");
+    }
+    function bili_conflictLine(c) {
+        const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
+        const items = [];
+        for (const e of c.latest || []) {
+            const name = shortConflictDetail(e);
+            if (!name) continue;
+            const hit = items.find((x) => x.name === name);
+            if (hit) hit.n += 1;
+            else items.push({ name: name, n: 1 });
+        }
+        let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
+        if (items.length > 0) {
+            const shown = items.slice(0, 4).map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : ""));
+            line += " — " + shown.join(" · ") + (items.length > 4 ? " …+" + (items.length - 4) : "");
+        }
+        return line;
+    }
+    window.bili_conflictLine = bili_conflictLine;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -255,8 +286,7 @@ export const WEB_CLIENT = `(function () {
             if (c && c.events > 0) {
                 cb.hidden = false;
                 cb.classList.add("show");
-                const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono"> (' + c.events + " event(s) in " + c.sessions + " session(s): " + kinds + ")</span>";
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono">(' + bili_conflictLine(c) + ")</span>";
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
@@ -1076,8 +1106,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
+            hydrateQuickConfig();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -1098,6 +1129,244 @@ export const WEB_CLIENT = `(function () {
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
         }
+    }
+    function hydrateQuickConfig() {
+        const box = $("quick-fields");
+        if (!box) return;
+        box.innerHTML = "";
+        const fe = $("cfg-file-edit");
+        let draft = {};
+        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
+        const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
+        const PRM_KERNEL_DEFAULT = 5;
+        const brokenNote = document.createElement("div");
+        brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
+        box.appendChild(brokenNote);
+        const qCtrls = [];
+        function quickBroken(on) {
+            brokenNote.textContent = on ? t("cfg.q_parse_err") : "";
+            qCtrls.forEach((el) => { el.disabled = !!on; });
+        }
+        function freshDraft() {
+            try {
+                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                if (!p || typeof p !== "object" || Array.isArray(p)) return {};
+                return p;
+            } catch (e) { quickBroken(true); return null; }
+        }
+        function syncAll() {
+            const cp = compressOf(draft);
+            dbg.inp.checked = draft.debug === true;
+            ptRow.inp.checked = draft.passthrough === true;
+            const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
+            while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
+            ["default", "lean"].forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                packSel.appendChild(o);
+            });
+            if (pv !== "default" && pv !== "lean") {
+                const o = document.createElement("option");
+                o.value = pv;
+                o.textContent = pv + " *";
+                packSel.appendChild(o);
+            }
+            packSel.value = pv;
+            updatePackNote();
+            nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
+            updateNudgeNote();
+            prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
+            neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
+            const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
+            mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+        }
+        function commit(mutate) {
+            const fresh = freshDraft();
+            if (fresh === null) return;
+            draft = fresh;
+            mutate(draft);
+            if (fe) fe.value = JSON.stringify(draft, null, 2);
+            quickBroken(false);
+            syncAll();
+        }
+        function row(id, label) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            const ctl = document.createElement("div");
+            ctl.style.flex = "0 0 auto";
+            const inp = document.createElement("input");
+            inp.type = "checkbox";
+            inp.id = id;
+            lab.appendChild(inp);
+            lab.append(document.createTextNode(" \u2009" + label));
+            w.appendChild(lab);
+            w.appendChild(ctl);
+            box.appendChild(w);
+            return { inp, ctl };
+        }
+        function textRow(id, label, placeholder) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.htmlFor = id;
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            lab.textContent = label;
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.id = id;
+            inp.className = "field-input mono";
+            inp.style.flex = "1 1 320px";
+            inp.spellcheck = false;
+            if (placeholder) inp.placeholder = placeholder;
+            w.appendChild(lab);
+            w.appendChild(inp);
+            box.appendChild(w);
+            return inp;
+        }
+        const dbg = row("quick-debug", t("cfg.q_debug"));
+        qCtrls.push(dbg.inp);
+        dbg.inp.addEventListener("change", () => commit((d) => { if (dbg.inp.checked) d.debug = true; else delete d.debug; }));
+        const ptRow = row("quick-pt", t("cfg.q_passthrough"));
+        qCtrls.push(ptRow.inp);
+        ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
+        void ptRow.ctl;
+        const packSel = document.createElement("select");
+        packSel.className = "field-input mono";
+        qCtrls.push(packSel);
+        const pw = document.createElement("div");
+        pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const plab = document.createElement("label");
+        plab.htmlFor = "quick-pack";
+        plab.style.cssText = "flex:0 1 auto;max-width:520px";
+        plab.textContent = t("cfg.q_pack");
+        pw.appendChild(plab);
+        pw.appendChild(packSel);
+        box.appendChild(pw);
+        const packNote = document.createElement("div");
+        packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePackNote() {
+            if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
+            else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else packNote.textContent = t("cfg.q_pack_custom");
+        }
+        box.appendChild(packNote);
+        packSel.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
+        const nudge = document.createElement("input");
+        nudge.type = "number";
+        nudge.id = "quick-nudge";
+        nudge.className = "field-input mono";
+        nudge.style.width = "140px";
+        nudge.min = "1";
+        nudge.step = "1000";
+        nudge.spellcheck = false;
+        qCtrls.push(nudge);
+        const nnote = document.createElement("div");
+        nnote.style.cssText = "min-height:18px;font-size:12px;margin-top:2px";
+        function updateNudgeNote() {
+            const v = parseInt(nudge.value, 10);
+            nnote.textContent = "";
+            nnote.style.color = "";
+            if (!isNaN(v)) {
+                if (v < NUDGE_LOW) { nnote.textContent = t("cfg.q_nudge_low"); nnote.style.color = "#cf222e"; }
+                else if (v > NUDGE_HIGH) { nnote.textContent = t("cfg.q_nudge_high"); nnote.style.color = "#bf8700"; }
+            }
+        }
+        function syncNudge() {
+            updateNudgeNote();
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const v = parseInt(nudge.value, 10);
+                if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) d.compress.nudgeGrowthTokens = v; else delete d.compress.nudgeGrowthTokens;
+            });
+        }
+        function nudgeBtn(label, delta) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn sm";
+            b.textContent = label;
+            b.title = t("cfg.q_nudge_step");
+            b.addEventListener("click", () => { const cur = parseInt(nudge.value, 10); const base = isNaN(cur) ? NUDGE_DEFAULT : cur; nudge.value = String(Math.max(1, base + delta)); syncNudge(); });
+            return b;
+        }
+        const nrow = document.createElement("div");
+        nrow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const nlab = document.createElement("label");
+        nlab.htmlFor = "quick-nudge";
+        nlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        nlab.textContent = t("cfg.q_nudge");
+        const ng = document.createElement("div");
+        ng.style.cssText = "display:flex;gap:6px;align-items:center";
+        ng.appendChild(nudgeBtn("\u2212", -NUDGE_STEP));
+        ng.appendChild(nudge);
+        ng.appendChild(nudgeBtn("+", NUDGE_STEP));
+        nrow.appendChild(nlab);
+        nrow.appendChild(ng);
+        const nwrap = document.createElement("div");
+        nwrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+        nwrap.appendChild(nrow);
+        nwrap.appendChild(nnote);
+        box.appendChild(nwrap);
+        nudge.addEventListener("change", syncNudge);
+        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
+        qCtrls.push(ptInp);
+        const ptWarn = document.createElement("div");
+        ptWarn.style.cssText = "font-size:12px;color:#57606a";
+        ptWarn.textContent = t("cfg.q_ptools_warn");
+        ptInp.parentElement.appendChild(ptWarn);
+        ptInp.addEventListener("change", () => commit((d) => {
+            const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+        }));
+        const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
+        prm.type = "number";
+        prm.min = "1";
+        prm.style.flex = "0 0 140px";
+        qCtrls.push(prm);
+        prm.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(prm.value, 10);
+            if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
+            else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
+        const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
+        qCtrls.push(neInp);
+        const neNote = document.createElement("div");
+        neNote.style.cssText = "font-size:12px;color:#57606a";
+        neNote.textContent = t("cfg.q_never_note");
+        neInp.parentElement.appendChild(neNote);
+        neInp.addEventListener("change", () => commit((d) => {
+            const list = neInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            const sameAsDefault = list.length === NEVER_DEFAULT.length && NEVER_DEFAULT.every((x) => list.indexOf(x) >= 0);
+            if (!compressOf(d)) d.compress = {};
+            if (list.length === 0 || sameAsDefault) delete d.compress.neverPreserveRecentTools; else d.compress.neverPreserveRecentTools = list;
+        }));
+        const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"));
+        qCtrls.push(mitmInp);
+        mitmInp.addEventListener("change", () => commit((d) => {
+            const domains = mitmInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (domains.length === 0) { delete d.mitm; return; }
+            if (!d.mitm || typeof d.mitm !== "object" || Array.isArray(d.mitm)) d.mitm = {};
+            d.mitm.domains = domains;
+        }));
+        const moreA = document.createElement("a");
+        moreA.href = t("cfg.q_more_url");
+        moreA.target = "_blank";
+        moreA.rel = "noopener";
+        moreA.style.cssText = "font-size:12px;color:#0969da";
+        moreA.textContent = t("cfg.q_more");
+        box.appendChild(moreA);
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        syncAll();
     }
     async function loadUpstream(cfg) {
         let up = null;
@@ -1273,6 +1542,17 @@ export const WEB_CLIENT = `(function () {
             const pu = $("proxy-url");
             const val = pu ? pu.value.trim() : "";
             await putCfg(su, { upstreamProxyMode: mode, upstreamProxy: val || null });
+        });
+        // #1748: quick-config controls edit the same in-memory draft as the raw JSON
+        // editor; every change re-serializes into #cfg-file-edit, one Save writes once.
+        const sq = $("save-quick");
+        if (sq) sq.addEventListener("click", async () => {
+            const el = $("cfg-file-edit");
+            const raw = el ? el.value : "";
+            let parsed;
+            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
+            await putCfg(sq, { file: raw });
         });
         // #1426: single raw config-file editor — the server validates every known field
         const sf = $("save-file");
