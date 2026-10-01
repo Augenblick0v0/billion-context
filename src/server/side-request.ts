@@ -241,6 +241,10 @@ export function sideRequestGuard(
     configuredCap?: number,
     headroomCap: number = 1,
     armedLimit: number = 0,
+    /** #1843 L1: pre-resolved image reserve (learned truth when fresh, else the
+     *  prior) — replaces the internal billing-based estimate when provided so
+     *  the guard sees the same image channel every other gate consumes. */
+    imageReserve?: number,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -252,6 +256,7 @@ export function sideRequestGuard(
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
+    const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
+    const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }

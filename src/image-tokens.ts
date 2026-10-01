@@ -282,16 +282,98 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
 // Cheap gate: most bodies carry no images — skip the JSON parse entirely then.
 // prepared.body is bili's own compact JSON.stringify, but client raw buffers
 // may carry spaces, so probe both forms.
-export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
-    const s = typeof raw === "string" ? raw : raw.toString("utf8");
-    const probe =
-        protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
+function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "google", s: string): boolean {
+    return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
         : protocol === "responses" ? s.includes("input_image")
         : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"')
         : s.includes('"type":"image"') || s.includes('"type": "image"');
-    if (!probe) return 0;
+}
+
+export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
+    const s = typeof raw === "string" ? raw : raw.toString("utf8");
+    if (!bodyHasImagesProbe(protocol, s)) return 0;
     try {
         return imageTokensInParsedBody(protocol, JSON.parse(s), billing, configuredCap);
+    } catch {
+        return 0;
+    }
+}
+
+/** #1843 L1: hostname key for per-route image-cost learning — the route's
+ *  vision encoder is a property of the upstream host, not of the path. */
+export function upstreamHost(url?: string): string {
+    if (!url) return "unknown";
+    try {
+        return new URL(url).hostname.toLowerCase();
+    } catch {
+        return url.toLowerCase();
+    }
+}
+
+// #1843 L1: image COUNT walkers — same branch shapes as the cost walkers above
+// (they must stay in lockstep or learned per-image costs misattribute), used by
+// the learning layer to turn a usage report into an observed per-image bill.
+export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown): number {
+    if (!isObj(body)) return 0;
+    let n = 0;
+    if (protocol === "google") {
+        const contents = body.contents;
+        if (!Array.isArray(contents)) return 0;
+        for (const c of contents) {
+            if (!isObj(c) || !Array.isArray(c.parts)) continue;
+            for (const part of c.parts) {
+                if (!isObj(part)) continue;
+                const inline = part.inlineData;
+                if (isObj(inline) && typeof inline.data === "string") n += 1;
+                const file = part.fileData;
+                if (isObj(file) && typeof file.fileUri === "string") n += 1;
+            }
+        }
+        return n;
+    }
+    if (protocol === "responses") {
+        const input = body.input;
+        if (!Array.isArray(input)) return 0;
+        for (const item of input) {
+            if (!isObj(item)) continue;
+            const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
+            if (!parts) continue;
+            for (const part of parts) {
+                if (!isObj(part) || part.type !== "input_image") continue;
+                if (urlOf(part.image_url)) n += 1;
+            }
+        }
+        return n;
+    }
+    const messages = body.messages;
+    if (!Array.isArray(messages)) return 0;
+    for (const m of messages) {
+        if (!isObj(m) || !Array.isArray(m.content)) continue;
+        for (const part of m.content) {
+            if (!isObj(part)) continue;
+            if (protocol === "openai") {
+                if (part.type === "image_url") {
+                    if (urlOf(part.image_url)) n += 1;
+                    continue;
+                }
+                if (part.type === "file") n += 1;
+                continue;
+            } else {
+                if (part.type !== "image") continue;
+                const src = part.source;
+                if (isObj(src) && src.type === "base64" && typeof src.data === "string") n += 1;
+                else if (isObj(src) && src.type === "url" && typeof src.url === "string") n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+export function countImagesInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer): number {
+    const s = typeof raw === "string" ? raw : raw.toString("utf8");
+    if (!bodyHasImagesProbe(protocol, s)) return 0;
+    try {
+        return countImagesInParsedBody(protocol, JSON.parse(s));
     } catch {
         return 0;
     }

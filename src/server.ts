@@ -73,11 +73,11 @@ import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, noteClientAbort, noteForwardedBody, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
-import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
+import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -1021,6 +1021,30 @@ function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): R
 // 0 = no cap.
 function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undefined): number {
     return findRoute(opts.routes, upstreamUrl)?.imageTokenCap ?? opts.imageTokenCap ?? 0;
+}
+
+// #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
+// (pixels/bytes per the resolved billing + cap) upgraded to LEARNED truth when
+// this session holds fresh usage-learned evidence for this route (per-image
+// cost x current image count), else the prior unchanged. Every window gate
+// consumes its image mass through here so one learning layer serves them all.
+function imageReserveFor(
+    session: Session,
+    protocol: "anthropic" | "openai" | "responses" | "google",
+    body: unknown,
+    opts: ProxyOptions,
+    upstreamUrl: string | undefined,
+): number {
+    const billing = imageBillingFor(opts, upstreamUrl);
+    const cap = imageTokenCapFor(opts, upstreamUrl);
+    const raw = typeof body === "string" || Buffer.isBuffer(body);
+    const prior = raw
+        ? imageTokensInRawBody(protocol, body as string | Buffer, billing, cap)
+        : imageTokensInParsedBody(protocol, body, billing, cap);
+    if (prior <= 0) return prior;
+    const nImages = raw ? countImagesInRawBody(protocol, body as string | Buffer) : countImagesInParsedBody(protocol, body);
+    if (nImages <= 0) return prior;
+    return learnedImageReserve(session, upstreamHost(upstreamUrl), nImages, `${billing}:${cap}`, cap) ?? prior;
 }
 
 // #1537: reduce a Host-header value or a URL hostname to its bare lowercase
@@ -2529,7 +2553,7 @@ async function handle(
             // model's real window. overflowArmTokens is set ONLY by an upstream
             // context-overflow 400 and cleared by the next real usage report.
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -3444,7 +3468,7 @@ async function prepareAnthropic(
         // #1320: signature-only thinking blocks bill restored thinking tokens upstream
         // but project as empty text locally — attribute the provider-vs-local residual
         // to them so every meter sees the billed context (metering-only, wire untouched).
-        const inboundImageTokens = imageTokensInParsedBody("anthropic", parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
+        const inboundImageTokens = imageReserveFor(session, "anthropic", parsed, opts, upstreamOrigin);
         projectThinkingMass(msgs, {
             providerInputTokens: session.stats.lastInputTokens,
             measured: session.stats.lastInputTokensSource === "usage",
@@ -3628,7 +3652,7 @@ async function prepareAnthropic(
     // blinded to a system+tools-only floor.
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
@@ -3710,7 +3734,7 @@ async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -3844,7 +3868,7 @@ async function prepareOpenai(
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -3874,7 +3898,7 @@ async function prepareOpenai(
     if (!isTitleGen) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin));
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -3961,7 +3985,7 @@ async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -4053,7 +4077,7 @@ async function prepareGoogle(
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("google", rebuilt, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin)) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin) }, sessionId, log);
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
@@ -4254,7 +4278,7 @@ async function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -4422,7 +4446,7 @@ async function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -4475,7 +4499,7 @@ async function prepareResponses(
     if (!isCompactionTrigger) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
-            + imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin), imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin));
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -5118,7 +5142,7 @@ function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body, imageBillingFor(opts, billingUpstream), imageTokenCapFor(opts, billingUpstream));
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
@@ -5727,6 +5751,27 @@ async function forward(
         body: req.method === "GET" || req.method === "HEAD" ? undefined : wireBody,
     };
     if (dispatcher) init.dispatcher = dispatcher;
+    // #1843 L1: capture this round's image facts at the SEND chokepoint so the
+    // turn's usage settle pairs with the bytes actually sent — streamed turns
+    // settle in plugin.ts's SSE handler and never revisit the request body, so
+    // a settle-site-only capture would miss every streamed turn. textSide
+    // mirrors outboundPayloadBreakdown (messages + wire overhead) so observed
+    // image mass = billed total - textSide. Retries within this forward
+    // (#5708/#5835 refolds) re-send near-identical image sets — first-send
+    // facts stay the pairing source, same as noteForwardedBody's semantics.
+    if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+        const nImages = countImagesInRawBody(prepared.protocol, wireBody);
+        if (nImages > 0) {
+            const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
+            const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            noteForwardedImageFacts(prepared.session, {
+                nImages,
+                textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
+                host: upstreamHost(learnUpstream),
+                fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
+            });
+        }
+    }
     // Must be created before fetchWithTimeout: the signal aborts the upstream
     // request when the client disconnects (IDE cancel), otherwise the proxy
     // keeps reading upstream and holds the per-session lock. Also passed to
@@ -6541,9 +6586,13 @@ async function forward(
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
             const loopDumpDir = opts.dumpSse;
+            // #1843 L1: route identity for image-cost learning, resolved here —
+            // the loop has no access to the provider route table. Same billing
+            // upstream expression as outboundPayloadBreakdown.
+            const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform },
                 adapter,
