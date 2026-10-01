@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PrefixAffinityResolver, prefixAffinity, MAX_TRACKED_SESSIONS } from "../src/prefix-affinity.ts";
-import { flushPrefixAffinity, hydratePrefixAffinity } from "../src/affinity-persist.ts";
+import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "../src/affinity-persist.ts";
 
 let tmp: string;
 
@@ -70,6 +70,67 @@ test("hydrate on a missing or corrupt file is a no-op", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "{not json");
     hydratePrefixAffinity();
+});
+
+test("scheduled write lands within the short quiesce window (#1834)", async () => {
+    // #1834: the affinity snapshot used to sit behind a flat 5s trailing
+    // debounce — a SIGKILL inside the window lost EVERY chain since the
+    // last flush, so a resumed conversation inherited nothing. The quiesce
+    // window is now ~500ms: after the last chain mutation the file must be
+    // on disk well inside 1.5s (this test fails on the old 5s debounce).
+    // Unique salt: the resolver is module-level and shared with earlier
+    // tests, so plain messages(6) would resolve as a prefix of a chain they
+    // already noted instead of via "new".
+    const salt = `#1834-quiesce-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const m = [{ role: "system", content: "sys" }, { role: "user", content: `msg ${salt}` }];
+    const aff = prefixAffinity.resolve(m);
+    assert.ok(aff && aff.via === "new");
+    prefixAffinity.note(aff.sessionId, aff.incomingDepth, aff.tailHash, aff.itemHashes);
+    scheduleAffinityPersist();
+    const file = path.join(tmp, "billion-context", "prefix-affinity.json");
+    assert.ok(!fs.existsSync(file), "debounce has not fired yet at t=0");
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline && !fs.existsSync(file)) {
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(fs.existsSync(file), "affinity snapshot must land within ~500ms of the last mutation (#1834)");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { entries: Array<{ sessionId: string }> };
+    assert.ok(parsed.entries.some((e) => e.sessionId === aff.sessionId), "the mutated chain is in the snapshot");
+});
+
+test("sustained mutations cannot starve the write — max-delay budget (#1834)", async () => {
+    // The old trailing debounce RESET on every mutation, so a busy proxy
+    // never wrote the file at all until 5s of silence — unbounded loss on
+    // SIGKILL under load. The #1834 max-delay budget guarantees the write
+    // still lands within 5s even while scheduleAffinityPersist keeps being
+    // re-armed every 100ms (this test fails on the old reset-only debounce:
+    // the file never appears).
+    const salt = `#1834-budget-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const m = [{ role: "system", content: "sys" }, { role: "user", content: `msg ${salt}` }];
+    const aff = prefixAffinity.resolve(m);
+    assert.ok(aff && aff.via === "new");
+    prefixAffinity.note(aff.sessionId, aff.incomingDepth, aff.tailHash, aff.itemHashes);
+    const file = path.join(tmp, "billion-context", "prefix-affinity.json");
+    const start = Date.now();
+    const sawFile = await new Promise<boolean>((resolve) => {
+        const churn = setInterval(() => scheduleAffinityPersist(), 100);
+        churn.unref?.();
+        const poll = setInterval(() => {
+            if (fs.existsSync(file)) {
+                clearInterval(churn);
+                clearInterval(poll);
+                resolve(true);
+            } else if (Date.now() - start > 6_500) {
+                clearInterval(churn);
+                clearInterval(poll);
+                resolve(false);
+            }
+        }, 50);
+        poll.unref?.();
+    });
+    assert.ok(sawFile, "re-armed debounce must still flush within the 5s max-delay budget (#1834)");
+    assert.ok(Date.now() - start < 6_000, "flush must not wait for 5s of silence");
+    flushPrefixAffinity(); // settle any pending timer from the churn
 });
 
 test("writeSnapshot unions with on-disk chains instead of clobbering a sibling instance's (#1724)", () => {
