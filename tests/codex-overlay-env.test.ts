@@ -72,7 +72,10 @@ test("prepareCodexHome: generated .env is a private regular file, real .env unto
         const st = fs.lstatSync(overlayEnv);
         assert.ok(!st.isSymbolicLink(), "overlay .env must not be a link to the real one");
         assert.ok(st.isFile());
-        assert.equal(st.mode & 0o777, 0o600, "generated .env holds user secrets → 0600");
+        // NTFS carries no POSIX mode bits (stat reports 0o666 for regular files)
+        if (process.platform !== "win32") {
+            assert.equal(st.mode & 0o777, 0o600, "generated .env holds user secrets → 0600");
+        }
 
         const text = fs.readFileSync(overlayEnv, "utf8");
         assert.ok(text.includes(`HTTPS_PROXY=${ORIGIN}`));
