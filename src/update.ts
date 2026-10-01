@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE } from "./dsh-channel.js";
+import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
@@ -278,7 +279,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
     }
     const xdgData = env.XDG_DATA_HOME && env.XDG_DATA_HOME.trim().length > 0 ? env.XDG_DATA_HOME : path.join(os.homedir(), ".local", "share");
     const homes: Array<[string, string, string]> = [
-        ["pi", resolvePiHome(env), "`pi update` (pi installs and upgrades the npm:billion-context entry itself)"],
+        ["pi", resolvePiHome(env), "`pi update --extension npm:billion-context` (the pi copy's own proxy drives pi's update channel every check cycle, #1196; manual: `pi update --all`)"],
         ["opencode", path.join(xdgData, "opencode"), "opencode's own plugin manager (reload/reinstall the billion-context plugin)"],
         ["dsh", resolveDshHome(env), "the dsh plugin channel (the global bili self-update refreshes profiles, and so does the profile proxy's own periodic check; or `dsh plugin add billion-context@latest`)"],
         ["kimi", resolveKimiHome(env), "`bili plugin install kimi` after updating the global bili install"],
@@ -624,6 +625,74 @@ export async function refreshDshProfileCopy(
     }
 }
 
+/** #1196-class fix for the pi lane: the copy under <piHome>/npm is pi's own
+ *  materialization of the settings `npm:billion-context` entry — #991 keeps
+ *  the global updater out, and pi has no background package updater, so the
+ *  proxy running FROM the copy drives `pi update --extension
+ *  npm:billion-context` (pi's owner channel) on its periodic check when the
+ *  registry has a newer version. Only the unpinned spec form self-refreshes;
+ *  an explicit `@version` pin (or a missing settings entry) is left alone.
+ *  Best-effort: never throws, never blocks the proxy; a failed refresh
+ *  retries on the next check cycle. */
+export async function refreshPiNpmCopy(
+    installDir: string,
+    opts: UpdateOptions,
+    env: NodeJS.ProcessEnv = process.env,
+    log: Logger = loggerLog,
+): Promise<void> {
+    if (!isPiNpmCopy(installDir, env)) return;
+    const entry = piNpmEntrySpec(env);
+    if (entry !== PI_NPM_SPEC) {
+        log("info", `[update] pi packages entry is ${entry ?? "(missing)"} — leaving the pi copy alone (only the unpinned ${PI_NPM_SPEC} form self-refreshes)`);
+        return;
+    }
+    let latest: string | undefined;
+    try {
+        latest = await fetchRegistryVersion(opts, opts.packageName);
+    } catch (e) {
+        log("warn", `[update] pi npm copy check failed: ${String(e)} — leaving the copy alone`);
+        return;
+    }
+    if (!latest) {
+        log("warn", `[update] could not resolve the latest version for ${opts.packageName} — leaving the pi copy alone`);
+        return;
+    }
+    const diskVersion = await readDiskVersion(installDir);
+    const currentVersion = diskVersion ?? opts.currentVersion;
+    if (!isVersionNewer(latest, currentVersion)) {
+        log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
+        return;
+    }
+    log("info", `[update] pi npm copy is stale (${currentVersion} → ${latest}) — refreshing via pi's update channel`);
+    const lock = await tryAcquireLock();
+    if (!lock) {
+        log("info", `[update] another process is updating, will check next cycle`);
+        return;
+    }
+    try {
+        await runPiAsync(["update", "--extension", PI_NPM_SPEC], env);
+        log("info", `[update] pi npm copy refreshed to ${latest} — restart pi to load it`);
+    } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        log("warn", `[update] pi npm copy refresh to ${latest} failed: ${detail} — manual fix: run \`pi update --extension ${PI_NPM_SPEC}\` from a shell where \`pi\` resolves (or point BILI_PI_BIN at pi's executable); retries next check cycle`);
+    } finally {
+        await lock.release();
+    }
+}
+
+/** Drive the owner-channel refresh for whichever host-managed lane this
+ *  install dir belongs to. Each helper no-ops when the classification does
+ *  not match, and a dir can only sit in one host's tree. */
+async function refreshOwnerManagedCopies(
+    installDir: string,
+    opts: UpdateOptions,
+    env: NodeJS.ProcessEnv,
+    log: Logger,
+): Promise<void> {
+    await refreshDshProfileCopy(installDir, opts, env, log);
+    await refreshPiNpmCopy(installDir, opts, env, log);
+}
+
 /** Registry-pinned dsh profile copies whose installed version is older
  *  than the global one ("name@version" per entry). Dev pins (link:/file:)
  *  and declared-but-not-installed mounts are out of scope: neither
@@ -713,7 +782,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             const managed = dir ? hostManagedInstall(dir) : undefined;
             if (managed && dir) {
                 loggerLog("info", `[update] deferring to the advisory loop; ${managed.owner}-managed install keeps its owner-channel refresh (#991/#1196)`);
-                await refreshDshProfileCopy(dir, opts, process.env, loggerLog);
+                await refreshOwnerManagedCopies(dir, opts, process.env, loggerLog);
                 return;
             }
             loggerLog("info", "[update] deferring to the advisory loop (an active critical-bug advisory owns this install)");
@@ -738,11 +807,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const managed = installDir ? hostManagedInstall(installDir) : undefined;
         if (managed && installDir) {
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
-            // #1196: a copy living inside a dsh profile bundle cannot wait
-            // for a global self-update that may never come (dsh-market users
-            // often have no global install at all) — drive the lockstep
-            // refresh through dsh's own plugin channel from here.
-            await refreshDshProfileCopy(installDir, opts, process.env, loggerLog);
+            // #1196: a copy inside a host's own tree (dsh profile bundle, pi
+            // npm dir) cannot wait for a global self-update that may never
+            // come — drive the lockstep refresh through the host's own
+            // channel from here.
+            await refreshOwnerManagedCopies(installDir, opts, process.env, loggerLog);
             return;
         }
 
