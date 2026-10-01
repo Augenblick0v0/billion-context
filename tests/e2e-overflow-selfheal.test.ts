@@ -234,7 +234,11 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
         assert.ok(s, "session exists");
         assert.equal(s!.metadata.confirmedContextLimits, undefined, "nothing learned");
         assert.ok(s!.stats.lastInputTokens > 10_000 && s!.stats.lastInputTokens < 400_000, `armed at the payload's own size (~16k, not the 400k declaration): ${s!.stats.lastInputTokens}`);
-        assert.equal(s!.stats.lastInputTokensSource, "usage", "a rejection the upstream itself issued is usage-grade");
+        // #1839 ask 3: an arm is NOT a billing report — it carries its own
+        // provenance grade "overflow-arm" (still rescue-grade: effectiveTokenCount's
+        // fast path, the #496 evidence gate and the preflight floors accept it;
+        // billing-grade consumers keep excluding it).
+        assert.equal(s!.stats.lastInputTokensSource, "overflow-arm", "the arm carries its own provenance grade, never billing-grade \"usage\"");
 
         // r2: forwarded as-is (no arm, nothing learned) — the pass-through
         // shape the old #969 test asserted is unchanged.

@@ -3229,32 +3229,38 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 // shrinks → the next estimate drops). Turn 1 of a fresh explicit session
 // still feeds 0 (nothing measured yet; nothing pending either), so
 // first-turn behavior is byte-identical to pre-#728.
-function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImageTokens = 0): number {
+function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImageTokens = 0): { tokens: number; source: "usage" | "estimate" } {
     // #1492: only usage-grade baselines are authoritative sizing inputs. An
     // estimate-sourced value describes ONE turn's outbound — possibly the FULL
     // raw history on an unfolded fallback turn — and pinning the nudge to it
     // misreads a folded ~160K payload as 1.27M for every later failed turn.
     // Fall through to the per-turn local measurements, which track the actual
     // outbound view (post-fold normally, raw when the transform failed).
-    if (session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage") return session.stats.lastInputTokens;
+    // #1839: an overflow arm rides in here too — it is evidence, not billing,
+    // but it is bounded by the declared/stated window so it cannot produce
+    // the >100% ghost class, and the next real usage report overwrites it.
+    if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
     const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
-    if (session.metadata.anonymousPrefixAffinity) return raw;
+    if (session.metadata.anonymousPrefixAffinity) return { tokens: raw, source: "estimate" };
     const est = session.stats.localInputEstimate ?? 0;
-    if (est <= 0) return 0;
-    // #1569: while the latest baseline is estimate-grade (the transient window
-    // right after a failed turn), min(est, raw) sizes on the char-count upper
-    // bound — ~3.5× high on code/JSON-heavy tool results. That inflation lit
-    // spurious nudge bands whose kernel growth-reference pin then blocked
-    // GENUINE nudges until context regrew past the artifact (false T1 at 66%,
-    // false EMERGENCY at 120%, ~20-min dead zone in the #1569 log). Once a
-    // REAL usage report has landed (lastUsageGradeTokens > 0), billing proved
-    // the calibrated CJK-aware rate holds for this session's content class —
-    // size on the current view's calibrated estimate instead. Never-reporting
-    // upstreams (#553/#728) keep the fail-closed upper bound: their anchor
-    // stays absent. No cap by est: est bounds the PREVIOUS turn's outbound,
-    // not this view's growth.
-    if ((session.stats.lastUsageGradeTokens ?? 0) > 0) return estimateCoreMessages(msgs) + inboundImageTokens;
-    return Math.min(est, raw);
+    if (est <= 0) return { tokens: 0, source: "estimate" };
+    // #1569/#1839: while the latest baseline is not usage-grade (the transient
+    // window right after a failed turn), sizing on ANY re-derived view is how
+    // ghosts enter: #1569 first tried min(est, raw) — the char-count upper
+    // bound, ~3.5× high on code/JSON — then the calibrated estimate of the
+    // INBOUND msgs; but msgs is the client's FULL resubmitted history, which
+    // carries unfolded raw content that server-side folding/CCR never shrank
+    // (#1839: one aborted turn armed 719521 and this branch re-amplified it to
+    // 2939167 in the same decision — 20.5× above the real 143419). The only
+    // number available without inflation is the last REAL usage report
+    // itself. Growth between reports is backstopped by preflight (it measures
+    // the actual outbound payload before every forward) and the nudge
+    // reference re-anchors as soon as the next usage lands (#1595).
+    // Never-reporting upstreams (#553/#728) keep the fail-closed upper bound:
+    // their anchor stays absent.
+    const grade = session.stats.lastUsageGradeTokens;
+    if (grade !== undefined && grade > 0) return { tokens: grade, source: "usage" };
+    return { tokens: Math.min(est, raw), source: "estimate" };
 }
 
 /** #1492: secondary processTurn feeds (count-token previews, the codex
@@ -3391,7 +3397,7 @@ async function prepareAnthropic(
         // zero-baseline forks replay their FULL raw history with no measurement,
         // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
         // compression trigger fires until overflow. See effectiveTokenCount.
-        const tokenCount = effectiveTokenCount(session, msgs, inboundImageTokens);
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, inboundImageTokens);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers are injected by the kernel's processTurn from
         // config.absorb. With no channel to call the tool (injection off),
@@ -3435,6 +3441,7 @@ async function prepareAnthropic(
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
+        session.stats.contextTokensSource = tokenCountSource;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -3631,7 +3638,7 @@ async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -3667,6 +3674,7 @@ async function prepareOpenai(
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
+        session.stats.contextTokensSource = tokenCountSource;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -3881,7 +3889,7 @@ async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
-        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -3915,6 +3923,7 @@ async function prepareGoogle(
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
+        session.stats.contextTokensSource = tokenCountSource;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4173,7 +4182,7 @@ async function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -4207,6 +4216,7 @@ async function prepareResponses(
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
+        session.stats.contextTokensSource = tokenCountSource;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -5094,13 +5104,17 @@ async function preflightCompressIfNeeded(
     // #1492: floor the trigger on the baseline only while it is authoritative
     // for THIS payload. A usage-grade baseline measures what upstream billed
     // (it can legitimately exceed every local estimate — invisible thinking/
-    // cache components), and ANY baseline is the best signal when the current
-    // payload is unmeasured (kernel transform failed → the outbound IS the raw
-    // body). An estimate-sourced baseline on a measured (folded) payload
-    // describes a different view and must not pull preflight into multi-minute
-    // runs over a payload whose own post-fold estimate fits the window.
+    // cache components). An overflow-armed baseline (#1839 "overflow-arm") is
+    // upstream REJECTION evidence at that size — floor it too, or the #1195
+    // in-request refold and #987 next-turn fold lose their trigger whenever
+    // the payload's own calibrated estimate undershoots. ANY baseline is the
+    // best signal when the current payload is unmeasured (kernel transform
+    // failed → the outbound IS the raw body). An estimate-sourced failure arm
+    // (#604) on a measured (folded) payload describes a different view and
+    // must not pull preflight into multi-minute runs over a payload whose own
+    // post-fold estimate fits the window.
     const baselineFloor = prepared.processedMessages.length > 0
-        ? (session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0)
+        ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
         : session.stats.lastInputTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
@@ -5116,12 +5130,16 @@ async function preflightCompressIfNeeded(
     // arms the emergency shrink (at the stated window, or the declared one
     // when the body carries no number) → later requests fail-fast.
     // #488's 400 loop stays broken (exactly one rejected forward). Evidence signals:
-    // A usage-grounded baseline ≥ window is evidence; an estimate-derived or
+    // A usage-grounded or overflow-armed baseline ≥ window is evidence (#1839:
+    // "overflow-arm" IS upstream overflow evidence — the rejection itself
+    // proved the payload overflows; without it the arm would no longer close
+    // the hatch and #488's 400 loop reopens); an estimate-derived or
     // legacy-unmarked baseline is NOT (#857: preflight used to write image
     // estimates back into lastInputTokens, which permanently closed this
     // hatch on pixel-billing upstreams). With evidence present we trust the
     // estimate and fall through to fold / fail-fast below.
-    const noOverflowEvidence = session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage";
+    const noOverflowEvidence = session.stats.lastInputTokens < limit
+        || (session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm");
     // #1800: images are the sole over-window component and we hold no overflow
     // evidence → the base64/4 (or pixels-fallback) image cost clears the window on
     // ESTIMATE alone while the real bill is far smaller, so we let the upstream
@@ -5292,6 +5310,19 @@ async function preflightCompressIfNeeded(
             ? result.fitsWindow
             : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
         if (fits) return rebuilt;
+        // #1839: the two measurements disagree — preflight's own final view
+        // (post-fold content + images + wire overhead) fits, but the fresh
+        // normal-config rebuild measures over. That divergence produced the
+        // self-contradictory fail-fast ("context ~44231 … exceeds window
+        // 253725"). Forward once and let the upstream arbitrate (the #496
+        // house pattern): a genuinely over-window payload is rejected once
+        // and armOverflowShrink recovers with real evidence; a fitting
+        // payload is no longer refused on a stale measurement. One forward
+        // only — the #330 relaxed-zone caveat still bounds the risk.
+        if (!unknownBaseline && result.failure?.kind !== "aborted" && result.payloadEstimate < limit) {
+            log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
+            return rebuilt;
+        }
     } else if (unknownBaseline
         ? result.fitsWindow
         : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
@@ -5332,41 +5363,32 @@ async function preflightCompressIfNeeded(
     return ff;
 }
 
-/** #604: arm the emergency shrink after an upstream failure that will never
- *  report usage (relay/gateway 5xx, network-level failure). A failed turn
- *  produces no usage report, so session.stats.lastInputTokens — the input to
- *  every usage-driven trigger (preflight floor, nudge bands, the kernel's
- *  emergency nudge + tool-result truncate at truncate.threshold) — stays
- *  frozen at the last SUCCESSFUL turn's value. A client that retries verbatim
- *  therefore re-sends the identical payload into the identical rejection
- *  forever (the relay-5xx deadlock). Raising lastInputTokens to a local
- *  estimate of the wire body we just sent breaks the loop: the next prepare()
- *  lands in the kernel's emergency band and truncates large tool results
- *  server-side without model cooperation; the next successful usage report
- *  overwrites the armed value.
- *
- *  Deliberate exception to the "tokenCount must be real usage" invariant: the
- *  estimate RAISES the value only (a lower bound → compress earlier, never
- *  later), the kernel no-ops below its thresholds, and real usage overwrites
- *  it on success. markDirty is required because both call sites return before
- *  forward()'s trailing save — without it the arm is lost on restart.
- *
- *  #1493: `est` is now the OUTBOUND payload size (outboundPayloadBreakdown — post-
- *  fold content + wire overhead + correctly-billed images), the SAME quantity the
- *  preflight trigger/fit gate compare against. The old chars/4 count of the whole
- *  JSON body over-counted base64 images and dense payloads to raw-history scale
- *  (#857 tagged it "estimate" to shield evidence-grade consumers, but the preflight
- *  floor + nudge baseline still consumed it). Measuring the real outbound size makes
- *  the arm self-correcting: a payload that genuinely overflows the window still arms
- *  high enough to break the deadlock; one that fits does not falsely cross the trigger. */
+/** #604/#1839: record an upstream failure that will never report usage
+ *  (relay/gateway 5xx, network-level failure). #604 raises
+ *  session.stats.lastInputTokens to a local estimate of the wire body so the
+ *  next prepare() lands in the kernel's emergency band (truncate.threshold =
+ *  0.95) and truncates large tool results server-side — the rescue that breaks
+ *  the relay-5xx deadlock (#1493 refines the arm to the OUTBOUND payload size
+ *  so fitting payloads don't over-trigger). The arm STAYS load-bearing:
+ *  removing it re-deadlocks exactly those sessions.
+ *  #1839: the arm stays ESTIMATE-grade and the ghost it once caused is killed
+ *  at the reader, not by deleting the arm — while any usage-grade anchor
+ *  exists, effectiveTokenCount's anchor branch prefers lastUsageGradeTokens
+ *  over every estimate-grade value, so the arm can no longer reach the nudge
+ *  denominator, the display or the preflight floors (pre-fix, one aborted turn
+ *  armed 719521 against a real input of 143419 and the inflated denominator
+ *  persisted ~23 min). Anchor-less sessions (fresh / silent backends) size on
+ *  the per-turn min(localInputEstimate, raw) views, where the arm guarantees a
+ *  near-window payload still crosses the emergency band on retry. The next
+ *  real usage report overwrites it. */
 function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number): void {
     const s = prepared.session;
     if (!Number.isFinite(est) || est <= 0) return;
     if (est > s.stats.lastInputTokens) {
         s.stats.lastInputTokens = est;
-        // An estimate is not a usage report: tag it so evidence-grade consumers
-        // (self-heal, #496 gate, retraction) skip it.
         s.stats.lastInputTokensSource = "estimate";
+        // The error path returns before forward()'s trailing markDirty — the
+        // arm must schedule its OWN save or it is lost on restart.
         markDirty(s);
         log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
     }
@@ -5738,11 +5760,16 @@ async function forward(
             // Arm the emergency shrink at EXACTLY the stated window: the
             // upstream just proved a turn cannot succeed above it, so the
             // next turn's kernel emergency nudge + tool-result truncate
-            // must fire. #857: a number the upstream itself stated is
-            // usage-grade provenance (not a content estimate); a real
-            // usage report on the next successful turn overwrites it.
+            // must fire. #857: a number the upstream itself stated bounds
+            // the payload (never a content estimate). #1839: it is still an
+            // ARM, not a billing report — tag it "overflow-arm", never
+            // "usage" (the only tier trusted unconditionally);
+            // effectiveTokenCount's fast path and the #496 forward-once gate
+            // accept it as rescue-grade, everything else usage-gated keeps
+            // excluding it. A real usage report on the next successful turn
+            // overwrites it.
             s.stats.lastInputTokens = info.window;
-            s.stats.lastInputTokensSource = "usage";
+            s.stats.lastInputTokensSource = "overflow-arm";
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline.
             s.stats.overflowArmTokens = info.window;
@@ -5767,7 +5794,10 @@ async function forward(
             const arm = Math.max(0, Math.min(declared, Number.isFinite(est) ? est : declared));
             if (arm > 0) {
                 s.stats.lastInputTokens = arm;
-                s.stats.lastInputTokensSource = "usage";
+                // #1839: an estimate promoted to "usage" would enter the nudge
+                // denominator unconditionally — tag it "overflow-arm" instead
+                // (still accepted by effectiveTokenCount + the #496 gate).
+                s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
@@ -6341,7 +6371,7 @@ async function forward(
                     // crossings — absorb prompts appeared/disappeared mid-history
                     // and broke the prefix cache on every fold while the
                     // threshold was being straddled (probe: cache-seam-probes).
-                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages));
+                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages).tokens);
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
                     // #1548: strip only when the compress call rides INBOUND history (client persists
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
@@ -6638,6 +6668,7 @@ function sendStats(res: http.ServerResponse): void {
             title: s.meta.title,
             requests: s.stats.requests,
             contextTokens: s.stats.contextTokens,
+            contextTokensSource: s.stats.contextTokensSource,
             inputTokens: s.stats.inputTokens,
             cachedTokens: s.stats.cachedTokens,
             outputTokens: s.stats.outputTokens,

@@ -437,14 +437,18 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
     }
 }
 
-test("#1569 B1: with a real-usage anchor, estimate-grade turns size on the calibrated view", async () => {
+test("#1569 B1 / #1839: with a real-usage anchor, estimate-grade turns size on the last usage report", async () => {
     const { streamed, nonStream, logs, anchorAfterTurn1 } = await runAnchorCase("issue1569-anchor-sess", true);
     assert.equal(anchorAfterTurn1, 5000, "turn 1's real usage report sets the calibration anchor");
     assert.equal(nonStream, 0, "preflight must stay silent (payload fits the window)");
     assert.equal(streamed.length, 2, "two streaming forwards (one per turn)");
     const sized = lastNudgeSized(logs, "issue1569-anchor-sess");
     assert.ok(sized >= 0, "turn 2 emitted a nudge diagnostic");
-    assert.ok(sized < 25_000, `anchored sizing must use the calibrated estimate (~11k for this payload), not the ~44k char-count upper bound (got ${sized})`);
+    // #1839: pre-fix this asserted < 25_000 against the calibrated estimate of
+    // the FULL INBOUND history (~11k here) — still a re-derivation, and the
+    // same branch amplified a poisoned baseline 4× in the field. The fix pins
+    // the denominator to the last REAL usage report itself.
+    assert.equal(sized, 5000, `anchored sizing must use the last usage report exactly, not any re-derived view (got ${sized})`);
     assert.ok(!streamed[1].includes(NUDGE_MARKER), "no spurious nudge injection on the anchored turn");
 });
 

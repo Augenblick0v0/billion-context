@@ -21,6 +21,9 @@ export interface WebSessionSummary {
     live: boolean;
     requests: number;
     contextTokens: number;
+    /** #1839: provenance of contextTokens — "usage" = last real usage report,
+     *  "estimate" = bounded local estimate (display should mark it as such). */
+    contextTokensSource?: "usage" | "estimate";
     tokensSaved: number;
     inputTokens: number;
     cachedTokens: number;
@@ -237,6 +240,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
         live,
         requests,
         contextTokens: s.stats.contextTokens,
+        ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
         tokensSaved: s.stats.tokensSaved,
         inputTokens,
         cachedTokens,
