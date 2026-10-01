@@ -133,12 +133,14 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
             new Promise((resolve, reject) => {
                 // Windows: npm.cmd cannot be spawned without a shell — run
                 // `node npm-cli.js` instead (argv stays literal, no quoting).
+                // Shell fallback passes the whole command as the file string:
+                // with shell:true, execFile prepends file to its args (`npm npm pack …`).
                 const cli = npmCliPath();
-                const cmd = cli ?? "npm";
-                const argv = cli ? [cli, ...args, "--registry", url, "--no-audit", "--no-fund"] : [`${[cmd, ...args, "--registry", url, "--no-audit", "--no-fund"].join(" ")}`];
+                const tail = [...args, "--registry", url, "--no-audit", "--no-fund"];
+                const shellLine = `npm ${tail.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ")}`;
                 execFile(
-                    cli ? process.execPath : cmd,
-                    argv,
+                    cli ? process.execPath : shellLine,
+                    cli ? [cli, ...tail] : [],
                     { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, shell: cli ? false : true, windowsHide: true, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(homeDir), ...windowsSystemEnv(), ...(process.env.NPM_ALLOW_DANGEROUS ? { NPM_ALLOW_DANGEROUS: process.env.NPM_ALLOW_DANGEROUS } : {}) } },
                     (error, stdout, stderr) => {
                         if (error) reject(new Error(`npm ${args.join(" ")} failed: ${(stderr || error.message).slice(0, 4000)}`));

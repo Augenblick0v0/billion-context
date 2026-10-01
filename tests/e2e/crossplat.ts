@@ -92,7 +92,7 @@ export function npmRunSync(args: string[], opts: { cwd: string; env: Record<stri
     if (cli) {
         return execFileSync(process.execPath, [cli, ...args], { cwd: opts.cwd, encoding: "utf8", timeout: 180_000, env, windowsHide: true });
     }
-    const line = ["npm", ...args.map((a) => (IS_WIN && /\s/.test(a) ? `"${a}"` : a))].join(" ");
+    const line = ["npm", ...args.map((a) => (/\s/.test(a) ? `"${a}"` : a))].join(" ");
     return execFileSync(line, { cwd: opts.cwd, encoding: "utf8", timeout: 180_000, shell: true, env, windowsHide: true });
 }
 
