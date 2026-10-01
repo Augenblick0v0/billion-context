@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
@@ -489,7 +489,7 @@ test("checkForUpdate: skips a candidate covered by a freshly parsed advisory ran
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -512,7 +512,7 @@ test("advisoryBlocksVersion: fails open when the feed goes unhealthy", async () 
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -537,6 +537,6 @@ test("advisoryBlocksVersion: released together with the deferral when the target
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
         _resetAdvisoryRefusalWarnsForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
