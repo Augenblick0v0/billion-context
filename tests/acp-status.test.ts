@@ -8,6 +8,7 @@ import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput, buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { recordBlindTunnel, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
+import { _resetAdvisoryWatcherForTest, _setAdvisoryStateForTest } from "../src/advisory.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
     return { id, role, contentType: "text", text };
@@ -152,6 +153,26 @@ test("#897: acp_status surfaces blind-tunneled CONNECT traffic as UNDECRYPTED TR
         assert.ok(out.includes("/__bili/stats → blindTunnels"), "points at the stats endpoint");
     } finally {
         _resetBlindTunnelStatsForTest();
+    }
+});
+
+test("#1577: acp_status surfaces an active instance-level advisory", () => {
+    _resetAdvisoryWatcherForTest();
+    try {
+        const ctx = makeCtx12();
+        const clean = handleAcpStatus({}, ctx);
+        assert.ok(!clean.includes("CRITICAL ADVISORY"), "no section when no advisory is active");
+
+        _setAdvisoryStateForTest({
+            active: { id: "bc-2026-001", affected: ">=0.1.155 <0.1.158", target: "0.1.157", reason: "corrupts tool-call arguments", currentVersion: "0.1.156" },
+        });
+        const out = handleAcpStatus({}, ctx);
+        assert.ok(out.includes("CRITICAL ADVISORY (instance-level):"), "section present while an advisory is active");
+        assert.ok(out.includes("[bc-2026-001] version 0.1.156 is affected (corrupts tool-call arguments)"), "id + affected version + reason rendered");
+        assert.ok(out.includes("npm install -g billion-context@0.1.157"), "manual fallback command present");
+        assert.ok(out.includes("GET /__bili/status → advisory"), "points at the live-state field");
+    } finally {
+        _resetAdvisoryWatcherForTest();
     }
 });
 

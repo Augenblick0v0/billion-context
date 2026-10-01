@@ -14,6 +14,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
+import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 
 export interface AcpStatusCtx {
     core: CompressionCore;
@@ -136,6 +137,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (cevents.length > 0) {
         extra.push("");
         extra.push(...formatConflictSection(cevents));
+    }
+    const adv = getAdvisoryState();
+    if (adv.active) {
+        // #1577: native/plugin lanes spawn the proxy with stdio→log file on an
+        // ephemeral port, so the stderr warn and web banner never reach the
+        // user's terminal. acp_status is the one surface they actually look at
+        // — surface the active advisory here (instance-level, like #897).
+        extra.push("");
+        extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
     }
     const blind = getBlindTunnelStats();
     if (blind.total > 0) {

@@ -18,6 +18,7 @@ import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
+import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
@@ -853,9 +854,22 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     // stripper (src/acp-panel.ts) anchors this box on its top border AND its
     // "Tag visibility" footer — anything appended after the footer would break the whole
     // message match and ship the panel into the model context.
+    // #1577: an active advisory must reach the one surface native/plugin-lane
+    // users actually see — the /acp panel — via the same before-footer slot the
+    // Web UI link uses (the footer anchors the LLM-context stripper).
+    const preFooter: string[] = [];
+    const adv = getAdvisoryState();
+    if (adv.active) {
+        preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
+    }
     const webUrl = webSessionUrl(deps.webOrigin, session.id);
-    if (panel !== undefined && webUrl !== undefined) {
-        panel = panel.replace(PANEL_BOX_FOOTER, `\nWeb UI: ${webUrl}\n${PANEL_BOX_FOOTER}`);
+    if (webUrl !== undefined) {
+        preFooter.push(`Web UI: ${webUrl}`);
+    }
+    if (panel !== undefined && preFooter.length > 0) {
+        // Escape $ so advisory text (remote doc content) cannot be read as
+        // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
+        panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

@@ -9,6 +9,7 @@ import path from "node:path";
 import { isPidAlive, listInstances, procMainScript } from "./instance.js";
 import { PLUGIN_AGENTS, UPDATE_CHANNEL, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
+import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 
 export type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
 
@@ -24,6 +25,8 @@ export interface DoctorGlobalInfo {
     lastCheckTime?: number;
     verdict: LaneVerdict;
     reason?: string;
+    /** Read-only advisory evaluation against the on-disk version (#1577). */
+    advisory?: AdvisoryEvaluation;
 }
 
 export interface DoctorLane {
@@ -63,6 +66,7 @@ export interface DoctorOpts {
     runningVersion: string;
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;
+    advisoryUrl?: string;
 }
 
 const REFERENCE_LANES = new Set<PluginAgent>(["omp", "claude", "codex", "kimi", "zcode", "hermes"]);
@@ -104,6 +108,15 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
     const managed = installDir !== undefined ? hostManagedInstall(installDir) : undefined;
     const diskVersion = installDir !== undefined ? pkgVersionAt(installDir) : undefined;
     const form: DoctorGlobalInfo["form"] = installDir === undefined ? "unknown" : gitTree ? "checkout" : managed !== undefined ? "host-managed" : "npm";
+    // #1577: read-only advisory check against the on-disk version (what a next
+    // start would load), independent of the advisoryCheck opt-out — doctor is a
+    // diagnostic, not the auto-updater. Fail-open: a failed source yields
+    // { error }, never a throw.
+    const advisory = await evaluateAdvisories({
+        version: diskVersion ?? opts.runningVersion,
+        advisoryUrl: opts.advisoryUrl,
+        resolveProxy: opts.resolveProxy,
+    });
     const g: DoctorGlobalInfo = {
         installDir,
         form,
@@ -115,6 +128,7 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
         updateTag: tag,
         lastCheckTime: lastCheck,
         verdict: globalVerdict({ form, diskVersion, registryVersion }),
+        advisory,
     };
     if (g.verdict === "frozen") g.reason = "source checkout — rebuild manually (npm run build); bili refuses to auto-update a working tree (#580)";
     else if (g.verdict === "stale") g.reason = managed !== undefined ? `newer on registry ${tag}: update through ${managed.owner}'s updater` : `newer on registry ${tag}: run 'bili update'`;
@@ -216,6 +230,9 @@ export function renderDoctorReport(report: DoctorReport): string {
     lines.push(`  versions      disk ${g.diskVersion ?? "?"}   registry[${g.updateTag}] ${g.registryVersion ?? "unreachable"}`);
     lines.push(`  last check    ${g.lastCheckTime !== undefined ? fmtTime(g.lastCheckTime) : "never"}`);
     lines.push(`  verdict       ${verdictText(g.verdict, { oldVersion: g.diskVersion, registryVersion: g.registryVersion })}${g.reason !== undefined ? ` — ${g.reason}` : ""}`);
+    if (g.advisory?.active !== undefined) lines.push(`  advisory      ⚠️ ${describeAdvisory(g.advisory.active, g.advisory.error)}`);
+    else if (g.advisory?.error !== undefined) lines.push(`  advisory      check failed (${g.advisory.error}) — status unknown`);
+    else lines.push(`  advisory      none`);
     lines.push("");
     lines.push("lanes");
     for (const lane of report.lanes) {
