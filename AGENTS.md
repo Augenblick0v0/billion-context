@@ -312,16 +312,15 @@ non-interactive — it either serves the token or fails, so if `git push`
 worked, the token extraction works. Never print the token; keep it in the
 variable only. Merging the PR stays human-only (see above).
 
-### External Contributors' PRs — Review, Don't Take Over
+### External Contributors' PRs — Fix Directly, Don't Replace
 
-For PRs authored by external (non-maintainer) contributors, the Agent's job
-is **review + verification only**. Never push to their branch, never
-rebase-and-replace their PR with an Agent-owned PR, and never suggest
-closing it — if any of that seems needed, explain the situation and let the
-owner decide. A first-time contributor's authorship and PR credit are part
-of the deliverable. (Lesson: #1765, 2026-10-01 — the Agent opened a
-replacement PR for a still-mergeable first contribution and had to walk it
-back.)
+The owner rule (小问题直接修, 2026-10-01) applies regardless of authorship:
+fixes are pushed as **additive commits to the contributor's PR branch**,
+whoever authored the PR — same as any other branch. What stays off-limits
+is REPLACING the contribution: no rebase-and-replace with an Agent-owned
+PR, no closing a still-mergeable contribution in favor of a new one
+(#1765) — the contributor's commits, diff and authorship stay in the
+merged history.
 
 Two mechanics to check before assuming a contributor's PR is broken:
 
@@ -357,10 +356,9 @@ When an Agent picks up an issue, these deliverables are MANDATORY:
    found while working — including during a PR review — are fixed RIGHT AWAY
    in the same branch (a tiny follow-up commit on the PR's own branch is
    fine), with a one-line note in the PR/issue thread. Do NOT open separate
-   issues for them, and do NOT leave them as "noted, not fixed".
-   Exception: never push to an EXTERNAL contributor's PR branch (see
-   "External Contributors' PRs" above) — report there and let the author
-   apply it. (Owner rule, 2026-10-01.)
+   issues for them, and do NOT leave them as "noted, not fixed". Applies to
+   ANY branch, including external contributors' PR branches (see "External
+   Contributors' PRs"). (Owner rule, 2026-10-01.)
 
 ### Problem Discovery & Fix Reporting (MANDATORY)
 
@@ -669,7 +667,7 @@ after that succeeded was the Windows fix shipped in a follow-up release.
   rule “小问题直接修” (see Issue Work §3): when your own review of a PR turns
   up a small, non-semantic flaw (typo, misaligned indent, log wording), push
   the one-line fix to the PR branch immediately instead of listing it as a
-  caveat — external contributors' branches excepted.
+  caveat — on ANY PR branch, external contributors included.
 - **Done = evidence, not "should work".** Double-review the code, then actually
   run the changed behavior and observe it matches expectation. For fixes that
   change context/wire behavior, prefer a real end-to-end A/B against the issue
