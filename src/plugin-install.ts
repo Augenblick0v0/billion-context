@@ -2179,8 +2179,8 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const latest = await fetchRegistryVersion(opts, opts.packageName);
         if (!latest) return ["dsh: could not resolve the latest version from npm — leaving profile bundles alone"];
         const before = targets.length;
-        await refreshDshProfileBundles(latest, log);
-        return [`dsh: refreshing ${before} profile bundle(s) to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+        const refreshed = await refreshDshProfileBundles(latest, log);
+        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel (see log for per-profile results)`];
     }
     if (agent === "hermes") {
         if (hermesStatus() !== "installed") return ["hermes: not installed — nothing to update"];
