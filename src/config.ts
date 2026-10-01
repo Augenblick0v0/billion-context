@@ -8,6 +8,7 @@ import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
+import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
@@ -52,8 +53,11 @@ export type ProviderRoute = {
      *  role name this upstream accepts (e.g. `"developer": "system"`) —
      *  applied at the forward boundary to the FINAL wire body, covering
      *  client-sent roles and bili's own injected prompt alike (#552). Wins
-     *  per key over the global `compat` block. */
-    compat?: { roles?: Record<string, string> };
+     *  per key over the global `compat` block. `dropFields` (#1757) is an
+     *  ADDITIVE union with the global list (a provider entry adds paths but
+     *  cannot retract global ones): dot-separated plain-object key paths of
+     *  client-sent fields this upstream's strict schema rejects. */
+    compat?: { roles?: Record<string, string>; dropFields?: string[] };
     /** Route-scoped passthrough (#661): same semantics as the global
      *  `passthrough` flag, but only for requests whose upstream URL matches
      *  this route — request body forwarded byte-for-byte (no kernel
@@ -588,8 +592,11 @@ export type ProxyOptions = {
     /** Wire-compat role map (global level; per-provider `compat.roles` overlays
      *  it per key). `{"developer":"system"}` rewrites developer→system on the
      *  forwarded body for upstreams without the developer role (#552). Empty =
-     *  byte-for-byte transparent. */
-    compat: { roles: Record<string, string> };
+     *  byte-for-byte transparent. `dropFields` (#1757): dot-separated
+     *  plain-object key paths of client-fixed fields to strip before forward
+     *  for strict-schema gateways that 400 on unknown fields; per-provider
+     *  lists union onto it additively. Empty = byte-for-byte transparent. */
+    compat: { roles: Record<string, string>; dropFields?: string[] };
     /** #1455: how upstream stream failures are presented to the client on the
      *  anthropic/openai wire — "protocol" (default) = protocol-native error
      *  frames; "completion" = legacy synthesized-completion shape for hosts
@@ -1042,7 +1049,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         promptCache: {
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
-        compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
+        compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {}, dropFields: parseCompatDropFields(fileConfig.compat?.dropFields) ?? [] },
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
@@ -1186,11 +1193,14 @@ type FileConfig = {
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).
+     *  `dropFields` (#1757): dot-separated plain-object key paths of
+     *  client-fixed fields stripped from every forwarded body (strict-schema
+     *  gateways that 400 on unknown fields); per-provider lists union onto it.
      *  `streamErrorShape` (#1455): "protocol" (default) presents upstream
      *  stream failures as protocol-native error frames; "completion" restores
      *  the legacy shape that delivered the failure text inside a synthesized
      *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file. */
-    compat?: { roles?: Record<string, string>; streamErrorShape?: string };
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[] };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
@@ -1347,13 +1357,17 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         if (obj.compress) route.compress = obj.compress;
+        const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
-        if (compatRoles) route.compat = { roles: compatRoles };
+        if (compatRoles) compat.roles = compatRoles;
+        const compatDrops = parseCompatDropFields(obj.compat?.dropFields);
+        if (compatDrops) compat.dropFields = compatDrops;
+        if (Object.keys(compat).length > 0) route.compat = compat;
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
         if (typeof obj.direct === "boolean") route.direct = obj.direct;
         const imageBilling = parseImageBilling(obj.imageBilling);

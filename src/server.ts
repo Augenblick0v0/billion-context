@@ -122,6 +122,7 @@ import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "./compat-drop.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
@@ -1487,6 +1488,11 @@ async function handle(
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
     }
+    // #1757: resolve compat.dropFields once, ahead of the verbatim branches
+    // that forward before reaching the final boundary (they can't use
+    // forward()'s own resolution). Same destination derivation as
+    // buildForwardTarget, so the list matches what the processed path applies.
+    const compatDropPaths = resolveCompatDropFields(opts.routes, forwardUpstreamUrl(req, opts, route), opts.compat.dropFields);
     // #1117: an unattributed in-process caller (native patch marked it — its
     // URL was already /bili/-routed by the settings overlay, so refusal was
     // impossible client-side) relays byte-untouched, mirroring a direct send
@@ -1494,7 +1500,7 @@ async function handle(
     // forward as the #920 bypass.
     if (passthroughMark) {
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
         return;
     }
     // #300: bili→bili chain detection. If the inbound request already carries
@@ -1530,7 +1536,7 @@ async function handle(
     // here would double-manage it. Raw forward, zero state touched.
     if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
-        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -1624,7 +1630,7 @@ async function handle(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
     }
@@ -2510,6 +2516,7 @@ async function handle(
                     log("info", `[${session.id}] side request normalized bili compaction handoffs (replaced=${replaced}, dropped=${dropped})`);
                 }
             }
+            sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
             const sidePrepared: Prepared = {
                 body: sideBody,
                 session,
@@ -2888,7 +2895,7 @@ async function handle(
         if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
-        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, reqConfig, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);
     }
 }
 
@@ -3295,6 +3302,28 @@ function scrubAnthropicPck(protocol: WireProtocol | null, bodyBuffer: Buffer, lo
     delete p.prompt_cache_key;
     log("debug", `stripped prompt_cache_key from verbatim anthropic forward (#1403)`);
     return Buffer.from(JSON.stringify(p), "utf8");
+}
+
+// #1757: protocol-neutral companion to scrubAnthropicPck for opt-in
+// compat.dropFields — client-fixed fields some strict-schema gateways reject
+// (SenseNova Responses 400 'json: unknown field "summary"' on pi-ai's fixed
+// reasoning.summary). Structural key deletion only (string leaves such as
+// tool-call arguments are never touched); a body with none of the configured
+// paths passes back byte-identical, so #661's fingerprinting contract is
+// untouched in the normal case (same guarantee as #1403).
+function scrubCompatDrop(bodyBuffer: Buffer, dropPaths: readonly string[], log: (level: string, msg: string) => void): Buffer {
+    if (dropPaths.length === 0 || bodyBuffer.length === 0) return bodyBuffer;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(bodyBuffer.toString("utf8"));
+    } catch {
+        return bodyBuffer;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyBuffer;
+    const dropped = dropCompatFieldsJson(parsed as Record<string, unknown>, dropPaths);
+    if (dropped === 0) return bodyBuffer;
+    log("info", `stripped ${dropped} field(s) per compat.dropFields (${dropPaths.join(", ")}) from verbatim forward (#1757)`);
+    return Buffer.from(JSON.stringify(parsed), "utf8");
 }
 
 async function prepareAnthropic(
@@ -4759,6 +4788,20 @@ function inferWireProtocol(path: string): "openai" | "responses" | "google" | nu
     return null;
 }
 
+// #1757: the destination URL exactly as buildForwardTarget will fetch it.
+// Shared by the early verbatim branches, which resolve compat.dropFields
+// before reaching forward()'s final-boundary resolution — both sides must
+// derive the same URL or per-provider drops would mismatch.
+function forwardUpstreamUrl(req: http.IncomingMessage, opts: ProxyOptions, route: ReturnType<typeof resolveUpstream>): string {
+    // route.rewrittenUrl may use a `mitm://` scheme (for config-lookup
+    // distinction — see resolveUpstream). fetch needs the real https://
+    // scheme, so strip mitm:// back to https:// for the actual upstream request.
+    const reqUrl = req.url ?? "";
+    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
+    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
+    return rewritten.replace(/^mitm:\/\//, "https://");
+}
+
 function buildForwardTarget(
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -4766,13 +4809,7 @@ function buildForwardTarget(
     affinity?: string,
     hopMarker?: string,
 ): ForwardTarget {
-    // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
-    // — see resolveUpstream). fetch needs the real https:// scheme, so strip
-    // mitm:// back to https:// for the actual upstream request.
-    const reqUrl = req.url ?? "";
-    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
-    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
-    const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
+    const upstreamUrl = forwardUpstreamUrl(req, opts, route);
     const headers: Record<string, string> = {};
     const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
     for (const [k, v] of Object.entries(req.headers)) {
@@ -5434,6 +5471,9 @@ async function forward(
     // forward, or a developer-role 400 would hit mid-stream on retry).
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
+    // #1757 resolved drop list, shared with wireTransform below (re-sent
+    // compress-retry bodies must carry the same drops as the initial forward).
+    let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
@@ -5480,6 +5520,19 @@ async function forward(
                 log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
             }
         }
+        // #1757: compat.dropFields — AFTER every other body mutation (roles,
+        // output steering) so the final shape carries the drops, BEFORE the
+        // #1421 outbound stamp whose digest must cover the exact forwarded
+        // bytes. Protocol-neutral (any JSON-object body), unlike the role
+        // rewrite above which is openai/responses-only.
+        compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat.dropFields);
+        if (compatDropPaths.length > 0 && typeof wireBody === "string") {
+            const applied = applyCompatDropFields(wireBody, compatDropPaths);
+            if (applied.dropped > 0) {
+                wireBody = applied.body;
+                log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+            }
+        }
     }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
@@ -5509,10 +5562,11 @@ async function forward(
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled)
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0
         ? (b: Record<string, unknown>): Record<string, unknown> => {
             if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
             if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
+            if (compatDropPaths.length > 0) dropCompatFieldsJson(b, compatDropPaths);
             return b;
         }
         : undefined;

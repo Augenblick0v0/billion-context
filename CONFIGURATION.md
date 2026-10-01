@@ -124,11 +124,12 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `compat`
 
-- **Type:** `{ roles?: Record<string, string>; streamErrorShape?: "protocol" | "completion" }`
+- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion" }`
 - **Default:** `{}` (disabled)
 - **Status:** ACTIVE
 - **Description:** Global wire-compat role map. `roles` maps message roles to the role name your upstream accepts, e.g. `{"compat":{"roles":{"developer":"system"}}}` rewrites `developer` → `system` on the final forwarded body for upstreams that reject the `developer` role (#552, newer codex clients). Applies to `openai` chat-completions and `responses` requests; exact-match roles only, everything else in the body is untouched; re-sent compress-retry bodies carry the same rewrite. Per-provider `compat.roles` entries (see [Providers](#providers)) win per key. Default `{}` forwards bodies byte-for-byte unchanged.
 - **Learn-on-failure:** with no compat configured, an upstream `400 Invalid role: …` is auto-fixed — bili rewrites the offending role to `system`, retries once, and remembers the mapping **session-scoped** (in-memory on the session; never written to config). Later requests in that session skip the 400 round-trip. The info log emitted when the fix fires carries the permanent per-provider snippet.
+- **dropFields:** dot-path list of fields to delete from the final forwarded body — for strict-schema upstreams that reject a field the *client* always sends but the upstream does not accept (#1757). Paths use plain-object segments only (`reasoning.summary`); wildcards and array indices are not supported; nonexistent paths and non-object intermediates are skipped silently; string values are never inspected or altered — structural keys only, so tool arguments and message content stay byte-exact. Unlike `roles`, it applies on every wire protocol (any JSON request body). Global and per-provider lists merge **additively** (union) — a provider entry can add paths but never retract a global one. Applied after role mapping / output steering on the final outbound body (before the prompt-cache stamp), to every body the compress-retry loops re-send, and to verbatim pass-through forwards alike. A body with no matching field is forwarded byte-for-byte unchanged; when ≥1 field is actually dropped an info line logs the dropped paths. Opt-in only — no learn-on-failure in v1: `"compat":{"dropFields":["reasoning.summary"]}`.
 - **streamErrorShape:** how an upstream stream failure is presented on the anthropic/openai wire once the 200 response is already committed (`"protocol"`, default, or `"completion"`). `protocol` rides the protocol-native failure channel — anthropic/responses get an `event: error` frame, openai a top-level `error` frame followed by `[DONE]` — so clients can distinguish "this turn failed" from "this turn finished" and keep their own retry logic armed (#1455: the old synthesized `end_turn`/`finish_reason` dressed a dead turn as a normal completion and silently consumed client retry budgets). `completion` restores that legacy shape (failure text inside a synthesized successful completion) for hosts whose SDK cannot surface in-band error events. Config file: `"compat":{"streamErrorShape":"completion"}`; env `BILI_STREAM_ERROR_SHAPE` wins. Only the google wire is unaffected (already native error frames); on the responses wire this knob changes the server-side exit from the synthesized item-lifecycle completion to the `event: error` frame (its in-loop exit was already native via `response.failed`).
 
 ### `proxy`
@@ -273,10 +274,20 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 
 ### `compat`
 
-- **Type:** `{ roles?: Record<string, string> }`
+- **Type:** `{ roles?: Record<string, string>; dropFields?: string[] }`
 - **Default:** `{}` (disabled)
 - **Status:** ACTIVE
-- **Description:** Per-provider wire-compat overrides. `roles` maps message roles to the role name this upstream accepts, e.g. `{"developer": "system"}` for upstreams that reject the `developer` role newer codex clients send (#552). Applied to the final forwarded `openai`/`responses` body — client-sent roles and bili's own injected prompt alike — and to every body the compress-retry loops re-send. Wins per key over the global `compat` block (see [Server Settings](#server-settings)). Default `{}` forwards byte-for-byte unchanged.
+- **Description:** Per-provider wire-compat overrides. `roles` maps message roles to the role name this upstream accepts, e.g. `{"developer": "system"}` for upstreams that reject the `developer` role newer codex clients send (#552). Applied to the final forwarded `openai`/`responses` body — client-sent roles and bili's own injected prompt alike — and to every body the compress-retry loops re-send. Wins per key over the global `compat` block (see [Server Settings](#server-settings)). `dropFields` deletes client-fixed fields that strict-schema upstreams reject (#1757): dot-path plain-object paths (no wildcards/indices), merged **additively** with the global list (a provider can add paths but never retract a global one); structural deletion only — string values untouched, nonexistent paths skipped, byte-for-byte forward when nothing matches. Canonical case — SenseNova's Responses gateway 400s on pi-ai's fixed `reasoning.summary: "auto"`:
+
+  ```jsonc
+  {
+    "providers": {
+      "https://token.sensenova.cn/v1": {
+        "compat": { "dropFields": ["reasoning.summary"] }
+      }
+    }
+  }
+  ```
 
 ### `passthrough`
 

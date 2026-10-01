@@ -113,6 +113,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "Anthropic prompt-caching API reference ('you can define up to 4 cache breakpoints'); surfaced by the #1639 review — the #1637 stamping emits 1 system + 3 message marks and anthropicToCore harvests client marks from message blocks only, so a client marking only its tools array would have combined into a 5th breakpoint; repair = tools-mark detection suppresses bili's stamps (src/loop/cache-control.ts anthropicToolsCarryCacheControl)",
     },
+    {
+        id: "WC-013",
+        wire: "responses",
+        summary:
+            "no reasoning.summary — not part of the OpenAI Responses API (reasoning carries effort only); strict-schema upstreams reject the unknown field with 'json: unknown field \"summary\"'. Clients such as pi-ai always send reasoning:{effort,summary:\"auto\"} when a thinking tier is requested, so bili strips it via opt-in compat.dropFields (#1757) — unconfigured, it stays untouched.",
+        provenance:
+            "bili #1757 per-field measurement against SenseNova's Responses gateway https://token.sensenova.cn/v1/responses (2026-09-30): every pi-ai outbound field 200 except reasoning.summary → 400 code InvalidParameter; OpenAI Responses API reference (reasoning.effort is the only documented subfield)",
+    },
 ];
 
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -208,7 +216,7 @@ function validateGeminiSchema(schema: unknown, path: string, out: string[]): voi
     validateGeminiSchema(schema.items, `${path}.items`, out);
 }
 
-/** WC-005, WC-009, WC-011, WC-012 on a Responses-API body (flat function entries). */
+/** WC-005, WC-009, WC-011, WC-012, WC-013 on a Responses-API body (flat function entries). */
 export function validateResponsesBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -227,6 +235,10 @@ export function validateResponsesBody(body: unknown): string[] {
                 out.push(`WC-012 input[${i}].id: expected an ID that begins with 'cmp'`);
         });
     }
+    // WC-013 (#1757): runs before the tools early-return — reasoning.summary
+    // exists on bodies without tools.
+    if (isPlainObject(body.reasoning) && "summary" in body.reasoning)
+        out.push('WC-013 reasoning.summary is not part of the OpenAI Responses API — strict-schema upstreams 400 (json: unknown field "summary"); drop it via compat.dropFields (#1757)');
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;

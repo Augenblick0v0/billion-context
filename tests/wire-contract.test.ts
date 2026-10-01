@@ -116,6 +116,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", name: "ok", parameters: { type: "object", properties: {}, anyOf: [] } }] },
             { tools: [], input: [{ type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" }] },
             { input: [{ type: "configuration_update", reasoning: { effort: "medium" } }, { type: "configuration_update", reasoning: { effort: "high" } }] },
+            { model: "m", input: [], reasoning: { effort: "high", summary: "auto" } },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
@@ -370,14 +371,14 @@ interface Rig {
 // Opt-in features arm through bili's CompressSettings namespace (`opts.compress`),
 // resolved per request by resolveCompress + applyCompressSettings — not through
 // the raw kernelConfig (server.ts stamps effectiveCcr from compressCfg.ccr only).
-async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>): Promise<Rig> {
+async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>, dropFields?: string[]): Promise<Rig> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: fakeUrl,
-        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } } } },
+        routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } }, ...(dropFields ? { compat: { dropFields } } : {}) } },
         modelContextLimit: 100_000,
         kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true, ...compressOverrides },
@@ -451,6 +452,64 @@ test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surf
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");
         assertCompressFormsKept(compress, "forwarded-optin");
+    } finally {
+        if (rig) await rig.close();
+        await fake.close();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// WC-013 gates (#1757): pi-ai-style fixed reasoning.summary vs a strict-schema
+// upstream. Negative control pins the opt-in default (untouched forward ⇒ the
+// fake's native 400 relays); positive control pins compat.dropFields stripping.
+// ---------------------------------------------------------------------------
+
+const PI_AI_RESPONSES_BODY = {
+    model: "resp-test",
+    stream: true,
+    reasoning: { effort: "high", summary: "auto" },
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+};
+
+test("WC-013 negative control: unconfigured bili forwards reasoning.summary untouched; the strict upstream's 400 relays", async () => {
+    const fake = await startFakeUpstream("responses");
+    let rig: Rig | undefined;
+    try {
+        rig = await startRig(fake.url, "resp-test", {});
+        const res = await fetch(`${rig.proxyUrl}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-wc013-neg" },
+            body: JSON.stringify(PI_AI_RESPONSES_BODY),
+        });
+        assert.equal(res.status, 400, "dropFields is opt-in — without config the field reaches the strict upstream and its 400 relays");
+        const err = (await res.json()) as { error?: { message?: string } };
+        assert.ok(err.error?.message?.includes("WC-013"), `relayed error envelope names WC-013, got: ${err.error?.message}`);
+        assert.ok(fake.violations.some((v) => v.includes("WC-013")), "fake recorded a WC-013 violation");
+        const fwd = fake.requests[0].body as Record<string, unknown>;
+        assert.deepEqual(fwd.reasoning, { effort: "high", summary: "auto" }, "unconfigured forward carries reasoning.summary byte-for-byte");
+    } finally {
+        if (rig) await rig.close();
+        await fake.close();
+    }
+});
+
+test("WC-013 configured: compat.dropFields strips reasoning.summary before forward; sibling keys survive", async () => {
+    const fake = await startFakeUpstream("responses");
+    let rig: Rig | undefined;
+    try {
+        rig = await startRig(fake.url, "resp-test", {}, ["reasoning.summary"]);
+        const res = await fetch(`${rig.proxyUrl}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-wc013-pos" },
+            body: JSON.stringify(PI_AI_RESPONSES_BODY),
+        });
+        assert.equal(res.status, 200, "configured bili strips the field — the strict upstream accepts the turn");
+        await res.text();
+        assert.equal(fake.violations.length, 0, `no violations expected:\n${fake.violations.join("\n")}`);
+        const fwd = fake.requests[0].body as Record<string, unknown>;
+        const reasoning = fwd.reasoning as Record<string, unknown> | undefined;
+        assert.equal(reasoning?.effort, "high", "sibling key reasoning.effort survives the drop");
+        assert.ok(!reasoning || !("summary" in reasoning), "reasoning.summary stripped before forward");
     } finally {
         if (rig) await rig.close();
         await fake.close();
