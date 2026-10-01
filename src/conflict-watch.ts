@@ -6,7 +6,7 @@
 
 import { markDirty, type Session } from "./session.js";
 
-export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
+export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "dual-stream";
 
 export interface ConflictEvent {
     at: number;

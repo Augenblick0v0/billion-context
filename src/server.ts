@@ -82,6 +82,7 @@ import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSession
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
+import { observeSessionStream } from "./stream-watch.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
@@ -3383,6 +3384,7 @@ async function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        observeSessionStream(session, { msgs: msgs.length, tokens: tokenCount, window: config.modelContextLimit, nudgeReason: turn.nudge?.reason }, log);
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -3615,6 +3617,7 @@ async function prepareOpenai(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        observeSessionStream(session, { msgs: msgs.length, tokens: tokenCount, window: config.modelContextLimit, nudgeReason: turn.nudge?.reason }, log);
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -3863,6 +3866,7 @@ async function prepareGoogle(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
+        observeSessionStream(session, { msgs: msgs.length, tokens: tokenCount, window: config.modelContextLimit, nudgeReason: turn.nudge?.reason }, log);
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
@@ -4155,6 +4159,7 @@ async function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        observeSessionStream(session, { msgs: msgs.length, tokens: tokenCount, window: config.modelContextLimit, nudgeReason: turn.nudge?.reason }, log);
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
