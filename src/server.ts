@@ -128,6 +128,7 @@ import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandar
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
+import { isDshAutoReviewSideCall } from "./server/dsh-autoreview-side.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
@@ -2469,7 +2470,20 @@ async function handle(
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
         const requestAgent = pluginRequestAgentHeader(req.headers);
-        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed, requestAgent)) {
+        // #1309: dsh experimental auto-review fires a normal-budget, no-tools
+        // review request before every tool call under the main session id —
+        // the #388 budget heuristic can never see it, and full-pipeline runs
+        // wrecked kernel state (#1307/#1308: snapshot clobber, orphan-GC
+        // wiping compressed blocks). Identified by the versioned REVIEW_POLICY
+        // system marker (never a human turn) and routed into the same
+        // side-passthrough lane below: forwarded, zero kernel contact. Shape
+        // heuristics are untouched, so #1075's short-view semantics hold.
+        const dshAutoReview = !countTokens && !responsesCompact && protocol !== null && isDshAutoReviewSideCall(protocol, parsed, inboundMsgs);
+        if (dshAutoReview && session.metadata.dshAutoReviewSideRouted !== true) {
+            session.metadata.dshAutoReviewSideRouted = true;
+            log("info", `[${session.id}] dsh auto-review request identified (REVIEW_POLICY system + ${inboundMsgs} msgs, no tools) — routed to side-passthrough: forwarded, no ref/snapshot/nudge/orphan-GC contact (#1309)`);
+        }
+        if (!countTokens && !responsesCompact && protocol !== null && (isSideRequest(parsed, requestAgent) || dshAutoReview)) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2500,7 +2514,7 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
+            log("info", `[${session.id}] side request (${dshAutoReview ? "dsh auto-review (#1309)" : requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
             let sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
             const sideInput = (parsed as ResponsesRequestBody).input;
             if (protocol === "responses" && Array.isArray(sideInput)) {
