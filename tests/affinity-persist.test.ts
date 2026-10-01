@@ -111,26 +111,25 @@ test("sustained mutations cannot starve the write — max-delay budget (#1834)",
     assert.ok(aff && aff.via === "new");
     prefixAffinity.note(aff.sessionId, aff.incomingDepth, aff.tailHash, aff.itemHashes);
     const file = path.join(tmp, "billion-context", "prefix-affinity.json");
+    // Re-arm the debounce every ~100ms for up to 6.5s via AWAITED sleeps —
+    // never setInterval (an unref'd interval cannot keep the event loop
+    // alive on every node version, and a dangling promise cascades
+    // cancellations into the rest of the file — seen on the Node 22 CI lane).
     const start = Date.now();
-    const sawFile = await new Promise<boolean>((resolve) => {
-        const churn = setInterval(() => scheduleAffinityPersist(), 100);
-        churn.unref?.();
-        const poll = setInterval(() => {
-            if (fs.existsSync(file)) {
-                clearInterval(churn);
-                clearInterval(poll);
-                resolve(true);
-            } else if (Date.now() - start > 6_500) {
-                clearInterval(churn);
-                clearInterval(poll);
-                resolve(false);
-            }
-        }, 50);
-        poll.unref?.();
-    });
-    assert.ok(sawFile, "re-armed debounce must still flush within the 5s max-delay budget (#1834)");
-    assert.ok(Date.now() - start < 6_000, "flush must not wait for 5s of silence");
-    flushPrefixAffinity(); // settle any pending timer from the churn
+    let sawFile = false;
+    while (Date.now() - start < 6_500) {
+        scheduleAffinityPersist();
+        await new Promise((r) => setTimeout(r, 100));
+        if (fs.existsSync(file)) {
+            sawFile = true;
+            break;
+        }
+    }
+    try {
+        assert.ok(sawFile, "re-armed debounce must still flush within the 5s max-delay budget (#1834)");
+    } finally {
+        flushPrefixAffinity(); // settle any pending timer from the churn
+    }
 });
 
 test("writeSnapshot unions with on-disk chains instead of clobbering a sibling instance's (#1724)", () => {
