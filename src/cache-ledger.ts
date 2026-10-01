@@ -715,7 +715,9 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
                 hitPct: l.hitPct ?? 0,
                 // #1847: this event's share is the residual only when this dimension won the partition —
                 // a co-occurring higher-priority cause absorbs the charge into its own bucket instead.
-                attributed: l.cause === dim ? l.tr : 0,
+                // Lines persisted pre-#1847 have no `cause` field: keep their historical display (full tr),
+                // so old ledgers render as before and the header's cold-tail delta stays honest.
+                attributed: l.cause === dim || l.cause === undefined ? l.tr : 0,
             });
         }
         return evs;
@@ -723,7 +725,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     const restartEvents: ModelSwitchEvent[] = [];
     for (const l of led.lines) {
         if (l.rs !== 1 || l.unk === 1) continue;
-        restartEvents.push({ seq: l.seq, at: l.at, from: null, to: "(restart)", input: l.input, cached: l.cached, hitPct: l.hitPct ?? 0, attributed: l.cause === "restart" ? l.tr : 0 });
+        restartEvents.push({ seq: l.seq, at: l.at, from: null, to: "(restart)", input: l.input, cached: l.cached, hitPct: l.hitPct ?? 0, attributed: l.cause === "restart" || l.cause === undefined ? l.tr : 0 });
     }
     const invalidation: InvalidationTokenBreakdown = {
         model: a.switchMissed,

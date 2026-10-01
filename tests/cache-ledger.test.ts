@@ -754,3 +754,18 @@ test("post-switch cold-tail rounds stay attributed, not flagged as seam suspects
     assert.equal(r.seam.suspects, 0, "a cause-attributed cold-tail round is not a seam candidate");
     assert.equal(r.invalidation.model, 80000, "both cold rounds stay charged to the switch");
 });
+
+test("pre-#1847 ledger lines keep their historical per-event attribution (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 40000, cached: 40000 });
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 40000, cached: 0 });
+    // Emulate a ledger persisted before #1847: drop the new per-line `cause` field.
+    const meta = (session.metadata as Record<string, { lines: Array<{ cause?: string }> }> & object)["cacheLedger"]!;
+    delete meta.lines[1].cause;
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.events.length, 1);
+    assert.equal(r.modelSwitches.events[0].attributed, 40000, "legacy sw line keeps its historical charge display");
+    assert.doesNotMatch(handleAcpCache(session), /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
+});
