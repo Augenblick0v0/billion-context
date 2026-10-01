@@ -149,7 +149,7 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
                 );
             });
 
-        return { url, port, homeDir, root, stop, publish: (tgz) => runNpm(["publish", tgz]), npm: runNpm };
+        return { url, port, homeDir, root, stop, publish: async (tgz) => { await runNpm(["publish", tgz]); }, npm: runNpm };
     } catch (err) {
         await stop();
         throw err;
