@@ -4,8 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight, isLegacyBcpEntry, legacyBcpEntriesIn } from "../src/agent/pi-native.ts";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight, isLegacyBcpEntry, legacyBcpEntriesIn, planNativePi, armNativePi, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } from "../src/agent/pi-native.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
+
+// #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
+// the routed-evidence grace so the probe fails fast instead of paying the 5s default.
+process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 // #820 coexistence: standalone billion-context-pi checks env at load time, so
 // the marker must be set synchronously during module evaluation (before our
@@ -118,4 +124,95 @@ test("legacyBcpEntriesIn: reads packages[], tolerates missing/broken files", () 
     fs.writeFileSync(file, "{ not json");
     assert.deepEqual(legacyBcpEntriesIn(file), []);
     assert.deepEqual(legacyBcpEntriesIn(path.join(dir, "missing.json")), []);
+});
+
+test("planNativePi: default is spawn; opt-out and /bili/ launches are off", () => {
+    assert.deepEqual(planNativePi({}), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
+});
+
+test("planNativePi: a preset BILLION_CONTEXT_PROXY is an attach target, not a stand-down", () => {
+    // #1795 regression: the pseudo-attach hole used to resolve a preset proxy
+    // to "off" (gate closed), disarming the fetch intercept entirely so every
+    // model request went direct and uncompressed.
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485/" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    // kill switches and a /bili/ launch still win over the preset
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
+    // a garbage / blank preset falls back to spawn (self-managed), never dead-off
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
+});
+
+test("planNativePi: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
+        { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
+    );
+});
+
+test("#1135 wiring: a dead attach target falls back to a spawned proxy", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativePi({ mode: "attach", attachOrigin: "http://127.0.0.1:9" });
+        assert.equal(typeof _stateRespawnForTest(), "function", "respawn seam armed at load");
+        // port 9 refuses connections instantly — the manifest probe fails fast,
+        // the fallback spawn lands and replaces the env origin
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, "http://127.0.0.1:7777");
+        assert.ok(spawned >= 1);
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:7777");
+    } finally {
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});
+
+test("#1135 wiring: a healthy attach target stays attached (no migration, no spawn)", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    const server = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7778";
+        });
+        armNativePi({ mode: "attach", attachOrigin: `http://127.0.0.1:${port}` });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, `http://127.0.0.1:${port}`, "healthy target resolves to itself");
+        assert.equal(spawned, 0, "no fallback spawn for a healthy target");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, `http://127.0.0.1:${port}`);
+    } finally {
+        server.close();
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
 });
