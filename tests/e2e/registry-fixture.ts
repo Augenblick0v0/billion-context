@@ -1,7 +1,9 @@
 // Hermetic local npm registry fixture (verdaccio) for the ACP_TEST_REGISTRY
 // e2e suite (#1153). Brings its own registry instance on loopback — it never
 // depends on any external (even internal) service, so runs are offline,
-// deterministic, and secret-free.
+// deterministic, and secret-free. `publish` shells out to npm; on dev machines
+// with an npm guard, pass NPM_ALLOW_DANGEROUS=1 through (loopback-only — the
+// #19 private-registry allowlist cannot know this fixture's ephemeral port).
 import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import net from "node:net";
@@ -131,7 +133,7 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
                 execFile(
                     "npm",
                     [...args, "--registry", url, "--no-audit", "--no-fund"],
-                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, env: { PATH: process.env.PATH ?? "", HOME: homeDir } },
+                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, env: { PATH: process.env.PATH ?? "", HOME: homeDir, ...(process.env.NPM_ALLOW_DANGEROUS ? { NPM_ALLOW_DANGEROUS: process.env.NPM_ALLOW_DANGEROUS } : {}) } },
                     (error, stdout, stderr) => {
                         if (error) reject(new Error(`npm ${args.join(" ")} failed: ${(stderr || error.message).slice(0, 4000)}`));
                         else resolve({ stdout, stderr });
