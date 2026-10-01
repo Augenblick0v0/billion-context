@@ -1297,6 +1297,10 @@ export const WEB_CLIENT = `(function () {
         }));
         const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
         qCtrls.push(ptInp);
+        const ptWarn = document.createElement("div");
+        ptWarn.style.cssText = "font-size:12px;color:#57606a";
+        ptWarn.textContent = t("cfg.q_ptools_warn");
+        ptInp.parentElement.appendChild(ptWarn);
         ptInp.addEventListener("change", () => commit((d) => {
             const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
             if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
