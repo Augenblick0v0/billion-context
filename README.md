@@ -342,6 +342,17 @@ again immediately.
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
 #362, opt-in cleanup #1082) — full paths in [CONFIGURATION.md](CONFIGURATION.md).
 
+**Why do render tags vanish from chat replies?** By design, not a bug (#933
+noise control + #1823 echo-loop break): well-formed ACP render tags in model
+prose are stripped on egress *and* scrubbed from incoming assistant history,
+because a leaked literal tag replays through client history every turn and
+self-reinforces into an unbounded echo loop. The filter is shape-based with
+zero markdown awareness — a tag-shaped example inside a fenced code block is
+stripped too. To show tag shapes to a user, use the supported channel: write
+them to a file — tool-call arguments (`write`/`edit`/`bash`) are forwarded
+byte-exact (#1039); escaped spellings (`\x3c…\x3e`) pass through untouched.
+See #1852 (closed by-design; consolidation target for duplicate reports).
+
 ## Running the proxy
 
 ### Flags

@@ -262,6 +262,8 @@ curl -s http://localhost:8787/__bili/stats
 
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
+**为什么聊天回复里的 render tag 会消失?** 设计行为而非缺陷(#933 噪音控制 + #1823 断回声环):模型正文中的良构 ACP render tag 会在出口被剥离、并在 assistant 历史摄入时被清洗——因为漏掉的字面标签每轮回放客户端历史、自我强化成无界复读环。过滤器按形状匹配、零 markdown 意识,围栏代码块里的标签示例也会被剥。要向用户展示标签形状,走受支持通道:写进文件——工具参数(`write`/`edit`/`bash`)逐字转发(#1039);转义写法(`\x3c…\x3e`)同样原样通过。详见 #1852(by-design 关闭;重复报告的归并靶子)。
+
 ## 运行代理
 
 ### 命令行参数
