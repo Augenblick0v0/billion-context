@@ -1,0 +1,40 @@
+{
+  "name": "billion-context-release-notes",
+  "version": "0.0.0",
+  "description": "Tiered, model-written release notes for billion-context. Read-only companion payload consumed by the proxy's #1870 visibility watcher; version number is bumped by CI on every publish (the field itself is meaningless).",
+  "private": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
+  "billionContextReleaseNotes": {
+    "schema": 1,
+    "updated": "2026-10-01",
+    "releases": [
+      {
+        "version": "0.1.179",
+        "date": "2026-10-01",
+        "tier": "recommended",
+        "summary": "Compression is now inherited across agent restart / resume / new-branch forks (#1834): folded summaries survive instead of silently re-expanding on the wire (claude-code and openai-chat wires; codex/gemini in #1853 follow-up)."
+      },
+      {
+        "version": "0.1.178",
+        "date": "2026-10-01",
+        "tier": "recommended",
+        "summary": "dsh installs self-heal: profile bundles now converge to the global version automatically (#1803/#1804) — fixes the one-time 'invalid plugin' boot crash after a new bili publish."
+      },
+      {
+        "version": "0.1.177",
+        "date": "2026-10-01",
+        "tier": "routine",
+        "summary": "dsh: stale landing page after restart fixed (#1787); no-op for other hosts."
+      },
+      {
+        "version": "0.1.176",
+        "date": "2026-10-01",
+        "tier": "recommended",
+        "summary": "Stability wave: zero-injection session identity keeps the prefix cache hot across fork/resume (#1692/#1611); launcher port hardening (#1756); ACP tag-echo strip no longer eats prose (#1722); responses degenerate-output guard and transport replay retry."
+      }
+    ]
+  }
+}
