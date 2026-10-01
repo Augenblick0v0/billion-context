@@ -37,10 +37,13 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
  *  estimate-grade baseline (raw-view poison from a transform-failure fallback
  *  arm) would mask the payload's own est through the max() and silently skip
  *  the #453 clamp (fail-open) while the poison persists. */
+export function estimateFreshInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown): number {
+    return estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
+}
+
 export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string): number {
-    const est = estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
     const baseline = lastInputTokens > 0 && lastInputTokensSource === "usage" ? lastInputTokens : 0;
-    return Math.max(baseline, est);
+    return Math.max(baseline, estimateFreshInputTokens(processedMessages, systemText, tools));
 }
 
 // #1320: Claude Code round-trips extended-thinking blocks as SIGNATURE-ONLY
@@ -195,21 +198,43 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return nudge.contextUsage >= escalationPct;
 }
 
+/** #1812: the overflow-refold rebuild's clamp ceiling. `ceiling` is the window
+ *  the upstream STATED in its overflow error (never larger than the declared
+ *  window at the call sites). The rebuild must measure input fresh — the arm
+ *  that preceded it set lastInputTokens to exactly this stated window
+ *  (#987), and feeding that baseline through max() would leave ~zero cap.
+ *  `statedPromptTokens` is the upstream tokenizer's exact count of the just-
+ *  rejected payload: a floor under the heuristic so CJK-heavy prompts (where
+ *  chars/4 under-counts) cannot make the cap too generous. */
+export interface OutputRefoldCeiling {
+    ceiling: number;
+    statedPromptTokens?: number;
+}
+
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: OutputBudgetField,
-    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number },
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number; refold?: OutputRefoldCeiling },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
-    // #488: images ride along in the rebuilt body but are invisible to the text model —
-    // without them the cap is too generous and input+output can still overflow.
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource) + ctx.imageTokens;
-    const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
+    let inputEstimate: number;
+    let window: number;
+    if (ctx.refold) {
+        // #488: images are invisible to the text model — same term as below.
+        inputEstimate = Math.max(estimateFreshInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools), ctx.refold.statedPromptTokens ?? 0) + ctx.imageTokens;
+        window = Math.min(ctx.nativeWindow, ctx.refold.ceiling);
+    } else {
+        // #488: images ride along in the rebuilt body but are invisible to the text model —
+        // without them the cap is too generous and input+output can still overflow.
+        inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource) + ctx.imageTokens;
+        window = ctx.nativeWindow;
+    }
+    const capped = clampOutputBudget(raw, inputEstimate, window);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
-        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)`);
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${window}); prevents input+output overflow (#453)`);
     }
 }
