@@ -176,11 +176,6 @@ export interface ContextOverflowInfo {
      *  number is present. #987: this arms the one-shot emergency shrink — it
      *  is never persisted as a learned window. */
     window?: number;
-    /** #1812: the rejected prompt's own size as stated by the upstream
-     *  tokenizer (vLLM dialect: "prompt (N tokens)"). Consumed only by the
-     *  overflow-refold rebuild's output clamp as an input-estimate floor —
-     *  never persisted. */
-    promptTokens?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -199,7 +194,11 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /exceeds the context window/i,
     // #1812: vLLM chat-completions dialect: "prompt (N tokens) + max tokens (M)
     // exceeds the context (W); requests are never truncated" — NO word "window"
-    // after "context", so the pattern above does not match it.
+    // after "context", so the pattern above does not match it. Recognition
+    // only: the numbers in this dialect are deliberately NOT extracted (error
+    // text is the least reliable window source — #1812 review); the rescue
+    // runs against the configured/declared window and the guidance warn tells
+    // the operator how to declare the real one.
     /exceeds the context\s*\(/i,
     /out of room in the model/i,
     /exceeded model token limit/i,
@@ -241,11 +240,10 @@ function parseOverflowWindow(text: string): number | undefined {
     // first parenthesized number is the rejected payload and must not be used.
     m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
     if (m) return toTokenNumber(m[1]);
-    // #1812 vLLM: "prompt (69886 tokens) + max tokens (65536) exceeds the
-    // context (131072)" — the window is the number after "the context"; the two
-    // earlier parenthesized numbers are the prompt and requested-output sizes.
-    m = text.match(/exceeds the context\s*\((\d[\d,]*)\)/i);
-    if (m) return toTokenNumber(m[1]);
+    // #1812: the vLLM "exceeds the context (W)" number is intentionally NOT
+    // parsed — learning a window from upstream error text proved unstable
+    // (relay rewrites, dialect drift); the arm/rescue sizes against the
+    // configured window instead.
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
         text.match(/maximum context length of (\d[\d,]*)/i) ??
@@ -258,17 +256,6 @@ function parseOverflowWindow(text: string): number | undefined {
     return undefined;
 }
 
-/** #1812: vLLM states the rejected prompt's own size ("prompt (N tokens)") in
- *  its overflow error — the upstream tokenizer's exact count of the payload
- *  just rejected. Returns undefined when absent (other dialects don't state
- *  it; no >=1000 filter here, a small prompt count is still a valid floor). */
-function parseStatedPromptTokens(text: string): number | undefined {
-    const m = text.match(/prompt\s*\((\d[\d,]*)\s*tokens?\)/i);
-    if (!m) return undefined;
-    const n = parseInt(m[1].replace(/,/g, ""), 10);
-    return Number.isFinite(n) && n > 0 ? n : undefined;
-}
-
 /** Inspect an upstream response for a context-overflow error. `status` is the
  *  HTTP status; `bodyText` is the (usually small) error body. Only 400/413 with
  *  a recognized context-too-long marker counts. */
@@ -278,7 +265,7 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
     if (!isOverflow) return { isOverflow: false, message };
-    return { isOverflow: true, window: parseOverflowWindow(bodyText), promptTokens: parseStatedPromptTokens(bodyText), message };
+    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the

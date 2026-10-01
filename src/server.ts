@@ -127,7 +127,7 @@ import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDum
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, type OutputRefoldCeiling } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -1085,6 +1085,10 @@ const headroomFallbackLogged = new Set<string>();
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
+// #1812: one-shot guidance guard — models already warned that their overflow
+// fired while the window was an unconfigured guess (source=default).
+const overflowGuessWarned = new Set<string>();
+
 async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1734,7 +1738,7 @@ async function handle(
                     // sized against a guessed denominator. Say so once per model
                     // instead of degrading silently into registry-peek.
                     if (runtimeAgent !== undefined && pluginWindow === undefined && runtimeWindow === undefined) {
-                        log("warn", `[window] model=${model} agent=${runtimeAgent} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource}`);
+                        log("warn", `[window] model=${model} agent=${runtimeAgent} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource}. Declare the real window so rescue/fold bands match the deployment: set the model's contextWindow in the client's own model catalog (e.g. dsh settings.yaml models[].contextWindow), or providers.<url>.models.<model>.context in billion-context config.json (docs: CONFIGURATION.md → Providers → models)`);
                     }
                 }
             }
@@ -2613,13 +2617,14 @@ async function handle(
             const runPreparedPipeline = async (
                 respondFailFast: boolean,
                 overflowWindow?: number,
-                statedPromptTokens?: number,
+                refoldClamp?: boolean,
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                // #1812: during an overflow refold the REBUILD's output clamp must
-                // target the window the upstream stated (not the declared one) and
-                // measure input fresh — armOverflowShrink already set
-                // lastInputTokens to exactly that stated window.
-                const overflowCeiling: OutputRefoldCeiling | undefined = overflowWindow !== undefined ? { ceiling: overflowWindow, statedPromptTokens } : undefined;
+                // #1812: during an overflow refold the REBUILD's output clamp
+                // must measure input fresh (armOverflowShrink may have set
+                // lastInputTokens to a window-sized baseline) while keeping the
+                // configured window as the ceiling — numbers stated in the
+                // upstream error text are not trusted window sources.
+                const refold: boolean | undefined = refoldClamp === true ? true : undefined;
                 const runPrepare = async (): Promise<Prepared> => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     // #1279: stamp this request's effective cache-economics price
@@ -2657,19 +2662,19 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, overflowCeiling);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, overflowWindow ?? nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, refold);
                     }
                     return protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, overflowCeiling)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, overflowWindow ?? nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, refold)
                           : responsesCompact
                             // #618 review nit: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                             // the re-serialized post-strip work instead so dropped images don't
                             // ride along. Unchanged bodies keep the original buffer byte-identical.
                             ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, overflowCeiling);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, overflowWindow ?? nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, refold);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2804,13 +2809,14 @@ async function handle(
                 // sees a context overflow it calls this hook: re-run prepare+
                 // preflight under the lock with the window the upstream STATED
                 // (per-call limit override — nothing is learned, #987 keeps
-                // governing), folding the payload below the REAL window and
-                // re-sending it within this same request. An unchanged body
+                // governing; dialects without a stated window fold against the
+                // configured window), folding the payload below the REAL window
+                // and re-sending it within this same request. An unchanged body
                 // (nothing foldable) returns null and forward() passes the
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (info: ContextOverflowInfo): Promise<string | Buffer | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline(false, info.window, info.promptTokens));
+                          const next = await withSessionLock(session, () => runPreparedPipeline(false, info.window, true));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
@@ -3516,7 +3522,7 @@ async function prepareOpenai(
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     billingUpstream?: string,
-    overflowCeiling?: OutputRefoldCeiling,
+    refoldClamp?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -3712,7 +3718,7 @@ async function prepareOpenai(
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)), refold: overflowCeiling }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)), refold: refoldClamp === true }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -3791,7 +3797,7 @@ async function prepareGoogle(
     stream: boolean,
     visibilityMarkers: boolean,
     upstreamOrigin: string,
-    overflowCeiling?: OutputRefoldCeiling,
+    refoldClamp?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
@@ -3921,7 +3927,7 @@ async function prepareGoogle(
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("google", rebuilt), refold: overflowCeiling }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("google", rebuilt), refold: refoldClamp === true }, sessionId, log);
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
@@ -3991,7 +3997,7 @@ async function prepareResponses(
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     billingUpstream?: string,
-    overflowCeiling?: OutputRefoldCeiling,
+    refoldClamp?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -4290,7 +4296,7 @@ async function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)), refold: overflowCeiling }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)), refold: refoldClamp === true }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -5658,6 +5664,16 @@ async function forward(
             reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
         } catch {
             reqModel = undefined;
+        }
+        // #1812: the overflow proves the sizing window was wrong for THIS
+        // deployment. When that window was bili's unconfigured fallback
+        // (no client/plugin/config/registry source — source=default), say so
+        // once per model and point at the knobs: error-text extraction was
+        // deliberately removed as a window source (unstable, relay-dependent);
+        // the durable fix is declaring the real window.
+        if (s.metadata.lastWindowSource === "default" && (reqModel === undefined || !overflowGuessWarned.has(reqModel))) {
+            if (reqModel !== undefined) overflowGuessWarned.add(reqModel);
+            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) while the model's window is bili's unconfigured fallback (no client/plugin/config/registry source) — folding/rescue are sized against a guess. Declare the real window: providers.<url>.models.<model>.context in billion-context config.json, or the model's contextWindow in the client's own catalog (docs: CONFIGURATION.md → Providers → models)`);
         }
         if (info.window) {
             // Arm the emergency shrink at EXACTLY the stated window: the

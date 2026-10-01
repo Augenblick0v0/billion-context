@@ -198,40 +198,33 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     return nudge.contextUsage >= escalationPct;
 }
 
-/** #1812: the overflow-refold rebuild's clamp ceiling. `ceiling` is the window
- *  the upstream STATED in its overflow error (never larger than the declared
- *  window at the call sites). The rebuild must measure input fresh — the arm
- *  that preceded it set lastInputTokens to exactly this stated window
- *  (#987), and feeding that baseline through max() would leave ~zero cap.
- *  `statedPromptTokens` is the upstream tokenizer's exact count of the just-
- *  rejected payload: a floor under the heuristic so CJK-heavy prompts (where
- *  chars/4 under-counts) cannot make the cap too generous. */
-export interface OutputRefoldCeiling {
-    ceiling: number;
-    statedPromptTokens?: number;
-}
+/** #1812: the overflow-refold rebuild's clamp must measure input FRESH.
+ *  The arm that preceded it may have set lastInputTokens to a
+ *  window-sized baseline (#987); feeding that baseline through the max()
+ *  below would leave a ~zero output cap. The window itself stays the
+ *  declared/configured one — numbers stated in upstream error text are not
+ *  trusted as window sources (#1812 review). */
 
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: OutputBudgetField,
-    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number; refold?: OutputRefoldCeiling },
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number; refold?: boolean },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
     let inputEstimate: number;
-    let window: number;
     if (ctx.refold) {
-        // #488: images are invisible to the text model — same term as below.
-        inputEstimate = Math.max(estimateFreshInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools), ctx.refold.statedPromptTokens ?? 0) + ctx.imageTokens;
-        window = Math.min(ctx.nativeWindow, ctx.refold.ceiling);
+        // #1812 refold rebuild: measure fresh (see above). #488: images are
+        // invisible to the text model — same term as below.
+        inputEstimate = estimateFreshInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools) + ctx.imageTokens;
     } else {
         // #488: images ride along in the rebuilt body but are invisible to the text model —
         // without them the cap is too generous and input+output can still overflow.
         inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource) + ctx.imageTokens;
-        window = ctx.nativeWindow;
     }
+    const window = ctx.nativeWindow;
     const capped = clampOutputBudget(raw, inputEstimate, window);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
