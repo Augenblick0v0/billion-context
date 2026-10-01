@@ -312,6 +312,35 @@ non-interactive — it either serves the token or fails, so if `git push`
 worked, the token extraction works. Never print the token; keep it in the
 variable only. Merging the PR stays human-only (see above).
 
+### External Contributors' PRs — Review, Don't Take Over
+
+For PRs authored by external (non-maintainer) contributors, the Agent's job
+is **review + verification only**. Never push to their branch, never
+rebase-and-replace their PR with an Agent-owned PR, and never suggest
+closing it — if any of that seems needed, explain the situation and let the
+owner decide. A first-time contributor's authorship and PR credit are part
+of the deliverable. (Lesson: #1765, 2026-10-01 — the Agent opened a
+replacement PR for a still-mergeable first contribution and had to walk it
+back.)
+
+Two mechanics to check before assuming a contributor's PR is broken:
+
+- **A deleted head branch does NOT kill an open PR.** GitHub freezes the PR
+  head at `refs/pull/N/head`; recreating the branch does not re-attach it,
+  but the frozen head can still be `MERGEABLE` with green checks. Check
+  `mergeable`/`mergeStateStatus` first.
+- **`BEHIND` is not a blocker.** The PR does not need to contain the latest
+  master; the merge button (or an owner's merge commit) handles it.
+
+### Supplements After a Merge — Follow-up PR, Never the Merged PR
+
+When something is missing or wrong AFTER a PR was merged, the supplement
+goes into a **small follow-up PR whose body references the original PR
+number** — never pushed into, rebased onto, or appended to the merged PR.
+Keep the original contribution history intact (its commits, its diff, its
+author). Verify first that a supplement is actually needed: a review that
+replays the same commit on newer master is verification, not content.
+
 ### Issue Work — Required Deliverables
 
 When an Agent picks up an issue, these deliverables are MANDATORY:
