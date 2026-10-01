@@ -100,7 +100,7 @@ import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
-import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
+import { stripAcpEchoTags, stripAcpEchoTagsGoogle, stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -3300,6 +3300,10 @@ async function prepareAnthropic(
     if (strippedCarriers > 0) {
         log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
     }
+    const strippedEchoTags = stripAcpEchoTags(parsed.messages);
+    if (strippedEchoTags > 0) {
+        log("info", `[${sessionId}] sanitized ${strippedEchoTags} assistant message(s) carrying render-tag echoes in incoming history (self-reinforcing echo loop, issue #1823)`);
+    }
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
@@ -3548,6 +3552,10 @@ async function prepareOpenai(
     const strippedCarriers = stripEmbeddedChainCarriers(parsed, "openai");
     if (strippedCarriers > 0) {
         log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
+    const strippedEchoTags = stripAcpEchoTags(parsed.messages);
+    if (strippedEchoTags > 0) {
+        log("info", `[${sessionId}] sanitized ${strippedEchoTags} assistant message(s) carrying render-tag echoes in incoming history (self-reinforcing echo loop, issue #1823)`);
     }
 
     try {
@@ -3810,6 +3818,10 @@ async function prepareGoogle(
     if (strippedCarriers > 0) {
         log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
     }
+    const strippedEchoTags = stripAcpEchoTagsGoogle(parsed.contents);
+    if (strippedEchoTags > 0) {
+        log("info", `[${sessionId}] sanitized ${strippedEchoTags} assistant message(s) carrying render-tag echoes in incoming history (self-reinforcing echo loop, issue #1823)`);
+    }
 
     try {
         const { msgs, systemText } = googleToCore(parsed);
@@ -4048,6 +4060,10 @@ async function prepareResponses(
     const strippedCarriers = stripEmbeddedChainCarriers(parsed, "responses");
     if (strippedCarriers > 0) {
         log("info", `[${sessionId}] stripped ${strippedCarriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
+    const strippedEchoTags = stripAcpEchoTags(parsed.input);
+    if (strippedEchoTags > 0) {
+        log("info", `[${sessionId}] sanitized ${strippedEchoTags} assistant message(s) carrying render-tag echoes in incoming history (self-reinforcing echo loop, issue #1823)`);
     }
 
     const shouldInject = opts.compress.injectTool;
@@ -4421,6 +4437,10 @@ function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    const strippedEchoTags = Array.isArray(parsed.input) ? stripAcpEchoTags(parsed.input) : 0;
+    if (strippedEchoTags > 0) {
+        log("info", `[${session.id}] sanitized ${strippedEchoTags} assistant message(s) carrying render-tag echoes in incoming compact history (self-reinforcing echo loop, issue #1823)`);
+    }
     // A bili-forged compaction item is never for the upstream (it carries our
     // sentinel blob) — strip it on every forwarding path, same as the normal
     // /responses pipeline does.

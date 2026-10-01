@@ -21,7 +21,7 @@
 //    renderer output the way we can for the two panels above.
 //  - wrapRuleReport (#1251, /acp-rule): same marker scheme around the
 //    executeRule output (a numbered list or a one-line add/list result).
-import { MARKER_LINE, stripMarkerLines } from "./loop/tag-echo-filter.js";
+import { MARKER_LINE, containsRenderTagText, stripAcpTags, stripMarkerLines } from "./loop/tag-echo-filter.js";
 
 const PANEL_BOX_TOP = "\u256d";
 const PANEL_BOX_TITLE = "ACP Context Analysis";
@@ -152,6 +152,94 @@ function countMarkerLines(text: string): number {
     let n = 0;
     for (const _ of text.matchAll(MARKER_LINE)) n++;
     return n;
+}
+
+// #1823: render-tag echoes in incoming ASSISTANT history. Every proxied wire
+// exit strips model-emitted render tags on the way out (egress tag-echo
+// filter), but two lanes bypass the pipeline entirely: takeover-gate refusals
+// send the request DIRECT (unrouted model URL) or stamp BILI_PASSTHROUGH_HEADER
+// (routed /bili/ URL), and the server relays those verbatim with no processing
+// (#1117). An echo that slips through either lane lands in the client's
+// history and is replayed on EVERY later turn — proxied or direct — so the
+// model keeps imitating it (self-reinforcing loop: #1823's A/B test shows
+// polluted history sustains echoes even after the prompt sample is removed).
+// Stripping echoed render tags from incoming assistant prose BEFORE projection
+// breaks the loop on the next proxied turn regardless of which lane produced
+// the contamination, and keeps the echoes out of the kernel archive (never
+// ingested, so never re-injected as tagged blocks).
+//
+// Scope mirrors the egress filter's invariant (#1039): assistant-role prose
+// ONLY. User messages carry user intent (a user may legitimately paste
+// tag-shaped text — including when reporting this very bug); tool-call
+// arguments are byte-exact and never touched; non-prose parts (tool_use,
+// images, structured reasoning_details) have no text field and are skipped.
+// Messages are NEVER deleted — a tag-only assistant message may still carry
+// tool_calls whose tool results must not be orphaned; such text degrades to a
+// single space (same contract as stripAcpStatusMarkers above).
+function sanitizeProse(text: string): string | null {
+    if (!containsRenderTagText(text)) return null;
+    const out = stripAcpTags(text);
+    return out === text ? null : (out.trim().length > 0 ? out : " ");
+}
+
+// Strip render-tag echoes from assistant prose in an openai/anthropic messages
+// array or a Responses input array (in place); returns the number of affected
+// assistant message(s). Covers content (string or parts array: text + thinking
+// fields) plus the openai reasoning_content/reasoning string siblings.
+export function stripAcpEchoTags(messages: unknown): number {
+    if (!Array.isArray(messages)) return 0;
+    let stripped = 0;
+    for (const rec of messages) {
+        if (rec === null || typeof rec !== "object") continue;
+        const m = rec as Record<string, unknown>;
+        if (m.role !== "assistant") continue;
+        let hit = false;
+        const content = m.content;
+        if (typeof content === "string") {
+            const out = sanitizeProse(content);
+            if (out !== null) { m.content = out; hit = true; }
+        } else if (Array.isArray(content)) {
+            for (const part of content) {
+                if (part === null || typeof part !== "object") continue;
+                const p = part as Record<string, unknown>;
+                for (const key of ["text", "thinking"]) {
+                    if (typeof p[key] !== "string") continue;
+                    const out = sanitizeProse(p[key] as string);
+                    if (out !== null) { p[key] = out; hit = true; }
+                }
+            }
+        }
+        for (const key of ["reasoning_content", "reasoning"]) {
+            if (typeof m[key] !== "string") continue;
+            const out = sanitizeProse(m[key] as string);
+            if (out !== null) { m[key] = out; hit = true; }
+        }
+        if (hit) stripped++;
+    }
+    return stripped;
+}
+
+// Google wire form: contents[].parts[] with role "model" (not "assistant").
+export function stripAcpEchoTagsGoogle(contents: unknown): number {
+    if (!Array.isArray(contents)) return 0;
+    let stripped = 0;
+    for (const rec of contents) {
+        if (rec === null || typeof rec !== "object") continue;
+        const c = rec as Record<string, unknown>;
+        if (c.role !== "model") continue;
+        const parts = c.parts;
+        if (!Array.isArray(parts)) continue;
+        let hit = false;
+        for (const part of parts) {
+            if (part === null || typeof part !== "object") continue;
+            const p = part as Record<string, unknown>;
+            if (typeof p.text !== "string") continue;
+            const out = sanitizeProse(p.text);
+            if (out !== null) { p.text = out; hit = true; }
+        }
+        if (hit) stripped++;
+    }
+    return stripped;
 }
 
 // Strip ACP panel user messages from a Responses input array (in place);
