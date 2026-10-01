@@ -36,7 +36,6 @@ import { startRegistry } from "./registry-fixture.js";
 import { rmrf } from "../tmp-rm.ts";
 
 const run = process.env.ACP_TEST_CANARY === "1";
-const skipReason = !run ? "set ACP_TEST_CANARY=1 (release canary; hermetic loopback)" : undefined;
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const DIST_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
@@ -45,6 +44,16 @@ const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "ut
 const NEW_VERSION = PKG.version; // the just-published number
 const OLD_VERSION = patchMinus(NEW_VERSION); // the machine that is behind
 const STALE_VERSION = patchMinus(OLD_VERSION); // a dsh profile copy left far behind (#1803)
+
+// Stable-only by design (#1811): prerelease / dev tags have no meaningful
+// N-1/N-2 to synthesize, so the lane skips (loudly) instead of going red.
+// Patch must be ≥ 2 because the scenario synthesizes both N-1 and N-2.
+const stableVersion = /^\d+\.\d+\.\d+$/.test(PKG.version) && Number(PKG.version.split(".")[2]) >= 2;
+const skipReason = !run
+    ? "set ACP_TEST_CANARY=1 (release canary; hermetic loopback)"
+    : !stableVersion
+      ? `release canary needs a stable version with patch ≥ 2 (got ${PKG.version}); prerelease/dev tags skip`
+      : undefined;
 
 function patchMinus(v: string): string {
     const m = v.match(/^(\d+)\.(\d+)\.(\d+)$/);
@@ -278,7 +287,7 @@ async function toolPost(port: number, body: Record<string, unknown>): Promise<{ 
     return { status: res.status, json: await res.json().catch(() => null) };
 }
 
-test("release canary: no-op self-update keeps every channel healthy (#1811)", { skip: skipReason }, async (t) => {
+test("release canary: no-op self-update keeps every channel healthy (#1811)", { skip: skipReason }, async () => {
     assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
     const workRoot = path.join(process.cwd(), "tmp");
     fs.mkdirSync(workRoot, { recursive: true });
@@ -287,92 +296,105 @@ test("release canary: no-op self-update keeps every channel healthy (#1811)", { 
     const relayPort = await relay.port;
     const registry = await startRegistry(path.join(work, "registry"));
     let proxy: Proxy | undefined;
-    t.after(async () => {
+    let failed = false;
+    try {
+
+        // ── machine setup: global tree one version behind, a dsh profile two behind ──
+        const oldTgz = await makeFixtureTarball(work, OLD_VERSION);
+        const newTgz = await makeFixtureTarball(work, NEW_VERSION);
+        await registry.publish(oldTgz);
+        const installDir = await extractInstall(work, oldTgz);
+        assert.equal(await readPkgVersion(installDir), OLD_VERSION);
+
+        const envBase = isolatedEnv(work);
+        envBase.DSH_HOME = path.join(work, "dsh-home");
+        fs.mkdirSync(path.join(envBase.DSH_HOME, "profiles"), { recursive: true });
+        const dsh = fakeDshBin(work, envBase);
+        envBase.BILI_DSH_BIN = dsh.bin;
+        envBase.FAKE_DSH_LOG = dsh.logPath;
+        const webCopyDir = seedDshProfile(envBase, "web", STALE_VERSION);
+        envBase.BILI_UPDATE_REGISTRY = registry.url;
+        envBase.BILI_UPDATE_CHECK_INTERVAL_MS = "1000";
+
+        // ── phase 1: boot the behind-machine as a live proxy ──
+        const port = await freePort();
+        proxy = spawnProxy(installDir, port, envBase);
+        await waitFor(() => healthOk(port), 30_000, "proxy healthy after boot");
+
+        // ── phase 2: pre-update convergence (#1804) — the up-to-date branch alone
+        // pulls a dsh profile copy that is behind the GLOBAL version ──
+        await waitFor(async () => (await readPkgVersion(webCopyDir)) === OLD_VERSION, 40_000, `dsh profile web converged to ${OLD_VERSION} before any update`);
+        assert.ok(
+            dshLogLines(dsh.logPath).some((l) => l.includes(`plugin --profile web add billion-context@${OLD_VERSION}`)),
+            `fake dsh log must show the web converge spawn: ${JSON.stringify(dshLogLines(dsh.logPath))}`,
+        );
+
+        // ── phase 3: publish N — the LIVE proxy flips its own disk in place ──
+        await registry.publish(newTgz);
+        await waitFor(async () => (await readPkgVersion(installDir)) === NEW_VERSION, 60_000, `global tree flipped to ${NEW_VERSION} by the live proxy`);
+        await waitFor(
+            () => new RegExp(`installed ${escapeRe(OLD_VERSION)} → ${escapeRe(NEW_VERSION)}\\. Restart to finish\\.`).test(proxy!.output()),
+            30_000,
+            "proxy must log the in-place install",
+        );
+        // case-3 refresh pulls the profile along with the update
+        await waitFor(async () => (await readPkgVersion(webCopyDir)) === NEW_VERSION, 40_000, `dsh profile web refreshed to ${NEW_VERSION} by case-3`);
+        // the live proxy keeps serving on the old in-memory code across the flip
+        await modelTurn(port, relayPort, "canary-live", "turn during the flip window");
+
+        // ── phase 4: a profile that goes stale only AFTER the flip converges on a
+        // later up-to-date cycle, then the checker goes silent (in-step skip) ──
+        const headlessCopyDir = seedDshProfile(envBase, "headless", STALE_VERSION);
+        await waitFor(async () => (await readPkgVersion(headlessCopyDir)) === NEW_VERSION, 40_000, `dsh profile headless converged to ${NEW_VERSION} without any update event`);
+        const linesAfterConverge = dshLogLines(dsh.logPath).length;
+        await new Promise((r) => setTimeout(r, 3_500)); // ≥3 check cycles at 1s
+        assert.equal(dshLogLines(dsh.logPath).length, linesAfterConverge, "in-step profiles must never re-spawn dsh (silent convergence)");
+
+        // ── phase 5: restart from the updated tree — version N and the ACP smoke ──
+        await proxy.stop();
+        const versionRes = spawnSync(process.execPath, [path.join(installDir, "dist", "index.js"), "--version"], {
+            encoding: "utf8",
+            timeout: 30_000,
+            env: { PATH: process.env.PATH ?? "", ...envBase },
+        });
+        assert.match(`${versionRes.stdout}${versionRes.stderr}`, new RegExp(escapeRe(NEW_VERSION)), "restarted tree must report the new version");
+
+        proxy = spawnProxy(installDir, port, envBase);
+        await waitFor(() => healthOk(port), 30_000, "proxy healthy after restart on the updated tree");
+        const bigText = `canary fold material. ${"The quick brown fox jumps over the lazy dog while the proxy counts tokens. ".repeat(220)}`;
+        await modelTurn(port, relayPort, "canary-smoke", bigText);
+        const fold = await toolPost(port, { tool: "compress", conversationId: "canary-smoke", args: {} });
+        assert.equal(fold.status, 200, `plugin compress must answer 200: ${JSON.stringify(fold.json)}`);
+        assert.equal(fold.json?.ok, true, `plugin compress must succeed: ${JSON.stringify(fold.json)}`);
+        assert.ok(typeof fold.json?.result === "string" && fold.json.result.length > 0, "fold must return a summary");
+        await modelTurn(port, relayPort, "canary-smoke", "post-fold turn");
+
+        // ── phase 6: post-update opencode plugin entry stays valid ──
+        const ocCfg = path.join(envBase.XDG_CONFIG_HOME!, "opencode", "opencode.jsonc");
+        fs.mkdirSync(path.dirname(ocCfg), { recursive: true });
+        fs.writeFileSync(ocCfg, `${JSON.stringify({ plugins: ["billion-context"], compaction: { auto: false } }, null, 2)}\n`);
+        const pluginRes = spawnSync(process.execPath, [path.join(installDir, "dist", "index.js"), "plugin", "install", "opencode"], {
+            encoding: "utf8",
+            timeout: 120_000,
+            env: { PATH: process.env.PATH ?? "", ...envBase, BILI_CLIENT_BIN: fakeOpencodeBin(work) },
+        });
+        assert.equal(pluginRes.status, 0, `post-update plugin install failed:\n${pluginRes.stdout}${pluginRes.stderr}`);
+        assert.ok(fs.readFileSync(ocCfg, "utf8").includes("billion-context"), "opencode entry must survive the update");
+    } catch (err) {
+        failed = true;
+        throw err;
+    } finally {
         await proxy?.stop();
-        await new Promise<void>((resolve, reject) => relay.server.close((e) => (e ? reject(e) : resolve())));
-        await registry.stop();
-        rmrf(work);
-    });
-
-    // ── machine setup: global tree one version behind, a dsh profile two behind ──
-    const oldTgz = await makeFixtureTarball(work, OLD_VERSION);
-    const newTgz = await makeFixtureTarball(work, NEW_VERSION);
-    await registry.publish(oldTgz);
-    const installDir = await extractInstall(work, oldTgz);
-    assert.equal(await readPkgVersion(installDir), OLD_VERSION);
-
-    const envBase = isolatedEnv(work);
-    envBase.DSH_HOME = path.join(work, "dsh-home");
-    fs.mkdirSync(path.join(envBase.DSH_HOME, "profiles"), { recursive: true });
-    const dsh = fakeDshBin(work, envBase);
-    envBase.BILI_DSH_BIN = dsh.bin;
-    envBase.FAKE_DSH_LOG = dsh.logPath;
-    const webCopyDir = seedDshProfile(envBase, "web", STALE_VERSION);
-    envBase.BILI_UPDATE_REGISTRY = registry.url;
-    envBase.BILI_UPDATE_CHECK_INTERVAL_MS = "1000";
-
-    // ── phase 1: boot the behind-machine as a live proxy ──
-    const port = await freePort();
-    proxy = spawnProxy(installDir, port, envBase);
-    await waitFor(() => healthOk(port), 30_000, "proxy healthy after boot");
-
-    // ── phase 2: pre-update convergence (#1804) — the up-to-date branch alone
-    // pulls a dsh profile copy that is behind the GLOBAL version ──
-    await waitFor(async () => (await readPkgVersion(webCopyDir)) === OLD_VERSION, 40_000, `dsh profile web converged to ${OLD_VERSION} before any update`);
-    assert.ok(
-        dshLogLines(dsh.logPath).some((l) => l.includes(`plugin --profile web add billion-context@${OLD_VERSION}`)),
-        `fake dsh log must show the web converge spawn: ${JSON.stringify(dshLogLines(dsh.logPath))}`,
-    );
-
-    // ── phase 3: publish N — the LIVE proxy flips its own disk in place ──
-    await registry.publish(newTgz);
-    await waitFor(async () => (await readPkgVersion(installDir)) === NEW_VERSION, 60_000, `global tree flipped to ${NEW_VERSION} by the live proxy`);
-    await waitFor(
-        () => new RegExp(`installed ${escapeRe(OLD_VERSION)} → ${escapeRe(NEW_VERSION)}\\. Restart to finish\\.`).test(proxy!.output()),
-        30_000,
-        "proxy must log the in-place install",
-    );
-    // case-3 refresh pulls the profile along with the update
-    await waitFor(async () => (await readPkgVersion(webCopyDir)) === NEW_VERSION, 40_000, `dsh profile web refreshed to ${NEW_VERSION} by case-3`);
-    // the live proxy keeps serving on the old in-memory code across the flip
-    await modelTurn(port, relayPort, "canary-live", "turn during the flip window");
-
-    // ── phase 4: a profile that goes stale only AFTER the flip converges on a
-    // later up-to-date cycle, then the checker goes silent (in-step skip) ──
-    const headlessCopyDir = seedDshProfile(envBase, "headless", STALE_VERSION);
-    await waitFor(async () => (await readPkgVersion(headlessCopyDir)) === NEW_VERSION, 40_000, `dsh profile headless converged to ${NEW_VERSION} without any update event`);
-    const linesAfterConverge = dshLogLines(dsh.logPath).length;
-    await new Promise((r) => setTimeout(r, 3_500)); // ≥3 check cycles at 1s
-    assert.equal(dshLogLines(dsh.logPath).length, linesAfterConverge, "in-step profiles must never re-spawn dsh (silent convergence)");
-
-    // ── phase 5: restart from the updated tree — version N and the ACP smoke ──
-    await proxy.stop();
-    const versionRes = spawnSync(process.execPath, [path.join(installDir, "dist", "index.js"), "--version"], {
-        encoding: "utf8",
-        timeout: 30_000,
-        env: { PATH: process.env.PATH ?? "", ...envBase },
-    });
-    assert.match(`${versionRes.stdout}${versionRes.stderr}`, new RegExp(escapeRe(NEW_VERSION)), "restarted tree must report the new version");
-
-    proxy = spawnProxy(installDir, port, envBase);
-    await waitFor(() => healthOk(port), 30_000, "proxy healthy after restart on the updated tree");
-    const bigText = `canary fold material. ${"The quick brown fox jumps over the lazy dog while the proxy counts tokens. ".repeat(220)}`;
-    await modelTurn(port, relayPort, "canary-smoke", bigText);
-    const fold = await toolPost(port, { tool: "compress", conversationId: "canary-smoke", args: {} });
-    assert.equal(fold.status, 200, `plugin compress must answer 200: ${JSON.stringify(fold.json)}`);
-    assert.equal(fold.json?.ok, true, `plugin compress must succeed: ${JSON.stringify(fold.json)}`);
-    assert.ok(typeof fold.json?.result === "string" && fold.json.result.length > 0, "fold must return a summary");
-    await modelTurn(port, relayPort, "canary-smoke", "post-fold turn");
-
-    // ── phase 6: post-update opencode plugin entry stays valid ──
-    const ocCfg = path.join(envBase.XDG_CONFIG_HOME!, "opencode", "opencode.jsonc");
-    fs.mkdirSync(path.dirname(ocCfg), { recursive: true });
-    fs.writeFileSync(ocCfg, `${JSON.stringify({ plugins: ["billion-context"], compaction: { auto: false } }, null, 2)}\n`);
-    const pluginRes = spawnSync(process.execPath, [path.join(installDir, "dist", "index.js"), "plugin", "install", "opencode"], {
-        encoding: "utf8",
-        timeout: 120_000,
-        env: { PATH: process.env.PATH ?? "", ...envBase, BILI_CLIENT_BIN: fakeOpencodeBin(work) },
-    });
-    assert.equal(pluginRes.status, 0, `post-update plugin install failed:\n${pluginRes.stdout}${pluginRes.stderr}`);
-    assert.ok(fs.readFileSync(ocCfg, "utf8").includes("billion-context"), "opencode entry must survive the update");
+        await new Promise<void>((resolve) => relay.server.close(() => resolve()));
+        await registry.stop().catch(() => {});
+        if (failed) {
+            // Keep the whole work dir (proxy output, verdaccio logs, fake-dsh
+            // call log, both packs, the global tree) for the workflow's
+            // failure artifacts — rmrf only on success.
+            fs.writeFileSync(path.join(work, "diagnostics.txt"), proxy?.output() ?? "(no proxy output)");
+            console.error(`[canary] failure — keeping work dir for artifacts: ${work}`);
+        } else {
+            rmrf(work);
+        }
+    }
 });
