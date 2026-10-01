@@ -749,12 +749,15 @@ export const WEB_CLIENT = `(function () {
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0);
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
+        // #1839: mark estimate-grade context numbers so a bounded local estimate
+        // is never read as a measured value (the ghost-denominator incident).
+        const ctxEstMark = d.contextTokensSource === "estimate" ? ' <span class="hint">' + t("common.ctx_est") + "</span>" : "";
         if (d.contextWindow && d.contextWindow > 0) {
             const pct = Math.min(100, Math.round((d.contextTokens / d.contextWindow) * 100));
             const cls = pct >= 90 ? "bar-fill danger" : pct >= 70 ? "bar-fill warn" : "bar-fill";
-            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(d.contextTokens) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)</span></div>");
+            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxEstMark + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(d.contextTokens) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)" + ctxEstMark + "</span></div>");
         } else {
-            parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ": " + fmtW(d.contextTokens || 0) + "</div>");
+            parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxEstMark + ": " + fmtW(d.contextTokens || 0) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
