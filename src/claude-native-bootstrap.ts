@@ -32,6 +32,7 @@ import path from "node:path";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
+import { ensureRootCA } from "./ca.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort } from "./instance.js";
 import { repinClaudeManagedBaseUrl } from "./plugin-install.js";
@@ -318,6 +319,18 @@ async function run(): Promise<void> {
         // host itself; when the walk cannot find it, chooseWatchdogParentPid
         // degrades via the wrapper's parent instead of the wrapper.
         const watchPid = chooseWatchdogParentPid();
+        // #1813: pay the one-time CA/bundle cost HERE — this is a short-lived
+        // hook process whose runtime budget is Claude Code's hook timeout, not
+        // the spawned child's 20s health window. After a successful prewarm
+        // the child always hits ca.ts's 24h freshness gate and starts fast
+        // (steady state: a sub-millisecond stat+read on every platform).
+        // Log-only: the hook must NEVER fail claude — if the prewarm fails,
+        // the child re-runs its own init exactly as before.
+        try {
+            ensureRootCA();
+        } catch (err) {
+            log(`CA prewarm failed (${err instanceof Error ? err.message : String(err)}) — continuing; the spawned proxy will initialize itself`);
+        }
         // #1660: an EXPLICIT pin stays exact + strict; otherwise pass port 0
         // so the launcher resolves the zone preference and settles the
         // actually-bound port sticky (a pre-resolved port > 0 would skip the
