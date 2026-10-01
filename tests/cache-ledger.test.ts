@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCacheReport, type CacheSample, type FoldEvent, type CompressionBlock } from "acp-kernel";
-import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample } from "../src/cache-ledger.ts";
+import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
 import type { Session } from "../src/session.ts";
 
 let seq = 0;
@@ -741,4 +741,16 @@ test("a large never-caused unattributed residual gets an explicit provider-side 
     assert.match(text, /CACHE INVALIDATION/);
     assert.match(text, /no observable cause|no cause observed/i);
     assert.match(text, /NOT a bili bug|not a bili bug/i);
+});
+
+test("post-switch cold-tail rounds stay attributed, not flagged as seam suspects (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    settleUsageReport(session, { total: 40000, reportedCached: 40000 });   // warm baseline
+    session.metadata.lastModel = "claude-opus";
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // the switch itself (flagged)
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // cold-tail continuation
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.seam.suspects, 0, "a cause-attributed cold-tail round is not a seam candidate");
+    assert.equal(r.invalidation.model, 80000, "both cold rounds stay charged to the switch");
 });

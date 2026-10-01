@@ -251,8 +251,9 @@ function detectSeam(session: Session, led: CacheLedger): void {
         line.abortedNear = 1;
         led.agg.abortCorrelated += 1;
     }
-    // Structural attributions already explain the miss — not a seam candidate.
-    if (line.sw === 1 || line.pw === 1 || line.uw === 1 || line.rs === 1 || line.foldSeq !== null) return;
+    // Structural attributions already explain the miss — not a seam candidate. `cause` additionally covers
+    // post-switch cold-tail continuations (they carry no sw/pw/uw flag); legacy lines lack it and keep old behavior.
+    if (line.sw === 1 || line.pw === 1 || line.uw === 1 || line.rs === 1 || line.cause !== undefined || line.foldSeq !== null) return;
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
