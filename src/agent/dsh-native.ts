@@ -156,7 +156,21 @@ function currentOrigin(): string | undefined {
 // Stale entries never leak across a model switch: refresh() keys off the
 // LIVE selection, and a changed selection re-resolves before overwriting.
 type ModelInfoCache = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
-const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean } = { refreshing: false };
+// #1812: retry cadence for window resolves that failed (or resolved without a
+// window). The pre-#1812 code cached {provider, model} on failure and the
+// early-return below then NEVER re-resolved — one boot-time race (catalog
+// still loading) silently stripped x-bili-plugin-context-window from every
+// request of the whole process lifetime, and the proxy sized the session
+// against its unconfigured fallback. A failed resolve now retries after this
+// cooldown instead of latching.
+const MODEL_INFO_RETRY_COOLDOWN_MS = 30_000;
+function modelInfoRetryCooldownMs(): number {
+    // BILI_MODEL_INFO_RETRY_MS: test hook to exercise the retry cadence without wall-clock waits.
+    const raw = process.env.BILI_MODEL_INFO_RETRY_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : MODEL_INFO_RETRY_COOLDOWN_MS;
+}
+const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean; retryAt?: number } = { refreshing: false };
 
 function selectionStillCurrent(svc: { agentDefaultModel?: PluginContext["agentDefaultModel"] }, provider: string, model: string): boolean {
     try {
@@ -179,13 +193,20 @@ function refreshModelInfo(origin: string | undefined): void {
     const provider = selection?.provider;
     const model = selection?.model;
     if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) return;
-    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) return;
+    // #1812: a matching cached entry is final only when it actually carries a
+    // window (or the service has no resolver at all). A failure-shaped cache
+    // ({provider, model}, no contextWindow) retries after the cooldown.
+    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) {
+        if (modelInfo.cached.contextWindow !== undefined) return;
+        if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
+    }
     const resolve = svc.llm?.resolveModelInfo;
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;
     }
     modelInfo.refreshing = true;
+    modelInfo.retryAt = Date.now() + modelInfoRetryCooldownMs();
     void Promise.resolve()
         .then(() => resolve(provider, model))
         .then((info) => {
@@ -200,6 +221,7 @@ function refreshModelInfo(origin: string | undefined): void {
                 contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
             };
+            if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
         })
         .catch(() => {
             if (!selectionStillCurrent(svc, provider, model)) return;
