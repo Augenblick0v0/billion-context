@@ -128,7 +128,7 @@ export function osStorePowerShellScript(): string {
 $out = New-Object System.Collections.Generic.List[string]
 foreach ($loc in 'LocalMachine','CurrentUser') {
     $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root',$loc)
-    try { $store.Open('ReadOnly'); foreach ($c in $store.Certificates) { $out.Add([Convert]::ToBase64String($c.Export('Cert'))) } } finally { $store.Close() }
+    try { $store.Open('ReadOnly'); foreach ($c in $store.Certificates) { $out.Add([Convert]::ToBase64String($c.Export('Cert'))) } } catch { } finally { $store.Close() }
 }
 $out | ForEach-Object { '{"d":"' + $_ + '"}' }`;
 }
@@ -161,11 +161,17 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
             const keychains = ["/Library/Keychains/System.keychain"];
             const login = path.join(os.homedir(), "Library/Keychains/login.keychain-db");
             if (fs.existsSync(login)) keychains.push(login);
+            let failures = 0;
             for (const k of keychains) {
-                const out = execFileSync("/usr/bin/security", ["find-certificate", "-a", "-p", k],
-                    { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
-                pems.push(...splitPemBlocks(out));
+                // One keychain failing (e.g. a locked login keychain) must not
+                // drop the certificates already collected from the others.
+                try {
+                    const out = execFileSync("/usr/bin/security", ["find-certificate", "-a", "-p", k],
+                        { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
+                    pems.push(...splitPemBlocks(out));
+                } catch { failures++; }
             }
+            if (failures === keychains.length) throw new Error(`all ${keychains.length} keychain exports failed`);
             return pems;
         }
         return [];
