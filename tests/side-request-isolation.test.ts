@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard } from "../src/server.ts";
+import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -142,6 +143,77 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     const side = { max_tokens: 100 } as { max_tokens: number };
     restoreOutputBudget(side, s3, noopLog, 32768);
     assert.equal(side.max_tokens, 100, "side request untouched even with a floor available");
+});
+
+test("restoreOutputBudget: warns once per model when no output ceiling backs the restore (#1840)", () => {
+    _resetNoOutputCeilingWarningsForTest();
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ name: "t" }];
+    const A = "stepfun/step-5-preview";
+    // Poisoned water mark seeded by a decaying client; NO ceiling from any source.
+    const s = metaSession("nocap");
+    restoreOutputBudget({ max_tokens: 583, model: A }, s, log);
+    assert.equal(lines.length, 0, "healthy-value learning is silent");
+    const starved = { max_tokens: 1, tools, model: A } as { max_tokens: number };
+    restoreOutputBudget(starved, s, log);
+    assert.equal(starved.max_tokens, 583, "without a ceiling the (poisoned) water mark still wins");
+    let warns = lines.filter((l) => l.includes("NO known output ceiling"));
+    assert.equal(warns.length, 1, "warns once for the ceiling-less restore");
+    assert.match(warns[0] ?? "", /model=stepfun\/step-5-preview/, "names the model");
+    assert.match(warns[0] ?? "", /restored 1 -> 583/, "states what was actually restored");
+    assert.match(warns[0] ?? "", /providers\.<url>\.models/, "points at the config escape hatch");
+    // Same model again → deduped (no second warn).
+    restoreOutputBudget({ max_tokens: 1, tools, model: A }, s, log);
+    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 1, "deduped per model");
+    // A different ceiling-less model warns once on its own.
+    restoreOutputBudget({ max_tokens: 1, tools, model: "other/model" }, metaSession("other"), log);
+    warns = lines.filter((l) => l.includes("NO known output ceiling"));
+    assert.equal(warns.length, 2, "per-model, not global");
+    assert.match(warns[1] ?? "", /forwarded verbatim/, "born-starved (no water yet) says so");
+    assert.equal((metaSession("other").metadata as Record<string, unknown>).outputBudgetHighWater, undefined);
+    // With a usable ceiling → no warn at all (the floor note rides on the info line).
+    _resetNoOutputCeilingWarningsForTest();
+    lines.length = 0;
+    const s2 = metaSession("capped");
+    restoreOutputBudget({ max_tokens: 583, model: "capped/model" }, s2, log);
+    const capped = { max_tokens: 1, tools, model: "capped/model" } as { max_tokens: number };
+    restoreOutputBudget(capped, s2, log, 32768);
+    assert.equal(capped.max_tokens, 32768, "ceiling lifts the death rattle");
+    assert.equal(lines.filter((l) => l.includes("NO known output ceiling")).length, 0, "a usable ceiling suppresses the warn");
+    assert.ok(lines.some((l) => l.includes("high-water 583 below known output ceiling — floored (#1665/#1840)")), "floored info note present");
+});
+
+test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
+    _resetPluginStateForTest();
+    setRegistryForTest({ "stepfun/step-5-preview": { limit: { context: 1_000_000, output: 1_000_000 } } });
+    try {
+        const routes = { "https://api.stepfun.com": { models: { "stepfun/step-5-preview": { output: 4096 } } } };
+        const url = "https://api.stepfun.com/step_plan/v1/chat/completions";
+        const parsed = { model: "stepfun/step-5-preview" };
+        // Registry alone (no headers, no routes): last-resort source. The host is
+        // not a known models.dev provider, so the cross-provider suffix scan finds it.
+        assert.equal(resolveKnownOutputCeiling({}, parsed, {}, url), 1_000_000, "registry ceiling is the last resort");
+        // Operator-declared outranks the registry data (#924 rank).
+        assert.equal(resolveKnownOutputCeiling({}, parsed, routes, url), 4096, "declared output outranks registry data");
+        // Agent-scoped runtime-info outranks the declaration (#955 rank): what the
+        // client is configured to ask beats operator guesswork.
+        recordPluginRuntimeInfo({ agent: "dsh", model: "stepfun/step-5-preview", maxOutput: 256_000, source: "client-config", ts: Date.now() });
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin": "dsh" }, parsed, routes, url), 256_000, "runtime-info table outranks declared");
+        // Per-request header outranks the table (same gate as the window chain).
+        recordPluginRuntimeInfo({ agent: "dsh", model: "stepfun/step-5-preview", maxOutput: 8_000, source: "client-config", ts: Date.now() });
+        const hdrs = { "x-bili-plugin": "dsh", "x-bili-plugin-model": "step-5-preview", "x-bili-plugin-max-output": "131072" };
+        assert.equal(resolveKnownOutputCeiling(hdrs, parsed, routes, url), 131_072, "per-request header outranks the runtime table");
+        // Stale entry: a report for one model never sizes another.
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin": "dsh" }, { model: "other/model" }, routes, url), undefined, "stale entry never sizes another model");
+        // Unannounced max-output header (no x-bili-plugin) is inert by design.
+        assert.equal(resolveKnownOutputCeiling({ "x-bili-plugin-max-output": "999999" }, parsed, routes, url), 4096, "unannounced header ignored, falls through to declared");
+        // No model on the body → nothing to resolve.
+        assert.equal(resolveKnownOutputCeiling({}, {}, routes, url), undefined);
+    } finally {
+        setRegistryForTest({});
+        _resetPluginStateForTest();
+    }
 });
 
 const MODEL = "claude-sonnet-4-5";
@@ -518,6 +590,50 @@ test("e2e: starved main request with a poisoned high-water is floored by the con
         await r2.text();
         assert.equal(rig.lastBody && rig.lastBody.max_tokens, 4096, "configured output limit floors the poisoned restore (#1665)");
     } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: poisoned high-water is floored by the known output ceiling when no route output is declared (#1840)", async () => {
+    // NO routeModels: nothing operator-declared on this route — exactly the
+    // stepfun scenario where the bili config stayed empty and only the registry
+    // (or the client itself) knows the model's output ceiling.
+    const rig = await startRig();
+    try {
+        setRegistryForTest({ [MODEL]: { limit: { output: 8192 } } });
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+        const tools = [{ name: "compress", description: "compress", input_schema: { type: "object", properties: {} } }];
+
+        // First request bili sees is already mid-death-spiral (budget decayed to
+        // 234) — seeds the poisoned water mark exactly like #1665.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 234, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.equal(getSession(SESSION).metadata.outputBudgetHighWater, 234, "poisoned water mark seeded");
+
+        // Fully starved, nothing declared anywhere but the registry knows the
+        // ceiling → the registry floor must lift the restore out of the rattle.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(9) }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 8192, "registry ceiling floors the poisoned restore when nothing is declared (#1840)");
+
+        // Born-starved session (fresh id, first request already <=200): the floor
+        // applies even though no high-water was ever learned.
+        const r3 = await fetch(url, { method: "POST", headers: { ...headers, "x-acp-session": SESSION + "-born" }, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(8) }) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 8192, "never-seeded session restored to the known ceiling (#1840)");
+
+        // Per-request runtime-info header (what dsh stamps from its own profile)
+        // outranks the registry listing — the client's configured budget wins.
+        const r4 = await fetch(url, { method: "POST", headers: { ...headers, "x-bili-plugin": "dsh", "x-bili-plugin-model": MODEL, "x-bili-plugin-max-output": "16384" }, body: JSON.stringify({ model: MODEL, max_tokens: 1, stream: true, tools, messages: mainConversation(10) }) });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(rig.lastBody && rig.lastBody.max_tokens, 16384, "client-reported max output outranks the registry listing (#1840)");
+    } finally {
+        setRegistryForTest({});
         await closeRig(rig);
     }
 });

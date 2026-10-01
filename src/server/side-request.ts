@@ -70,18 +70,50 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
     parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: value };
 }
 
+// #1840: one-shot "restore has no ceiling" warnings, keyed by MODEL (the fact
+// is model-scoped — any session hitting the same ceiling-less model repeats
+// the same silent degradation). Capped like warnedNoModelRequests: an unbounded
+// set would grow one entry per dead model id on long-running daemons.
+const warnedNoOutputCeiling = new Set<string>();
+const WARNED_NO_OUTPUT_CEILING_CAP = 4096;
+function noteNoOutputCeilingWarning(model: string): boolean {
+    if (warnedNoOutputCeiling.has(model)) return false;
+    if (warnedNoOutputCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedNoOutputCeiling.clear();
+    warnedNoOutputCeiling.add(model);
+    return true;
+}
+export function _resetNoOutputCeilingWarningsForTest(): void {
+    warnedNoOutputCeiling.clear();
+}
+
 /** #546: clients that derive the output budget from their RAW (uncompressed)
  *  history drive it down to <=200 tokens on long sessions, then truncate every
  *  reply mid-thought — the model cannot even emit a compress tool call, so the
  *  loop can never rescue the session. The proxy's compressed view still fits
  *  the window, so remember the healthy budget per session (last non-starved
  *  value wins) and restore it on tool-carrying main requests whose budget has
- *  starved. Mutates `parsed` in place BEFORE prepare() serializes it. */
+ *  starved. Mutates `parsed` in place BEFORE prepare() serializes it.
+ *  #1665/#1840: the remembered water mark can itself be pathologically low — a
+ *  client that sizes its budget from RAW history decays through small positive
+ *  values (…, 680, 234) before starving at <=200, so "last non-starved wins"
+ *  ends holding a death rattle; a session first opened into bili with an
+ *  already-oversized history never seeds anything at all. Floor the restore
+ *  target at the best-known OUTPUT ceiling for the model (`outputCeiling`,
+ *  resolved by the caller through the same source chain as the output-headroom
+ *  fallback — #1840 widened the #1665 operator-declared-only floor to
+ *  runtime-info / launcher / registry sources) so a broken client cannot pin
+ *  the session at a few hundred tokens forever. The #453 clamp downstream
+ *  still bounds the result by real window headroom. A ceiling at/below the
+ *  side-request threshold is not usable; a healthy water mark above the
+ *  ceiling keeps winning (it is a capability floor, not an instruction cap).
+ *  When NO source knows a ceiling, warn once per model: the restore is backed
+ *  only by the client's own last non-starved value, which is exactly the
+ *  silent-degradation path this issue reports. */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
-    configuredOutputLimit?: number,
+    outputCeiling?: number,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -95,24 +127,19 @@ export function restoreOutputBudget(
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
-    // #1665: the remembered water mark can itself be pathologically low — a
-    // client that sizes its budget from RAW history decays through small
-    // positive values (…, 680, 234) before starving at <=200, so "last
-    // non-starved wins" ends holding a death rattle; a session first opened
-    // into bili with an already-oversized history never seeds anything at all.
-    // Floor the restore target at the operator-declared model output limit
-    // (ModelEntry.output, #924 surface) so a broken client cannot pin the
-    // session at a few hundred tokens forever. The #453 clamp downstream
-    // still bounds the result by real window headroom.
     let target = highWater;
-    const floor = typeof configuredOutputLimit === "number" && configuredOutputLimit > SIDE_REQUEST_MAX_TOKENS ? configuredOutputLimit : undefined;
-    if (floor !== undefined && (target === undefined || floor > target)) target = floor;
+    const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
+    if (ceiling !== undefined && (target === undefined || ceiling > target)) target = ceiling;
+    const modelName = typeof p.model === "string" && p.model.length > 0 ? p.model : "?";
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
-        const note = target === floor && floor !== undefined
-            ? (highWater === undefined ? "; no healthy high-water yet — using configured output limit (#1665)" : `; high-water ${highWater} below configured output limit — floored (#1665)`)
+        const note = target === ceiling && ceiling !== undefined
+            ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
             : "";
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
+    }
+    if (ceiling === undefined && noteNoOutputCeilingWarning(modelName)) {
+        log("warn", `[${session.id}] output-budget restore has NO known output ceiling for model=${modelName}${typeof target === "number" ? ` (restored ${value} -> ${target})` : ` (starved budget ${value} forwarded verbatim)`} — the target is the client's own last non-starved budget; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${modelName}".output) or have the client report it to floor the restore (#1840)`);
     }
 }
 

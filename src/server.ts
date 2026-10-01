@@ -1080,6 +1080,38 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
 // no budget → configured/registry max output) — same pattern as windowSourceLogged.
 const headroomFallbackLogged = new Set<string>();
 
+// #1840: best-known OUTPUT ceiling for the request's model, resolved through
+// the SAME source chain (and rank order) the output-headroom fallback uses
+// (#955 runtime-info > #971 launcher channel > #924 operator-declared route
+// value > #853 models.dev registry, cache-only with bundled-snapshot floor).
+// Consumed as the #546/#1665 restore floor in restoreOutputBudget: a poisoned
+// or missing high-water must not pin the session to a death-rattle budget when
+// ANY source knows the model can do more. One resolution for "this model's
+// output ceiling" keeps the reservation and the restore from ever disagreeing.
+export function resolveKnownOutputCeiling(
+    headers: Record<string, string | string[] | undefined>,
+    parsed: Record<string, unknown>,
+    routes: ProxyOptions["routes"],
+    upstreamUrl: string | undefined,
+    sessionHeaderName?: string,
+): number | undefined {
+    const model = typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
+    if (!model) return undefined;
+    const agent = pluginAgentHeader(headers);
+    const runtimeMax = (pluginHeadersMatchModel(headers, model) ? pluginReportedMaxOutput(headers) : undefined)
+        ?? (agent !== undefined
+            ? pluginRuntimeInfoFor(agent, model)?.maxOutput
+            : pluginRuntimeInfoForConversation(runtimeConversationId(headers, parsed, sessionHeaderName), model)?.maxOutput);
+    if (typeof runtimeMax === "number" && runtimeMax > 0) return runtimeMax;
+    const launcherMax = launcherMaxOutput(model);
+    if (typeof launcherMax === "number" && launcherMax > 0) return launcherMax;
+    const cfgOut = resolveConfiguredOutputLimit(routes, upstreamUrl, model);
+    if (cfgOut !== undefined && cfgOut > 0) return cfgOut;
+    let host: string | undefined;
+    try { host = upstreamUrl !== undefined ? new URL(upstreamUrl).host : undefined; } catch { host = undefined; }
+    return peekRegistryOutputLimit(model, host);
+}
+
 // #7: how long the shared-proxy watchdog stays up after its LAST watcher
 // died. Long enough for a second session's registration to land when the
 // spawner exits immediately after it starts; short enough that an abandoned
@@ -2393,9 +2425,11 @@ async function handle(
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
-        // restoreOutputBudget for the starvation mechanism). #1665: the
-        // operator-declared model output limit floors the restore target.
-        restoreOutputBudget(parsed, session, log, resolveConfiguredOutputLimit(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model));
+        // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
+        // best-known model output ceiling (runtime-info > launcher > declared >
+        // registry — resolveKnownOutputCeiling) floors the restore target; a
+        // warn fires when no source knows one at all.
+        restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
@@ -6810,5 +6844,5 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, type OutputBudgetField } from "./server/side-request.js";
+export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
