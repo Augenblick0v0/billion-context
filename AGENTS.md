@@ -533,8 +533,9 @@ The workflow then:
 
 1. **Drift guard**: master's `package.json` version must equal the npm latest,
    else it aborts (never release off a drifted tree). It also rejects a target
-   version that is already published, and verifies the release-notes entry
-   exists for the target version (#1870) — see the prerequisite above.
+   version that is already published. A separate dispatch-time step then
+   verifies the release-notes entry exists for the target version (#1870) —
+   see the prerequisite above.
 2. Bumps ONLY `package.json` + `package-lock.json` and commits
    `release v{VERSION}` — the same one-version-one-commit discipline as the
    Version Bumps section above.
