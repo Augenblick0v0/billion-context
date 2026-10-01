@@ -42,13 +42,15 @@ const DIST_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[] };
 
 const NEW_VERSION = PKG.version; // the just-published number
-const OLD_VERSION = patchMinus(NEW_VERSION); // the machine that is behind
-const STALE_VERSION = patchMinus(OLD_VERSION); // a dsh profile copy left far behind (#1803)
 
 // Stable-only by design (#1811): prerelease / dev tags have no meaningful
 // N-1/N-2 to synthesize, so the lane skips (loudly) instead of going red.
 // Patch must be ≥ 2 because the scenario synthesizes both N-1 and N-2.
+// Must precede patchMinus(): that throws at module load on non-x.y.z, failing import instead of skipping.
 const stableVersion = /^\d+\.\d+\.\d+$/.test(PKG.version) && Number(PKG.version.split(".")[2]) >= 2;
+const OLD_VERSION = stableVersion ? patchMinus(NEW_VERSION) : NEW_VERSION; // the machine that is behind
+const STALE_VERSION = stableVersion ? patchMinus(OLD_VERSION) : NEW_VERSION; // a dsh profile copy left far behind (#1803)
+
 const skipReason = !run
     ? "set ACP_TEST_CANARY=1 (release canary; hermetic loopback)"
     : !stableVersion
