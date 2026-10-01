@@ -1149,6 +1149,8 @@ export const WEB_CLIENT = `(function () {
             updateNudgeNote();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
             ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
+            neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
         }
@@ -1284,6 +1286,16 @@ export const WEB_CLIENT = `(function () {
         nwrap.appendChild(nnote);
         box.appendChild(nwrap);
         nudge.addEventListener("change", syncNudge);
+        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
+        qCtrls.push(ptInp);
+        const ptWarn = document.createElement("div");
+        ptWarn.style.cssText = "font-size:12px;color:#57606a";
+        ptWarn.textContent = t("cfg.q_ptools_warn");
+        ptInp.parentElement.appendChild(ptWarn);
+        ptInp.addEventListener("change", () => commit((d) => {
+            const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+        }));
         const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
         prm.type = "number";
         prm.min = "1";
@@ -1295,15 +1307,18 @@ export const WEB_CLIENT = `(function () {
             if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
             else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
         }));
-        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
-        qCtrls.push(ptInp);
-        const ptWarn = document.createElement("div");
-        ptWarn.style.cssText = "font-size:12px;color:#57606a";
-        ptWarn.textContent = t("cfg.q_ptools_warn");
-        ptInp.parentElement.appendChild(ptWarn);
-        ptInp.addEventListener("change", () => commit((d) => {
-            const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
-            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+        const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
+        const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
+        qCtrls.push(neInp);
+        const neNote = document.createElement("div");
+        neNote.style.cssText = "font-size:12px;color:#57606a";
+        neNote.textContent = t("cfg.q_never_note");
+        neInp.parentElement.appendChild(neNote);
+        neInp.addEventListener("change", () => commit((d) => {
+            const list = neInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            const sameAsDefault = list.length === NEVER_DEFAULT.length && NEVER_DEFAULT.every((x) => list.indexOf(x) >= 0);
+            if (!compressOf(d)) d.compress = {};
+            if (list.length === 0 || sameAsDefault) delete d.compress.neverPreserveRecentTools; else d.compress.neverPreserveRecentTools = list;
         }));
         const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"));
         qCtrls.push(mitmInp);
