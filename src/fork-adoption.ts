@@ -1,6 +1,10 @@
-import { anthropicToCore, openaiToCore } from "acp-kernel/wire";
+import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
 import { STORED_PLACEHOLDER_MARKER, type CompressionBlock, type CoreMessage } from "acp-kernel";
-import { stripAcpPanelMessages, stripAcpStatusMarkers } from "./acp-panel.js";
+import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
+import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
+import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
+import { replaceBiliCompactionItems } from "./codex-compact.js";
+import { stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import { peekSession, markDirty, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { adoptContentStore, cloneStoreForRefs, contentStoreOf } from "./store.js";
@@ -65,10 +69,11 @@ import type { WireProtocol } from "./util.js";
  */
 
 /** Protocols whose prepare* pipeline this module mirrors for the id pass.
- *  Responses/google anonymous forks log-skip in v1 (their conversion
- *  pipelines differ; missing adoption there is a perf loss, never a
- *  correctness risk). */
-const SUPPORTED: ReadonlySet<WireProtocol> = new Set<WireProtocol>(["openai", "anthropic"]);
+ *  All four wires are covered (#1853): responses and google log-skipped in
+ *  v1, so identified resumes on those wires (codex over /v1/responses;
+ *  gemini clients with a conversation header) inherited nothing but lineage
+ *  and re-folded everything the parent had already folded. */
+const SUPPORTED: ReadonlySet<WireProtocol> = new Set<WireProtocol>(["openai", "anthropic", "responses", "google"]);
 
 export interface ForkAdoptionPlan {
     /** Blocks to seed (active adoptables + their tier children, inactive). */
@@ -91,12 +96,38 @@ export interface ForkAdoptionPlan {
 
 /** Core messages of the incoming request, computed through the SAME
  *  strip + convert pipeline as prepare* so the ids match what processTurn
- *  will see. Returns null for protocols without adoption support. */
+ *  will see. Returns null for protocols without adoption support.
+ *  #1853: the responses branch mirrors prepareResponses's pre-projection
+ *  mutations IN ORDER (compaction-echo replacement → type stamping → id
+ *  sanitize → whitespace drop → panel/marker strip → chain-carrier strip)
+ *  before converting with the same tool-images wrapper prepare uses; google
+ *  mirrors prepareGoogle (chain-carrier strip → googleToCore). Id parity
+ *  with the kernel's processTurn input is the whole point: an id this pass
+ *  misses drops a parent ref from the inheritance; an id it invents matches
+ *  nothing (harmless superset). The plugin-mode mid-history sys/developer
+ *  in-place marking (prepareResponses's `__bili_inplace_sysdev`) is
+ *  deliberately NOT replicated: marked or hoisted, those items contribute
+ *  no core message either way, so the id set is identical. */
 function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): CoreMessage[] | null {
     if (!SUPPORTED.has(protocol)) return null;
-    const clone = structuredClone(parsed) as {
-        messages?: unknown;
-    };
+    const clone = structuredClone(parsed) as Record<string, unknown>;
+    if (protocol === "responses") {
+        if (Array.isArray(clone.input)) {
+            const { items, replaced, dropped } = replaceBiliCompactionItems(clone.input);
+            if (replaced + dropped > 0) clone.input = items;
+        }
+        normalizeResponsesMessageItems(clone.input);
+        sanitizeResponsesInputIds(clone.input);
+        dropWhitespaceResponsesMessages(clone.input);
+        stripAcpPanelResponsesInput(clone.input);
+        stripAcpStatusMarkers(clone.input);
+        stripEmbeddedChainCarriers(clone, "responses");
+        return responsesToCoreWithToolImages(clone as Parameters<typeof responsesToCoreWithToolImages>[0]).msgs;
+    }
+    if (protocol === "google") {
+        stripEmbeddedChainCarriers(clone, "google");
+        return googleToCore(clone as Parameters<typeof googleToCore>[0]).msgs;
+    }
     stripAcpPanelMessages(clone.messages);
     stripAcpStatusMarkers(clone.messages);
     if (protocol === "openai") {
