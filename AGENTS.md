@@ -41,7 +41,7 @@ billion-context/
 │   ├── session-id.ts             # Session ID generation
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── update.ts                 # Auto-update: checks npm, auto-installs latest
-│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/codebuddy/qoder/trae/jcode/kimi)
+│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/codebuddy/qoder/trae/jcode/kimi/zcode)
 │   ├── client-config.ts          # READ-only discovery of each client's upstream config
 │   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)
@@ -69,7 +69,7 @@ billion-context/
 │   ├── web/                      # Web UI (config + context windows)
 │   ├── fetch-util.ts             # HTTP fetch with timeout
 │   └── util.ts                   # Misc utilities
-├── tests/                        # 66 test files
+├── tests/                        # 385 test files
 ├── tsup.config.ts
 └── package.json
 ```
@@ -81,7 +81,7 @@ billion-context/
 3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`), first check per process ignores throttle
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
 5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
-6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids.
+6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi/hermes/zcode) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids.
 7. **Two compression modes with different summary carriers** — `pluginMode` (the `x-bili-plugin` header / registered agent, e.g. `bili pi`) means the ACP-native agent OWNS compression: it executes `compress` locally, the call+result live in its own re-sent history, and the summary carrier on the wire is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`). Proxy mode (plain client, no header) means the proxy executes `compress` server-side: the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the summary carrier is the **`acp_summary` message**, which the kernel renders as role `system` but `systemToUser` (`src/util.ts`) re-voices as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache. The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See TECHNICAL-NOTES.md "Two compression modes".
 
 8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; the window-percentage scaling was deliberately removed — kernel #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or re-introduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. bili exposes the user escape hatch as `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Gentle growth nudges are advisory by design; prompt wording is kernel-owned (`src/nudge-text.ts`).
@@ -143,7 +143,7 @@ misattributes on decompress. Consequences for this repo:
   the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
 - Historical note: kernel 0.0.48/0.0.49 briefly contained ref-slot
   reclamation (reverted in kernel #191, see `persist/store.ts`). The guard
-  "do not bump past 0.0.47" is obsolete — master pins 0.0.56.
+  "do not bump past 0.0.47" is obsolete — master pins 0.0.99.
 
 ## 3. Development Standards
 
@@ -220,17 +220,25 @@ download → sha512 verify → staged extract → in-place install → disk flip
 plus post-update `plugin install opencode`. Loopback only; zero external
 network, zero secrets, zero tokens.
 
+`tests/e2e/e2e-advisory-rollback.test.ts` (same gate, same fixture infra)
+drives a resident `bili start` against a rollback-form advisory document and
+asserts the #1588 contract end-to-end: control self-update, forced rollback
+to the older target + persistent restart banner, no ping-pong across cycles
+(pre-restart), and the candidate gate refusing the affected latest
+(post-restart).
+
 ```bash
 npm run build
-ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts
+ACP_TEST_REGISTRY=1 node --import tsx --test \
+  tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
 ```
 
 Rules:
 
 - Gated by `ACP_TEST_REGISTRY=1`; skips by default, and the `npm test` glob
   does not cover `tests/e2e/` anyway. CI job: `.github/workflows/ci-registry.yml`.
-- Run it before merging changes to `src/update.ts` or the install/uninstall
-  pipeline (`src/plugin-install.ts`).
+- Run it before merging changes to `src/update.ts`, `src/advisory.ts`, or the
+  install/uninstall pipeline (`src/plugin-install.ts`).
 - The updater's registry base URL and check interval are overridable via
   `BILI_UPDATE_REGISTRY` / `BILI_UPDATE_CHECK_INTERVAL_MS` (defaults unchanged
   when unset) — these seams exist for this suite (#1153); keep them
