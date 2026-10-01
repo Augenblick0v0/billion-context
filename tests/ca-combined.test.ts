@@ -121,9 +121,16 @@ test("#1802: osStorePowerShellScript covers both Root stores without interpolati
     assert.ok(!s.includes("${"));
 });
 
-test("#1802: collectOsStorePems degrades to [] when platform tooling is absent", () => {
-    for (const platform of ["win32", "darwin", "linux"] as const) {
-        assert.deepEqual(collectOsStorePems(platform), []);
+test("#1802: collectOsStorePems degrades to [] where the platform tooling is absent", () => {
+    assert.deepEqual(collectOsStorePems("linux"), [], "linux has no OS-store source");
+    if (process.platform !== "win32") assert.deepEqual(collectOsStorePems("win32"), [], "no powershell off-Windows");
+    if (process.platform !== "darwin") assert.deepEqual(collectOsStorePems("darwin"), [], "no security(1) off-macOS");
+    // On a native host the real store IS reachable — exercise the production
+    // export path end-to-end (PS script + decode + parse on win32, security(1) on darwin).
+    if (process.platform === "win32" || process.platform === "darwin") {
+        const pems = collectOsStorePems();
+        assert.ok(pems.length > 0, `native ${process.platform} OS-store export returned no certs`);
+        for (const pem of pems) assert.ok(pem.startsWith("-----BEGIN CERTIFICATE-----"));
     }
 });
 
