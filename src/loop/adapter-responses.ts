@@ -513,6 +513,20 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                        // #1862: a completed custom tool call IS executable output — count it
+                        // like function_call so the degenerate-retry gate (calls.length === 0)
+                        // does not treat a reasoning+custom-tool turn as an empty turn and
+                        // re-issue the request (duplicating the action). Passthrough: the wire
+                        // bytes already reached the client verbatim above, so the loop must not
+                        // re-emit it via emitToolCall. `input` is the custom-tool argument field.
+                        toolCallsEmitted++;
+                        yield {
+                            kind: "tool_call",
+                            name: typeof item.name === "string" ? item.name : "",
+                            callId: typeof item.call_id === "string" ? item.call_id : "",
+                            arguments: typeof item.input === "string" ? item.input : "",
+                            passthrough: true,
+                        } as ParsedStreamEvent;
                     } else if (item?.type === "message") {
                         const origId = typeof item.id === "string" ? item.id : "";
                         const mapped = remapped.get(origId);

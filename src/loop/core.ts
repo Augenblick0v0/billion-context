@@ -428,6 +428,25 @@ export async function* runCompressLoop(
                 if (visible) forwardedVisible = true;
                 return chunk;
             };
+            // #1862: settle a measured attempt's usage the moment a retry replaces it.
+            // recordUsage below runs once per ROUND, but a successful retry re-fetches within
+            // the same round and the top-of-loop `usage = {}` reset drops the replaced attempt's
+            // usage before it is ever recorded — billed tokens vanish from the internal ledger.
+            // Called on the success path only: each upstream attempt is accounted exactly once.
+            // A FAILED retry never reaches these call sites (it catches and falls through to
+            // break), so the surviving original attempt is settled once by recordUsage — no
+            // double counting. The client-facing completion still carries only the FINAL
+            // attempt's usage (emitCompletion reads `usage`, which this never mutates), so the
+            // internal ledger and the response's usage representation stay separate.
+            const settleAttemptUsage = (): void => {
+                if (
+                    usage.inputTokens !== undefined ||
+                    usage.outputTokens !== undefined ||
+                    usage.cachedTokens !== undefined
+                ) {
+                    recordUsage(ctx, usage, round);
+                }
+            };
 
             for (;;) {
                 assistantText = "";
@@ -562,6 +581,7 @@ export async function* runCompressLoop(
                             throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
                         }
                         currentUpstream = adoptUpstream(respResult);
+                        settleAttemptUsage();
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
@@ -624,6 +644,7 @@ export async function* runCompressLoop(
                         }
                         currentUpstream = adoptUpstream(respResult);
                         roundBody = retryBody;
+                        settleAttemptUsage();
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
@@ -669,6 +690,7 @@ export async function* runCompressLoop(
                         }
                         currentUpstream = adoptUpstream(respResult);
                         roundBody = retryBody;
+                        settleAttemptUsage();
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
