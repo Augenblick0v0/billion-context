@@ -1328,6 +1328,13 @@ export const WEB_CLIENT = `(function () {
             if (!d.mitm || typeof d.mitm !== "object" || Array.isArray(d.mitm)) d.mitm = {};
             d.mitm.domains = domains;
         }));
+        const moreA = document.createElement("a");
+        moreA.href = t("cfg.q_more_url");
+        moreA.target = "_blank";
+        moreA.rel = "noopener";
+        moreA.style.cssText = "font-size:12px;color:#0969da";
+        moreA.textContent = t("cfg.q_more");
+        box.appendChild(moreA);
         if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
         syncAll();
     }
