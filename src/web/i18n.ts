@@ -330,7 +330,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "common.requests": "requests",
         "common.saved": "saved",
         "common.context": "context",
-  "common.ctx_est": "estimated",
+        "common.ctx_est": "estimated",
         "common.window": "window",
         "common.title": "title",
         "common.protocol": "protocol",
