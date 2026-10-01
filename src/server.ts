@@ -2284,8 +2284,10 @@ async function handle(
         // restarts via the persisted snapshot) and inherit: every ref
         // assignment whose raw id is present (refs are content-addressed — a
         // seeded ref always denotes the exact bytes the model saw), the
-        // fully-present blocks (forkAdoption-gated), and the derivedFrom
-        // lineage (decompress/search_context fall back to the parent chain).
+        // fully-present blocks (#1834: adopted together with this inheritance —
+        // losing them on resume meant the folded originals came back on the
+        // wire; forkAdoption only gates anonymous forks, #629), and the
+        // derivedFrom lineage (decompress/search_context fall back to the parent chain).
         // First request only: the state copy must land before processTurn
         // assigns refs. A resolved explicit plugin-reported lineage above wins
         // (gate on derivedFromSessionId); this content match is the fallback
@@ -2307,7 +2309,7 @@ async function handle(
                             protocol,
                             parsed,
                             upstreamOrigin,
-                            blocksEnabled: opts.forkAdoption === true,
+                            blocksEnabled: true, // #1834: this branch is already gated on resumeInheritance — identified resume-forks adopt blocks by default; forkAdoption only gates anonymous forks (#629)
                             log,
                         });
                     } catch (err) {
