@@ -229,7 +229,7 @@ function piInstall(): string {
         ? `\npi: replaced existing entries: ${removed.join(", ")}`
           + "\npi: also check <project>/.pi/settings.json — a project-scope billion-context-pi entry (pi install -l) lives there, not in this global settings"
         : "";
-    const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs/updates it; `pi update` upgrades)" : "";
+    const form = entry === PI_NPM_ENTRY ? " (pi-managed — pi installs it; the proxy self-refreshes it via `pi update --extension npm:billion-context`, or run that manually)" : "";
     return `pi: installed -> ${file} packages += ${entry}${form}${note}`;
 }
 
@@ -2093,7 +2093,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
 // (omp/claude/codex/kimi/hermes/zcode) follow the global bili install itself —
 // hermes additionally re-copies its Python files via `bili plugin update hermes`.
 export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
-    pi: "pi update (pi owns the npm:billion-context copy)",
+    pi: "pi update --extension npm:billion-context (pi owns the npm copy; its proxy self-drives the refresh every check cycle, #1196)",
     omp: "the global bili install (entry points at it)",
     claude: "the global bili install (hook/MCP point at it)",
     codex: "the global bili install (the mcp launcher shells out to it)",
@@ -2120,7 +2120,8 @@ export interface PluginUpdateOpts {
  *    point at the global install, so only the global copy updates;
  *  - host-managed copies (pi npm entry, opencode plugin entry) are never
  *    overwritten by bili — the report says which host command upgrades
- *    them;
+ *    them (the pi copy's own proxy also self-refreshes through pi's
+ *    update channel on its periodic check, #1196);
  *  - dsh profile bundles are re-resolved to the latest registry version
  *    through dsh's own plugin channel.
  *  Returns user-facing lines. Network is only touched when a dsh profile
