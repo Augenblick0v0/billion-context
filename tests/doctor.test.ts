@@ -359,7 +359,7 @@ test("#1577: bili doctor reports an active advisory against the on-disk version"
             });
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -390,6 +390,6 @@ test("#1577: bili doctor reports a clean advisory state as 'none' and a failed s
             });
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
