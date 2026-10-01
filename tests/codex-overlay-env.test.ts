@@ -196,3 +196,46 @@ test("prepareCodexHome: manageRouting=false keeps the legacy shared .env (direct
         rmrf(`${dir}-bili`);
     }
 });
+
+test("prepareCodexHome: routed→direct switch never merges the generated .env back into the real home (#1802 review)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-env-"));
+    try {
+        const realEnv = path.join(dir, ".env");
+        fs.writeFileSync(realEnv, "HTTPS_PROXY=socks5h://127.0.0.1:7890\nMY_TOKEN=tok-123\n");
+        const realBefore = fs.readFileSync(realEnv);
+        const realInode = fs.statSync(realEnv).ino;
+
+        prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:11111", caPath: CA, manageRouting: true });
+        const overlay = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:22222", caPath: CA, conversationId: "conv-x", manageRouting: false });
+        assert.ok(overlay);
+
+        assert.deepEqual(fs.readFileSync(realEnv), realBefore, "real .env byte-identical across the mode switch");
+        assert.equal(fs.statSync(realEnv).ino, realInode, "real .env inode unchanged");
+        assert.ok(!fs.existsSync(`${realEnv}.bili-conflict`), "no conflict residue left in the real home");
+        const st = fs.lstatSync(path.join(overlay, ".env"));
+        assert.ok(st.isSymbolicLink() || st.nlink > 1, "overlay .env is back to shared state");
+    } finally {
+        rmrf(dir);
+        rmrf(`${dir}-bili`);
+    }
+});
+
+test("prepareCodexHome: unreadable real .env after a routed launch keeps the real home intact (#1802 review)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-env-"));
+    try {
+        // A DIRECTORY where .env should be makes readFileSync throw EISDIR —
+        // the same fail-closed branch an EACCES/locked file takes.
+        fs.mkdirSync(path.join(dir, ".env"));
+        const overlay1 = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:11111", caPath: CA, manageRouting: true });
+        assert.ok(overlay1);
+
+        const overlay = prepareCodexHome({ codexHome: dir, origin: ORIGIN, caPath: CA, manageRouting: true });
+        assert.ok(overlay);
+
+        assert.ok(fs.statSync(path.join(dir, ".env")).isDirectory(), "real .env entry untouched");
+        assert.ok(!fs.existsSync(`${path.join(dir, ".env")}.bili-conflict`), "no conflict residue left in the real home");
+    } finally {
+        rmrf(dir);
+        rmrf(`${dir}-bili`);
+    }
+});

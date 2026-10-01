@@ -2184,6 +2184,9 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  override it after spawn (#1802). Every other real-home entry is shared
  *  (auth.json, sessions, model settings survive); generated files are
  *  rewritten each launch and never linked back nor merged into the real home.
+ *  The overlay's .env is refresh-protected on EVERY launch, so a stale
+ *  generated copy can never merge back into the real home even when a later
+ *  launch does not manage it (#1802 review).
  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
  *  be built (caller degrades: wire-injected compression still works, native
  *  MCP tools / the .env protection do not). */
@@ -2210,8 +2213,11 @@ export function prepareCodexHome(opts: {
             }
         }
     }
-    const generatedFiles: string[] = [];
-    if (manageDotEnv) generatedFiles.push(".env");
+    // ".env" is ALWAYS refresh-protected, even on launches that do not
+    // generate it: a previous routed launch may have left an owned copy in the
+    // overlay, and letting refresh treat that as user data would merge it back
+    // into the real home (#1802 review).
+    const generatedFiles: string[] = [".env"];
     if (conversationId !== undefined) generatedFiles.push("config.toml");
     const overlay = `${codexHome}-bili`;
     if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
@@ -2226,6 +2232,30 @@ export function prepareCodexHome(opts: {
             }
         } catch {}
         writeOverlayFileAtomic(overlay, ".env", renderCodexDotEnv(userEnvText, { origin, caPath }), 0o600);
+    } else {
+        // Non-generating launch: .env must end up SHARED with the real home
+        // (or absent) — drop any owned residue and re-link from the real one.
+        const envPath = path.join(overlay, ".env");
+        const realEnvPath = path.join(codexHome, ".env");
+        let needsLink = false;
+        try {
+            const st = fs.lstatSync(envPath);
+            const shared = st.isSymbolicLink()
+                ? fs.readlinkSync(envPath) === realEnvPath
+                : isWriteThroughHardlink(envPath, realEnvPath, st);
+            if (!shared) {
+                fs.unlinkSync(envPath);
+                needsLink = true;
+            }
+        } catch {
+            needsLink = true;
+        }
+        if (needsLink) {
+            try {
+                fs.lstatSync(realEnvPath);
+                linkOverlayEntry(codexHome, overlay, ".env");
+            } catch {}
+        }
     }
     if (conversationId !== undefined) {
         let txt = "";
