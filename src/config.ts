@@ -636,9 +636,11 @@ export type ProxyOptions = {
      *  (#970, default on). Opt out with env BILI_SUBAGENT_SPLIT=0 or
      *  `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
-    /** Opt-in fork block-adoption (#629, default off). Anonymous clients
+    /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
      *  fully-present compression blocks instead of restarting at zero.
+     *  Identified resume-forks are NOT governed by this switch — they adopt
+     *  blocks with resumeInheritance (#1834, default on).
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
     /** Resume-fork inheritance (#1486, default ON). Identified clients that
@@ -648,9 +650,10 @@ export type ProxyOptions = {
      *  m00001, so the model's stale citations mis-hit renumbered messages.
      *  The proxy detects the resume by byte-exact full-history match against
      *  tracked chains and inherits the parent's ref assignments, its
-     *  fully-present compression blocks (when forkAdoption is on), and the
-     *  derivedFrom lineage. Disable with `resumeInheritance: false` or env
-     *  BILI_RESUME_INHERITANCE=0. */
+     *  fully-present compression blocks (#1834: adopted together with this
+     *  inheritance — losing them on resume meant the folded originals came
+     *  back on the wire), and the derivedFrom lineage. Disable with
+     *  `resumeInheritance: false` or env BILI_RESUME_INHERITANCE=0. */
     resumeInheritance?: boolean;
     /** Body-content detection of the bili→bili chain awareness: when an inbound
      *  request carries ACP artifacts / a `<bili-chain …/>` checkpoint in the

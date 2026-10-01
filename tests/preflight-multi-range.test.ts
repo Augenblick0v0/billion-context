@@ -37,11 +37,16 @@ function okSse(inputTokens: number): string {
     );
 }
 
-function conversation(n: number): Array<{ role: string; content: string }> {
+// Per-test tag salts the content: the three tests below use the SAME
+// generator with different lengths (24/16/48), so without a salt each
+// longer history byte-prefix-matches the shorter ones and — once #1834
+// made identified resume-forks adopt the parent's blocks — the later test's
+// session legitimately resume-inherits the earlier test's blocks.
+function conversation(n: number, tag: string): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < n; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        msgs.push({ role, content: `${tag} Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return msgs;
 }
@@ -121,7 +126,7 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-regress-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(24) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(24, "t1-regress") }),
         });
         assert.equal(r.status, 200, "the request succeeds even though the oldest range's summary is unusable");
         await r.text();
@@ -155,7 +160,7 @@ test("#574 truthful exhaustion: every range's summary unusable → 502 only afte
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-exhaust-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(16) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(16, "t2-exhaust") }),
         });
         assert.equal(r.status, 502, "nothing compressible → fail-fast 502");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
@@ -192,7 +197,7 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-budget-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(48) }),
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(48, "t3-budget") }),
         });
         assert.equal(r.status, 502, "still over-window after the budget → fail-fast 502");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
