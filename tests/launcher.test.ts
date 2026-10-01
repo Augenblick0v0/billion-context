@@ -71,7 +71,6 @@ import {
     writeDshClientShimFiles,
     writeDshClientShim,
     dshArgsWithPatch,
-    buildCodexMcpArgs,
     prepareCodexHome,
     prepareCodexMcpInjection,
     resolveCodexHome,
@@ -3276,7 +3275,7 @@ test("prepareCodexHome: no real config → overlay holds only the bili MCP block
         fs.mkdirSync(path.join(dir, "sessions"));
         const authOriginal = fs.readFileSync(path.join(dir, "auth.json"), "utf8");
 
-        const overlay = prepareCodexHome(dir, origin, cid);
+        const overlay = prepareCodexHome({ codexHome: dir, origin, caPath: "/ca.pem", conversationId: cid, manageRouting: false });
         assert.ok(overlay);
         assert.equal(overlay, `${dir}-bili`);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
@@ -3305,7 +3304,7 @@ test("prepareCodexHome: real config without bili → original preserved, block a
             ['model = "gpt-5"', "", '[model_providers.openai]', 'name = "OpenAI"', ''].join("\n"),
         );
         const original = fs.readFileSync(path.join(dir, "config.toml"), "utf8");
-        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-2");
+        const overlay = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:8787", caPath: "/ca.pem", conversationId: "conv-2", manageRouting: false });
         assert.ok(overlay);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
         assert.ok(txt.includes('model = "gpt-5"'));
@@ -3336,7 +3335,7 @@ test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never dupli
                 "",
             ].join("\n"),
         );
-        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-3");
+        const overlay = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:8787", caPath: "/ca.pem", conversationId: "conv-3", manageRouting: false });
         assert.ok(overlay);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
         assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1, "exactly one bili block");
@@ -3351,33 +3350,43 @@ test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never dupli
     }
 });
 
-test("prepareCodexMcpInjection: POSIX keeps inline -c args, no CODEX_HOME redirect (#681)", () => {
-    const r = prepareCodexMcpInjection({
-        platform: "linux",
-        codexHome: "/nonexistent-codex-home",
-        origin: "http://127.0.0.1:8787",
-        conversationId: "conv-x",
-    });
-    assert.deepEqual(r.clientArgs, buildCodexMcpArgs("http://127.0.0.1:8787", "conv-x"));
-    assert.deepEqual(r.envPatch, {});
-    assert.equal(r.warning, undefined);
-});
-
-test("prepareCodexMcpInjection: win32 redirects CODEX_HOME to the overlay, drops inline args (#681)", () => {
+test("prepareCodexMcpInjection: redirects CODEX_HOME to the overlay on every platform, no inline -c args (#681/#1802)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
     try {
         fs.writeFileSync(path.join(dir, "auth.json"), "{}");
         const r = prepareCodexMcpInjection({
-            platform: "win32",
             codexHome: dir,
             origin: "http://127.0.0.1:8787",
+            caPath: "/ca.pem",
             conversationId: "conv-w",
+            manageRouting: false,
         });
-        assert.deepEqual(r.clientArgs, [], "no inline -c args on Windows");
+        assert.deepEqual(r.clientArgs, [], "no inline -c args anywhere");
         assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
         assert.ok(fs.existsSync(path.join(`${dir}-bili`, "config.toml")));
         const txt = fs.readFileSync(path.join(`${dir}-bili`, "config.toml"), "utf8");
         assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        rmrf(`${dir}-bili`);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("prepareCodexMcpInjection: routing-only launch (no MCP) still builds the overlay for .env protection (#1802)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, ".env"), "HTTPS_PROXY=socks5h://127.0.0.1:7890\nOPENAI_API_KEY=sk-user\n");
+        const r = prepareCodexMcpInjection({
+            codexHome: dir,
+            origin: "http://127.0.0.1:8787",
+            caPath: "/ca.pem",
+            manageRouting: true,
+        });
+        assert.equal(r.warning, undefined);
+        assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
+        assert.ok(!fs.existsSync(path.join(`${dir}-bili`, "config.toml")) || fs.lstatSync(path.join(`${dir}-bili`, "config.toml")).isSymbolicLink(), "config.toml stays shared without a conversation id");
+        const envText = fs.readFileSync(path.join(`${dir}-bili`, ".env"), "utf8");
+        assert.ok(envText.includes("HTTPS_PROXY=http://127.0.0.1:8787"));
         rmrf(`${dir}-bili`);
     } finally {
         rmrf(dir);
