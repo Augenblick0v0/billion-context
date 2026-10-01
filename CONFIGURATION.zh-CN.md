@@ -124,11 +124,12 @@
 
 ### `compat`
 
-- **类型：** `{ roles?: Record<string, string>; streamErrorShape?: "protocol" | "completion" }`
+- **类型：** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion" }`
 - **默认值：** `{}`（禁用）
 - **状态：** ACTIVE
 - **说明：** 全局线上兼容角色映射。`roles` 把消息角色映射为上游接受的角色名，例如 `{"compat":{"roles":{"developer":"system"}}}` 把 `developer` → `system`，用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发送）。作用于 `openai` chat-completions 与 `responses` 请求；仅精确匹配角色，体内其它内容不动；压缩重试重发的请求体同样携带。按 provider 的 `compat.roles`（见 [Providers](#providers)）按键优先。默认 `{}` 逐字节透明转发。
 - **失败自学习：** 未配置 compat 时，上游返回 `400 Invalid role: …` 会被自动修复 —— bili 把被拒角色改写为 `system`，重试一次，并把学到的映射记在**会话上**（仅内存，绝不写入配置）。该会话后续请求免 400 往返。修复生效时打印的 info 日志附带可永久化的 per-provider 片段。
+- **dropFields：** 最终转发体中要删除的字段点分路径列表 —— 用于严格 schema 上游拒绝*客户端*固定发送但上游不认的字段（#1757）。路径仅限纯对象段（如 `reasoning.summary`），不支持通配符与数组下标；不存在的路径与非对象中间节点静默跳过；字符串值永不检查或改写 —— 只删结构键，工具参数与消息内容逐字节不变。与 `roles` 不同，适用于所有 wire 协议（任意 JSON 请求体）。全局与 per-provider 列表**相加**合并（并集）—— provider 条目只能追加、不能撤销全局路径。应用于角色映射/输出转向之后的最终出站体（prompt-cache stamp 之前）、压缩重试重发的每个请求体，以及逐字节直通转发。无命中时逐字节不变；实际删除 ≥1 个字段时打一条 info 日志列出被删路径。纯 opt-in，v1 不做失败自学习：`"compat":{"dropFields":["reasoning.summary"]}`。
 - **streamErrorShape：** 200 响应已提交后，上游流式失败在 anthropic/openai 线上如何呈现给客户端（默认 `"protocol"`，或 `"completion"`）。`protocol` 走协议原生失败通道——anthropic/responses 收 `event: error` 帧，openai 收顶层 `error` 帧后跟 `[DONE]`——客户端能区分「这一轮失败了」和「这一轮完成了」，自身重试逻辑保持可用（#1455：旧版合成的 `end_turn`/`finish_reason` 让死掉的回合看起来像正常完成，静默吃掉了客户端的重试预算）。`completion` 恢复该旧形状（失败文本包在合成的成功完成里），供无法呈现带内错误事件的宿主使用。配置文件：`"compat":{"streamErrorShape":"completion"}`；环境变量 `BILI_STREAM_ERROR_SHAPE` 优先。仅 google 线不受影响（本来就是原生错误帧）；responses 线上该开关改变的是服务端出口：从合成的 item 生命周期完成帧改为 `event: error` 帧（其循环内出口本就走 `response.failed` 原生通道）。
 
 ### `proxy`
@@ -271,10 +272,20 @@
 
 ### `compat`
 
-- **类型：** `{ roles?: Record<string, string> }`
+- **类型：** `{ roles?: Record<string, string>; dropFields?: string[] }`
 - **默认值：** `{}`（禁用）
 - **状态：** ACTIVE
-- **说明：** 按 provider 的线上兼容覆盖。`roles` 把消息角色映射为该上游接受的角色名，例如 `{"developer": "system"}` —— 用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发这个角色）。作用于最终转发的 `openai`/`responses` 请求体 —— 客户端发送的角色和 bili 自己注入的提示一视同仁 —— 压缩重试循环重发的请求体同样携带该改写。按键覆盖全局 `compat` 块（见[服务端设置](#服务端设置)）。默认 `{}` 逐字节透明转发。
+- **说明：** 按 provider 的线上兼容覆盖。`roles` 把消息角色映射为该上游接受的角色名，例如 `{"developer": "system"}` —— 用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发这个角色）。作用于最终转发的 `openai`/`responses` 请求体 —— 客户端发送的角色和 bili 自己注入的提示一视同仁 —— 压缩重试循环重发的请求体同样携带该改写。按键覆盖全局 `compat` 块（见[服务端设置](#服务端设置)）。`dropFields` 删除严格 schema 上游拒绝的客户端固定字段（#1757）：点分纯对象路径（无通配/下标），与全局列表**相加**合并（provider 只能追加、不能撤销全局路径）；仅结构删除 —— 字符串值永不改动，不存在的路径跳过，无命中时逐字节转发。canonical 用例 —— SenseNova Responses 网关对 pi-ai 固定发送的 `reasoning.summary: "auto"` 返回 400：
+
+  ```jsonc
+  {
+    "providers": {
+      "https://token.sensenova.cn/v1": {
+        "compat": { "dropFields": ["reasoning.summary"] }
+      }
+    }
+  }
+  ```
 
 ### `passthrough`
 
