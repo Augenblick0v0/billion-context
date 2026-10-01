@@ -176,7 +176,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** positive integer (tokens per image)
 - **Default:** *(unset — no cap)*
 - **Status:** ACTIVE
-- **Description:** Blanket ceiling on the per-image token estimate used by the preflight size gate, output clamp, and image-compression stats (#488/#496/#1843). Applied on top of whatever billing mode resolved — useful when a route's real encoder bills far below even the pixel prior. Precedence: `BILI_IMAGE_TOKEN_CAP` env var (live-read, no restart) > per-provider `providers.<url>.imageTokenCap` > this global. Non-numeric or non-positive values are ignored with a warning.
+- **Description:** Blanket ceiling on the per-image token estimate used by the preflight size gate, output clamp, and image-compression stats (#488/#496/#1843). Applied on top of whatever billing mode resolved — useful when a route's real encoder bills far below even the pixel prior. Precedence: `BILI_IMAGE_TOKEN_CAP` env var (live-read, no restart) > per-provider `providers.<url>.imageTokenCap` > this global. Non-numeric or non-positive values are dropped (lenient parse, same as `imageBilling`).
 
 ---
 
@@ -346,7 +346,7 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 - **Type:** positive integer (tokens per image)
 - **Default:** *(global `imageTokenCap`, then unset — no cap)*
 - **Status:** ACTIVE
-- **Description:** Per-route ceiling on the per-image token estimate (#1843), applied on top of whichever billing mode resolved for this route. Wins over the global `imageTokenCap`; the `BILI_IMAGE_TOKEN_CAP` env var wins over both. Non-numeric or non-positive values are ignored with a warning.
+- **Description:** Per-route ceiling on the per-image token estimate (#1843), applied on top of whichever billing mode resolved for this route. Wins over the global `imageTokenCap`; the `BILI_IMAGE_TOKEN_CAP` env var wins over both. Non-numeric or non-positive values are dropped (lenient parse, same as `imageBilling`).
 
 ---
 
