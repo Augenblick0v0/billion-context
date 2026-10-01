@@ -2442,7 +2442,15 @@ async function handle(
                 return;
             }
             log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
-            const sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            let sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            const sideInput = (parsed as ResponsesRequestBody).input;
+            if (protocol === "responses" && Array.isArray(sideInput)) {
+                const { items, replaced, dropped } = replaceBiliCompactionItems(sideInput);
+                if (replaced + dropped > 0) {
+                    sideBody = Buffer.from(JSON.stringify({ ...parsed, input: items }));
+                    log("info", `[${session.id}] side request normalized bili compaction handoffs (replaced=${replaced}, dropped=${dropped})`);
+                }
+            }
             const sidePrepared: Prepared = {
                 body: sideBody,
                 session,
