@@ -691,7 +691,7 @@ export async function refreshDshDesktopCopy(
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
             return;
         }
-        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball));
+        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env);
         if (result.ok) {
             log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it`);
         } else {
@@ -1025,6 +1025,7 @@ export async function installViaTarball(
     integrity?: string,
     shasum?: string,
     dispatcher?: object,
+    env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -1048,7 +1049,7 @@ export async function installViaTarball(
     // #991 single-writer: refuse to overwrite a host-managed copy (pnpm
     // store, host agent data trees) — only its owner may update it.
     // Exception: the dsh desktop-profile copy is bili-owned in place (#1575).
-    const managed = hostManagedInstall(installDir);
+    const managed = hostManagedInstall(installDir, env);
     if (managed) {
         return { ok: false, error: `install dir is managed by ${managed.owner} (${installDir}) \u2014 refusing in-place overwrite (single-writer); update via ${managed.channel}` };
     }

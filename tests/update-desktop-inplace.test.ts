@@ -30,6 +30,14 @@ function writePkg(dir: string, version: string): void {
     writeFileSync(path.join(dir, "dist", "index.js"), `export const loaded = '${version}';\n`);
 }
 
+/** Create the flat node_modules link the way pnpm does on each platform.
+ * Windows directory junctions need no SeCreateSymbolicLinkPrivilege, so the
+ * junction path (rename the link itself, never follow it) stays covered on
+ * windows runners instead of being skipped (EPERM). */
+function makePnpmLink(target: string, linkPath: string): void {
+    symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+}
+
 test("desktop profile copy: link displaced, real dir laid down, .pnpm store untouched (#1575)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-"));
     const prevDshHome = process.env.DSH_HOME;
@@ -47,7 +55,7 @@ test("desktop profile copy: link displaced, real dir laid down, .pnpm store unto
         const flat = path.join(profileDir, "node_modules", "billion-context");
         writePkg(storeCopy, "1.2.3");
         mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
-        symlinkSync(storeCopy, flat);
+        makePnpmLink(storeCopy, flat);
         process.env.DSH_HOME = dshHome;
 
         const src = path.join(root, "pkg", "package");
@@ -93,7 +101,7 @@ function buildDesktopFixture(root: string, storeVersion: string, tarballVersion:
     const flat = path.join(profileDir, "node_modules", "billion-context");
     writePkg(storeCopy, storeVersion);
     mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
-    symlinkSync(storeCopy, flat);
+    makePnpmLink(storeCopy, flat);
     const src = path.join(root, "pkg", "package");
     writePkg(src, tarballVersion);
     const tgzPath = path.join(root, "pkg.tgz");
