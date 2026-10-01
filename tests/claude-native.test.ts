@@ -26,6 +26,7 @@ import {
     resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
+import { ensureRootCA } from "../src/ca.ts";
 import { ZONE_PORT_BASE, resolveClaudeNativePort, resolveNativeAttachExternal } from "../src/config.ts";
 import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -1055,6 +1056,26 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
         cache: path.join(home, "cache"),
         data: path.join(home, "data"),
     };
+    // #1807: first-run CA init now merges the OS trust store — on Windows
+    // that is a synchronous PowerShell export (~8s on loaded runners) inside
+    // the hook's 20s bring-up budget. Pre-warm the CA here (outside the
+    // budget) so the spawned proxy hits the 24h freshness gate and skips the
+    // export; the export itself stays covered end-to-end by
+    // tests/ca-combined.test.ts on native hosts.
+    if (process.platform === "win32") {
+        const prevHome = process.env.HOME;
+        const prevData = process.env.XDG_DATA_HOME;
+        process.env.HOME = xdg.home;
+        process.env.XDG_DATA_HOME = xdg.data;
+        try {
+            ensureRootCA();
+        } finally {
+            if (prevHome === undefined) delete process.env.HOME;
+            else process.env.HOME = prevHome;
+            if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = prevData;
+        }
+    }
     const port = await freePort();
     const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     let proxyPid = 0;
