@@ -86,6 +86,7 @@ function proxyOptions(upstreamPort: number): ProxyOptions {
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
         }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
