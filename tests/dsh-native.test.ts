@@ -1042,6 +1042,99 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     }
 });
 
+// #1783: repro of the windows-22 CI deadlock — when the dead-preset probe is
+// slow (windows loopback), headersFor#1 fires while register.base still holds
+// the stale preset: registerTools burns a manifest fetch on it, and the apply
+// chain's late landing (evidence grace + spawn) used to clobber the healed
+// register and/or poison retryAt for a full 10s back-off. The landing guard +
+// per-base back-off must keep the self-heal alive under any interleaving.
+test("#983 slow preset probe: a late landing never clobbers the self-healed register (#1783)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    const answers: Array<string | undefined> = [undefined, forward.origin];
+    _setSpawnForTest(async () => answers.shift());
+    const realFetch = globalThis.fetch;
+    // Emulate the windows runner: loopback fetches to the dead port-1 preset
+    // take ~60ms instead of refusing instantly. node --test runs each file in
+    // its own process, so a scoped globalThis.fetch swap is safe here.
+    globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const u = typeof input === "string" ? input : String(input);
+        if (u.includes("127.0.0.1:1")) {
+            return new Promise<Response>((res, rej) => {
+                setTimeout(() => { void realFetch(input, init).then(res, rej); }, 60);
+            });
+        }
+        return realFetch(input, init);
+    }) as typeof fetch;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1783-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            await new Promise((r) => setTimeout(r, 50));
+            const headersFor = _stateHeadersForTest();
+            headersFor!("https://api.anthropic.com/v1/messages");
+            // Self-heal is request-driven in production: each poll below is a
+            // "later model request" calling headersFor -> maybeRetry until the
+            // unfrozen base-less register heals via the spawn seam.
+            await waitFor(() => {
+                headersFor!("https://api.anthropic.com/v1/messages");
+                return ctx.registeredTools.length === 1;
+            }, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1783" } } });
+            assert.equal(out, "compressed 42 tokens");
+            ctx.setInitiator({ session: { id: "s1783" } });
+            await waitFor(() => headersFor!("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+        });
+    } finally {
+        globalThis.fetch = realFetch;
+        _setSpawnForTest(undefined);
+        forward.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #1783 second interleaving: the spawn seam itself is slow (windows process
+// spawn), so registerTools fails against the stale preset and arms the 10s
+// back-off BEFORE the landing's unfreeze wipe. The wipe must clear that
+// back-off together with the stale base, or the first heal after unfreeze is
+// still gated behind the wall.
+test("#983 late spawn landing clears the back-off armed against the stale preset (#1783)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    const answers: Array<string | undefined> = [undefined, forward.origin];
+    _setSpawnForTest(async () => {
+        const answer = answers.shift();
+        await new Promise((r) => setTimeout(r, 120));
+        return answer;
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1783b-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            await new Promise((r) => setTimeout(r, 30));
+            const headersFor = _stateHeadersForTest();
+            await waitFor(() => {
+                headersFor!("https://api.anthropic.com/v1/messages");
+                return ctx.registeredTools.length === 1;
+            }, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1783b" } } });
+            assert.equal(out, "compressed 42 tokens");
+            ctx.setInitiator({ session: { id: "s1783b" } });
+            await waitFor(() => headersFor!("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        forward.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution", async () => {
     const proxy = await startMockProxy([]);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-state-"));
