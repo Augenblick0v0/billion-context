@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import test from "node:test";
-import { combinedCaPath, collectSystemCaPems, ensureRootCA, rootCaPath } from "../src/ca.js";
+import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
 import { resolveCombinedCaPath } from "../src/launcher.js";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -77,4 +77,75 @@ test("#152: resolveCombinedCaPath mirrors the caDir layout", () => {
     assert.ok(p.endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
     assert.equal(resolveCombinedCaPath({ XDG_DATA_HOME: "/custom/data" } as NodeJS.ProcessEnv),
         path.join("/custom/data", "billion-context", "ca", "combined-ca.pem"));
+});
+
+const b64Of = (pem: string): string => pem.replace(/-----(BEGIN|END) CERTIFICATE-----/g, "").replace(/\s+/g, "");
+
+test("#1802: wrapDerPem round-trips a real root cert at 64 columns", () => {
+    const b64 = b64Of(tls.rootCertificates[0]);
+    const wrapped = wrapDerPem(b64);
+    const lines = wrapped.trim().split("\n");
+    assert.equal(lines[0], "-----BEGIN CERTIFICATE-----");
+    assert.equal(lines[lines.length - 1], "-----END CERTIFICATE-----");
+    const body = lines.slice(1, -1);
+    for (const l of body.slice(0, -1)) assert.equal(l.length, 64);
+    assert.ok(body[body.length - 1].length > 0 && body[body.length - 1].length <= 64, "final base64 line is a short tail");
+    assert.equal(b64Of(wrapped), b64);
+});
+
+test("#1802: pemFingerprint dedupes across wrappings, separates distinct certs", () => {
+    const b64a = b64Of(tls.rootCertificates[0]);
+    const altWrap = (b64: string) => `-----BEGIN CERTIFICATE-----\n${b64.match(/.{1,32}/g)!.join("\n")}\n-----END CERTIFICATE-----`;
+    assert.equal(pemFingerprint(tls.rootCertificates[0]), pemFingerprint(altWrap(b64a)));
+    assert.notEqual(pemFingerprint(tls.rootCertificates[0]), pemFingerprint(altWrap(b64Of(tls.rootCertificates[1]))));
+});
+
+test("#1802: parseOsStoreNdjson skips junk/malformed lines and tolerates CRLF", () => {
+    const b64 = b64Of(tls.rootCertificates[0]);
+    const out = `{"d":"${b64}"}\r\ngarbage line\r\nnot json at all\r\n{"d":""}\r\n{"nope":1}\r\n{"d":"${b64}"}\r\n`;
+    const pems = parseOsStoreNdjson(out);
+    assert.equal(pems.length, 2);
+    assert.equal(pems[0], wrapDerPem(b64));
+});
+
+test("#1802: decodeOsStoreOutput handles UTF-16LE PowerShell pipes", () => {
+    const text = '{"d":"QUJDRA=="}';
+    assert.equal(decodeOsStoreOutput(Buffer.from(text, "utf8")), text);
+    assert.equal(decodeOsStoreOutput(Buffer.from(text, "utf16le")), text);
+});
+
+test("#1802: osStorePowerShellScript covers both Root stores without interpolation leaks", () => {
+    const s = osStorePowerShellScript();
+    assert.ok(s.includes("X509Store('Root'"));
+    assert.ok(s.includes("'LocalMachine','CurrentUser'"));
+    assert.ok(!s.includes("${"));
+});
+
+test("#1802: collectOsStorePems degrades to [] when platform tooling is absent", () => {
+    for (const platform of ["win32", "darwin", "linux"] as const) {
+        assert.deepEqual(collectOsStorePems(platform), []);
+    }
+});
+
+test("#1802: combined bundle reused while fresh, rebuilt when stale or CA-missing", () => {
+    ensureRootCA();
+    const file = combinedCaPath();
+    const mitmRoot = fs.readFileSync(rootCaPath(), "utf8").trim();
+    const future = new Date(Date.now() + 3600e3);
+    fs.utimesSync(file, future, future);
+    const before = fs.statSync(file).mtimeMs;
+    ensureRootCA();
+    assert.equal(fs.statSync(file).mtimeMs, before, "fresh bundle carrying the MITM CA is NOT rewritten");
+
+    const stale = new Date(Date.now() - 25 * 3600e3);
+    fs.utimesSync(file, stale, stale);
+    ensureRootCA();
+    assert.notEqual(fs.statSync(file).mtimeMs, stale.getTime(), "stale (>24h) bundle is rebuilt");
+    assert.ok(fs.readFileSync(file, "utf8").includes(mitmRoot), "rebuilt bundle carries the MITM CA");
+
+    fs.writeFileSync(file, "-----BEGIN CERTIFICATE-----\n" + Buffer.from("junk").toString("base64") + "\n-----END CERTIFICATE-----\n");
+    const freshButWrong = new Date(Date.now() + 3600e3);
+    fs.utimesSync(file, freshButWrong, freshButWrong);
+    ensureRootCA();
+    assert.ok(fs.readFileSync(file, "utf8").includes(mitmRoot), "fresh file missing the MITM CA is rebuilt");
 });
