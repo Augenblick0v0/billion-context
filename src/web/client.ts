@@ -19,6 +19,37 @@ export const WEB_CLIENT = `(function () {
     function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, (c) => c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === \'"\' ? "&quot;" : "&#39;");
     }
+    // #1206 ledger detail carries per-event identity (client/entry/source); the
+    // banner used to show counts only and force users into acp_status — surface
+    // the named entries here instead.
+    function shortConflictDetail(e) {
+        if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") return "";
+        let s = e.detail;
+        const suspected = s.indexOf("[suspected]") >= 0;
+        const si = s.lastIndexOf("[suspected]");
+        if (si >= 0) s = s.slice(0, si);
+        const pi = s.lastIndexOf(" (");
+        if (pi > 0) s = s.slice(0, pi);
+        return s.trim() + (suspected ? " [suspected]" : "");
+    }
+    function bili_conflictLine(c) {
+        const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
+        const items = [];
+        for (const e of c.latest || []) {
+            const name = shortConflictDetail(e);
+            if (!name) continue;
+            const hit = items.find((x) => x.name === name);
+            if (hit) hit.n += 1;
+            else items.push({ name: name, n: 1 });
+        }
+        let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
+        if (items.length > 0) {
+            const shown = items.slice(0, 4).map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : ""));
+            line += " — " + shown.join(" · ") + (items.length > 4 ? " …+" + (items.length - 4) : "");
+        }
+        return line;
+    }
+    window.bili_conflictLine = bili_conflictLine;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -255,8 +286,7 @@ export const WEB_CLIENT = `(function () {
             if (c && c.events > 0) {
                 cb.hidden = false;
                 cb.classList.add("show");
-                const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono"> (' + c.events + " event(s) in " + c.sessions + " session(s): " + kinds + ")</span>";
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono">(' + bili_conflictLine(c) + ")</span>";
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
