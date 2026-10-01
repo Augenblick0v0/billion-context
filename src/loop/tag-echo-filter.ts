@@ -102,16 +102,17 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // #1755: a 2-letter "name" is not a render-tag name (names are 3-4 letters,
-// see buildAcplikeName), so a bare 2-letter head can never complete into a
-// real tag once proven dead, and can never be prose either — it is a tag echo
-// truncated mid-name. Two dead shapes: closed (\x3cxx\x3e — no 2-letter HTML
-// tag exists among the set's pairs) and decided (the next char outside the
-// letter set proves the name over). An UNDECIDED head at buffer end (no
-// following char yet) is NOT matched here: it stays in PARTIAL_TAIL's hold
-// until the next push decides it. A 1-letter head stays releasable too —
+// see buildAcplikeName), so a CLOSED bare 2-letter form (\x3cxx\x3e) can never
+// be a real tag — no 2-letter HTML tag exists among the set's pairs — and is
+// a tag echo truncated mid-name. Only the closed form is stripped: a head whose
+// next char merely breaks the letter run (\x3cai in \x3cai-video\x3e) is NOT
+// proof of death — user-defined kebab elements start that way, so such heads
+// stay in PARTIAL_TAIL's hold until the next push decides them and release as
+// prose when the run dies (owner review of PR #1759). An UNDECIDED head at
+// buffer end likewise stays held; a 1-letter head stays releasable too —
 // \x3ca\x3e/\x3ci\x3e/\x3cp\x3e are real HTML and a truncated one must survive
 // (#1039 content preservation).
-const BARE_ECHO = new RegExp("\x3c\\/?[aAcCpPiI]{2}>|\x3c\\/?[aAcCpPiI]{2}(?=[^aAcCpPiI])");
+const BARE_ECHO = new RegExp("\x3c\\/?[aAcCpPiI]{2}>");
 // A bare letter run of ≥2 at the very end of finished text (\x3cac, \x3c/acp, …):
 // the name never got its attrs or close — a truncated echo, dropped at flush
 // / end of whole text. Mirrors TRUNC_OPEN/TRUNC_CLOSE, which require \s after

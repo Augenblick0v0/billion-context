@@ -531,7 +531,7 @@ test("held bare head stitches into a real tag when the name completes (#1755)", 
     assert.ok(f.dropped());
 });
 
-test("decided bare head: dead form stripped, live prose released (#1755)", () => {
+test("bare head at chunk boundary: closed form stripped, live prose released (#1755)", () => {
     const f = createTagEchoFilter();
     let v1 = f.push(`x ${LT}ac`);
     v1 += f.push(`id>`);
@@ -542,6 +542,25 @@ test("decided bare head: dead form stripped, live prose released (#1755)", () =>
     v2 += g.push(`>`);
     v2 += g.flush();
     assert.equal(v2, "x ");
+});
+
+// Owner review of PR #1759: a head whose next char merely breaks the letter
+// run is NOT proof of death — user-defined kebab elements (\x3cai-video\x3e)
+// start that way. Only the CLOSED 2-letter form is stripped mid-text.
+test("kebab elements starting with a 2-letter in-set pair survive (#1759 review)", () => {
+    const safe = [
+        `use the ${LT}ai-video> element here`,
+        `render ${LT}pi-chart> now`,
+        `${LT}ac-x attr="1">body${LT}/ac-x>`,
+    ];
+    for (const s of safe) {
+        assert.equal(stripAcpTags(s), s, s);
+        for (let split = 0; split <= s.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+            assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+        }
+    }
 });
 
 test("streaming filter drops a long bare in-set run past the tag-open cap (#1755)", () => {
