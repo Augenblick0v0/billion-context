@@ -16,6 +16,10 @@ import { promisify } from "node:util";
 import { resolveDshHome } from "./client-config.js";
 
 export const DSH_PACKAGE = "billion-context";
+// The profile owned by dsh's own desktop app. Its billion-context copy is
+// updated in place by bili itself (#1575 owner decision — the CLI refuses this
+// profile by design), so every channel-side refresh path must skip it.
+export const DSH_DESKTOP_PROFILE = "desktop";
 
 const DSH_EXEC_TIMEOUT_MS = 5 * 60 * 1000; // cold pnpm store + slow network
 
@@ -409,6 +413,13 @@ export async function refreshDshProfileBundles(
         const spec = dshProfileDepSpec(dir);
         if (spec !== undefined && !isRegistryDepSpec(spec)) {
             log("info", `[update] dsh profile ${name}: billion-context pinned to ${spec} (local source) — leaving it alone`);
+            continue;
+        }
+        if (name === DSH_DESKTOP_PROFILE) {
+            // #1575 owner decision: the CLI refuses --profile desktop by design, and the
+            // in-app plugin manager cannot be relied on — bili owns that copy in place,
+            // driven by update.ts refreshDshDesktopCopy alongside every call site of
+            // this function. Spawning the CLI here would just log a guaranteed failure.
             continue;
         }
         if (installedProfileVersion(dir) === targetVersion) continue; // #1803: already in step

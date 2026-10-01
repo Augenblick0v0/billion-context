@@ -20,7 +20,7 @@
  * version and stops trying. No notified Set — failed installs retry next
  * cycle automatically.
  */
-import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
@@ -30,7 +30,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
-import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE } from "./dsh-channel.js";
+import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -270,6 +270,23 @@ export interface HostManagedInstall {
  *  store. Returns the owner + its update channel, or undefined when the copy
  *  is bili-owned (npm global, manual install) and may be updated in place.
  *  Exported for tests. */
+// #1575 (owner decision 2026-10-01, recorded on the issue): the dsh DESKTOP
+// profile copy is bili-owned IN PLACE. Every other update channel for that
+// lane is closed by design upstream — the dsh CLI refuses `--profile desktop`
+// outright ("managed exclusively by the Electron application") and the
+// in-app plugin manager does not reliably pull newer bundled deps — so the
+// global self-update / periodic check is the only working path and it must be
+// allowed to overwrite in place. Residual second-writer risk with the app's
+// own manager is explicitly accepted by the owner; reverting means dropping
+// this check.
+function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
+    const anchor = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE).split(path.sep).join("/");
+    return [installDir, real].some((dir) => {
+        const norm = dir.split(path.sep).join("/");
+        return norm.startsWith(anchor + "/") && norm.endsWith(`/node_modules/${DSH_PACKAGE}`);
+    });
+}
+
 export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = process.env): HostManagedInstall | undefined {
     let real = installDir;
     try {
@@ -277,6 +294,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
     } catch {
         // nonexistent or unreadable — evaluate the literal path
     }
+    if (isDshDesktopBiliCopy(installDir, real, env)) return undefined;
     for (const dir of [installDir, real]) {
         if (dir.split(path.sep).some((seg) => seg === ".pnpm")) {
             return {
@@ -638,8 +656,49 @@ export async function refreshDshProfileCopy(
     }
     try {
         await refreshDshProfileBundles(latest, log, env);
+        await refreshDshDesktopCopy(latest, log, env);
     } finally {
         await lock.release();
+    }
+}
+
+/** #1575 (owner decision): refresh the dsh DESKTOP profile copy IN PLACE. The
+ *  CLI refuses --profile desktop outright ("managed exclusively by the Electron
+ *  application") and the in-app plugin manager cannot be relied on, so bili owns
+ *  that copy: a verified-registry-tarball install through the standard
+ *  junction-safe installer (whose hostManagedInstall exemption recognizes this
+ *  exact layout), keyed off the running user's DSH_HOME. Called alongside
+ *  refreshDshProfileBundles at every driver site; all sites hold the shared
+ *  update lock. Silent while the copy is missing, in step, or ahead; failures
+ *  log and retry next cycle; never throws. */
+export async function refreshDshDesktopCopy(
+    targetVersion: string,
+    log: Logger = loggerLog,
+    env: NodeJS.ProcessEnv = process.env,
+    resolveProxy?: (url: string) => string | undefined,
+): Promise<void> {
+    const flat = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE, "node_modules", DSH_PACKAGE);
+    try {
+        try {
+            await access(flat, constants.F_OK);
+        } catch {
+            return; // no desktop profile on this machine — nothing to keep in step
+        }
+        const diskVersion = await readDiskVersion(flat);
+        if (!isVersionNewer(targetVersion, diskVersion ?? "0.0.0")) return; // in step or ahead — never downgrade
+        const doc = await fetchVersionDoc({ resolveProxy }, DSH_PACKAGE, targetVersion);
+        if (!doc?.tarball) {
+            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
+            return;
+        }
+        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env);
+        if (result.ok) {
+            log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it`);
+        } else {
+            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed: ${result.error}; retrying next cycle`);
+        }
+    } catch (err) {
+        log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${err instanceof Error ? err.message : String(err)}; leaving the copy untouched`);
     }
 }
 
@@ -710,7 +769,6 @@ async function refreshOwnerManagedCopies(
     await refreshDshProfileCopy(installDir, opts, env, log);
     await refreshPiNpmCopy(installDir, opts, env, log);
 }
-
 /** Registry-pinned dsh profile copies whose installed version is older
  *  than the global one ("name@version" per entry). Dev pins (link:/file:)
  *  and declared-but-not-installed mounts are out of scope: neither
@@ -767,6 +825,7 @@ export async function convergeDshProfileBundles(
     }
     try {
         await refreshDshProfileBundles(globalVersion, log, env);
+        await refreshDshDesktopCopy(globalVersion, log, env);
     } finally {
         await lock.release();
     }
@@ -912,6 +971,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 // the old version next to the new global one (#953). Best-effort:
                 // never fails the update itself.
                 await refreshDshProfileBundles(latest, loggerLog);
+                await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
                 notifyStaleInstall(opts, latest);
             } else {
                 loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
@@ -965,6 +1025,7 @@ export async function installViaTarball(
     integrity?: string,
     shasum?: string,
     dispatcher?: object,
+    env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -987,7 +1048,8 @@ export async function installViaTarball(
 
     // #991 single-writer: refuse to overwrite a host-managed copy (pnpm
     // store, host agent data trees) — only its owner may update it.
-    const managed = hostManagedInstall(installDir);
+    // Exception: the dsh desktop-profile copy is bili-owned in place (#1575).
+    const managed = hostManagedInstall(installDir, env);
     if (managed) {
         return { ok: false, error: `install dir is managed by ${managed.owner} (${installDir}) \u2014 refusing in-place overwrite (single-writer); update via ${managed.channel}` };
     }
@@ -1080,27 +1142,65 @@ export async function installViaTarball(
         await rm(tmpFile, { force: true });
     }
 
+    // pnpm virtual-store copy (#1575 desktop lane): the flat node_modules
+    // entry is a directory symlink/junction into <profile>/.pnpm/. fs.cp would
+    // FOLLOW the link and rewrite shared store content (hardlinked,
+    // integrity-checked by pnpm), so displace the LINK itself and lay down the
+    // verified package as a real directory at this path instead.
+    let pnpmOldLink: string | null = null;
+    {
+        let linkStat: Awaited<ReturnType<typeof lstat>> | null = null;
+        try {
+            linkStat = await lstat(installDir);
+        } catch {
+            // vanished mid-update — treat as a plain missing/real dir below
+        }
+        if (linkStat?.isSymbolicLink()) {
+            pnpmOldLink = `${installDir}.pnpm-${Date.now()}`;
+            try {
+                await rename(installDir, pnpmOldLink);
+            } catch (e) {
+                return { ok: false, error: `failed to move the pnpm link aside (${pnpmOldLink}): ${String(e)} (install left untouched)` };
+            }
+        }
+    }
+
     // Back up the current install before overwriting. If anything fails after
     // the copy (partial copy, version drift, corrupted entry), the backup is
     // restored so the previously working version keeps running.
     const backupDir = path.join(cacheDir(), `.update-backup-${version}`);
-    try {
-        await rm(backupDir, { recursive: true, force: true });
-        await cp(installDir, backupDir, { recursive: true, force: true });
-    } catch (e) {
-        // Fail closed: without a backup we refuse to overwrite the running
-        // install — the current version keeps working.
-        return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
+    if (pnpmOldLink) {
+        // The displaced artifact IS the link itself (kept at pnpmOldLink) and
+        // the store contents it points into were never touched — nothing to
+        // back up as files.
+        try {
+            await rm(backupDir, { recursive: true, force: true });
+        } catch {
+            // clearing a stale backup dir failing is not fatal in this branch
+        }
+    } else {
+        try {
+            await rm(backupDir, { recursive: true, force: true });
+            await cp(installDir, backupDir, { recursive: true, force: true });
+        } catch (e) {
+            // Fail closed: without a backup we refuse to overwrite the running
+            // install — the current version keeps working.
+            return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
+        }
     }
 
     const restoreFromBackup = async (): Promise<string | null> => {
         try {
             await rm(installDir, { recursive: true, force: true });
-            await cp(backupDir, installDir, { recursive: true, force: true });
+            if (pnpmOldLink) {
+                await rename(pnpmOldLink, installDir);
+            } else {
+                await cp(backupDir, installDir, { recursive: true, force: true });
+            }
             return null;
         } catch (e) {
-            // Keep the backup dir — it is the only healthy copy left.
-            return `ROLLBACK FAILED — restore ${backupDir} to ${installDir} manually: ${String(e)}`;
+            // Keep the backup — it is the only healthy copy left.
+            return `ROLLBACK FAILED — restore ${pnpmOldLink ?? backupDir} to ${installDir} manually: ${String(e)}`;
         }
     };
 
@@ -1137,8 +1237,16 @@ export async function installViaTarball(
         return { ok: false, error: rb ?? postEntryErr };
     }
 
-    // Success: the backup is no longer needed.
+    // Success: the backup is no longer needed, and neither is the displaced
+    // pnpm link (the store copy underneath it was left byte-identical).
     await rm(backupDir, { recursive: true, force: true });
+    if (pnpmOldLink) {
+        try {
+            await unlink(pnpmOldLink);
+        } catch {
+            // inert once installDir holds the fresh real directory
+        }
+    }
 
     return { ok: true };
 }
@@ -1247,6 +1355,7 @@ export async function forceInstallVersion(
         if (result.ok) {
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await refreshDshProfileBundles(targetVersion, loggerLog);
+            await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);
             notifyStaleInstall(opts, targetVersion);
             return { ok: true };
         }
