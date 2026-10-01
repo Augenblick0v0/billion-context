@@ -930,6 +930,47 @@ test("apply() runtime-info (#956): a mid-resolve model switch discards the stale
     }
 });
 
+test("apply() runtime-info (#1812): a failed window resolve retries after the cooldown instead of latching headerless", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-retry-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // boot race: the first two resolves fail (catalog still loading);
+            // pre-#1812 the failure-shaped cache latched and the process never
+            // sent x-bili-plugin-context-window again
+            let attempts = 0;
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async () => {
+                        attempts += 1;
+                        if (attempts <= 2) throw new Error("catalog not ready");
+                        return { context: { contextWindow: 262144 }, defaultMaxTokens: 32768 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "qwen-ri" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (retry)");
+            ctx.setInitiator({ session: { id: "session-retry" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // the failed resolve cached {provider, model}: model id still stamped, window absent
+            await waitFor(() => stamp()?.["x-bili-plugin-model"] === "qwen-ri", "failure-shaped cache stamped the model id");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            // each further request drives headersFor → refreshModelInfo; the
+            // cooldown (1ms here) expires and a retry commits the window
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "262144", "retry after cooldown recovered the window header");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+            assert.ok(attempts >= 3, `the resolver was retried past its failures (attempts=${attempts})`);
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("apply() /acp pre-first-request (#955): renders the runtime-table entry before any model request", async () => {
     const pre = {
         ok: true,
