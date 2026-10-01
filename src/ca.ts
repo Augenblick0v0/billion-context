@@ -6,13 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { caDir } from "./paths.js";
-import { log } from "./logger.js";
+import { log as loggerLog } from "./logger.js";
 
 const ROOT_CERT_FILE = "root-ca.pem";
 const ROOT_KEY_FILE = "root-ca-key.pem";
 const COMBINED_CA_FILE = "combined-ca.pem";
 const ROOT_CN = "billion-context MITM Root CA";
-// #1802: the combined bundle merges the OS trust store, which costs a
+// #1807: the combined bundle merges the OS trust store, which costs a
 // PowerShell spawn on Windows — bound the rebuild to once per day per machine.
 const COMBINED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -80,7 +80,7 @@ export function collectSystemCaPems(env: NodeJS.ProcessEnv = process.env): strin
     return pems;
 }
 
-/** #1802: sha256 over the whitespace-stripped base64 payload — dedupes the
+/** #1807: sha256 over the whitespace-stripped base64 payload — dedupes the
  *  same certificate across differently-wrapped PEM encodings (Node's Mozilla
  *  snapshot vs OS-store exports wrap at different columns). */
 export function pemFingerprint(pem: string): string {
@@ -88,7 +88,7 @@ export function pemFingerprint(pem: string): string {
     return crypto.createHash("sha256").update(b64).digest("hex");
 }
 
-/** #1802: wrap a base64 DER certificate as a 64-column PEM block. */
+/** #1807: wrap a base64 DER certificate as a 64-column PEM block. */
 export function wrapDerPem(b64: string): string {
     const clean = b64.replace(/[^A-Za-z0-9+/=]/g, "");
     const lines: string[] = [];
@@ -96,7 +96,7 @@ export function wrapDerPem(b64: string): string {
     return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`;
 }
 
-/** #1802: decode captured PowerShell output — PS 5.1 pipes are frequently
+/** #1807: decode captured PowerShell output — PS 5.1 pipes are frequently
  *  UTF-16LE even though our payload is pure ASCII, so a NUL stride at odd
  *  offsets is the tell; re-decode accordingly instead of dropping everything. */
 export function decodeOsStoreOutput(buf: Buffer): string {
@@ -104,7 +104,7 @@ export function decodeOsStoreOutput(buf: Buffer): string {
     return buf.toString("utf8");
 }
 
-/** #1802: parse the NDJSON lines emitted by osStorePowerShellScript() into PEM
+/** #1807: parse the NDJSON lines emitted by osStorePowerShellScript() into PEM
  *  blocks. Malformed/junk lines are skipped, never fatal. */
 export function parseOsStoreNdjson(out: string): string[] {
     const pems: string[] = [];
@@ -119,7 +119,7 @@ export function parseOsStoreNdjson(out: string): string[] {
     return pems;
 }
 
-/** #1802: PowerShell 5.1 script exporting every certificate of the machine +
+/** #1807: PowerShell 5.1 script exporting every certificate of the machine +
  *  user Root stores as one NDJSON {"d":"<base64 DER>"} line per certificate
  *  (NDJSON keeps the pipe output parseable regardless of locale/console code
  *  page — no human-readable table text to mangle). */
@@ -141,7 +141,7 @@ function splitPemBlocks(text: string): string[] {
     return out;
 }
 
-/** #1802: certificates from the OS-native trust store. Launched clients treat
+/** #1807: certificates from the OS-native trust store. Launched clients treat
  *  combined-ca.pem as their ENTIRE trust pool when SSL_CERT_FILE points at it
  *  (codex/rustls replace, not append — see codex-rs/http-client custom_ca.rs),
  *  so the bundle must be a superset of what the OS itself trusts: any direct
@@ -176,7 +176,7 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
         }
         return [];
     } catch (err) {
-        log("warn", `os-store merge skipped (${platform}): ${String(err).slice(0, 200)}`);
+        loggerLog("warn", `os-store merge skipped (${platform}): ${String(err).slice(0, 200)}`);
         return [];
     }
 }

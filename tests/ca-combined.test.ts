@@ -81,7 +81,7 @@ test("#152: resolveCombinedCaPath mirrors the caDir layout", () => {
 
 const b64Of = (pem: string): string => pem.replace(/-----(BEGIN|END) CERTIFICATE-----/g, "").replace(/\s+/g, "");
 
-test("#1802: wrapDerPem round-trips a real root cert at 64 columns", () => {
+test("#1807: wrapDerPem round-trips a real root cert at 64 columns", () => {
     const b64 = b64Of(tls.rootCertificates[0]);
     const wrapped = wrapDerPem(b64);
     const lines = wrapped.trim().split("\n");
@@ -93,14 +93,14 @@ test("#1802: wrapDerPem round-trips a real root cert at 64 columns", () => {
     assert.equal(b64Of(wrapped), b64);
 });
 
-test("#1802: pemFingerprint dedupes across wrappings, separates distinct certs", () => {
+test("#1807: pemFingerprint dedupes across wrappings, separates distinct certs", () => {
     const b64a = b64Of(tls.rootCertificates[0]);
     const altWrap = (b64: string) => `-----BEGIN CERTIFICATE-----\n${b64.match(/.{1,32}/g)!.join("\n")}\n-----END CERTIFICATE-----`;
     assert.equal(pemFingerprint(tls.rootCertificates[0]), pemFingerprint(altWrap(b64a)));
     assert.notEqual(pemFingerprint(tls.rootCertificates[0]), pemFingerprint(altWrap(b64Of(tls.rootCertificates[1]))));
 });
 
-test("#1802: parseOsStoreNdjson skips junk/malformed lines and tolerates CRLF", () => {
+test("#1807: parseOsStoreNdjson skips junk/malformed lines and tolerates CRLF", () => {
     const b64 = b64Of(tls.rootCertificates[0]);
     const out = `{"d":"${b64}"}\r\ngarbage line\r\nnot json at all\r\n{"d":""}\r\n{"nope":1}\r\n{"d":"${b64}"}\r\n`;
     const pems = parseOsStoreNdjson(out);
@@ -108,20 +108,20 @@ test("#1802: parseOsStoreNdjson skips junk/malformed lines and tolerates CRLF", 
     assert.equal(pems[0], wrapDerPem(b64));
 });
 
-test("#1802: decodeOsStoreOutput handles UTF-16LE PowerShell pipes", () => {
+test("#1807: decodeOsStoreOutput handles UTF-16LE PowerShell pipes", () => {
     const text = '{"d":"QUJDRA=="}';
     assert.equal(decodeOsStoreOutput(Buffer.from(text, "utf8")), text);
     assert.equal(decodeOsStoreOutput(Buffer.from(text, "utf16le")), text);
 });
 
-test("#1802: osStorePowerShellScript covers both Root stores without interpolation leaks", () => {
+test("#1807: osStorePowerShellScript covers both Root stores without interpolation leaks", () => {
     const s = osStorePowerShellScript();
     assert.ok(s.includes("X509Store('Root'"));
     assert.ok(s.includes("'LocalMachine','CurrentUser'"));
     assert.ok(!s.includes("${"));
 });
 
-test("#1802: collectOsStorePems degrades to [] where the platform tooling is absent", () => {
+test("#1807: collectOsStorePems degrades to [] where the platform tooling is absent", () => {
     assert.deepEqual(collectOsStorePems("linux"), [], "linux has no OS-store source");
     if (process.platform !== "win32") assert.deepEqual(collectOsStorePems("win32"), [], "no powershell off-Windows");
     if (process.platform !== "darwin") assert.deepEqual(collectOsStorePems("darwin"), [], "no security(1) off-macOS");
@@ -134,7 +134,7 @@ test("#1802: collectOsStorePems degrades to [] where the platform tooling is abs
     }
 });
 
-test("#1802: combined bundle reused while fresh, rebuilt when stale or CA-missing", () => {
+test("#1807: combined bundle reused while fresh, rebuilt when stale or CA-missing", () => {
     ensureRootCA();
     const file = combinedCaPath();
     const mitmRoot = fs.readFileSync(rootCaPath(), "utf8").trim();
