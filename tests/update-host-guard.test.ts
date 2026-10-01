@@ -60,6 +60,22 @@ test("hostManagedInstall: host agent homes own their trees", () => {
     }
 });
 
+test("hostManagedInstall: dsh desktop profile copy is bili-owned in place (#1575)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-host-guard-"));
+    try {
+        const ds = path.join(base, "dsh-root");
+        const env = { DSH_HOME: ds };
+        // flat node_modules entry (the pnpm forwarder path the proxy runs from)
+        assert.equal(hostManagedInstall(path.join(ds, "profiles", "desktop", "node_modules", "billion-context"), env), undefined);
+        // realpath form: the virtual-store target beneath the desktop profile
+        assert.equal(hostManagedInstall(path.join(ds, "profiles", "desktop", ".pnpm", "billion-context@0.1.178_x", "node_modules", "billion-context"), env), undefined);
+        // identical shape under any OTHER profile stays pnpm-owned
+        assert.equal(hostManagedInstall(path.join(ds, "profiles", "web", ".pnpm", "billion-context@0.1.178_x", "node_modules", "billion-context"), env)?.owner, "pnpm");
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("hostManagedInstall: bili-owned dirs (npm global layout, scratch) stay updatable", () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-host-guard-"));
     try {
