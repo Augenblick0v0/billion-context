@@ -20,6 +20,21 @@ import { REMOTE_IMAGE_TOKENS, imageTokensInParsedBody, imageTokensInRawBody } fr
 const B64_8K = "A".repeat(8000);
 const DATA_URL = `data:image/png;base64,${B64_8K}`;
 
+// Minimal parseable PNG header (signature + IHDR dims, CRC unchecked by the
+// dimension decoder) — needed by the #488-A2 scenario because #1843 made the
+// auto billing mode resolve to pixels: an unparsable base64 blob now bills at
+// the flat 16,384 fallback (≥ this suite's 10k window), which would disable
+// the output clamp entirely instead of shrinking it.
+function realPngB64(w: number, h: number): string {
+    const b = Buffer.alloc(24);
+    b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    b.writeUInt32BE(13, 8);
+    b.write("IHDR", 12, "ascii");
+    b.writeUInt32BE(w, 16);
+    b.writeUInt32BE(h, 20);
+    return b.toString("base64");
+}
+
 test("image-tokens: base64 data URLs count as ceil(b64len/4) across protocols", () => {
     assert.equal(
         imageTokensInParsedBody("responses", { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }, { type: "input_image", image_url: DATA_URL }] }] }),
@@ -173,9 +188,10 @@ test("e2e #488-A/#496 (Responses): image-dominated payload with no overflow evid
         req.on("end", () => {
             const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
             streamForwards.push(parsed.stream === true);
-            // Pixel-tile upstream shape: accepts the payload and reports a SMALL real
-            // input cost despite the large base64 body (a 60k-char screenshot bills as
-            // ~1.6K tiles upstream, not the 15K tokens bili estimates from b64/4).
+            // Upstream that bills far below bili's estimate: accepts the payload
+            // and reports a SMALL real input cost despite the large base64 body
+            // (an unparsable 60k-char blob bills at the flat 16,384 pixel-fallback
+            // per image since #1843, not b64/4's 15K — same order, right direction).
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(completed(3000));
             res.end();
@@ -187,13 +203,14 @@ test("e2e #488-A/#496 (Responses): image-dominated payload with no overflow evid
     const { proxy, url } = await startProxy(upstreamPort);
 
     try {
-        // 7 screenshots × 60k base64 chars = 7 × 15_000 = 105_000 ESTIMATED image
-        // tokens against a 10_000 window. Text is trivially small, so images are the
-        // sole over-window component. Fresh session (lastInputTokens=0, no learned
-        // limit) → no upstream overflow evidence → #496 forward-once-then-learn lets
-        // the upstream arbitrate the true billing instead of a hard 502 (#488's
-        // original expectation was withheld+never-forwarded; that was the false
-        // positive for tile-billed upstreams this issue fixes).
+        // 7 unparsable 60k-base64-char blobs = 7 × 16_384 = 114_688 ESTIMATED image
+        // tokens (flat pixel fallback, #1843) against a 10_000 window. Text is
+        // trivially small, so images are the sole over-window component. Fresh
+        // session (lastInputTokens=0, no learned limit) → no upstream overflow
+        // evidence → #496/#1800 arbitration forwards for the upstream to settle the
+        // true billing instead of a hard 502 (#488's original expectation was
+        // withheld+never-forwarded; that was the false positive for tile-billed
+        // upstreams those issues fixed).
         const bigB64 = "A".repeat(60_000);
         const input = [
             {
@@ -264,13 +281,14 @@ test("e2e #488-A2 (Responses): image tokens count toward the output-budget clamp
         assert.equal(r1.status, 200);
         await r1.text();
 
-        // Same shape plus one 16k-base64-char screenshot (4_000 image tokens): input+output
-        // would overflow the 10k window, so the outgoing max_output_tokens must be clamped.
-        const bigB64 = "A".repeat(16_000);
+        // Same shape plus two 2048×1536 screenshots (pixel-billed: 2 × 2,125 =
+        // 4,250 image tokens): input+output would overflow the 10k window, so
+        // the outgoing max_output_tokens must be clamped.
+        const shot = `data:image/png;base64,${realPngB64(2048, 1536)}`;
         const r2 = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "img-sess-c2", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "screenshot attached" }, { type: "input_image", image_url: `data:image/png;base64,${bigB64}` }] }], max_output_tokens: 5_000 }),
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "img-sess-c2", instructions: "You are the test coding agent.", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "screenshots attached" }, { type: "input_image", image_url: shot }, { type: "input_image", image_url: shot }] }], max_output_tokens: 5_000 }),
         });
         assert.equal(r2.status, 200);
         await r2.text();

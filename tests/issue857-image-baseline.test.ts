@@ -41,7 +41,9 @@ const MODEL = "deepseek-flash";
 const FALLBACK_MODEL = "unknown-model-857";
 // One screenshot whose BYTES-mode cost (b64/4) is exactly IMAGE_FLOOR tokens —
 // large enough to exceed even the fake 1,072,519 window on its own, as in the
-// issue (multiple pages of screenshots).
+// issue (multiple pages of screenshots). #1843 made auto resolve to pixels for
+// every host, so this scenario pins imageBilling:"bytes" explicitly — the
+// conservative over-estimate class that still exists as an opt-in.
 const IMAGE_FLOOR = 1_100_000;
 // pngB64() emits 32 base64 characters of header; bytes cost = ceil(len/4).
 const IMG_PAD = IMAGE_FLOOR * 4 - 32;
@@ -93,7 +95,7 @@ async function startProxy(upstreamPort: number, models: Record<string, { context
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models, imageBilling: "bytes" } },
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
         compress: { injectTool: true, injectNudge: true },

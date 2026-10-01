@@ -73,12 +73,18 @@ export type ProviderRoute = {
      *  as every other provider field, so it is generic across lanes (an MITM
      *  lane could honor it by skipping interception for the domain). */
     direct?: boolean;
-    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4)
-     *  (conservative, matches byte-counting relays); "pixels" = dimension-
-     *  based tile estimate (matches first-party pixel-tile upstreams);
-     *  "auto" (default) classifies known first-party pixel hosts. Wins over
-     *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
+    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4), an
+     *  EXPLICIT opt-in for byte-counting relays only; "pixels" = dimension-
+     *  based tile estimate; "auto" (default) resolves to pixels for every host
+     *  (#1843: base64/4 as an implicit default was a ±1500% estimate that
+     *  poisoned every window gate). Wins over the global `imageBilling`; env
+     *  BILI_IMAGE_BILLING wins over both. */
     imageBilling?: ImageBillingMode;
+    /** #1843 L3: per-image token ceiling for this route — clamps each image's
+     *  estimated cost (both billing modes). Wins over the global
+     *  `imageTokenCap`; env BILI_IMAGE_TOKEN_CAP wins over both. Positive
+     *  integer; undefined/unset = no cap. */
+    imageTokenCap?: number;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -604,8 +610,13 @@ export type ProxyOptions = {
      *  wins over the file's compat.streamErrorShape. */
     streamErrorShape: "protocol" | "completion";
     /** Global-level image billing mode (#767); per-provider route entries
-     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
+     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto
+     *  (= pixels for every host since #1843). */
     imageBilling?: ImageBillingMode;
+    /** #1843 L3: global per-image token ceiling; per-provider route entries
+     *  override it, env BILI_IMAGE_TOKEN_CAP overrides both. Positive integer;
+     *  undefined/unset = no cap. */
+    imageTokenCap?: number;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -704,7 +715,7 @@ export type ProxyOptions = {
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
  *  WITHOUT `bind` they are inert (longest-prefix matching never hits a name),
  *  so loadRoutes warns loudly instead of letting them sit dead (#1469). */
-const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "compat", "imageBilling"] as const;
+const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
 // the same named-provider warning (same pattern as the absorb warnings below).
@@ -1058,6 +1069,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {}, dropFields: parseCompatDropFields(fileConfig.compat?.dropFields) ?? [] },
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
+        imageTokenCap: parseImageTokenCap(fileConfig.imageTokenCap),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -1221,6 +1233,9 @@ type FileConfig = {
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
     imageBilling?: string;
+    /** #1843 L3: global per-image token ceiling (positive integer); per-route
+     *  `imageTokenCap` overrides it, env BILI_IMAGE_TOKEN_CAP wins over both. */
+    imageTokenCap?: number;
     /** Claude-native port override (#964/#1660): an explicit port for the
      *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
@@ -1422,7 +1437,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -1437,6 +1452,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (typeof obj.direct === "boolean") route.direct = obj.direct;
         const imageBilling = parseImageBilling(obj.imageBilling);
         if (imageBilling) route.imageBilling = imageBilling;
+        const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
+        if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
@@ -1446,6 +1463,12 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
 
 export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
+}
+
+/** #1843 L3: per-image token ceiling — positive integer only (lenient like
+ *  parseImageBilling: anything else is dropped, never a throw). */
+export function parseImageTokenCap(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {

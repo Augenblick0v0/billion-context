@@ -238,6 +238,7 @@ export function sideRequestGuard(
     protocol: WireProtocol,
     modelContextLimit: number,
     imageBilling: ResolvedImageBilling = "bytes",
+    configuredCap?: number,
     headroomCap: number = 1,
     armedLimit: number = 0,
 ): { blocked: boolean; estimate: number; limit: number } {
@@ -251,6 +252,6 @@ export function sideRequestGuard(
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
+    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }
