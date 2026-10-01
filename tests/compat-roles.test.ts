@@ -472,7 +472,7 @@ test("e2e #583 G: mid-list assistant→system 400s on a placement-strict backend
         });
         assert.equal(res2.status, 200);
         assert.equal(seen.length, 4, `expected 4 upstream hits total (3 + 1), got ${JSON.stringify(seen)}`);
-        assert.ok(!seen[3].includes("assistant") && !seen[3].includes("system"), "second request pre-rewritten via learned map");
+        assert.ok(!seen[3].includes("assistant") && !midListSystem(seen[3]), "second request pre-rewritten via learned map");
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");
     } finally {
