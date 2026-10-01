@@ -8,9 +8,11 @@ import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-// #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
-// default (waitFor below caps at 5s — a full grace would race it). Pinned-path
-// tests override per-test.
+// #1365: legacy dead-attach suites see no routed traffic, so without this pin
+// each would sit out the FULL routed-evidence grace window (default 5s,
+// native-intercept observeRoutedOrigin) before the spawn fallback — keep the
+// grace tiny so the POLL_DEADLINE_MS cap dominates timing. Pinned-path tests
+// override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
@@ -407,10 +409,13 @@ type RegisteredTool = {
     execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
 };
 
-/** Poll until cond() holds (10ms ticks, 5s cap) — a fixed sleep races on
- *  slow CI runners (windows loopback fetch can outlast 50ms). */
+// #1785: poll budget raised 5s→15s so a loaded dev host clears a loopback round-trip (fast CI is sub-second).
+const POLL_DEADLINE_MS = 15000;
+
+/** Poll until cond() holds (10ms ticks, POLL_DEADLINE_MS cap) — a fixed sleep
+ *  races on slow runners (a loopback fetch can outlast tens of ms). */
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     while (!cond()) {
         if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
         await new Promise((r) => setTimeout(r, 10));
@@ -1476,7 +1481,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
             _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
             const t0 = Date.now();
             while (!errors.some((l) => l.includes("refusing to spawn a second instance"))) {
-                if (Date.now() - t0 > 5000) throw new Error("timed out waiting for the loud refusal");
+                if (Date.now() - t0 > POLL_DEADLINE_MS) throw new Error("timed out waiting for the loud refusal");
                 await new Promise((r) => setTimeout(r, 10));
             }
             assert.equal(spawnCalls, 0);
@@ -1523,7 +1528,7 @@ test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to 
             for (;;) {
                 const st = await ctx.registeredCommands[0].handler();
                 if (st.text.includes("PANEL-B")) break;
-                if (Date.now() - t0 > 4000) throw new Error("timed out waiting for the tool-channel rebind");
+                if (Date.now() - t0 > POLL_DEADLINE_MS) throw new Error("timed out waiting for the tool-channel rebind");
                 await new Promise((r) => setTimeout(r, 10));
             }
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365c" } } });
