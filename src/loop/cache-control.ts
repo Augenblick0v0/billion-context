@@ -82,6 +82,10 @@ export function stampAnthropicSystemCacheControl(systemOut: AnthropicRequestBody
     for (const block of systemOut) {
         if ((block as { cache_control?: unknown }).cache_control) return systemOut;
     }
-    (systemOut[systemOut.length - 1] as { cache_control?: unknown }).cache_control = { type: "ephemeral" };
+    // Stamp by replacement, never in place: the array may share block
+    // references with the frozen client head (parsed.system), which must stay
+    // unmarked (#1085).
+    const last = systemOut.length - 1;
+    systemOut[last] = { ...systemOut[last], cache_control: { type: "ephemeral" } };
     return systemOut;
 }

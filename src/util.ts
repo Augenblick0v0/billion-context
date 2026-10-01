@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 
 // #920: stamped per request by the opencode thin plugin for LEGACY
 // opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
@@ -354,6 +355,34 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
         if (c === null || c === undefined) return { ...m, content: "" } as T;
         return m;
     });
+}
+
+// #1876: rebuild the outbound Anthropic `system` by APPENDING bili's added
+// text (the compress prompt) instead of merging it into one block. The kernel's
+// buildSystem(flattenedText, original) collapses a client's N-block system into
+// a single joined block and relocates the first client cache_control onto it —
+// which breaks downstream gateways that identify Claude Code traffic by system
+// BLOCK SHAPE (sub2api's systemHasBillingAttributionBlock requires some block's
+// text to startsWith the billing-attribution prefix — true pre-merge only when
+// the billing block happened to lead) and shifts byte-prefix/sticky-hash
+// anchors (#1754/#1631). Original blocks therefore ride out byte-exact, in
+// order, with their cache_control in place; the added text becomes ONE fresh
+// trailing text block with no mark (the "---" separator is redundant once the
+// prompt stands alone as its own block). String/absent/empty originals have no
+// block shape to preserve: the legacy flat join (base + "\n\n---\n\n" + added)
+// stays byte-identical. REPLACEMENT semantics (#1085 anchor rollback, where the
+// frozen text is NOT an extension of the current client text) stay on kernel
+// buildSystem — this helper is for appends only.
+export function appendSystemText(
+    added: string,
+    original: AnthropicRequestBody["system"],
+): string | AnthropicRequestBody["system"] {
+    if (Array.isArray(original) && original.length > 0) {
+        return added ? [...original, { type: "text", text: added }] : [...original];
+    }
+    const base = typeof original === "string" ? original : "";
+    if (!added) return base;
+    return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
 /**
