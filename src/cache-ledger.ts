@@ -23,6 +23,13 @@ const FULL_DETAIL_LINES = 512;
 // upstream KV was dropped during downtime even though bili's message refs were preserved.
 const BOOT_ID = randomUUID();
 
+// #1847: a dimension that changed keeps claiming this sample's stable-prefix residual for up to
+// SWITCH_COLD_ROUNDS later samples (by sample index — unmeasured ones also advance it, tightening the
+// window), until a line >= WARM_HIT_PCT proves re-cache (retires all open windows). Beyond the bound
+// the residual reverts to unattributed TTL — an old switch must never swallow later, unrelated churn.
+const SWITCH_COLD_ROUNDS = 4;
+const WARM_HIT_PCT = 85;
+
 interface LedgerFold {
     seq: number;
     at: number;
@@ -43,7 +50,7 @@ interface LedgerLine {
     input: number;
     cached: number;
     output: number;
-    hitPct: number;
+    hitPct: number | null;
     missed: number;
     nc: number;
     cr: number;
@@ -78,6 +85,9 @@ interface LedgerLine {
      *  expired: its uncached input is initial content, booked as newContent and
      *  never a seam candidate. Sparse: omitted unless set. */
     nb?: 1;
+    /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
+     *  never more than one); omitted when unattributed or unmeasured. */
+    cause?: "restart" | "model" | "wire" | "upstream";
 }
 
 export interface CacheLedger {
@@ -136,6 +146,14 @@ export interface CacheLedger {
     /** #1536: BOOT_ID of the process that recorded the last line — a mismatch on
      *  the next sample marks a proxy-restart boundary (#499). Absent pre-#1536. */
     lastBoot?: string;
+    /** #1847: incremental switch-attribution trackers, advanced by measured samples only. Absent
+     *  pre-#1847 — robust detection + cold-window continuation simply don't apply to older ledgers. */
+    lastKnownModel?: string;
+    lastKnownProto?: string;
+    lastKnownUp?: string;
+    invModel?: { seq: number; at: number; from: string | null; to: string };
+    invWire?: { seq: number; at: number; from: string | null; to: string };
+    invUp?: { seq: number; at: number; from: string | null; to: string };
 }
 
 const LEDGER_KEY = "cacheLedger";
@@ -265,7 +283,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
     }
     if (cur !== undefined && prev !== undefined) {
         const f = seamLcp(prev, cur);
-        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct, ...f };
+        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...f };
         (led.seamEvents ?? (led.seamEvents = [])).push(ev);
         if (agg.seamSuspects === 1) {
             loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
@@ -407,7 +425,7 @@ export function recordCacheSample(
         for (const f of pendRefs) hi = Math.max(hi, f.seq);
         led.consumedFoldSeq = Math.max(led.consumedFoldSeq, hi);
     }
-    const hitPct = known && s.input > 0 ? round1((effCached / s.input) * 100) : 0;
+    const hitPct: number | null = known && s.input > 0 ? round1((effCached / s.input) * 100) : null;
     // Target identity (#1535 model, generalized to model|wire|upstream in #1536):
     // each component flags only when BOTH sides are known (unknown never flags).
     const model = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== ""
@@ -415,12 +433,12 @@ export function recordCacheSample(
         : undefined;
     const proto = typeof s.protocol === "string" && s.protocol !== "" ? s.protocol : undefined;
     const up = typeof s.upstream === "string" && s.upstream !== "" ? s.upstream : undefined;
-    const prevModel = prevLine?.model;
-    const prevProto = prevLine?.proto;
-    const prevUp = prevLine?.up;
-    const modelSwitched = model !== undefined && prevModel !== undefined && model !== prevModel;
-    const wireSwitched = proto !== undefined && prevProto !== undefined && proto !== prevProto;
-    const upstreamSwitched = up !== undefined && prevUp !== undefined && up !== prevUp;
+    // #1847: detect a dimension change against the last KNOWN value, not the immediately-previous
+    // line — an unmeasured (null-cache) request at the switch boundary must not swallow the flag,
+    // or the following measured cold re-bill lands unattributed. Unknown samples never advance it.
+    const modelSwitched = known && model !== undefined && led.lastKnownModel !== undefined && model !== led.lastKnownModel;
+    const wireSwitched = known && proto !== undefined && led.lastKnownProto !== undefined && proto !== led.lastKnownProto;
+    const upstreamSwitched = known && up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp;
     // #499: first KNOWN sample under a fresh daemon boot with prior history →
     // proxy-restart / re-fork boundary (upstream KV dropped during downtime).
     const restarted = known && led.lines.length > 0 && led.lastBoot !== undefined && led.lastBoot !== BOOT_ID;
@@ -440,6 +458,26 @@ export function recordCacheSample(
         if (owner) owner.T += dec.compRepay;
     }
     led.sampleSeq += 1;
+    // #1847: attribute this sample's stable-prefix residual to AT MOST ONE named cause — a partition,
+    // not overlapping charges. Priority: restart drops every KV entry regardless of identity; then
+    // identity changes (model recomputes everything, wire/upstream re-route); plain TTL expiry is the
+    // unattributed remainder. A changed dimension also claims the bounded post-switch cold tail until a
+    // warm line proves re-cache — so a switch that cools several rounds is fully charged to it.
+    const isWarm = known && s.input > 0 && (hitPct ?? 0) >= WARM_HIT_PCT;
+    const seq = led.sampleSeq;
+    const contWithin = (inv: { seq: number } | undefined): boolean =>
+        inv !== undefined && !isWarm && seq - inv.seq <= SWITCH_COLD_ROUNDS;
+    // A fresh change on THIS line outranks any prior-line continuation; among fresh changes use the fixed
+    // priority; with none, fall to the highest-priority dimension whose cold window is still open.
+    const cause: "restart" | "model" | "wire" | "upstream" | null =
+        restarted ? "restart"
+            : modelSwitched ? "model"
+            : wireSwitched ? "wire"
+            : upstreamSwitched ? "upstream"
+            : contWithin(led.invModel) ? "model"
+            : contWithin(led.invWire) ? "wire"
+            : contWithin(led.invUp) ? "upstream"
+            : null;
     led.lines.push({
         seq: led.sampleSeq,
         at: s.at,
@@ -461,6 +499,7 @@ export function recordCacheSample(
         rs: restarted ? 1 : undefined,
         unk: known ? undefined : 1,
         nb: noBaseline ? 1 : undefined,
+        cause: known && cause !== null ? cause : undefined,
     });
     led.lastBoot = BOOT_ID;
     const agg = led.agg;
@@ -477,28 +516,35 @@ export function recordCacheSample(
     agg.nc += dec.newContent;
     agg.cr += dec.compRepay;
     agg.tr += dec.ttlRepay;
-    if (modelSwitched) {
-        // #1535: charge only this sample's unexplained residual (tr) — compRepay stays booked to its fold.
-        agg.switches += 1;
-        agg.switchMissed += dec.ttlRepay;
+    // Event counters fire whenever a dimension actually changed (or a restart boundary did) — independent
+    // of attribution, preserving the full from→to log. Token buckets charge EXACTLY the primary cause so
+    // the per-cause breakdown partitions the residual instead of overlapping it across dimensions.
+    if (modelSwitched) agg.switches += 1;
+    if (wireSwitched) agg.wireSwitches += 1;
+    if (upstreamSwitched) agg.upstreamSwitches += 1;
+    if (restarted) agg.restartDrops += 1;
+    if (cause === "model") agg.switchMissed += dec.ttlRepay;
+    else if (cause === "wire") agg.wireSwitchMissed += dec.ttlRepay;
+    else if (cause === "upstream") agg.upstreamSwitchMissed += dec.ttlRepay;
+    else if (cause === "restart") agg.restartDropMissed += dec.ttlRepay;
+    if (cause !== null) agg.attributedMissed += dec.ttlRepay;
+    // Advance the trackers (measured samples only): a warm line retires every open cold-window, an expired
+    // window drops out, and a fresh change opens/replaces it.
+    if (isWarm) {
+        led.invModel = undefined;
+        led.invWire = undefined;
+        led.invUp = undefined;
+    } else {
+        if (led.invModel && seq - led.invModel.seq > SWITCH_COLD_ROUNDS) led.invModel = undefined;
+        if (led.invWire && seq - led.invWire.seq > SWITCH_COLD_ROUNDS) led.invWire = undefined;
+        if (led.invUp && seq - led.invUp.seq > SWITCH_COLD_ROUNDS) led.invUp = undefined;
     }
-    if (wireSwitched) {
-        agg.wireSwitches += 1;
-        agg.wireSwitchMissed += dec.ttlRepay;
-    }
-    if (upstreamSwitched) {
-        agg.upstreamSwitches += 1;
-        agg.upstreamSwitchMissed += dec.ttlRepay;
-    }
-    if (restarted) {
-        agg.restartDrops += 1;
-        agg.restartDropMissed += dec.ttlRepay;
-    }
-    if (modelSwitched || wireSwitched || upstreamSwitched || restarted) {
-        // Union residual charged to ≥1 named cause (buckets may overlap each
-        // other; this one does not, keeping `remaining` non-negative).
-        agg.attributedMissed += dec.ttlRepay;
-    }
+    if (modelSwitched) led.invModel = { seq, at: s.at, from: led.lastKnownModel ?? null, to: model! };
+    if (wireSwitched) led.invWire = { seq, at: s.at, from: led.lastKnownProto ?? null, to: proto! };
+    if (upstreamSwitched) led.invUp = { seq, at: s.at, from: led.lastKnownUp ?? null, to: up! };
+    if (model !== undefined) led.lastKnownModel = model;
+    if (proto !== undefined) led.lastKnownProto = proto;
+    if (up !== undefined) led.lastKnownUp = up;
     if (noBaseline) {
         agg.nbSamples += 1;
         agg.nbInput += s.input;
@@ -645,21 +691,30 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
-    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined): ModelSwitchEvent[] => {
+    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "wire" | "upstream"): ModelSwitchEvent[] => {
         const evs: ModelSwitchEvent[] = [];
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
             if (!l || l.unk === 1 || !flag(l)) continue;
-            const prev = i > 0 ? led.lines[i - 1] : undefined;
+            // #1847: from = the last KNOWN line strictly before this one (its value is the pre-switch
+            // identity) — scanning past intervening unmeasured lines keeps the pair intact when a
+            // switch straddles an unknown-cache boundary.
+            let from: string | undefined;
+            for (let j = i - 1; j >= 0; j--) {
+                const p = led.lines[j];
+                if (p && p.unk !== 1) { from = value(p); break; }
+            }
             evs.push({
                 seq: l.seq,
                 at: l.at,
-                from: value(prev) ?? null,
+                from: from ?? null,
                 to: value(l) ?? "?",
                 input: l.input,
                 cached: l.cached,
-                hitPct: l.hitPct,
-                attributed: l.tr,
+                hitPct: l.hitPct ?? 0,
+                // #1847: this event's share is the residual only when this dimension won the partition —
+                // a co-occurring higher-priority cause absorbs the charge into its own bucket instead.
+                attributed: l.cause === dim ? l.tr : 0,
             });
         }
         return evs;
@@ -667,7 +722,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     const restartEvents: ModelSwitchEvent[] = [];
     for (const l of led.lines) {
         if (l.rs !== 1 || l.unk === 1) continue;
-        restartEvents.push({ seq: l.seq, at: l.at, from: null, to: "(restart)", input: l.input, cached: l.cached, hitPct: l.hitPct, attributed: l.tr });
+        restartEvents.push({ seq: l.seq, at: l.at, from: null, to: "(restart)", input: l.input, cached: l.cached, hitPct: l.hitPct ?? 0, attributed: l.cause === "restart" ? l.tr : 0 });
     }
     const invalidation: InvalidationTokenBreakdown = {
         model: a.switchMissed,
@@ -688,7 +743,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             input: l.input,
             cached: l.cached,
             output: l.output,
-            hitPct: l.hitPct,
+            hitPct: l.hitPct ?? 0,
             missed: l.missed,
             newContent: l.nc,
             compRepay: l.cr,
@@ -696,9 +751,9 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             foldSeq: l.foldSeq,
         })),
         linesOmitted: led.sampleSeq - led.lines.length,
-        modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model) },
-        wireSwitches: { count: a.wireSwitches, missedTokens: a.wireSwitchMissed, events: switchEvents((l) => l.pw === 1 && l.proto !== undefined, (l) => l?.proto) },
-        upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up) },
+        modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
+        wireSwitches: { count: a.wireSwitches, missedTokens: a.wireSwitchMissed, events: switchEvents((l) => l.pw === 1 && l.proto !== undefined, (l) => l?.proto, "wire") },
+        upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up, "upstream") },
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
         unmeasured: { samples: a.unknownSamples, inputTokens: a.unknownInput },
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
@@ -759,7 +814,11 @@ function formatModelSwitches(sw: ModelSwitchStats, detail: "summary" | "full"): 
         out.push("  none observed");
         return out.join("\n");
     }
-    out.push(`  ${sw.count} switch(es) · ${fmtTok(sw.missedTokens)} tok re-billed (stable-prefix miss charged to the model change)`);
+    // #1847: missedTokens includes the bounded post-switch cold rounds (attributed to the switch but not
+    // discrete from→to events); surface that delta so the per-event list reconciles with the total.
+    const eventSum = sw.events.reduce((n, e) => n + e.attributed, 0);
+    const tail = sw.missedTokens - eventSum;
+    out.push(`  ${sw.count} switch(es) · ${fmtTok(sw.missedTokens)} tok re-billed${tail > 0 ? ` (${fmtTok(tail)} on post-switch cold rounds)` : ""}`);
     const shown = detail === "full" ? sw.events : sw.events.slice(-SWITCH_LIST_CAP);
     for (const e of shown) {
         out.push(`  #${e.seq} ${fmtTime(e.at)} ${e.from ?? "?"} → ${e.to} · hit ${e.hitPct.toFixed(1)}% · attributed ${fmtTok(e.attributed)}`);
@@ -801,12 +860,22 @@ function formatSeam(r: BiliCacheReport): string {
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
     const named = b.model + b.wire + b.upstream + b.restart;
+    const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
-    out.push(`  stable-prefix re-bill by cause: ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
+    out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
     out.push(`    model switch:    ${fmtTok(b.model)} (${r.modelSwitches.count})`);
     out.push(`    wire switch:     ${fmtTok(b.wire)} (${r.wireSwitches.count})`);
     out.push(`    upstream switch: ${fmtTok(b.upstream)} (${r.upstreamSwitches.count})`);
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
+    // #1847: a dominant unattributed residual with NO observed cause is the misleading case — the README
+    // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
+    if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
+        const pct = Math.round((b.remaining / total) * 100);
+        const noCauseEver = r.modelSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        out.push(noCauseEver
+            ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
+            : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);
+    }
     if (r.unmeasured.samples > 0) {
         out.push(`  unmeasured (provider reported no cache tokens): ${r.unmeasured.samples} sample(s) · ${fmtTok(r.unmeasured.inputTokens)} tok — excluded from hit rate`);
     }
