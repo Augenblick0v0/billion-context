@@ -1107,8 +1107,60 @@ export const WEB_CLIENT = `(function () {
         const fe = $("cfg-file-edit");
         let draft = {};
         try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
-        const compress = (draft.compress && typeof draft.compress === "object" && !Array.isArray(draft.compress)) ? draft.compress : null;
-        function writeDraft() { if (fe) fe.value = JSON.stringify(draft, null, 2); }
+        function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
+        const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
+        const PRM_KERNEL_DEFAULT = 5;
+        const brokenNote = document.createElement("div");
+        brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
+        box.appendChild(brokenNote);
+        const qCtrls = [];
+        function quickBroken(on) {
+            brokenNote.textContent = on ? t("cfg.q_parse_err") : "";
+            qCtrls.forEach((el) => { el.disabled = !!on; });
+        }
+        function freshDraft() {
+            try {
+                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                if (!p || typeof p !== "object" || Array.isArray(p)) return {};
+                return p;
+            } catch (e) { quickBroken(true); return null; }
+        }
+        function syncAll() {
+            const cp = compressOf(draft);
+            dbg.inp.checked = draft.debug === true;
+            ptRow.inp.checked = draft.passthrough === true;
+            const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
+            while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
+            ["default", "lean"].forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                packSel.appendChild(o);
+            });
+            if (pv !== "default" && pv !== "lean") {
+                const o = document.createElement("option");
+                o.value = pv;
+                o.textContent = pv + " *";
+                packSel.appendChild(o);
+            }
+            packSel.value = pv;
+            updatePackNote();
+            nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
+            updateNudgeNote();
+            prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
+            mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+        }
+        function commit(mutate) {
+            const fresh = freshDraft();
+            if (fresh === null) return;
+            draft = fresh;
+            mutate(draft);
+            if (fe) fe.value = JSON.stringify(draft, null, 2);
+            quickBroken(false);
+            syncAll();
+        }
         function row(id, label) {
             const w = document.createElement("div");
             w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
@@ -1126,7 +1178,7 @@ export const WEB_CLIENT = `(function () {
             box.appendChild(w);
             return { inp, ctl };
         }
-        function textRow(id, label, placeholder, value) {
+        function textRow(id, label, placeholder) {
             const w = document.createElement("div");
             w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
             const lab = document.createElement("label");
@@ -1140,34 +1192,21 @@ export const WEB_CLIENT = `(function () {
             inp.style.flex = "1 1 320px";
             inp.spellcheck = false;
             if (placeholder) inp.placeholder = placeholder;
-            inp.value = value == null ? "" : value;
             w.appendChild(lab);
             w.appendChild(inp);
             box.appendChild(w);
             return inp;
         }
         const dbg = row("quick-debug", t("cfg.q_debug"));
-        dbg.inp.checked = draft.debug === true;
-        dbg.inp.addEventListener("change", () => { if (dbg.inp.checked) draft.debug = true; else delete draft.debug; writeDraft(); });
+        qCtrls.push(dbg.inp);
+        dbg.inp.addEventListener("change", () => commit((d) => { if (dbg.inp.checked) d.debug = true; else delete d.debug; }));
         const ptRow = row("quick-pt", t("cfg.q_passthrough"));
-        ptRow.inp.checked = draft.passthrough === true;
-        ptRow.inp.addEventListener("change", () => { if (ptRow.inp.checked) draft.passthrough = true; else delete draft.passthrough; writeDraft(); });
-        const packVal = (compress && typeof compress.promptPack === "string") ? compress.promptPack : "default";
+        qCtrls.push(ptRow.inp);
+        ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
+        void ptRow.ctl;
         const packSel = document.createElement("select");
-        ["default", "lean"].forEach((name) => {
-            const o = document.createElement("option");
-            o.value = name;
-            o.textContent = name;
-            packSel.appendChild(o);
-        });
-        if (packVal !== "default" && packVal !== "lean") {
-            const o = document.createElement("option");
-            o.value = packVal;
-            o.textContent = packVal + " *";
-            packSel.appendChild(o);
-        }
-        packSel.value = packVal;
         packSel.className = "field-input mono";
+        qCtrls.push(packSel);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -1185,15 +1224,10 @@ export const WEB_CLIENT = `(function () {
             else packNote.textContent = t("cfg.q_pack_custom");
         }
         box.appendChild(packNote);
-        packSel.addEventListener("change", () => {
-            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
-            if (packSel.value === "default") delete draft.compress.promptPack; else draft.compress.promptPack = packSel.value;
-            writeDraft();
-            updatePackNote();
-        });
-        updatePackNote();
-        const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
-        const nudgeShown = (compress && typeof compress.nudgeGrowthTokens === "number") ? compress.nudgeGrowthTokens : NUDGE_DEFAULT;
+        packSel.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
         const nudge = document.createElement("input");
         nudge.type = "number";
         nudge.id = "quick-nudge";
@@ -1201,11 +1235,11 @@ export const WEB_CLIENT = `(function () {
         nudge.style.width = "140px";
         nudge.min = "1";
         nudge.step = "1000";
-        nudge.value = String(nudgeShown);
         nudge.spellcheck = false;
+        qCtrls.push(nudge);
         const nnote = document.createElement("div");
         nnote.style.cssText = "min-height:18px;font-size:12px;margin-top:2px";
-        function syncNudge() {
+        function updateNudgeNote() {
             const v = parseInt(nudge.value, 10);
             nnote.textContent = "";
             nnote.style.color = "";
@@ -1213,9 +1247,14 @@ export const WEB_CLIENT = `(function () {
                 if (v < NUDGE_LOW) { nnote.textContent = t("cfg.q_nudge_low"); nnote.style.color = "#cf222e"; }
                 else if (v > NUDGE_HIGH) { nnote.textContent = t("cfg.q_nudge_high"); nnote.style.color = "#bf8700"; }
             }
-            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
-            if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) draft.compress.nudgeGrowthTokens = v; else delete draft.compress.nudgeGrowthTokens;
-            writeDraft();
+        }
+        function syncNudge() {
+            updateNudgeNote();
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const v = parseInt(nudge.value, 10);
+                if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) d.compress.nudgeGrowthTokens = v; else delete d.compress.nudgeGrowthTokens;
+            });
         }
         function nudgeBtn(label, delta) {
             const b = document.createElement("button");
@@ -1245,39 +1284,34 @@ export const WEB_CLIENT = `(function () {
         nwrap.appendChild(nnote);
         box.appendChild(nwrap);
         nudge.addEventListener("change", syncNudge);
-        syncNudge();
-        const PRM_KERNEL_DEFAULT = 5;
-        const prmVal = (compress && typeof compress.preserveRecentMessages === "number") ? compress.preserveRecentMessages : PRM_KERNEL_DEFAULT;
-        const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"), prmVal);
+        const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
         prm.type = "number";
         prm.min = "1";
         prm.style.flex = "0 0 140px";
-        prm.addEventListener("change", () => {
+        qCtrls.push(prm);
+        prm.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
             const v = parseInt(prm.value, 10);
-            if (!draft.compress || typeof draft.compress !== "object") draft.compress = {};
-            if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) { draft.compress.preserveRecentMessages = v; } else { delete draft.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
-            writeDraft();
-        });
-        const ptVal = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
-        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"), ptVal);
-        ptInp.addEventListener("change", () => {
+            if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
+            else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
+        qCtrls.push(ptInp);
+        ptInp.addEventListener("change", () => commit((d) => {
             const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
-            if (list.length === 0) { delete draft.protectedTools; } else { draft.protectedTools = list; }
-            writeDraft();
-        });
-        const mitm = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
-        const mitmList = (mitm && Array.isArray(mitm.domains)) ? mitm.domains.filter((d) => typeof d === "string").join(", ") : "";
-        const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"), mitmList);
-        mitmInp.addEventListener("change", () => {
+            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+        }));
+        const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"));
+        qCtrls.push(mitmInp);
+        mitmInp.addEventListener("change", () => commit((d) => {
             const domains = mitmInp.value.split(",").map((s) => s.trim()).filter(Boolean);
-            if (domains.length === 0) { delete draft.mitm; return writeDraft(); }
-            if (!draft.mitm || typeof draft.mitm !== "object" || Array.isArray(draft.mitm)) draft.mitm = {};
-            draft.mitm.domains = domains;
-            writeDraft();
-        });
-        void ptRow.ctl;
+            if (domains.length === 0) { delete d.mitm; return; }
+            if (!d.mitm || typeof d.mitm !== "object" || Array.isArray(d.mitm)) d.mitm = {};
+            d.mitm.domains = domains;
+        }));
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        syncAll();
     }
-
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
