@@ -924,6 +924,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
+        // #1839: stale-floor stall — the floor ALONE holds currentTokens at or
+        // above target while the payload's own post-fold measure fits. Folding
+        // more cannot move the floor, so stop burning summary rounds on ranges
+        // the window never needed (#1492's comment described exactly this
+        // failure; the floor gate only made it rarer, not impossible — a
+        // usage-grade baseline from a bigger earlier turn still floors here).
+        // Behaviorally inert elsewhere: floor < target ⇒ currentTokens equals
+        // the payload measure (clause redundant), and the unknown-baseline
+        // regime deliberately judges on finalUpper (#553).
+        if (baselineKnown && baselineFloor >= target && result.payloadEstimate < target) break;
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the

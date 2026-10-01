@@ -101,15 +101,17 @@ export type Session = {
          *  estimate. See onCacheUsage in compress-loop-*.ts. */
         lastInputTokens: number;
         /** #857: provenance of lastInputTokens. "usage" = last written by an
-         *  upstream usage report (or a value stated BY the upstream, e.g. a
-         *  parsed overflow window); "estimate" = last RAISED by a local
-         *  estimate (preflight fold write-back, #604 failure arming, weak-
-         *  overflow arming). Derivative adjustments (compress credits, fold
-         *  reclaims) preserve the existing flag. Absent on legacy session
-         *  files — evidence-grade consumers (upward window self-heal, #496
-         *  overflow-evidence gate, stale-limit retraction) treat absent as
-         *  untrusted. */
-        lastInputTokensSource?: "usage" | "estimate";
+         *  upstream usage report; "overflow-arm" = armed by an upstream
+         *  context-overflow rejection — live evidence this session cannot
+         *  exceed that size, bounded by the declared/stated window (#1839:
+         *  overflow arming used to ride in as "usage", promoting a local
+         *  estimate into the one tier trusted unconditionally); "estimate" =
+         *  last RAISED by a local estimate (preflight fold write-back).
+         *  Derivative adjustments (compress credits, fold reclaims) preserve
+         *  the existing flag. Absent on legacy session files — evidence-grade
+         *  consumers (upward window self-heal, #496 overflow-evidence gate,
+         *  stale-limit retraction) treat absent as untrusted. */
+        lastInputTokensSource?: "usage" | "estimate" | "overflow-arm";
         /** #1110: one-shot emergency ceiling armed by an upstream context-
          *  overflow 400 (server.ts overflow handler) — live evidence this
          *  session cannot exceed that size. Kept SEPARATE from lastInputTokens
@@ -133,6 +135,12 @@ export type Session = {
         pendingFoldUsage?: boolean;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
+        /** #1839: provenance of contextTokens — "usage" = billing-grade
+         *  (upstream input_tokens or an overflow arm bounded by the declared
+         *  window); "estimate" = locally-derived upper bound (PFA forks,
+         *  never-reporting upstreams). Display surfaces mark estimate-grade
+         *  values instead of presenting them as measurements. */
+        contextTokensSource?: "usage" | "estimate";
         /** #728: char-count upper bound of the LAST turn's outbound payload
          *  (post-fold processed messages + system/tools overhead + images),
          *  recorded locally in prepare* each turn. Read ONLY while
@@ -646,6 +654,7 @@ export function resetSessionCompression(session: Session): void {
     // no longer exists — fall back to legacy sizing until a fresh report lands.
     delete session.stats.lastUsageGradeTokens;
     session.stats.contextTokens = 0;
+    delete session.stats.contextTokensSource;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }

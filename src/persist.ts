@@ -106,6 +106,7 @@ interface PersistedSession {
         lastInputTokensSource?: string;
         overflowArmTokens?: number;
         contextTokens?: number;
+        contextTokensSource?: string;
         retrieveCalls?: number;
         retrieveHits?: number;
         retrieveMisses?: number;
@@ -732,12 +733,14 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokens: Math.max(0, stats.lastInputTokens ?? parsed.lastInputTokens ?? 0),
             // #857: provenance — legacy files lack it; absent stays absent and
             // evidence-grade consumers treat absent as untrusted.
-            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" ? stats.lastInputTokensSource : undefined,
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
+            // #1839: display provenance — legacy files lack it; absent = no marker.
+            contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
             retrieveCalls: stats.retrieveCalls ?? 0,
             retrieveHits: stats.retrieveHits ?? 0,
             retrieveMisses: stats.retrieveMisses ?? 0,

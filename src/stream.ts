@@ -449,7 +449,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // preContext is read BEFORE the credit netting below (lastInputTokens
         // still holds the pre-compress context at this point).
         const preContext = ctx.session.stats.lastInputTokens;
-        const shrinkRatio = preContext > 0 ? r.tokensCompressed / preContext : 0;
+        // #1839: an estimate-grade (or zero) baseline makes the ratio and the
+        // #695 ceiling physically meaningless — a poisoned baseline used to
+        // print shrink=10527% and "cache ceiling ≥0%". Mark the observation
+        // untrustworthy instead of emitting impossible numbers.
+        const trustworthy = preContext > 0 && r.tokensCompressed <= preContext;
+        const shrinkRatio = trustworthy ? r.tokensCompressed / preContext : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
         ctx.session.stats.pendingFoldUsage = true;
@@ -461,7 +466,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const postCtx = Math.max(0, preContext - r.tokensCompressed);
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${res.state.blocks.filter((b) => b.active).length} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        if (trustworthy) {
+            ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${res.state.blocks.filter((b) => b.active).length} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        } else {
+            ctx.log(`[acp-compress-obs] baseline untrustworthy (~${r.tokensCompressed} folded vs baseline ${preContext}) — ratio/postCtx suppressed (#1839) foldPoint=${foldPoint} blocks=${r.blocksCreated}`);
+        }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
         recordCacheFoldsFromBlocks(
