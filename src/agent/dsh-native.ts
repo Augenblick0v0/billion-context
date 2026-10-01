@@ -88,10 +88,24 @@ type PluginContext = {
     // agent preset where the bundle patch cannot reach it.
     profileContext?: { startedBundles?: readonly string[] | undefined };
     inject?: (deps: readonly string[], callback: (sub: PluginContext) => void) => unknown;
+    // #1809: lifecycle disposal for registrations made inside an injected
+    // callback (cordis Context.effect); optional so non-cordis hosts skip it.
+    effect?: (fn: () => void | (() => void), label?: string) => void;
     // #1590: host event bus (web-profile hosts only) — webserver/index-inject
     // gathers per-startup rows for the web index; we push the __BILI__ global
     // the dsh-native-client.js settings entry reads.
     on?: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => void;
+    // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
+    // /bili/origin route the settings entry polls. Optional like llm/
+    // profileContext above: TUI/headless profiles lack it.
+    webServer?: {
+        // returns the disposer (cordis WebServer.register contract)
+        register: (route: {
+            kind: "exact" | "prefix";
+            path: string;
+            handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }) => void | Promise<void>;
+        }) => (() => void) | undefined;
+    };
 };
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -127,6 +141,14 @@ const register: RegisterState = { base: undefined, toolsReady: false, dead: fals
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+
+/** #1590/#1809: origin of the proxy as currently reachable — register.base
+ *  once bound (attach synchronously, spawn after bootstrap), else the preset
+ *  env origin. Shared by the index-inject row and the live /bili/origin route. */
+function currentOrigin(): string | undefined {
+    const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
+    return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+}
 
 // Runtime-info cache (#955): the host's current model selection plus what
 // ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
@@ -602,10 +624,41 @@ export function apply(ctx: PluginContext): void {
     // startup-time index collection that entry degrades to a hint instead of
     // a stale link.
     ctx.on?.("webserver/index-inject", (table) => {
-        const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
-        const origin = register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+        const origin = currentOrigin();
         if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
     });
+
+    // #1809: the row above is a snapshot taken at index render — spawn mode
+    // binds register.base only AFTER bootstrap, so an already-loaded page (a
+    // web tab opened at launch) never sees the origin, and desktop is worse:
+    // its boot payload is captured once per app launch, leaving the settings
+    // entry degraded for the whole session even after the proxy is up. Serve
+    // the origin live on a named route instead; the client half polls it
+    // while unresolved. Missing webServer (TUI/headless profiles) keeps the
+    // snapshot row as the only source.
+    const originRoute = {
+        kind: "exact" as const,
+        path: "/bili/origin",
+        handler: (_req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
+            const body = JSON.stringify({ origin: currentOrigin() ?? null });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(body);
+        },
+    };
+    if (typeof ctx.inject === "function") {
+        // Cordis inject: fires once the service is available, re-runs on
+        // change; the effect disposes the prior registration on each re-run
+        // (same lifecycle as dsh's own bundle route). Profiles without a
+        // webserver never fire the callback — the snapshot row alone stands.
+        ctx.inject(["webServer"], (sub) => {
+            const ws = sub.webServer;
+            if (ws === undefined) return;
+            if (typeof sub.effect === "function") sub.effect(() => ws.register(originRoute), "bili: /bili/origin route");
+            else ws.register(originRoute);
+        });
+    } else if (ctx.webServer !== undefined) {
+        ctx.webServer.register(originRoute);
+    }
 
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
