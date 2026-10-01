@@ -5068,13 +5068,17 @@ async function preflightCompressIfNeeded(
     // #1492: floor the trigger on the baseline only while it is authoritative
     // for THIS payload. A usage-grade baseline measures what upstream billed
     // (it can legitimately exceed every local estimate — invisible thinking/
-    // cache components), and ANY baseline is the best signal when the current
-    // payload is unmeasured (kernel transform failed → the outbound IS the raw
-    // body). An estimate-sourced baseline on a measured (folded) payload
-    // describes a different view and must not pull preflight into multi-minute
-    // runs over a payload whose own post-fold estimate fits the window.
+    // cache components). An overflow-armed baseline (#1839 "overflow-arm") is
+    // upstream REJECTION evidence at that size — floor it too, or the #1195
+    // in-request refold and #987 next-turn fold lose their trigger whenever
+    // the payload's own calibrated estimate undershoots. ANY baseline is the
+    // best signal when the current payload is unmeasured (kernel transform
+    // failed → the outbound IS the raw body). An estimate-sourced failure arm
+    // (#604) on a measured (folded) payload describes a different view and
+    // must not pull preflight into multi-minute runs over a payload whose own
+    // post-fold estimate fits the window.
     const baselineFloor = prepared.processedMessages.length > 0
-        ? (session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0)
+        ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
         : session.stats.lastInputTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
@@ -5324,24 +5328,34 @@ async function preflightCompressIfNeeded(
 }
 
 /** #604/#1839: record an upstream failure that will never report usage
- *  (relay/gateway 5xx, network-level failure). #604 originally raised
+ *  (relay/gateway 5xx, network-level failure). #604 raises
  *  session.stats.lastInputTokens to a local estimate of the wire body so the
- *  next prepare() would land in the kernel's emergency band and break the
- *  relay-5xx deadlock. Since #1492/#1493 every trigger measures the ACTUAL
- *  outbound payload itself (preflight runs before every forward and sizes on
- *  post-fold content + wire overhead + images), the raised baseline kept no
- *  remaining trigger consumer — it only flipped lastInputTokensSource off
- *  usage-grade, pushing the nudge onto the estimate fallback (#1839: one
- *  aborted turn armed 719521 against a real input of 143419 and the ghost
- *  denominator persisted up to ~23 min until a real usage report landed),
- *  and poisoned [acp-compress-obs] ratios plus the UI top bar. The arm is now
- *  a log-only marker: genuinely over-window payloads are still caught by
- *  preflight on the retry, and the next successful usage report restores the
- *  baseline exactly as before. */
+ *  next prepare() lands in the kernel's emergency band (truncate.threshold =
+ *  0.95) and truncates large tool results server-side — the rescue that breaks
+ *  the relay-5xx deadlock (#1493 refines the arm to the OUTBOUND payload size
+ *  so fitting payloads don't over-trigger). The arm STAYS load-bearing:
+ *  removing it re-deadlocks exactly those sessions.
+ *  #1839: the arm stays ESTIMATE-grade and the ghost it once caused is killed
+ *  at the reader, not by deleting the arm — while any usage-grade anchor
+ *  exists, effectiveTokenCount's anchor branch prefers lastUsageGradeTokens
+ *  over every estimate-grade value, so the arm can no longer reach the nudge
+ *  denominator, the display or the preflight floors (pre-fix, one aborted turn
+ *  armed 719521 against a real input of 143419 and the inflated denominator
+ *  persisted ~23 min). Anchor-less sessions (fresh / silent backends) size on
+ *  the per-turn min(localInputEstimate, raw) views, where the arm guarantees a
+ *  near-window payload still crosses the emergency band on retry. The next
+ *  real usage report overwrites it. */
 function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) => void, reason: string, est: number): void {
     const s = prepared.session;
     if (!Number.isFinite(est) || est <= 0) return;
-    log("warn", `[${s.id}] ${reason} with no usage report — local outbound estimate ${est} tokens; baseline left untouched (estimate-grade values never enter sizing decisions, #1839)`);
+    if (est > s.stats.lastInputTokens) {
+        s.stats.lastInputTokens = est;
+        s.stats.lastInputTokensSource = "estimate";
+        // The error path returns before forward()'s trailing markDirty — the
+        // arm must schedule its OWN save or it is lost on restart.
+        markDirty(s);
+        log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
+    }
 }
 
 async function forward(

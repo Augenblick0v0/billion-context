@@ -14,8 +14,12 @@ process.env.NODE_ENV = "test";
 // unnecessary irreversible folds that invalidated ~129K-token cache prefixes,
 // self-contradictory preflight fail-fast 502s, impossible [acp-compress-obs]
 // ratios). Pinned here:
-//   1. armFailureShrink never raises the baseline anymore (log-only) — e2e via a
-//      real upstream 503.
+//   1. a failed turn without a usage report arms the baseline ONLY as an
+//      estimate-grade value (#604's emergency-band rescue stays intact) — and
+//      while a real-usage anchor exists, that arm can no longer reach any sizing
+//      decision: the next turn still sizes on the MEASURED input (pre-fix the
+//      same arm led to the 719521→2939167 ghost vs real input 143419) — e2e via
+//      a real upstream 503.
 //   2. once a REAL usage report has anchored lastUsageGradeTokens, an
 //      estimate-grade turn sizes on that anchor — not on any re-derived view of
 //      the inbound history.
@@ -185,7 +189,7 @@ async function startHarness(sessionId: string, script: VerdictRule[]) {
     return { logs, relay, post, session, close };
 }
 
-test("#1839 G1: a failed turn without a usage report no longer raises the baseline (e2e)", async () => {
+test("#1839 G1: a failed turn arms only an estimate-grade value; the measured anchor still sizes the next turn (e2e)", async () => {
     const id = "sess-1839-g1";
     const h = await startHarness(id, [
         { when: "step two?", status: 503, body: '{"error":"upstream unavailable"}' },
@@ -204,9 +208,15 @@ test("#1839 G1: a failed turn without a usage report no longer raises the baseli
         assert.equal(r2.status, 503, "upstream 503 passes through");
         await r2.text();
         s = h.session();
-        assert.equal(s.stats.lastInputTokens, 5000, "failed turn must NOT raise the baseline (#1839)");
-        assert.equal(s.stats.lastInputTokensSource, "usage", "baseline stays usage-grade after a failed turn");
-        assert.ok(h.logs.some((l) => l.includes("baseline left untouched")), "armFailureShrink log-only line present");
+        // #604's arm IS still written — it is load-bearing for the emergency-band
+        // rescue on anchor-less sessions — but it carries ESTIMATE grade, and
+        // that grade must no longer reach a sizing decision while a usage-grade
+        // anchor exists (pre-#1839 this exact write led to the ghost: the next
+        // turn re-derived a char-count upper bound from the full inbound history
+        // and pinned the nudge to it until a real usage report landed).
+        assert.ok(s.stats.lastInputTokens > 5000, `failure arm raised the baseline to an outbound estimate (${s.stats.lastInputTokens})`);
+        assert.equal(s.stats.lastInputTokensSource, "estimate", "the arm is tagged estimate-grade");
+        assert.ok(h.logs.some((l) => l.includes("armed emergency shrink with local estimate")), "armFailureShrink warn present");
 
         const msgs3: Msg[] = [...msgs2, { role: "assistant", content: "working." }, { role: "user", content: "step three?" }];
         const r3 = await h.post(msgs3);

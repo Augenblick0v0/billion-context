@@ -205,17 +205,16 @@ test("#1492 A: poisoned estimate baseline must not drive nudge/preflight on a fo
     );
 });
 
-test("#1492 B / #1839: a stale usage-grade floor must not burn irreversible folds", async () => {
+test("#1492 B: a usage-sourced high baseline must STILL fire preflight (real overflow evidence)", async () => {
     const { streamed, nonStream, session } = await runCase("issue1492-usage-sess", "usage");
-    assert.equal(nonStream, 0, "a stale usage-grade baseline above the window must NOT burn summarization rounds (pre-#1839: the floor alone held currentTokens ≥ target through MAX_PREFLIGHT_ROUNDS, folding unneeded ranges before the guaranteed fail-fast verdict)");
-    for (let i = 0; i < 6; i++) {
-        assert.ok(streamed[1].includes(`CODE_${i}_`), `heavy ${i} must survive unfolded (no fold ran)`);
-    }
-    // The asymmetry pinned by this file: estimate-source never enters preflight
-    // at all (case A); usage-source still ENTERS (a real billing-grade number
-    // is evidence) but the fit loop's stale-floor break stops it before any
-    // irreversible fold when the payload's own measure fits (#1839) — the
-    // request forwards as-is and the next real usage report heals the baseline.
+    assert.ok(nonStream >= 1, `a usage-grade baseline above the window must keep driving compression (nonStream=${nonStream})`);
+    // No nudge-marker assertion here: the forwarded body is the POST-FOLD
+    // rebuild (server.ts re-runs prepare after preflight), whose fresh nudge
+    // decision sees nothing left to fold and suppresses — kernel-owned
+    // behavior, identical pre/post fix. The asymmetry pinned by this case is
+    // the trigger itself: estimate-source stays silent (case A), usage-source
+    // still burns summarization calls.
+    void streamed;
     assert.equal(session.stats.lastInputTokens, 5000, "self-heal via the next real usage report");
 });
 
