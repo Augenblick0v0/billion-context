@@ -1302,55 +1302,48 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
     return { clientArgs: ["--settings", tmpFile], tmpFile };
 }
 
-/** Codex: -c inline overrides for the bili MCP server only.
- *
- *  `conversationId` is a per-spawn UUID injected as BILI_CONVERSATION_ID:
- *  codex passes no session id to MCP children (verified codex-cli 0.147.0),
- *  so the MCP shell uses this to self-register headlessly; the first model
- *  request that creates a NEW session consumes the registration and binds
- *  the conversation (MITM route — in direct-URL mode the model traffic does
- *  not reach the proxy and the binding cannot happen, see the direct-mode
- *  warning). Without it every native tool call fails with "no conversation
- *  id". */
-export function buildCodexMcpArgs(origin: string, conversationId: string): string[] {
-    const script = selfDistFile("mcp.js");
-    return [
-        "-c",
-        `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
-        "-c",
-        `mcp_servers.bili.args=${JSON.stringify([script])}`,
-        "-c",
-        `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
-        "-c",
-        `mcp_servers.bili.env.BILI_CONVERSATION_ID=${JSON.stringify(conversationId)}`,
-    ];
-}
-
-/** #681: how the bili MCP server reaches the spawned codex. On POSIX the
- *  inline `-c mcp_servers.bili.*` values are safe (no shell re-parses argv),
- *  so buildCodexMcpArgs stands. On Windows every codex launch rides a .cmd
- *  shim through cmd.exe, and a `-c` value embedding an absolute path carries
- *  both quotes and spaces — cmd.exe strips the TOML-required quotes (it has no
- *  literal-quote escape), leaving malformed TOML. There the definition is
- *  delivered via a file instead: a persistent <CODEX_HOME>-bili overlay whose
- *  merged config.toml holds [mcp_servers.bili], pointed at by CODEX_HOME.
- *  When the overlay cannot be built the injection degrades to nothing (wire
- *  mode still compresses server-side) with a warning. */
+/** #681/#1802: how the bili MCP server reaches the spawned codex, and why
+ *  EVERY launch that needs the overlay points CODEX_HOME at it on every
+ *  platform. Windows launches codex through a .cmd shim via cmd.exe, where a
+ *  `-c mcp_servers.bili.*` value embedding an absolute path carries both
+ *  quotes and spaces — cmd.exe strips the TOML-required quotes (it has no
+ *  literal-quote escape), leaving malformed TOML. So the server definition is
+ *  delivered via a file: a persistent <CODEX_HOME>-bili overlay whose merged
+ *  config.toml holds [mcp_servers.bili]. POSIX could still take inline `-c`
+ *  args (no shell re-parses argv), but since #1802 the overlay doubles as the
+ *  carrier of a generated .env pinning the launcher's routing (see
+ *  renderCodexDotEnv) — one mechanism on all platforms beats two.
+ *  `conversationId` is a per-spawn UUID for BILI_CONVERSATION_ID: codex passes
+ *  no session id to MCP children (verified codex-cli 0.147.0), so the MCP
+ *  shell self-registers headlessly with it; the first model request creating a
+ *  NEW session consumes the registration and binds the conversation (MITM
+ *  route — in direct-URL mode the model traffic does not reach the proxy and
+ *  the binding cannot happen). When the overlay cannot be built the injection
+ *  degrades to nothing (wire mode still compresses server-side) with a
+ *  warning. */
 export function prepareCodexMcpInjection(opts: {
-    platform: NodeJS.Platform;
     codexHome: string;
     origin: string;
-    conversationId: string;
+    caPath: string;
+    conversationId?: string;
+    manageRouting: boolean;
 }): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
-    if (opts.platform !== "win32") {
-        return { clientArgs: buildCodexMcpArgs(opts.origin, opts.conversationId), envPatch: {} };
-    }
-    const overlay = prepareCodexHome(opts.codexHome, opts.origin, opts.conversationId);
+    const overlay = prepareCodexHome({
+        codexHome: opts.codexHome,
+        origin: opts.origin,
+        caPath: opts.caPath,
+        conversationId: opts.conversationId,
+        manageRouting: opts.manageRouting,
+    });
     if (!overlay) {
+        const losses = [
+            opts.conversationId !== undefined ? "launching without native bili MCP tools" : null,
+            opts.manageRouting ? "the user's $CODEX_HOME/.env may override the injected proxy/CA" : null,
+        ].filter((s): s is string => s !== null);
         return {
             clientArgs: [],
             envPatch: {},
-            warning: "could not prepare the codex MCP overlay (<CODEX_HOME>-bili) — launching without native bili MCP tools; wire-injected compression is still active.",
+            warning: `could not prepare the codex overlay (<CODEX_HOME>-bili) — ${losses.join("; ")}; wire-injected compression is still active.`,
         };
     }
     return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
@@ -1828,10 +1821,10 @@ export function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
-function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {
+function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string, mode?: number): void {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
-        fs.writeFileSync(draft, contents);
+        fs.writeFileSync(draft, contents, { mode });
         fs.renameSync(draft, path.join(overlay, fileName));
     } catch {
         try {
@@ -2140,21 +2133,107 @@ function mergeCodexBiliBlock(text: string, origin: string, conversationId: strin
     return base + (base.endsWith("\n") || base.length === 0 ? "" : "\n") + block;
 }
 
-/** #681: persistent <CODEX_HOME>-bili overlay carrying the bili MCP server in
- *  config.toml instead of inline `-c` args (which cmd.exe cannot transmit when
- *  they embed a spaced/quoted Windows path). Every real-home entry except
- *  config.toml is shared (auth.json, sessions, model settings survive); the
- *  generated config.toml is the real contents plus [mcp_servers.bili]. Returns
- *  the overlay dir to point CODEX_HOME at, or undefined when it cannot be
- *  built (caller then skips native MCP injection). */
-export function prepareCodexHome(codexHome: string, origin: string, conversationId: string): string | undefined {
-    let txt = "";
-    try {
-        txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
-    } catch {}
+/** #1802: keys whose values must reflect THIS launch's routing when codex
+ *  reads $CODEX_HOME/.env — its load_dotenv() calls set_var() UNCONDITIONALLY
+ *  for every non-CODEX_-prefixed key on top of the launcher's spawn env, so a
+ *  user .env pointing at e.g. a socks5h proxy silently re-routes the client
+ *  off bili after spawn (and codex's custom-CA rustls HTTP stack cannot speak
+ *  SOCKS at all). Matched case-insensitively; a replaced line keeps the user's
+ *  original key spelling. */
+const CODEX_DOTENV_MANAGED = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "BILLION_CONTEXT_PROXY"] as const;
+
+/** Pure renderer for the generated overlay .env (#1802): every user line is
+ *  preserved verbatim (comments, order, quoting) except managed-key lines,
+ *  which are rewritten to this launch's values; absent managed keys are
+ *  appended. Values stay unquoted while they match dotenv-safe characters,
+ *  otherwise JSON.stringify'd into a quoted basic string. */
+export function renderCodexDotEnv(userText: string | undefined, values: { origin: string; caPath: string }): string {
+    const formatted = (value: string): string => (/^[A-Za-z0-9:._/,\-]+$/.test(value) ? value : JSON.stringify(value));
+    const managed: Record<string, string> = {
+        HTTP_PROXY: values.origin,
+        HTTPS_PROXY: values.origin,
+        ALL_PROXY: values.origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        SSL_CERT_FILE: values.caPath.split("\\").join("/"),
+        BILLION_CONTEXT_PROXY: values.origin,
+    };
+    const lines = (userText ?? "").split(/\r?\n/);
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const line of lines) {
+        const m = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/.exec(line);
+        if (m !== null && m[1] !== undefined && (CODEX_DOTENV_MANAGED as readonly string[]).includes(m[1].toUpperCase())) {
+            out.push(`${m[1]}=${formatted(managed[m[1].toUpperCase()])}`);
+            seen.add(m[1].toUpperCase());
+            continue;
+        }
+        out.push(line);
+    }
+    for (const key of CODEX_DOTENV_MANAGED) {
+        if (!seen.has(key)) out.push(`${key}=${formatted(managed[key])}`);
+    }
+    return `${out.join("\n")}\n`;
+}
+
+/** #681/#1802: persistent <CODEX_HOME>-bili overlay. Carries (a) the bili MCP
+ *  server in a merged config.toml when a per-spawn conversationId is given
+ *  (inline `-c` args cannot survive cmd.exe on Windows), and (b) whenever the
+ *  launcher injected proxy routing (manageRouting), a generated .env pinning
+ *  exactly that routing, so the user's own $CODEX_HOME/.env can no longer
+ *  override it after spawn (#1802). Every other real-home entry is shared
+ *  (auth.json, sessions, model settings survive); generated files are
+ *  rewritten each launch and never linked back nor merged into the real home.
+ *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
+ *  be built (caller degrades: wire-injected compression still works, native
+ *  MCP tools / the .env protection do not). */
+export function prepareCodexHome(opts: {
+    codexHome: string;
+    origin: string;
+    caPath: string;
+    conversationId?: string;
+    manageRouting: boolean;
+}): string | undefined {
+    const { codexHome, origin, caPath, conversationId, manageRouting } = opts;
+    let userEnvText: string | undefined;
+    let manageDotEnv = manageRouting;
+    if (manageRouting) {
+        try {
+            userEnvText = fs.readFileSync(path.join(codexHome, ".env"), "utf8");
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+                // Present but unreadable: a substitute .env would drop the
+                // user's own variables (often secrets) from the effective env
+                // — keep the legacy shared link and warn instead.
+                console.error(`bili: ${path.join(codexHome, ".env")} is not readable — keeping the shared .env, so the injected proxy/CA may be overridden by it.`);
+                manageDotEnv = false;
+            }
+        }
+    }
+    const generatedFiles: string[] = [];
+    if (manageDotEnv) generatedFiles.push(".env");
+    if (conversationId !== undefined) generatedFiles.push("config.toml");
     const overlay = `${codexHome}-bili`;
-    if (!refreshOverlayHome(codexHome, overlay, "config.toml")) return undefined;
-    writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
+    if (manageDotEnv) {
+        try {
+            const st = fs.lstatSync(path.join(overlay, ".env"));
+            // Pre-#1802 overlays share .env with the real home (symlink, or a
+            // write-through hardlink where symlinks are unavailable): unlink
+            // before writing so the generated file stops touching the real one.
+            if (st.isSymbolicLink() || isWriteThroughHardlink(path.join(overlay, ".env"), path.join(codexHome, ".env"), st)) {
+                fs.unlinkSync(path.join(overlay, ".env"));
+            }
+        } catch {}
+        writeOverlayFileAtomic(overlay, ".env", renderCodexDotEnv(userEnvText, { origin, caPath }), 0o600);
+    }
+    if (conversationId !== undefined) {
+        let txt = "";
+        try {
+            txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+        } catch {}
+        writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    }
     return overlay;
 }
 
@@ -3882,10 +3961,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
         const codexConversationId = injectMcp ? randomUUID() : undefined;
+        const codexCaPath = resolveCombinedCaPath(process.env);
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
-            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+            env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             const budgetArgs = await resolveCodexBudgetArgs({
                 model: config.codex?.model,
@@ -3899,12 +3979,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 console.error(`bili: codex budget aligned — ${budgetArgs.slice(2).join(", ")} (model: ${config.codex?.model})`);
             }
         }
-        if (injectMcp && codexConversationId) {
+        // #1802: every routed launch points CODEX_HOME at the overlay so the
+        // generated .env pins this launch's proxy/CA against the user's own
+        // $CODEX_HOME/.env (load_dotenv overrides spawn env after start);
+        // direct-URL launches only need it to carry the MCP server block.
+        if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
             const inj = prepareCodexMcpInjection({
-                platform: deps.platform ?? process.platform,
                 codexHome: resolveCodexHome(process.env),
                 origin,
+                caPath: codexCaPath,
                 conversationId: codexConversationId,
+                manageRouting: !directUrl,
             });
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
