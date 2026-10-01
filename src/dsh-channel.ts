@@ -132,6 +132,21 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
 }
 
+/** The version of the profile's installed billion-context copy, or undefined
+ *  when there is no readable copy yet (declared but never installed). #1803:
+ *  refresh skips profiles already sitting at the target version so a stale
+ *  sibling cannot cause in-step copies to re-spawn dsh every check cycle;
+ *  declared-but-missing mounts still refresh (install what the manifest
+ *  declares — #1196 live-update-path contract). */
+function installedProfileVersion(profileDir: string): string | undefined {
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(profileDir, "node_modules", DSH_PACKAGE, "package.json"), "utf-8")) as { version?: unknown };
+        return typeof pkg.version === "string" ? pkg.version : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 /** Registry-form dep specs (^1.2.3, 1.2.3, >=1.0.0, dist-tags) carry no
  *  scheme; local pins (link:, file:, workspace:, git+, github:, https:) do.
  *  Refresh must never clobber a deliberate local pin. */
@@ -371,20 +386,23 @@ export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv =
  *  the proxy never drift apart again (#953). Best-effort by contract: never
  *  throws — a failed refresh degrades to the pre-fix behavior (stale profile
  *  copy until the next manual update), never to a broken update loop.
- *  Profiles pinned to a local source (link:/file:/git specs) are left alone. */
+ *  Profiles pinned to a local source (link:/file:/git specs) are left alone.
+ *  Returns the number of profiles actually refreshed (#1803: copies already
+ *  at the target version are skipped, so callers must not assume every
+ *  dependent profile re-ran). */
 export async function refreshDshProfileBundles(
     targetVersion: string,
     log: (level: "info" | "warn", msg: string) => void,
     env: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+): Promise<number> {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
-        return; // dsh has never run on this machine — nothing to keep in step
+        return 0; // dsh has never run on this machine — nothing to keep in step
     }
     const targets = dirs.filter((dir) => dshProfileDependsOnBili(dir));
-    if (targets.length === 0) return;
+    if (targets.length === 0) return 0;
     let refreshed = 0;
     for (const dir of targets) {
         const name = path.basename(dir);
@@ -393,6 +411,7 @@ export async function refreshDshProfileBundles(
             log("info", `[update] dsh profile ${name}: billion-context pinned to ${spec} (local source) — leaving it alone`);
             continue;
         }
+        if (installedProfileVersion(dir) === targetVersion) continue; // #1803: already in step
         try {
             await runDshPluginAsync(["plugin", "--profile", name, "add", `${DSH_PACKAGE}@${targetVersion}`], env);
             refreshed += 1;
@@ -404,4 +423,5 @@ export async function refreshDshProfileBundles(
     if (refreshed > 0) {
         log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }
+    return refreshed;
 }
