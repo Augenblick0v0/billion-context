@@ -459,7 +459,7 @@ Release branches: `YYYY-MM-DD_release-v{VERSION}` (e.g., `2026-08-08_release-v0.
 
 ### Process (exact steps)
 
-The Agent does steps 1–5, the human does step 6 (merge).
+The Agent does steps 1–6, the human does step 7 (merge).
 
 1. **Sync master**:
    ```bash
@@ -474,25 +474,44 @@ The Agent does steps 1–5, the human does step 6 (merge).
    -    "version": "0.1.16",
    +    "version": "0.1.17",
    ```
-4. **Local pre-flight** — run the same checks CI runs:
+4. **Add the release-notes entry (#1870)** — in the SAME release PR, as its
+   own commit (never bundled into the release commit): prepend an entry to
+   the `releases` array in `release-notes/package.json`:
+   ```json
+   {
+     "version": "0.1.17",
+     "date": "2026-08-08",
+     "tier": "recommended",
+     "summary": "what changes FOR THE USER, one line, issue/PR refs"
+   }
+   ```
+   - `tier`: `routine` (default) or `recommended` (worth restarting soon —
+     correctness/cache/self-heal fixes; marketing is NEVER recommended).
+     Critical defects go to `advisories/`, never here.
+   - The summary is model-written, ≤400 chars, newest-first order, cap 20
+     entries. NEVER hand-edit the companion package's own `"version"` field —
+     CI bumps it on publish.
+   - Full rules: `release-notes/README.md`. Enforcement: `release.yml` fails
+     the publish if the version being released has no entry.
+5. **Local pre-flight** — run the same checks CI runs:
    ```bash
    npm run typecheck
    npm test
    npm run build
    ```
-5. **Commit, push, open PR** — release-commit convention:
+6. **Commit, push, open PR** — release-commit convention:
    - Message: `release v{VERSION}`
    - The commit changes ONLY `package.json` (+ `package-lock.json` if it
      drifts). Never bundle other changes into a release commit.
    - PR title: `release v{VERSION}`; body lists changes since last tag.
-6. **Human merges the PR** (Agent MUST NOT merge).
-7. **CI publishes automatically** — no manual `npm publish`:
+7. **Human merges the PR** (Agent MUST NOT merge).
+8. **CI publishes automatically** — no manual `npm publish`:
    - On merge, `release.yml` detects the `*_release-v*` branch name +
      `release v{VERSION}` commit message.
    - It runs `npm ci` + `typecheck` + `test` + `build`, then
      `npm publish --tag latest` (using the `NPM_TOKEN` repo secret),
      creates git tag `v{VERSION}`, and creates a GitHub Release.
-8. **Verify** the published version is live:
+9. **Verify** the published version is live:
    ```bash
    npm view billion-context version
    ```
@@ -500,13 +519,22 @@ The Agent does steps 1–5, the human does step 6 (merge).
 ### One-click manual release (fast path)
 
 For routine patch releases, skip the branch/PR dance: **Actions →
-“Release (one-click)” → Run workflow** (`.github/workflows/release-manual.yml`).
+"Release (one-click)" → Run workflow** (`.github/workflows/release-manual.yml`).
 The `version` input is optional — blank means auto next-patch over the npm
-latest; type a full semver for minor/major/prerelease bumps. The workflow:
+latest; type a full semver for minor/major/prerelease bumps.
+
+**Prerequisite (#1870):** the version being released must ALREADY have a
+release-notes entry merged to master (`release-notes/package.json`, same
+shape as §5 step 4) — the workflow checks this at dispatch time and aborts
+with a pointer to `release-notes/README.md` if the entry is missing. So for
+one-click releases the agent adds the entry in a tiny docs PR (or the owner
+commits it) BEFORE dispatching. Prereleases (dev channel) are exempt.
+The workflow then:
 
 1. **Drift guard**: master's `package.json` version must equal the npm latest,
    else it aborts (never release off a drifted tree). It also rejects a target
-   version that is already published.
+   version that is already published, and verifies the release-notes entry
+   exists for the target version (#1870) — see the prerequisite above.
 2. Bumps ONLY `package.json` + `package-lock.json` and commits
    `release v{VERSION}` — the same one-version-one-commit discipline as the
    Version Bumps section above.
