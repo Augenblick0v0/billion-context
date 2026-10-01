@@ -44,7 +44,11 @@ import {
     ACP_SEARCH_CLOSE,
     ACP_DECOMPRESS_OPEN,
     ACP_DECOMPRESS_CLOSE,
+    buildCompressSystemPrompt,
+    buildCompressHybridSystemPrompt,
+    defaultPrompts,
 } from "acp-kernel";
+import type { CompressPromptSections, Prompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -94,6 +98,38 @@ export {
 } from "acp-kernel";
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
+
+// #1881: the ACP-TAGS NEVER-echo prohibition must not disappear with injectTool.
+// renderTags runs independent of injectTool — tags keep being rendered into history,
+// so removing the whole compress prompt when the tool is off removes the only
+// constraint keeping the model from echoing tags ("the more you switch off, the more
+// it leaks"). This extracts just the kernel-owned acpTags section: philosophy/rules/
+// tools describe compression mechanics that do not exist without the tool.
+const NON_ACP_TAGS_SECTIONS = {
+    function: ["tools", "summariesInContext"],
+    hybrid: ["textProtocol", "functionTools"],
+} as const;
+
+export function buildAcpTagsOnlyPrompt(
+    family: keyof typeof NON_ACP_TAGS_SECTIONS,
+    prompts?: Prompts,
+    sections?: CompressPromptSections,
+): string {
+    const p = prompts ?? defaultPrompts;
+    const overrides: CompressPromptSections = { ...(sections ?? {}) };
+    for (const key of NON_ACP_TAGS_SECTIONS[family]) overrides[key] = null;
+    // The builder joins [philosophy, rules, ...sections] with "\n\n" and a null
+    // override omits its element entirely, so everything after the fixed prefix
+    // is exactly the acpTags section (kernel default or user override). The
+    // startsWith guard fails safe to "" (no injection) if the kernel ever changes
+    // the builder's prefix structure instead of slicing garbage into every prompt.
+    const prefix = `${p.compressPhilosophy}\n\n${p.howToCompressRules}\n\n`;
+    const full = family === "hybrid"
+        ? buildCompressHybridSystemPrompt(p, overrides)
+        : buildCompressSystemPrompt(p, overrides);
+    if (!full.startsWith(prefix)) return "";
+    return full.slice(prefix.length);
+}
 
 // #1685 zero-injection identity: search_context's host-side
 // conversation_id extension (#841/#760) is REMOVED — the model never sees a

@@ -332,8 +332,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const remapped = new Map<string, MappedItem>();
             // #206: render-tag echo filter — deltas stream through the filter;
             // full-text events (.done / output_item.done / completed response)
-            // are stripped wholesale via stripResponsesText.
-            const tagFilter = composeStreamFilters(
+            // are stripped wholesale via stripResponsesText. #1881: reasoning
+            // summaries stream through their own per-summary filters — the old
+            // generic raw passthrough leaked model-emitted tags on this wire.
+            const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
                         loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -346,6 +348,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
+            const tagFilter = makeFilter();
+            const reasoningFilters = new Map<string, { filter: ReturnType<typeof makeFilter>; ref: { itemId: string; outputIndex: number; summaryIndex: number } }>();
             let lastTextRef: { itemId: string; outputIndex: number } | null = null;
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
@@ -355,12 +359,31 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         : undefined;
                     yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
                 }
+                for (const entry of reasoningFilters.values()) {
+                    const rtail = entry.filter.flush();
+                    if (rtail.length > 0) {
+                        yield {
+                            kind: "meta",
+                            chunk: rebuildResponsesEvent("response.reasoning_summary_text.delta", {
+                                type: "response.reasoning_summary_text.delta",
+                                item_id: entry.ref.itemId,
+                                output_index: entry.ref.outputIndex,
+                                summary_index: entry.ref.summaryIndex,
+                                delta: rtail,
+                            }),
+                            firstRoundOnly: true,
+                        } as ParsedStreamEvent;
+                    }
+                }
             };
             let sawReasoning = false;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
                 if (degenerateWarned) return;
+                // #1881: the gate reads the TEXT channel only — reasoning
+                // presence reaches it via sawReasoning, and counting reasoning
+                // chars as visible output would silence a tag-echo-only turn.
                 const msg = degenerateTurnWarning({ reason, terminalReason: "completed", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "responses" });
                 if (msg) {
                     degenerateWarned = true;
@@ -424,7 +447,12 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        // #1881: reasoning items carry whole-text summaries in
+                        // this fallthrough — strip on detection like the message
+                        // branches above (stripResponsesText never touches tool
+                        // argument fields).
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
                     type === "response.content_part.added" ||
@@ -538,7 +566,12 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        // #1881: reasoning items carry whole-text summaries in
+                        // this fallthrough — strip on detection like the message
+                        // branches above (stripResponsesText never touches tool
+                        // argument fields).
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
                     yield* flushFilter();
@@ -570,6 +603,36 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                } else if (type.startsWith("response.reasoning")) {
+                    // #1881: reasoning prose (summaries) streams through its own
+                    // per-summary filter instead of the raw passthrough this
+                    // used to fall into. firstRoundOnly keeps multi-round
+                    // forwarding semantics unchanged — only the bytes are cleaned.
+                    const rsDelta = typeof obj.delta === "string" ? obj.delta : "";
+                    if (rsDelta.length > 0) {
+                        const key = `${typeof obj.item_id === "string" ? obj.item_id : ""}:${typeof obj.summary_index === "number" ? obj.summary_index : 0}`;
+                        let entry = reasoningFilters.get(key);
+                        if (!entry) {
+                            entry = {
+                                filter: makeFilter(),
+                                ref: {
+                                    itemId: typeof obj.item_id === "string" ? obj.item_id : "",
+                                    outputIndex: typeof obj.output_index === "number" ? obj.output_index : 0,
+                                    summaryIndex: typeof obj.summary_index === "number" ? obj.summary_index : 0,
+                                },
+                            };
+                            reasoningFilters.set(key, entry);
+                        }
+                        const clean = entry.filter.push(rsDelta);
+                        if (clean.length > 0) {
+                            const chunk = clean === rsDelta ? rawBuf : rebuildResponsesEvent(type, { ...obj, delta: clean });
+                            yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        }
+                    } else if (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) {
+                        yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj)), firstRoundOnly: true } as ParsedStreamEvent;
+                    } else {
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    }
                 } else {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
