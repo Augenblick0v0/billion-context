@@ -1244,9 +1244,58 @@ function dedupeDomains(list: string[]): string[] {
     return out;
 }
 
+// #1815: a top-level key the loader does not consume must not vanish without
+// feedback — a misplaced key (e.g. "promptPack" at root instead of under
+// "compress") was dropped silently, violating the never-silently-drop-user-
+// config rule (§7.3). KNOWN_TOP_LEVEL_KEYS is the runtime mirror of FileConfig
+// above; keep it in sync when adding fields there.
+const KNOWN_TOP_LEVEL_KEYS = new Set([
+    "port", "host", "upstream", "providersPath", "providers", "proxy",
+    "modelContextLimit", "sessionHeader", "log", "debug", "dumpSse",
+    "passthrough", "autoUpdate", "autoRestartOnUpdate", "updateTag",
+    "advisoryCheck", "advisoryUrl", "upstreamProxy", "upstreamProxyMode",
+    "logFile", "compress", "promptCache", "mitm", "maskHosts",
+    "subagentSplit", "forkAdoption", "resumeInheritance",
+    "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "compat", "imageBilling", "claude", "native",
+]);
+
+// Every field parseCompressSettings accepts — hint source for misplaced keys:
+// an unknown top-level key that appears here almost certainly belongs one
+// level down under "compress". Keep in sync with parseCompressSettings.
+const COMPRESS_SETTING_FIELDS = new Set([
+    "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
+    "nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens",
+    "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent",
+    "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
+    "neverPreserveRecentTools", "preserveRecentTools", "stripImages",
+    "visibilityMarkers", "rules", "injectTool", "injectNudge",
+    "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
+    "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
+]);
+
+// Deduped per unique key set per process (same pattern as
+// seenAbsorbDivergenceWarnings): loadConfigFile() runs on every config read,
+// so without this one startup would log the same warning several times.
+const seenUnknownTopLevelKeySignatures = new Set<string>();
+
+export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
+    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key));
+    if (unknown.length === 0) return;
+    const signature = [...unknown].sort().join("\u0000");
+    if (seenUnknownTopLevelKeySignatures.has(signature)) return;
+    seenUnknownTopLevelKeySignatures.add(signature);
+    const misplaced = unknown.filter((key) => COMPRESS_SETTING_FIELDS.has(key));
+    const hint = misplaced.length > 0
+        ? ` — ${misplaced.map((k) => `"${k}" belongs under "compress" (did you mean "compress.${k}"?)`).join("; ")}`
+        : "";
+    loggerLog("warn", `[acp-config] ignoring unknown top-level config key(s): ${unknown.join(", ")}${hint}`);
+}
+
 function loadConfigFile(): FileConfig {
     const parsed = safeReadJson(configFile());
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
         return parsed as FileConfig;
     }
     return {};
