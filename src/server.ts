@@ -1492,7 +1492,7 @@ async function handle(
     // that forward before reaching the final boundary (they can't use
     // forward()'s own resolution). Same destination derivation as
     // buildForwardTarget, so the list matches what the processed path applies.
-    const compatDropPaths = resolveCompatDropFields(opts.routes, forwardUpstreamUrl(req, opts, route), opts.compat.dropFields);
+    const compatDropPaths = resolveCompatDropFields(opts.routes, forwardUpstreamUrl(req, opts, route), opts.compat?.dropFields);
     // #1117: an unattributed in-process caller (native patch marked it — its
     // URL was already /bili/-routed by the settings overlay, so refusal was
     // impossible client-side) relays byte-untouched, mirroring a direct send
@@ -5525,7 +5525,7 @@ async function forward(
         // #1421 outbound stamp whose digest must cover the exact forwarded
         // bytes. Protocol-neutral (any JSON-object body), unlike the role
         // rewrite above which is openai/responses-only.
-        compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat.dropFields);
+        compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat?.dropFields);
         if (compatDropPaths.length > 0 && typeof wireBody === "string") {
             const applied = applyCompatDropFields(wireBody, compatDropPaths);
             if (applied.dropped > 0) {
