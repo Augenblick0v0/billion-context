@@ -16,7 +16,6 @@
 // Loopback only, zero secrets, zero tokens. Gated like ACP_TEST_REGISTRY so
 // plain `npm test` stays free; requires `npm run build` first.
 import { spawn, type ChildProcess } from "node:child_process";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -24,6 +23,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import * as tar from "tar";
 import { startRegistry } from "./registry-fixture.js";
+import { biliSpawnEnv, isolatedEnv, npmHomeEnv, npmRunSync } from "./crossplat.ts";
 import { rmrf } from "../tmp-rm.ts";
 
 const run = process.env.ACP_TEST_REGISTRY === "1";
@@ -73,24 +73,18 @@ function freePort(): Promise<number> {
     });
 }
 
-function isolatedEnv(work: string): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const [key, dir] of [
-        ["HOME", "home"],
-        ["XDG_CONFIG_HOME", "config"],
-        ["XDG_CACHE_HOME", "cache"],
-        ["XDG_STATE_HOME", "state"],
-        ["XDG_DATA_HOME", "data"],
-    ] as const) {
-        const p = path.join(work, dir);
-        fs.mkdirSync(p, { recursive: true });
-        env[key] = p;
-    }
-    return env;
-}
 
 async function readPkgVersion(dir: string): Promise<string> {
     return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
+}
+
+function packTarball(stage: string, packs: string, home: string): string {
+    const listing = npmRunSync(["pack", "--silent", "--pack-destination", packs], { cwd: stage, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(home) } })
+        .trim()
+        .split("\n")
+        .pop()
+        ?.trim();
+    return listing ?? "";
 }
 
 // Stage a publishable tarball of THIS package at a synthetic version (same
@@ -107,17 +101,9 @@ async function makeFixtureTarball(work: string, version: string): Promise<string
     }
     const home = path.join(work, "home-pkg");
     fs.mkdirSync(home, { recursive: true });
-    const listing = execFileSync("npm", ["pack", "--silent", "--pack-destination", packs], {
-        cwd: stage,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", HOME: home },
-    })
-        .trim()
-        .split("\n")
-        .pop()
-        ?.trim();
-    assert.ok(listing?.endsWith(".tgz"), `npm pack produced no tarball for ${version}: ${listing}`);
-    return path.join(packs, listing!);
+    const listing = packTarball(stage, packs, home);
+    assert.ok(listing.endsWith(".tgz"), `npm pack produced no tarball for ${version}: ${listing}`);
+    return path.join(packs, listing);
 }
 
 // The companion advisory package: a minimal tarball whose package.json
@@ -144,17 +130,9 @@ async function makeAdvisoryTarball(work: string): Promise<string> {
     const home = path.join(work, "home-pkg");
     const packs = path.join(work, "packs");
     fs.mkdirSync(packs, { recursive: true });
-    const listing = execFileSync("npm", ["pack", "--silent", "--pack-destination", packs], {
-        cwd: stage,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", HOME: home },
-    })
-        .trim()
-        .split("\n")
-        .pop()
-        ?.trim();
-    assert.ok(listing?.endsWith(".tgz"), `npm pack produced no advisory tarball: ${listing}`);
-    return path.join(packs, listing!);
+    const listing = packTarball(stage, packs, home);
+    assert.ok(listing.endsWith(".tgz"), `npm pack produced no advisory tarball: ${listing}`);
+    return path.join(packs, listing);
 }
 
 // The fake install MUST sit under a node_modules directory (isNpmInstallForm
@@ -171,7 +149,7 @@ type BiliProc = { child: ChildProcess; port: number; stderr: string };
 
 function spawnBiliStart(installDir: string, port: number, env: Record<string, string>): BiliProc {
     const child = spawn(process.execPath, [path.join(installDir, "dist", "index.js"), "start", "--port", String(port)], {
-        env: { PATH: process.env.PATH ?? "", ...env },
+        env: biliSpawnEnv(env),
     });
     const proc: BiliProc = { child, port, stderr: "" };
     child.stderr?.on("data", (d) => (proc.stderr += d));

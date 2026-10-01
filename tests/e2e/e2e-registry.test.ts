@@ -3,13 +3,14 @@
 // in-place install → disk flip — plus the post-update opencode plugin entry,
 // against a local verdaccio. Loopback only, zero secrets, zero tokens.
 // Gated like ACP_TEST_E2E so plain `npm test` stays free.
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import * as tar from "tar";
 import { startRegistry } from "./registry-fixture.js";
+import { IS_WIN, biliSpawnEnv, fakeVersionBin, isolatedEnv, npmHomeEnv, npmRunSync } from "./crossplat.ts";
 import { rmrf } from "../tmp-rm.ts";
 
 const run = process.env.ACP_TEST_REGISTRY === "1";
@@ -32,27 +33,11 @@ function escapeRe(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isolatedEnv(work: string): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const [key, dir] of [
-        ["HOME", "home"],
-        ["XDG_CONFIG_HOME", "config"],
-        ["XDG_CACHE_HOME", "cache"],
-        ["XDG_STATE_HOME", "state"],
-        ["XDG_DATA_HOME", "data"],
-    ] as const) {
-        const p = path.join(work, dir);
-        fs.mkdirSync(p, { recursive: true });
-        env[key] = p;
-    }
-    return env;
-}
-
 function runBili(installDir: string, args: string[], env: Record<string, string>): { code: number; stdout: string; stderr: string } {
     const res = spawnSync(process.execPath, [path.join(installDir, "dist", "index.js"), ...args], {
         encoding: "utf8",
         timeout: 180_000,
-        env: { PATH: process.env.PATH ?? "", ...env },
+        env: biliSpawnEnv(env),
     });
     return { code: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
@@ -63,23 +48,24 @@ async function readPkgVersion(dir: string): Promise<string> {
 
 // Stage a publishable tarball of THIS package at a synthetic version: same
 // files field, same dist build, rewritten package.json version.
-async function makeFixtureTarball(work: string, version: string): Promise<string> {
+// `bare` strips runtime dependencies — needed when the REAL npm client
+// resolves the tree (`install -g`): the hermetic registry has no uplinks, so
+// any dependency fetch would 404. The flip/layout mechanics under test
+// don't involve dependency resolution.
+async function makeFixtureTarball(work: string, version: string, opts?: { bare?: boolean }): Promise<string> {
     const packs = path.join(work, "packs");
     fs.mkdirSync(packs, { recursive: true });
     const stage = path.join(work, "fixtures", version);
     fs.mkdirSync(stage, { recursive: true });
-    fs.writeFileSync(path.join(stage, "package.json"), `${JSON.stringify({ ...PKG, version }, null, 2)}\n`);
+    const stagedPkg = opts?.bare ? { ...PKG, version, dependencies: {}, optionalDependencies: {} } : { ...PKG, version };
+    fs.writeFileSync(path.join(stage, "package.json"), `${JSON.stringify(stagedPkg, null, 2)}\n`);
     for (const entry of PKG.files) {
         const src = path.join(REPO_ROOT, entry);
         if (fs.existsSync(src)) await fs.promises.cp(src, path.join(stage, entry), { recursive: true });
     }
     const home = path.join(work, "home-pkg");
     fs.mkdirSync(home, { recursive: true });
-    const listing = execFileSync("npm", ["pack", "--silent", "--pack-destination", packs], {
-        cwd: stage,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", HOME: home },
-    })
+    const listing = npmRunSync(["pack", "--silent", "--pack-destination", packs], { cwd: stage, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(home) } })
         .trim()
         .split("\n")
         .pop()
@@ -110,13 +96,10 @@ function seedOpencodeConfig(work: string): void {
 
 // Deterministic host-major probe target: prints a 2.x version so
 // detectOpencodeMajor() lands on key "plugins" regardless of what (if
-// anything) is installed on the host.
+// anything) is installed on the host. Cross-platform: .cmd shim on Windows
+// (the product routes .cmd through the shell), shebang script on POSIX.
 function fakeOpencodeBin(work: string): string {
-    const bin = path.join(work, "bin", "fake-opencode");
-    fs.mkdirSync(path.dirname(bin), { recursive: true });
-    fs.writeFileSync(bin, "#!/bin/sh\necho 2.4.0\n");
-    fs.chmodSync(bin, 0o755);
-    return bin;
+    return fakeVersionBin(work, "fake-opencode", "2.4.0");
 }
 
 test("hermetic registry e2e", { skip: skipReason }, async (t) => {
@@ -179,4 +162,49 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
         assert.deepEqual(cfg.compaction, { auto: false });
         assert.match(res.stdout, /plugins present/);
     });
+});
+
+test("hermetic npm -g install e2e (real npm client, real global layout)", { skip: skipReason }, async (t) => {
+    assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
+    const workRoot = path.join(process.cwd(), "tmp");
+    fs.mkdirSync(workRoot, { recursive: true });
+    const work = fs.mkdtempSync(path.join(workRoot, "e2e-npm-global-"));
+    t.after(() => rmrf(work));
+
+    const reg = await startRegistry(path.join(work, "registry"));
+    t.after(() => reg.stop());
+    await reg.publish(await makeFixtureTarball(work, OLD_VERSION, { bare: true }));
+    await reg.publish(await makeFixtureTarball(work, NEW_VERSION, { bare: true }));
+    const envBase = isolatedEnv(work);
+
+    // The REAL npm client installing globally into an isolated prefix — not
+    // the manual tar extraction the flip test above uses. This is the layout
+    // real users get from `npm install -g billion-context`, per platform:
+    //   win32:  <prefix>/node_modules/<pkg> + <prefix>/bili.cmd shim
+    //   POSIX:  <prefix>/lib/node_modules/<pkg> + <prefix>/bin/bili shim
+    const prefix = path.join(work, "npm-global");
+    fs.mkdirSync(prefix, { recursive: true });
+    await reg.npm(["install", "--global", `${PKG.name}@${OLD_VERSION}`, "--prefix", prefix]);
+    const installDir = fs.existsSync(path.join(prefix, "node_modules", PKG.name))
+        ? path.join(prefix, "node_modules", PKG.name)
+        : path.join(prefix, "lib", "node_modules", PKG.name);
+    assert.equal(await readPkgVersion(installDir), OLD_VERSION, `npm -g did not lay the package at ${installDir}`);
+    const shim = IS_WIN ? path.join(prefix, "bili.cmd") : path.join(prefix, "bin", "bili");
+    assert.ok(fs.existsSync(shim), `npm -g must lay the bili shim at ${shim} for this platform`);
+
+    // Self-update must classify the npm-global layout as bili-owned
+    // (hostManagedInstall) and flip it in place over the real chain.
+    const res = runBili(installDir, ["update"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url });
+    assert.equal(res.code, 0, `bili update failed:\n${res.stderr}`);
+    assert.match(res.stderr, new RegExp(`installed ${escapeRe(OLD_VERSION)} → ${escapeRe(NEW_VERSION)}\. Restart to finish\.`));
+    assert.equal(await readPkgVersion(installDir), NEW_VERSION, "npm-global on-disk version must flip to the published one");
+
+    // The shim npm laid down still resolves through to the flipped tree.
+    // (.cmd shims cannot be spawned without a shell on Windows — route them
+    // through cmd like the product's own client probe does.)
+    const probe = IS_WIN
+        ? spawnSync(`"${shim}" --version`, { shell: true, encoding: "utf8", timeout: 60_000, env: biliSpawnEnv(envBase) })
+        : spawnSync(shim, ["--version"], { encoding: "utf8", timeout: 60_000, env: biliSpawnEnv(envBase) });
+    const shimVersion = (probe.stdout ?? "").trim();
+    assert.match(shimVersion, new RegExp(`^v?${escapeRe(NEW_VERSION)}$`), `bili shim must report the flipped version, got: ${JSON.stringify(shimVersion)}`);
 });

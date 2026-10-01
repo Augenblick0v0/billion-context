@@ -10,6 +10,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { assertPortDead } from "../port-race.js";
+import { npmCliPath, npmHomeEnv, windowsSystemEnv } from "./crossplat.ts";
 
 export interface RegistryFixture {
     /** Base URL, e.g. http://127.0.0.1:43210 */
@@ -130,10 +131,15 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
 
         const runNpm = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
             new Promise((resolve, reject) => {
+                // Windows: npm.cmd cannot be spawned without a shell — run
+                // `node npm-cli.js` instead (argv stays literal, no quoting).
+                const cli = npmCliPath();
+                const cmd = cli ?? "npm";
+                const argv = cli ? [cli, ...args, "--registry", url, "--no-audit", "--no-fund"] : [`${[cmd, ...args, "--registry", url, "--no-audit", "--no-fund"].join(" ")}`];
                 execFile(
-                    "npm",
-                    [...args, "--registry", url, "--no-audit", "--no-fund"],
-                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, env: { PATH: process.env.PATH ?? "", HOME: homeDir, ...(process.env.NPM_ALLOW_DANGEROUS ? { NPM_ALLOW_DANGEROUS: process.env.NPM_ALLOW_DANGEROUS } : {}) } },
+                    cli ? process.execPath : cmd,
+                    argv,
+                    { cwd: root, encoding: "utf8", timeout: NPM_TIMEOUT_MS, shell: cli ? false : true, windowsHide: true, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(homeDir), ...windowsSystemEnv(), ...(process.env.NPM_ALLOW_DANGEROUS ? { NPM_ALLOW_DANGEROUS: process.env.NPM_ALLOW_DANGEROUS } : {}) } },
                     (error, stdout, stderr) => {
                         if (error) reject(new Error(`npm ${args.join(" ")} failed: ${(stderr || error.message).slice(0, 4000)}`));
                         else resolve({ stdout, stderr });
