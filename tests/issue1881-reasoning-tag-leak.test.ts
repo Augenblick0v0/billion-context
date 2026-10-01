@@ -135,6 +135,33 @@ test("#1881 google: an all-proxy call chunk still delivers its UNEDITED sibling 
     assert.ok(!out.includes("bili_absorb"), `the proxy call must not ride along: ${out}`);
 });
 
+test("#1881 openai: an all-proxy tool frame still delivers its sibling content once", async () => {
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events = await collect(
+        adapter,
+        sse({ choices: [{ index: 0, delta: { content: "sibling text", tool_calls: [{ index: 0, id: "call_p", type: "function", function: { name: "bili_compress", arguments: "{}" } }] } }] }) +
+            sse({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+            "data: [DONE]\n\n",
+    );
+    const out = clientBytes(events);
+    assert.equal((out.match(/sibling text/g) ?? []).length, 1, `withheld sibling prose arrives once, got: ${out}`);
+    assert.ok(!out.includes("bili_compress"), `the proxy call must not ride along: ${out}`);
+});
+test("#1881 openai: a mixed round drops a proxy-only frame but keeps its sibling content", async () => {
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events = await collect(
+        adapter,
+        sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "read", arguments: "{}" } }] } }] }) +
+            sse({ choices: [{ index: 0, delta: { content: "between the calls", tool_calls: [{ index: 1, id: "call_p", type: "function", function: { name: "bili_compress", arguments: "{}" } }] } }] }) +
+            sse({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+            "data: [DONE]\n\n",
+    );
+    const out = clientBytes(events);
+    assert.equal((out.match(/between the calls/g) ?? []).length, 1, `dropped frame's prose arrives once, got: ${out}`);
+    assert.ok(out.includes('"name":"read"'), `the real call still reaches the client: ${out}`);
+    assert.ok(!out.includes("bili_compress"), `the proxy call must not ride along: ${out}`);
+});
+
 test("#1881 google: a terminal chunk carrying a REAL call sends its sibling prose exactly once", async () => {
     const adapter = createGoogleAdapter({ model: "gemini-3-pro-preview" }, undefined, "bili_absorb", "gemini-3-pro-preview");
     const events = await collect(

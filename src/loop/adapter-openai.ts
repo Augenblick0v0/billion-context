@@ -51,6 +51,23 @@ function filterRealToolFragments(
     return filtered;
 }
 
+// #1881: settle drops proxy-only frames without forwarding their sibling prose.
+// Rebuild such a frame without tool_calls so that prose still reaches the
+// client. The stored copy already carries cleaned values; null when nothing
+// visible is left after filtering (those fields were deleted at push time).
+function withheldProseFrame(parsed: Record<string, unknown>): Buffer | null {
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
+    const choice = choices?.[0];
+    const delta = choice?.delta as Record<string, unknown> | undefined;
+    if (!choice || !delta) return null;
+    const ct = typeof delta.content === "string" ? delta.content : "";
+    const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+    if (ct.length === 0 && rc.length === 0) return null;
+    const cleanDelta = { ...delta };
+    delete cleanDelta.tool_calls;
+    return Buffer.from("data: " + JSON.stringify({ ...parsed, choices: [{ ...choice, delta: cleanDelta }, ...(choices ?? []).slice(1)] }) + "\n\n", "utf8");
+}
+
 interface ToolCallBuffer {
     index: number;
     id: string;
@@ -356,6 +373,12 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 if (!sawRealToolCall) {
                     yield* flushPendingAsStructured();
+                    // #1881: nothing is replayed here, so deliver each frame's
+                    // withheld sibling prose instead of losing it on round 1.
+                    for (const { parsed } of rawToolChunks) {
+                        const prose = withheldProseFrame(parsed);
+                        if (prose) yield { kind: "meta", chunk: prose } as ParsedStreamEvent;
+                    }
                     return;
                 }
                 for (const [idx, tc] of pending) {
@@ -376,6 +399,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from("data: " + json + "\n\n", "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
                         yield { kind: "meta", chunk: Buffer.from("data: " + JSON.stringify(filtered) + "\n\n", "utf8") } as ParsedStreamEvent;
+                    } else {
+                        // #1881: proxy-only frame dropped — deliver its withheld sibling prose inline (wire order).
+                        const prose = withheldProseFrame(parsed);
+                        if (prose) yield { kind: "meta", chunk: prose } as ParsedStreamEvent;
                     }
                 }
                 for (const [idx, tc] of pending) {
