@@ -89,6 +89,31 @@ resolve → tarball download → sha512 verify → staged extract → in-place i
 instance the suite **brings itself**. Loopback only; zero external network,
 zero secrets, zero tokens (#1153).
 
+`e2e-advisory-rollback.test.ts` (same gate, same fixture infra) proves the
+rollback-form advisory contract (#1588 / PR #1596) against a **live, resident
+`bili start`**: it publishes synthetic `START` (installed, affected),
+`LATEST` (registry latest, also affected) and `TARGET` (older, clean)
+versions plus a `billion-context-advisories` package whose document matches
+the affected range, then asserts the four-behavior contract —
+
+1. **control**: before the advisory exists, the normal self-update loop
+   advances `START → LATEST` (the loop is alive);
+2. **forced rollback**: once the advisory is published, the watcher
+   force-installs the older `TARGET` onto disk and keeps a persistent
+   restart banner (the running process is still affected) —
+   `runAdvisoryCheck` re-evaluates against the *running* version and surfaces
+   `pendingRestart` + `installedVersion` on `/__bili/status`;
+3. **no ping-pong (#1588-A, pre-restart)**: across ≥3 check cycles the disk
+   stays at `TARGET`; the update loop logs `deferring to the advisory loop`
+   and never re-installs `LATEST`;
+4. **candidate gate (#1588-A, post-restart)**: after restarting the proxy on
+   the clean `TARGET`, the update check **refuses** to pull the affected
+   `LATEST` back in (`skipping … covered by a critical-bug advisory's
+   affected range (#1588)`) and `/__bili/status.advisory` clears.
+
+The cycle interval is accelerated via `BILI_UPDATE_CHECK_INTERVAL_MS=2500`
+(the documented #1153 seam; default unchanged).
+
 ## Running
 
 ```bash
@@ -105,6 +130,7 @@ free (the `npm test` glob doesn't cover `tests/e2e/` anyway).
 |---|---|---|
 | `ACP_TEST_REGISTRY` | – | `1` enables the suite |
 | `BILI_UPDATE_REGISTRY` | `https://registry.npmjs.org` | set by the suite per child process to the local registry URL |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `180000` | accelerated to 2500 ms by the advisory-rollback suite only |
 
 ## Mechanics
 

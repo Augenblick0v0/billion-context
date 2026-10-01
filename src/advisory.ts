@@ -298,7 +298,12 @@ export async function runAdvisoryCheck(opts: AdvisoryWatcherOptions, force = fal
             }
             const adv = runningMatched[0];
             state.active = { ...(state.active ?? { ...adv, currentVersion: opts.currentVersion }), pendingRestart: true, installedVersion: diskVersion };
-            warnOnce(log, adv.id, `[advisory] ⚠️ ${adv.id}: running version ${opts.currentVersion} is affected (${adv.reason}) while the on-disk version ${diskVersion ?? "?"} is outside the range — restart bili to finish`);
+            // Distinct warnOnce key from the "forcing update" line: both use
+            // adv.id as the user-facing id, but a rollback-form advisory emits
+            // them in sequence in ONE process (force the target, then keep the
+            // restart hint alive) — sharing the key would dedupe the restart
+            // hint away and leave the rollback silent in the log (#1588-B).
+            warnOnce(log, `${adv.id}:restart`, `[advisory] ⚠️ ${adv.id}: running version ${opts.currentVersion} is affected (${adv.reason}) while the on-disk version ${diskVersion ?? "?"} is outside the range — restart bili to finish`);
             return;
         }
         const adv = matched[0];
