@@ -138,6 +138,19 @@ type RegisterState = { base: string | undefined; toolsReady: boolean; dead: bool
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
 
+// #1797: attach/recovery chains still in flight after apply() returned — a late
+// chain would clobber the shared register mid-run of whatever executes next.
+const pendingChains = new Set<Promise<unknown>>();
+
+function trackChain<T>(p: Promise<T>): Promise<T> {
+    pendingChains.add(p);
+    void p.then(
+        () => { pendingChains.delete(p); },
+        () => { pendingChains.delete(p); },
+    );
+    return p;
+}
+
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
@@ -466,7 +479,7 @@ function maybeRetry(ctx: PluginContext): void {
         const respawn = state.respawn;
         if (respawn === undefined) return;
         register.retryAt = Date.now() + RETRY_INTERVAL_MS;
-        void respawn()
+        void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
                 register.base = origin;
@@ -717,7 +730,7 @@ export function apply(ctx: PluginContext): void {
                     console.warn(line);
                 });
             };
-            state.ready = start();
+            state.ready = trackChain(start());
         } else {
             state.ready = Promise.resolve(undefined);
         }
@@ -730,7 +743,7 @@ export function apply(ctx: PluginContext): void {
             register.base = undefined;
             register.toolsReady = false;
         };
-        state.ready = start();
+        state.ready = trackChain(start());
     }
 
     // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
@@ -902,6 +915,13 @@ export function _resetRegisterForTest(base: string | undefined): void {
     modelInfo.cached = undefined;
     modelInfo.services = undefined;
     modelInfo.refreshing = false;
+}
+
+/** Test hook (#1797): resolve once every in-flight attach/recovery chain has
+ *  settled, plus one macrotask so their .then state-writes have run. */
+export function _settleNativeForTest(): Promise<void> {
+    const all = [...pendingChains];
+    return Promise.all(all).catch(() => undefined).then(() => new Promise((resolve) => setTimeout(resolve, 0)));
 }
 
 export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {
