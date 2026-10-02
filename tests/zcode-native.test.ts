@@ -9,6 +9,7 @@ import {
     bootstrapZcodeNative,
     handoffZcodeRoutingOnExit,
     planNativeZcode,
+    planZcodeRouting,
     probeProxyHealth,
     repairSharedStoreDrift,
     restoreZcodeBackup,
@@ -306,7 +307,7 @@ test("routeZcodeConfig refuses to wrap the v3.14+ store (#1621 client signing)",
     }
 });
 
-test("bootstrapZcodeNative degrades to off on the v3.14+ store without proxy bring-up (#1621)", async () => {
+test("bootstrapZcodeNative degrades (no proxy bring-up) on the v3.14+ signing store (#1621/#1892)", async () => {
     const { dir, file } = newStoreDir();
     writeFileSync(file, readFileSync(file, "utf8").replace(UPSTREAM, `http://127.0.0.1:9999/bili/${UPSTREAM}`));
     try {
@@ -323,7 +324,7 @@ test("bootstrapZcodeNative degrades to off on the v3.14+ store without proxy bri
                 return { origin: "http://127.0.0.1:1", attached: false };
             },
         });
-        assert.deepEqual(out, { mode: "off" });
+        assert.deepEqual(out, { mode: "degraded", reason: "signing" });
         assert.equal(proxyTouched, false);
         assert.match(logs[0], /client signing/);
         // mcp-entry's off path runs unrouteZcode — a wrapper left by a
@@ -735,18 +736,88 @@ test("#1892: every personal rule behind the #1621 signing wall names cert-MITM",
     }
 });
 
-test("#1892: bootstrap on an empty personal store degrades to active-with-no-route (MCP exits pre-init)", async () => {
+test("#1892: bootstrap on an empty personal store degrades BEFORE bring-up (entry serves idle, never exits pre-init)", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-bootstrap-empty-"));
     mkdirSync(path.join(dir, "v2"), { recursive: true });
     writeFileSync(zcodeStoreCandidates(dir, "new", {})[0], EMPTY_NEW_STORE);
     try {
-        await withHealthServer(async (origin) => {
-            const out = await bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {} });
-            assert.equal(out.mode, "active");
-            if (out.mode !== "active") return;
-            assert.equal(out.attached, true);
-            assert.equal(out.routed, undefined);
+        await withHealthServer(async () => {
+            const out = await bootstrapZcodeNative({ env: {}, dataDir: dir, log: () => {}, ensureProxy: async () => { throw new Error("degraded bootstrap must not bring up a proxy"); } });
+            assert.deepEqual(out, { mode: "degraded", reason: "empty-rules" });
         });
+    } finally {
+        rmrf(dir);
+    }
+});
+
+// ── #1892: pure routing plan + degraded bootstrap (no bring-up) ──────────────
+
+function emptyPersonalStoreDir(): string {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-plan-empty-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    writeFileSync(path.join(dir, "v2", "provider_config.json"), JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [] } } }) + "\n");
+    return dir;
+}
+
+test("planZcodeRouting classifies the no-route world before any bring-up (#1892)", async () => {
+    // No store at all → no-store.
+    const bare = mkdtempSync(path.join(tmpdir(), "zcode-plan-bare-"));
+    try {
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: bare, log: () => {} }), { routable: false, reason: "no-store" });
+        // v2 dir but the personal store file is absent → no-file.
+        mkdirSync(path.join(bare, "v2"), { recursive: true });
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: bare, log: () => {} }), { routable: false, reason: "no-file" });
+    } finally {
+        rmrf(bare);
+    }
+    // Personal store present with zero rules → empty-rules + the #1896 hint.
+    const empty = emptyPersonalStoreDir();
+    try {
+        const logs: string[] = [];
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: empty, log: (m) => logs.push(m) }), { routable: false, reason: "empty-rules" });
+        assert.match(logs.join(" "), /no routable provider entry found/);
+        assert.match(logs.join(" "), /built-in\/account layer/);
+    } finally {
+        rmrf(empty);
+    }
+    // Whole store behind the signing wall under route:"plans" → signing.
+    const { dir } = newStoreDir();
+    try {
+        const logs: string[] = [];
+        assert.deepEqual(
+            planZcodeRouting({ env: { BILI_ZCODE_ROUTE: "plans" }, dataDir: dir, log: (m) => logs.push(m) }),
+            { routable: false, reason: "signing" },
+        );
+        assert.match(logs.join(" "), /client[- ]signing/);
+    } finally {
+        rmrf(dir);
+    }
+    // A legacy store with a wrappable provider is routable (dry-run wraps >0).
+    const legacy = dataDir();
+    try {
+        assert.deepEqual(planZcodeRouting({ env: {}, dataDir: legacy, log: () => {} }), { routable: true });
+        // …and the dry-run never touched the file.
+        assert.doesNotMatch(readFileSync(zcodeStoreCandidates(legacy, "legacy", {})[0], "utf8"), /\/bili\//);
+    } finally {
+        rmrf(legacy);
+    }
+});
+
+test("bootstrapZcodeNative returns degraded, without proxy bring-up, for an empty personal store (#1892)", async () => {
+    const dir = emptyPersonalStoreDir();
+    try {
+        let proxyTouched = false;
+        const out = await bootstrapZcodeNative({
+            env: {},
+            dataDir: dir,
+            log: () => {},
+            ensureProxy: async () => {
+                proxyTouched = true;
+                return { origin: "http://127.0.0.1:1", attached: false };
+            },
+        });
+        assert.deepEqual(out, { mode: "degraded", reason: "empty-rules" });
+        assert.equal(proxyTouched, false);
     } finally {
         rmrf(dir);
     }

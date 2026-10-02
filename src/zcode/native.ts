@@ -365,11 +365,65 @@ export function defaultLog(msg: string): void {
 
 export type BootstrapMode =
     | { readonly mode: "off" }
+    | { readonly mode: "degraded"; readonly reason: ZcodeDegradedReason }
     | {
         readonly mode: "active";
         readonly attached: boolean;
         readonly routed: ZcodeRouteApplied | undefined;
     };
+
+/** Why a session degraded instead of routing (#1892). "off" (kill-switch,
+ * BILI_ZCODE_ROUTE=none) is a DECISION; "degraded" is the environment having
+ * nothing natively routable — the MCP entry still serves (idle) so the
+ * client handshake completes instead of the process dying before
+ * initialize (the "Connection closed" zcode reports). */
+export type ZcodeDegradedReason = "no-store" | "signing" | "no-file" | "empty-rules";
+
+export type ZcodeRoutePlan = { readonly routable: true } | { readonly routable: false; readonly reason: ZcodeDegradedReason };
+
+/** Read-only routing viability check (#1892): everything routeZcodeConfig
+ *  decides BEFORE it needs an origin to write — store presence, the #1621
+ *  signing wall, file readability, and a pure applyZcodeRouting dry-run to
+ *  count wrappable entries. Never writes, never spawns. Logging mirrors
+ *  routeZcodeConfig's no-route branches (incl. #1896 next-step hints) so the
+ *  degraded path keeps the full diagnostic trail. */
+export function planZcodeRouting(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; log?: (msg: string) => void; policy?: ZcodeRoutePolicy } = {}): ZcodeRoutePlan {
+    const env = opts.env ?? process.env;
+    const log = opts.log ?? (() => {});
+    const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
+    const v2Dir = path.join(dataDir, "v2");
+    const hasStore = fs.existsSync(v2Dir) || zcodeStoreCandidates(dataDir, "new", env).some((f) => fs.existsSync(f));
+    if (!hasStore) {
+        log(`no ${v2Dir} — nothing to route`);
+        return { routable: false, reason: "no-store" };
+    }
+    const { kind, file } = detectZcodeStore(dataDir, env);
+    const policy = opts.policy ?? zcodePolicyFromEnv(env);
+    if (zcodeSigningBlocksRouting(kind, policy)) {
+        log(SIGNING_BLOCK_MESSAGE);
+        return { routable: false, reason: "signing" };
+    }
+    let text: string;
+    try {
+        text = fs.readFileSync(file, "utf8");
+    } catch {
+        log(`no ${file} — nothing to route`);
+        return { routable: false, reason: "no-file" };
+    }
+    // Dry-run origin is a placeholder: it only lands in the (discarded)
+    // rewrite text, never on disk — the wrapped count and skip reasons are
+    // origin-independent.
+    const applied = applyZcodeRouting(text, kind, "http://127.0.0.1:1", policy);
+    if (applied.wrapped.length === 0) {
+        log("no routable provider entry found — leaving the config untouched");
+        if (applied.skipped.length > 0) {
+            log(`skipped ${applied.skipped.length} entr${applied.skipped.length === 1 ? "y" : "ies"}: ${applied.skipped.map((s) => `${s.id} (${s.reason})`).join("; ")}`);
+        }
+        logNoRouteNextSteps({ kind, dataDir, env, origin: "http://127.0.0.1:1", policy, skipped: applied.skipped, log });
+        return { routable: false, reason: "empty-rules" };
+    }
+    return { routable: true };
+}
 
 export interface BootstrapZcodeOptions {
     readonly env?: NodeJS.ProcessEnv;
@@ -395,12 +449,15 @@ export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Pr
         return { mode: "off" };
     }
 
-    // #1621: degrade BEFORE any proxy bring-up; the caller's off-path runs
-    // unrouteZcode, which also strips wrappers left by older bili versions.
+    // #1621 + #1892: settle routing viability with the PURE dry-run BEFORE
+    // any proxy bring-up. A degraded session (empty personal store, signing
+    // wall, missing store) must not spawn a proxy it can never route
+    // through; the caller serves idle instead of exiting pre-handshake
+    // (which the zcode client reports as "Connection closed").
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
-    if (zcodeSigningBlocksRouting(detectZcodeStore(dataDir, env).kind, policy)) {
-        log(SIGNING_BLOCK_MESSAGE);
-        return { mode: "off" };
+    const routePlan = planZcodeRouting({ env, dataDir, log, policy });
+    if (!routePlan.routable) {
+        return { mode: "degraded", reason: routePlan.reason };
     }
 
     let origin: string;
