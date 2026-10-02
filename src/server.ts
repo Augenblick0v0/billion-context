@@ -2539,10 +2539,12 @@ async function handle(
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
         // three layers reserved room for the output before this). Anthropic is
-        // exempt: its input limit is enforced independently of max_tokens
-        // (separate output budget), so reserving would shift every band down by
-        // maxOutput on every session for no safety gain — see
-        // shouldReserveOutputHeadroom. The request's own budget field is the exact
+        // exempt from this proactive reservation: it counts max_tokens against
+        // the window too (#1908), but its overflow is covered at forward time by
+        // the outgoing clamp in prepareAnthropic; reserving would additionally
+        // shift every band down by maxOutput on every anthropic session — an
+        // open product decision, see shouldReserveOutputHeadroom. The request's
+        // own budget field is the exact
         // output budget requested for THIS turn, so it is precise and per-request;
         // when the harness omits every budget field (#924 fallback below) the
         // model's declared max output stands in for it.
