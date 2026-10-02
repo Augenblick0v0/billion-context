@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { prepareCodexHome, refreshOverlayHome, isSqliteMain } from "../src/launcher.js";
+import { prepareCodexHome, refreshOverlayHome, isSqliteMain, SQLITE_ORIGIN_FILE } from "../src/launcher.js";
 
 const crequire = createRequire(import.meta.url);
 
@@ -373,4 +373,251 @@ test("prepareCodexHome gives codex a private db copy while owning config/.env", 
     assert.deepEqual(rowsOf(path.join(overlay!, "state_5.sqlite")), [1, 2]);
     assert.equal(fs.readFileSync(path.join(codexHome, "config.toml"), "utf8"), cfgText, "real config untouched");
     assert.deepEqual(fs.readFileSync(path.join(codexHome, "state_5.sqlite")), mainBefore, "real db untouched");
+});
+
+test("sequential relaunch merges back silently: no warning, no conflict files (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:seed", "", true);
+    fs.writeFileSync(path.join(real, "config.toml"), "[x]\n");
+
+    // Launch 1: cold copy into the overlay.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    assert.ok(fs.existsSync(path.join(overlay, SQLITE_ORIGIN_FILE)), "origin snapshot recorded at copy time");
+
+    // Normal bili session: write through the OVERLAY db only, close cleanly.
+    const ov = path.join(overlay, "state_5.sqlite");
+    const re = path.join(real, "state_5.sqlite");
+    const db = new sqliteCtor(ov);
+    db.prepare("INSERT INTO t VALUES(2, 'viaOverlay')").run();
+    db.close();
+
+    // Launch 2: both sides hold a main — the NORMAL steady state, not a
+    // divergence. Must merge silently.
+    const T = Date.now() / 1000;
+    touch(ov, T);
+    touch(re, T - 60);
+    const errs2 = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs2.some((e) => e.includes("diverge") || e.includes("distinct")), `no spurious divergence on sequential use: ${JSON.stringify(errs2)}`);
+    assert.deepEqual(rowsOf(re), [1, 2], "winner keeps all rows");
+    for (const dir of [real, overlay]) {
+        for (const n of fs.readdirSync(dir)) {
+            assert.ok(!n.includes("bili-conflict"), `no conflict accumulation in ${dir}: ${n}`);
+        }
+    }
+    assert.ok(!fs.existsSync(path.join(real, SQLITE_ORIGIN_FILE)), "origin metadata never leaks into the real home");
+    const st = fs.lstatSync(ov);
+    assert.ok(st.isFile() && st.nlink === 1, "steady state: overlay holds a fresh private copy");
+    assert.deepEqual(rowsOf(ov), [1, 2]);
+
+    // Launch 3 with no writes at all: still silent, still no conflicts.
+    const errs3 = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs3.some((e) => e.includes("diverge") || e.includes("distinct")), `no spurious divergence on idle relaunch: ${JSON.stringify(errs3)}`);
+    assert.deepEqual(rowsOf(re), [1, 2]);
+    for (const n of fs.readdirSync(real)) {
+        assert.ok(!n.includes("bili-conflict"), `no conflict accumulation in real home: ${n}`);
+    }
+});
+
+test("true divergence with the REAL side as loser still warns and preserves (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:seed", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+
+    const ov = path.join(overlay, "state_5.sqlite");
+    const re = path.join(real, "state_5.sqlite");
+    let db = new sqliteCtor(ov);
+    db.prepare("INSERT INTO t VALUES(2, 'viaOverlay')").run();
+    db.close();
+    db = new sqliteCtor(re);
+    db.prepare("INSERT INTO t VALUES(3, 'viaReal')").run();
+    db.close();
+
+    // Overlay generation is newer → wins; the REAL side lost and differs from
+    // what bili copied → genuine divergence: loud warning + preserved loser.
+    const T = Date.now() / 1000;
+    touch(ov, T);
+    touch(re, T - 60);
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(errs.some((e) => e.includes("diverge")), "true divergence must be reported loudly");
+    assert.deepEqual(rowsOf(re), [1, 2], "newer generation wins the merge-back");
+    const conflict = path.join(real, "state_5.sqlite.bili-conflict");
+    assert.deepEqual(rowsOf(conflict), [1, 3], "diverged real generation survives intact in the conflict file");
+});
+
+test("concurrent plain run with an idle bili: no warning, plain side wins (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:seed", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+
+    // Plain run advances the REAL home; the bili session did nothing.
+    const re = path.join(real, "state_5.sqlite");
+    const db = new sqliteCtor(re);
+    db.prepare("INSERT INTO t VALUES(3, 'viaReal')").run();
+    db.close();
+
+    const T = Date.now() / 1000;
+    touch(re, T);
+    touch(path.join(overlay, "state_5.sqlite"), T - 60);
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("diverge") || e.includes("distinct")), `unmodified bili copy is not a divergence: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(re), [1, 3], "plain-run rows kept");
+    for (const n of fs.readdirSync(real)) {
+        assert.ok(!n.includes("bili-conflict"), `no conflict for an unmodified loser: ${n}`);
+    }
+    assert.deepEqual(rowsOf(path.join(overlay, "state_5.sqlite")), [1, 3], "overlay re-copied from the merged set");
+});
+
+test("missing origin record falls back to warn-and-preserve (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:seed", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    fs.rmSync(path.join(overlay, SQLITE_ORIGIN_FILE), { force: true });
+
+    const ov = path.join(overlay, "state_5.sqlite");
+    const re = path.join(real, "state_5.sqlite");
+    const db2 = new sqliteCtor(ov);
+    db2.prepare("INSERT INTO t VALUES(2, 'viaOverlay')").run();
+    db2.close();
+
+    const T = Date.now() / 1000;
+    touch(ov, T);
+    touch(re, T - 60);
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(errs.some((e) => e.includes("diverge")), "without provenance the conservative warning must fire");
+    assert.deepEqual(rowsOf(re), [1, 2]);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite.bili-conflict")), [1], "loser preserved when provenance is unknown");
+});
+
+test("crashed set: stale loser WAL dropped silently once replayed into the winner (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    // Crashed launch: row 10 checkpointed into main, row 11 left in the WAL.
+    buildDb(root, real, "state_5.sqlite", "10:a", "11:tail", false);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    assert.ok(fs.existsSync(path.join(overlay, "state_5.sqlite-wal")), "crashed set copied whole");
+
+    // The bili session opens the overlay db: recovery replays the copied WAL
+    // into the overlay main, then a clean close removes the overlay sidecars.
+    const ov = path.join(overlay, "state_5.sqlite");
+    assert.deepEqual(rowsOf(ov), [10, 11], "recovery replays the copied WAL against its main");
+    const db = new sqliteCtor(ov);
+    db.prepare("INSERT INTO t VALUES(12, 'viaOverlay')").run();
+    db.close();
+
+    const T = Date.now() / 1000;
+    touch(ov, T);
+    touch(path.join(real, "state_5.sqlite"), T - 60);
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("diverge") || e.includes("distinct")), `replayed WAL is not a divergence: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite")), [10, 11, 12], "WAL tail recovered into the merged main");
+    assert.ok(quickCheckOk(path.join(real, "state_5.sqlite")));
+    for (const n of fs.readdirSync(real)) {
+        assert.ok(!n.includes("bili-conflict"), `no conflict for the stale crashed set: ${n}`);
+    }
+});
+
+test("isSqliteMain accepts uppercase extensions (#1919)", () => {
+    assert.equal(isSqliteMain("STATE_5.DB", new Set()), true);
+    assert.equal(isSqliteMain("Logs.SQLITE", new Set()), true);
+    assert.equal(isSqliteMain("cache.Sqlite3", new Set()), true);
+    assert.equal(isSqliteMain("X.WAL", new Set()), false);
+    assert.equal(isSqliteMain("X.SHM", new Set()), false);
+    assert.equal(isSqliteMain("x.JOURNAL", new Set()), false);
+});
+
+test("a directory named like a db is mirrored, not copied as a db set (#1919)", (t) => {
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(path.join(real, "logs.db", "inner"), { recursive: true });
+    fs.writeFileSync(path.join(real, "logs.db", "inner", "note.txt"), "keep\n");
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("could not link")), `directory must not land in linkFailures: ${JSON.stringify(errs)}`);
+    const st = fs.lstatSync(path.join(overlay, "logs.db"));
+    assert.ok(st.isDirectory() || st.isSymbolicLink(), "directory mirrored via the ordinary link path");
+    assert.equal(fs.readFileSync(path.join(overlay, "logs.db", "inner", "note.txt"), "utf8"), "keep\n");
+    for (const n of fs.readdirSync(real)) {
+        assert.ok(!n.includes("bili-conflict"), `no conflict files from a db-named directory: ${n}`);
+    }
+});
+
+test("relative legacy symlink to the real main is migrated too (#1919)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    fs.mkdirSync(overlay, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:seed", "", true);
+    const realMainBefore = fs.readFileSync(path.join(real, "state_5.sqlite"));
+    // RELATIVE target spelling — the exact-string readlink match used to miss it.
+    fs.symlinkSync(path.join("..", "real", "state_5.sqlite"), path.join(overlay, "state_5.sqlite"));
+
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(errs.some((e) => e.includes("#1917")), "legacy migration must be announced for relative links too");
+    const st = fs.lstatSync(path.join(overlay, "state_5.sqlite"));
+    assert.ok(st.isFile() && !st.isSymbolicLink(), "relative symlink replaced by a private copy");
+    assert.equal(st.nlink, 1);
+    assert.deepEqual(fs.readFileSync(path.join(overlay, "state_5.sqlite")), realMainBefore);
+    assert.deepEqual(fs.readFileSync(path.join(real, "state_5.sqlite")), realMainBefore, "real main untouched");
 });
