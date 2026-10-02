@@ -412,6 +412,21 @@ export type CompressSettings = {
      *  every report face. Merged sub-field-wise across the three levels like
      *  `absorb`. */
     priceProfile?: { w?: number; r?: number; q?: number };
+    /** [#1921] Fold-state reconciliation — how the proxy reacts when the
+     *  resent history no longer contains a folded message's content-hash id
+     *  (client restart/resume re-serialized the history, formatting churn on
+     *  tool results, duplicate-cluster shift after a deletion; see
+     *  src/fold-reconcile.ts). `"repair"` (default) matches each missing
+     *  covered id against an inbound candidate via its protocol-stable
+     *  toolCallId or its normalized identity (NFC + whitespace-collapsed text
+     *  equality at the same duplicate ordinal inside the aligned churn
+     *  region) and rewrites the fold blocks' covered ids, so the fold
+     *  survives byte churn. `"warn"` computes and logs the matches but never
+     *  rewrites. `"off"` disables the layer entirely (pre-#1921 behavior).
+     *  Env `BILI_FOLD_RECONCILE` (off|warn|repair) overrides every level.
+     *  Real edits never match (normalized text differs) and honestly
+     *  re-enter the wire unfolded, exactly as before. */
+    reconcile?: "off" | "warn" | "repair";
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -1303,6 +1318,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
+    "reconcile",
 ]);
 
 // Deduped per unique key set per process (same pattern as
