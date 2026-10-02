@@ -69,7 +69,7 @@ billion-context/
 │   ├── web/                      # Web UI (config + context windows)
 │   ├── fetch-util.ts             # HTTP fetch with timeout
 │   └── util.ts                   # Misc utilities
-├── tests/                        # 385 test files
+├── tests/                        # 399 test files
 ├── tsup.config.ts
 └── package.json
 ```
@@ -143,7 +143,7 @@ misattributes on decompress. Consequences for this repo:
   the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
 - Historical note: kernel 0.0.48/0.0.49 briefly contained ref-slot
   reclamation (reverted in kernel #191, see `persist/store.ts`). The guard
-  "do not bump past 0.0.47" is obsolete — master pins 0.0.99.
+  "do not bump past 0.0.47" is obsolete — master pins 0.0.100.
 
 ## 3. Development Standards
 
