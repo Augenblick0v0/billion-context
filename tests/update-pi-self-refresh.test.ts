@@ -21,11 +21,43 @@ const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pi-self
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
 
 const { refreshPiNpmCopy } = await import("../src/update.ts");
-const { isPiNpmCopy, piNpmEntrySpec, _setPiRunnersForTest } = await import("../src/pi-channel.ts");
+const { isPiNpmCopy, piNpmEntrySpec, resolvePiBinary, _setPiRunnersForTest } = await import("../src/pi-channel.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
     rmrf(root);
+});
+
+test("resolvePiBinary: finds a stock npm install's pi-stable(.cmd), prefers canonical pi, honors BILI_PI_BIN", () => {
+    const binDir = fs.mkdtempSync(path.join(root, "bindir-"));
+    const norm = (p: string): string => p.split(path.sep).join("/");
+
+    // Stock `npm install -g pi-stable` on Windows lays down pi-stable.cmd in
+    // %APPDATA%/npm — and NOT a `pi` shim. Probing only `pi` misses it.
+    const appdata = fs.mkdtempSync(path.join(root, "appdata-"));
+    const npmDir = path.join(appdata, "npm");
+    fs.mkdirSync(npmDir);
+    fs.writeFileSync(path.join(npmDir, "pi-stable.cmd"), "@echo off\r\n");
+    const win = resolvePiBinary({ PATH: binDir, APPDATA: appdata, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32", fs.existsSync, "C:\\nodejs\\node.exe");
+    assert.equal(norm(win), norm(path.join(npmDir, "pi-stable.cmd")));
+
+    // Canonical `pi` wins when both exist in one dir: `pi` is probed ahead of
+    // `pi-stable`. Synthetic dir + stubbed exists keeps this host-independent —
+    // a real temp path carries a drive-letter ':' on Windows, which the linux
+    // separator below would shred into non-matching fragments.
+    const pref = resolvePiBinary(
+        { PATH: "probedir" },
+        "linux",
+        (c) => c === "probedir/pi" || c === "probedir/pi-stable",
+        process.execPath,
+    );
+    assert.equal(pref, "probedir/pi");
+
+    // The override short-circuits everything.
+    assert.equal(resolvePiBinary({ PATH: binDir, BILI_PI_BIN: "/opt/weird/pi-nightly" }, "linux", fs.existsSync, process.execPath), "/opt/weird/pi-nightly");
+
+    // Nothing found → the bare name (spawn ENOENT is handled by the caller).
+    assert.equal(resolvePiBinary({ PATH: binDir }, "linux", () => false, process.execPath), "pi");
 });
 
 // — isPiNpmCopy classification ————————————————————————————————————

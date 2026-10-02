@@ -207,4 +207,15 @@ test("hermetic npm -g install e2e (real npm client, real global layout)", { skip
         : spawnSync(shim, ["--version"], { encoding: "utf8", timeout: 60_000, env: biliSpawnEnv(envBase) });
     const shimVersion = (probe.stdout ?? "").trim();
     assert.match(shimVersion, new RegExp(`^v?${escapeRe(NEW_VERSION)}$`), `bili shim must report the flipped version, got: ${JSON.stringify(shimVersion)}`);
+
+    // No-op re-run: already sitting at the registry's latest — must exit
+    // clean, say so, and touch nothing on disk (no re-download, no churn).
+    const pkgJson = path.join(installDir, "package.json");
+    const mtimeBefore = fs.statSync(pkgJson).mtimeMs;
+    const noop = runBili(installDir, ["update"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url });
+    assert.equal(noop.code, 0, `no-op update failed:\n${noop.stderr}`);
+    assert.match(noop.stderr, /\(up to date\)/, "no-op update must log the up-to-date line");
+    assert.doesNotMatch(noop.stderr, /Restart to finish/, "no-op update must not claim an install happened");
+    assert.equal(await readPkgVersion(installDir), NEW_VERSION);
+    assert.equal(fs.statSync(pkgJson).mtimeMs, mtimeBefore, "no-op update must not touch the installed tree");
 });
