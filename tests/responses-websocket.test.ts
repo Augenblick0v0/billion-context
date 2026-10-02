@@ -162,7 +162,7 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
             };
             client.on("message", onMessage);
             client.once("close", onClose);
-            client.send(JSON.stringify({ type: "response.create", model: "gpt-5.2", store: false, input, tools: BILI_ACP_TOOLS_RESPONSES, ...(previous ? { previous_response_id: previous } : {}), ...extra }));
+            client.send(JSON.stringify({ type: "response.create", model: "gpt-5.2", store: false, input, tools: [...BILI_ACP_TOOLS_RESPONSES, { type: "function", name: "write", parameters: { type: "object", properties: {} } }], ...(previous ? { previous_response_id: previous } : {}), ...extra }));
         });
     }
     return { rows, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, openPeer,
@@ -222,6 +222,25 @@ test("Responses WS: both ends use sockets; incremental tool continuation reaches
         assert.equal(session.stats.requests, 2);
         assert.equal(session.stats.lastInputTokens, 500);
         assert.ok(session.state.messageRefs.byRef);
+    } finally { await f.close(); }
+});
+
+test("Responses WS: demoted auxiliary requests forward Buffer bodies without touching main usage", async () => {
+    const f = await fixture();
+    try {
+        completed(await f.turn([user("main history")]));
+        const session = peekSession(f.sid)!;
+        const before = JSON.stringify({ stats: session.stats, refs: session.state.messageRefs });
+        completed(await f.turn([user("auxiliary title")], undefined, { tools: BILI_ACP_TOOLS_RESPONSES, max_output_tokens: 1024 }));
+        assert.equal(f.httpRequests, 0);
+        assert.equal(f.rows.length, 2);
+        assert.equal(f.rows[1].request.tools, undefined);
+        assert.equal(f.rows[1].request.max_output_tokens, 1024);
+        assert.equal(JSON.stringify({ stats: session.stats, refs: session.state.messageRefs }), before);
+        completed(await f.turn([user("main history"), user("resume main")]));
+        assert.equal(session.stats.requests, 2);
+        assert.ok(JSON.stringify(f.rows[2].full).includes("resume main"));
+        assert.ok(!JSON.stringify(f.rows[2].full).includes("auxiliary title"));
     } finally { await f.close(); }
 });
 

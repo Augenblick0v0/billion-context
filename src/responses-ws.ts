@@ -171,8 +171,8 @@ export class ResponsesWsUpstream {
     }
 
     async fetch(url: string, options: FetchOptions, rotateRetry = true): Promise<Response> {
-        if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || typeof options.body !== "string") throw new Error("Unsupported request in Responses WebSocket transport");
-        const parsed: unknown = JSON.parse(options.body);
+        if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || (typeof options.body !== "string" && !Buffer.isBuffer(options.body))) throw new Error("Unsupported request in Responses WebSocket transport");
+        const parsed: unknown = JSON.parse(typeof options.body === "string" ? options.body : options.body.toString("utf8"));
         if (!object(parsed) || !Array.isArray(parsed.input)) throw new Error("Invalid Responses WebSocket request");
         const { stream, stream_options: _streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
         const socket = await this.connect(url, options);
