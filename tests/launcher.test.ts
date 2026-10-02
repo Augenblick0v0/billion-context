@@ -81,6 +81,7 @@ import {
     findFreePort,
     ensureProxyRunning,
     resolveNodeRuntime,
+    probeNodeWrapperTarget,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
@@ -3680,6 +3681,92 @@ test("resolveNodeRuntime: non-Electron host still throws when no Node resolves (
         () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/nonexistent" }, "linux", () => false, undefined),
         /BILLION_CONTEXT_NODE/,
     );
+});
+
+test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves to the real Node (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const real = "C:/Users/x/scoop/apps/nodejs-lts/current/node.exe";
+    const probed: string[] = [];
+    const probe = (c: string): string | undefined => { probed.push(c); return real; };
+    const exists = (p: string): boolean => p === shim || p === real;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        real,
+    );
+    // the discovered candidate is consulted exactly once, on the wrapper itself
+    assert.deepEqual(probed, [shim]);
+});
+
+test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unchanged (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => undefined;
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back to the shim (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => "C:/gone/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 real node whose probe reports itself is left unchanged (#1887)", () => {
+    const node = "C:/Program Files/nodejs/node.exe";
+    const probe = (c: string): string | undefined => c;
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        node,
+    );
+});
+
+test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () => {
+    const node = "/opt/host/bin/node";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        node,
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a live Node executable is returned without probing (#1887)", () => {
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    assert.equal(
+        resolveNodeRuntime("C:/nodejs/node.exe", { PATH: "C:/whatever" }, "win32", () => false, undefined, probe),
+        "C:/nodejs/node.exe",
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored verbatim, not probed (#1887)", () => {
+    const override = "C:/pinned/node.exe";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    const exists = (p: string): boolean => p === override || p === "C:/shim/node.exe";
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { BILLION_CONTEXT_NODE: override, PATH: "C:/shim" }, "win32", exists, undefined, probe),
+        override,
+    );
+    assert.equal(calls, 0);
+});
+
+test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
+    const out = probeNodeWrapperTarget(process.execPath, { ...process.env });
+    assert.ok(typeof out === "string" && out.length > 0, "expected a non-empty path");
+    assert.ok(fs.existsSync(out), `expected an existing path, got ${out}`);
+    const lower = out.toLowerCase();
+    assert.ok(lower.endsWith("node") || lower.endsWith("node.exe"), `expected a node path, got ${out}`);
 });
 
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
