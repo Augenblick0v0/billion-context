@@ -158,6 +158,13 @@ const PROBE_TIMEOUT_MS = 1500;
 // A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
 // disks and client teardown before it clears the marker.
 const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
+// #1903: budget for the post-exit re-discovery below. A spawned child dying
+// before becoming healthy is evidence the port it wanted is HELD — but our
+// one-shot discovery snapshot may predate the holder publishing its identity
+// record (a manual `bili start` accepts TCP before its 'listening' callback
+// writes proxy-origin / registry markers). Refresh the snapshot on this
+// bounded retry instead of failing from a stale view.
+const POST_EXIT_REDISCOVERY_MS = 3000;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
 
@@ -3300,11 +3307,42 @@ export async function ensureProxyRunning(
                 }
             }
         }
+        // #1903: bounded re-discovery after a fast child death — same
+        // discovery+attach decision as the one-shot probe above, re-run on a
+        // short budget so a listener whose identity record published during
+        // our spawn attempt is still attachable instead of mistaken for air.
+        const rediscoverAfterChildExit = async (): Promise<ProxyHandle | undefined> => {
+            console.error(
+                `bili: spawned proxy exited before becoming healthy — re-checking for a late-publishing listener on port ${port} before failing`,
+            );
+            const rediscoveryDeadline = now() + POST_EXIT_REDISCOVERY_MS;
+            while (now() < rediscoveryDeadline) {
+                await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, refusedLog, attachDiag);
+                if (late) {
+                    console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
+                    return attachTo(late);
+                }
+            }
+            return undefined;
+        };
         if (childError !== undefined) {
             const detail = childError instanceof Error ? childError.message : String(childError);
             throw new Error(`bili: proxy spawn failed (${detail}) (log: ${logPath})`);
         }
         if (childExit) {
+            // #1903: the child died before becoming healthy. Under strictPort
+            // that death is almost certainly EADDRINUSE — proof the pinned port
+            // is held by a listener our one-shot discovery above missed because
+            // its identity record published AFTER that snapshot (a manual
+            // `bili start` accepts TCP before its 'listening' callback writes
+            // proxy-origin / registry markers; CI flake on PR #1896). The spawn
+            // attempt just proved occupancy: refresh the stale snapshot on a
+            // bounded budget and attach if the late publisher shows up; when
+            // nothing appears, fall through to the original error below.
+            const retried = await rediscoverAfterChildExit();
+            if (retried) return retried;
             const detail = childExit.code !== null
                 ? `code ${childExit.code}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";

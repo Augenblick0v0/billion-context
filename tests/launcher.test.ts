@@ -1167,6 +1167,83 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
     };
 }
 
+// #1903: post-exit re-discovery. A spawned child dying before healthy PROVES
+// the port it wanted is held; when the holder's identity record published
+// AFTER our one-shot discovery snapshot (manual `bili start`: TCP accept
+// precedes the 'listening' callback that writes proxy-origin), the launcher
+// must attach on a bounded retry instead of failing from a stale view — and
+// throw the original error when nothing republishes within the budget.
+function makeFastExitChild(code: number): SpawnChild {
+    const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
+    return {
+        pid: 42423,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on(event, listener) {
+            const list = handlers.get(event) ?? [];
+            list.push(listener);
+            handlers.set(event, list);
+            // synchronous emit: the death lands before the spawn poll loop's
+            // first tick, so the failure path is reached without burning SPAWN_WAIT_MS
+            if (event === "exit") listener(code, null);
+        },
+    };
+}
+
+test("ensureProxyRunning: attaches a late-publishing instance after the spawned child dies (#1903)", async () => {
+    const PORT = 38991;
+    const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+    let reads = 0;
+    const registrations: Array<[string, number]> = [];
+    let t = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+        {
+            spawnImpl: () => makeFastExitChild(1),
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+            readInstanceFile: () => (++reads > 1 ? late : undefined),
+            now: () => t,
+            sleep: async (ms) => { t += ms; },
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
+            attachDiag: () => {},
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
+    assert.equal(handle.origin, late.origin);
+    assert.equal(handle.refusedWatcher, true, "manual daemon refuses watchers — #1322 flag carried through the retry path");
+    assert.deepEqual(registrations, [[late.origin, process.pid]]);
+    assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+});
+
+test("ensureProxyRunning: throws the original child-death error when nothing republishes within the budget (#1903)", async () => {
+    let reads = 0;
+    let t = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 38992, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
+                readInstanceFile: () => { reads++; return undefined; },
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "failed",
+                attachDiag: () => {},
+                scriptPath: FP_SCRIPT,
+            },
+        ),
+        /exited before becoming healthy \(code 1\)/,
+    );
+    // exactly one initial discovery + POST_EXIT_REDISCOVERY_MS / HEALTH_POLL_INTERVAL_MS
+    // re-discovery ticks — the budget is bounded and honored under the injected clock
+    assert.equal(reads, 1 + Math.round(3000 / 200));
+});
+
 test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
     let spawnCalls = 0;
     const registrations: Array<[string, number]> = [];

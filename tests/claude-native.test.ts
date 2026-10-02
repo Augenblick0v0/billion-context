@@ -940,6 +940,36 @@ async function waitForInstanceFile(file: string, ms: number): Promise<string> {
     }
 }
 
+// #1903: TCP accept alone is NOT readiness for the hook's attach machinery —
+// the proxy publishes its identity record (proxy-origin file) inside its
+// 'listening' callback, which lags kernel accept by an event-loop-dependent
+// margin (waitForInstanceFile above documents the same window, #1031). Gate
+// the squatter on BOTH the health endpoint and the published record so the
+// hook's one-shot discovery can never race the daemon's publication (CI flake
+// on PR #1896: the hook probed between accept and publication, took the SPAWN
+// path, and its strict-port child died on EADDRINUSE).
+async function waitForProxyVisible(port: number, instanceFile: string, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        let healthy = false;
+        try {
+            const res = await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(2_000) });
+            if (res.ok) {
+                const body = (await res.json()) as { ok?: boolean };
+                healthy = body.ok === true;
+            }
+        } catch {}
+        if (healthy) {
+            try {
+                JSON.parse(fs.readFileSync(instanceFile, "utf8"));
+                return true;
+            } catch {}
+        }
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+}
+
 function runHook(distScript: string, port: number, xdg: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
     // Hermetic tmp: the hook's spawned proxy logs to
     // <tmpdir>/bili-proxy-<port>.log. The minimal child env has no platform
@@ -1340,6 +1370,7 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
     const port = await freePort();
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1353,6 +1384,10 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     let claudePid = 0;
     try {
         assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
+        assert.ok(
+            await waitForProxyVisible(port, instanceFile, 60_000),
+            "squatter fully visible to the attach machinery (health + identity record, #1903)",
+        );
         // Fake claude reproducing the live SessionStart shape: node-shebang
         // binary (npm install form: argv [node, <path>/claude]), launches the
         // hook through /bin/sh -c, captures hook stderr to a file, then
