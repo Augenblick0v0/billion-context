@@ -10,7 +10,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, resignEnabled } from "../apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -77,7 +77,7 @@ export interface NativeInterceptState {
      *  origin when healthy, or the session splits across two instances. */
     onRoutedOriginObserved?: (origin: string) => void;
     /** Test/observability hook: every dispatched decision. */
-    onDispatch?: (url: string, action: "rewrite" | "direct" | "self" | "retry") => void;
+    onDispatch?: (url: string, action: "rewrite" | "direct" | "self" | "retry" | "refused") => void;
     /** #1290: observability hook — fired for every POST request the fetch patch
      *  lets through WITHOUT routing because its URL is not a recognized model
      *  endpoint (isModelApiUrl miss). Such requests never reach a bili proxy,
@@ -688,15 +688,19 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // SignatureDoesNotMatch). When the host can supply the signing
         // credential (dsh credential service), the request tunnels WITH a
         // re-sign arm: bili re-signs every egress body it produces. Without a
-        // credential (or for schemes we cannot re-sign) the request goes
-        // direct — bytes unchanged, inbound signature intact, no compression
-        // (#1886 fallback).
+        // credential (or for schemes we cannot re-sign) the request is
+        // REFUSED locally (403, actionable message): silent verbatim
+        // forwarding would silently disable compression, and an un-armed
+        // tunnel 401s upstream anyway. BILI_RESIGN_PASSTHROUGH=1 opts in to
+        // the verbatim direct fallback (#1886 semantics); BILI_RESIGN=0
+        // un-deploys the whole branch (signed bodies fall through to the
+        // normal takeover path — pre-#1884 behavior).
         let resignExtra: Record<string, string> | undefined;
         const signedScheme = bodySignedSchemeOf(input, init);
-        if (signedScheme !== undefined) {
+        if (signedScheme !== undefined && resignEnabled()) {
             state.onSignedModelUrl?.(url, signedScheme);
             let cred: { ak: string; sk: string; token?: string } | undefined;
-            if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined && resignEnabled()) {
+            if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
                 try {
                     cred = await state.resignCredentialFor(url, signedScheme);
                 } catch {
@@ -704,6 +708,11 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 }
             }
             if (cred === undefined) {
+                if (!resignPassthroughEnabled()) {
+                    state.onDispatch?.(url, "refused");
+                    const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
+                    return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
+                }
                 state.onDispatch?.(url, "direct");
                 return send(input, init);
             }

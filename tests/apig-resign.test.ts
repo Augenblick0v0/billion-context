@@ -304,43 +304,80 @@ test("#1884 intercept: signed + credential → tunneled with re-sign markers", a
     assert.equal(sink[0].headers["authorization"], "SDK-HMAC-SHA256 Access=CLIENT,SignedHeaders=host;x-sdk-content-sha256;x-sdk-date,Signature=0000", "inbound (stale) signature rides for the server to replace");
 });
 
-test("#1884 intercept: no credential → direct, untouched bytes (#1886 fallback)", async () => {
+test("#1884 intercept: no credential → REFUSED locally (403), nothing hits the wire", async () => {
     const dispatches: string[] = [];
     const state = armedState({ resignCredentialFor: async () => undefined, onDispatch: (_u, action) => dispatches.push(action) });
-    const { sink } = await withIntercept(state, async (fetch) =>
+    const { sink, result } = await withIntercept(state, async (fetch) =>
         fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
-    assert.equal(sink.length, 1);
-    assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "original URL, never rewritten");
-    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
-    assert.deepEqual(dispatches, ["direct"]);
+    assert.equal(sink.length, 0, "refused before any send — no network side effects");
+    assert.equal(result.status, 403);
+    assert.equal(result.headers.get("x-bili-resign"), "unavailable");
+    const payload = JSON.parse(await result.text()) as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, "bili_resign_unavailable");
+    assert.match(payload.error.message, /BILI_RESIGN_PASSTHROUGH=1/, "message tells the user how to opt in");
+    assert.deepEqual(dispatches, ["refused"]);
 });
 
-test("#1884 intercept: resolver throws → direct (never fail the request)", async () => {
-    const state = armedState({ resignCredentialFor: async () => { throw new Error("credentials service down"); } });
-    const { sink } = await withIntercept(state, async (fetch) =>
-        fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
-    assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions");
-    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
-});
-
-test("#1884 intercept: BILI_RESIGN=0 → direct even with a live credential", async () => {
-    await withEnv({ BILI_RESIGN: "0" }, async () => {
-        const { sink } = await withIntercept(armedState(), async (fetch) =>
+test("#1884 intercept: no credential + BILI_RESIGN_PASSTHROUGH=1 → direct, untouched bytes (#1886 opt-in)", async () => {
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const state = armedState({ resignCredentialFor: async () => undefined });
+        const { sink } = await withIntercept(state, async (fetch) =>
             fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
-        assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "kill switch forces direct");
+        assert.equal(sink.length, 1);
+        assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "original URL, never rewritten");
         assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
     });
 });
 
-test("#1884 intercept: AWS4 (unsupported scheme) → direct even with a credential", async () => {
-    const { sink } = await withIntercept(armedState(), async (fetch) =>
+test("#1884 intercept: resolver throws → REFUSED (never half-send)", async () => {
+    const state = armedState({ resignCredentialFor: async () => { throw new Error("credentials service down"); } });
+    const { sink, result } = await withIntercept(state, async (fetch) =>
+        fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
+    assert.equal(sink.length, 0);
+    assert.equal(result.status, 403);
+});
+
+test("#1884 intercept: anthropic-wire signed request gets the anthropic refusal shape", async () => {
+    const state = armedState({ resignCredentialFor: async () => undefined });
+    const { result } = await withIntercept(state, async (fetch) =>
+        fetch("http://127.0.0.1:9199/v1/messages", SIGNED_INIT()));
+    assert.equal(result.status, 403);
+    const payload = JSON.parse(await result.text()) as { type: string; error: { type: string } };
+    assert.equal(payload.type, "error");
+    assert.equal(payload.error.type, "invalid_request_error");
+});
+
+test("#1884 intercept: BILI_RESIGN=0 → signed branch un-deployed, normal takeover path (pre-resign behavior)", async () => {
+    await withEnv({ BILI_RESIGN: "0" }, async () => {
+        const dispatches: string[] = [];
+        const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+        const { sink } = await withIntercept(state, async (fetch) =>
+            fetch("http://127.0.0.1:9199/v1/chat/completions", SIGNED_INIT()));
+        assert.equal(sink[0].url, "http://127.0.0.1:40001/bili/http://127.0.0.1:9199/v1/chat/completions", "falls through to the rewrite path exactly like unsigned traffic");
+        assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
+        assert.deepEqual(dispatches, ["rewrite"]);
+    });
+});
+
+test("#1884 intercept: AWS4 (unsupported scheme) → refused by default; direct only with the opt-in", async () => {
+    const { sink, result } = await withIntercept(armedState(), async (fetch) =>
         fetch("http://127.0.0.1:9199/v1/chat/completions", {
             method: "POST",
             headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
             body: "{}",
         }));
-    assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions");
-    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
+    assert.equal(sink.length, 0, "default is refusal, not silent passthrough");
+    assert.equal(result.status, 403);
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const { sink: sink2 } = await withIntercept(armedState(), async (fetch) =>
+            fetch("http://127.0.0.1:9199/v1/chat/completions", {
+                method: "POST",
+                headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
+                body: "{}",
+            }));
+        assert.equal(sink2[0].url, "http://127.0.0.1:9199/v1/chat/completions");
+        assert.equal(sink2[0].headers[APIG_RESIGN_HEADER], undefined);
+    });
 });
 
 test("#1884 intercept: unsigned model traffic is unaffected", async () => {
@@ -457,26 +494,51 @@ test("e2e #1884: armed tunnel — every egress body is re-signed, markers never 
     }
 });
 
-test("e2e #1884: signed without the arm → byte-untouched passthrough (#1886 twin)", async () => {
+test("e2e #1884: signed without the arm → REFUSED 403 by default (no silent passthrough)", async () => {
     const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
     const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
-        const staleAuth = "SDK-HMAC-SHA256 Access=CLIENT,SignedHeaders=host;x-sdk-content-sha256;x-sdk-date,Signature=0000";
-        // client signs its OWN body with its OWN (client-side) key — an
-        // independent signature the verifying upstream accepts as-is
-        const bodyStr = chatBody("deepseek-v4.1-flash", "signed-passthrough-1");
+        const bodyStr = chatBody("deepseek-v4.1-flash", "signed-refused-1");
         const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
         signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
         const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
-        assert.equal(r.status, 200, `original signature stays valid because bytes are untouched: ${await r.text()}`);
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
-        assert.equal(String(calls[0].headers["authorization"]), clientHeaders["authorization"], "client signature preserved");
+        const rBody = await r.text();
+        assert.equal(r.status, 403, `refused locally, not forwarded: ${rBody}`);
+        assert.equal(r.headers.get("x-bili-resign"), "unavailable");
+        const payload = JSON.parse(rBody) as { error: { code: string; message: string } };
+        assert.equal(payload.error.code, "bili_resign_unavailable");
+        assert.match(payload.error.message, /BILI_RESIGN_PASSTHROUGH=1/);
+        assert.equal(calls.length, 0, "upstream never saw the request");
     } finally {
         proxy.close();
         (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
         upstream.close();
         upstream.closeAllConnections?.();
     }
+});
+
+test("e2e #1884: signed without the arm + BILI_RESIGN_PASSTHROUGH=1 → byte-untouched passthrough (#1886 opt-in twin)", async () => {
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            // client signs its OWN body with its OWN (client-side) key — an
+            // independent signature the verifying upstream accepts as-is
+            const bodyStr = chatBody("deepseek-v4.1-flash", "signed-passthrough-1");
+            const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+            signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+            const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+            assert.equal(r.status, 200, `original signature stays valid because bytes are untouched: ${await r.text()}`);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
+            assert.equal(String(calls[0].headers["authorization"]), clientHeaders["authorization"], "client signature preserved");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
 });

@@ -19,9 +19,15 @@ import { createHash, createHmac } from "node:crypto";
  * tests/apig-resign.test.ts which validates signatures with the ak/sk it
  * issued.
  *
- * Kill switch: BILI_RESIGN=0 disables both the native-lane arming and the
- * server-side re-sign (signed traffic then rides the #1886 direct fallback /
- * byte-untouched passthrough).
+ * Kill switch: BILI_RESIGN=0 un-deploys the feature: the native lane stops
+ * arming signed requests (they fall through to the normal takeover path —
+ * pre-#1884 behavior) and the server-side guard stays silent.
+ *
+ * A signed request that cannot be re-signed (no credential resolvable, or a
+ * scheme we cannot sign) is REFUSED by default — 403 with an actionable
+ * message. Silently forwarding byte-untouched would silently disable
+ * compression; the user opted into bili, not into a pass-through tunnel.
+ * BILI_RESIGN_PASSTHROUGH=1 opts in to verbatim no-compression forwarding.
  *
  * Credential refresh is intentionally NOT ported: the plugin refreshes its
  * own credentials; when they expire, the upstream 401 is visible and the
@@ -58,6 +64,30 @@ export function apigBenefitModels(): Set<string> {
 
 export function resignEnabled(): boolean {
     return process.env.BILI_RESIGN !== "0";
+}
+
+/** Opt-in verbatim forwarding for signed requests that cannot be re-signed
+ *  (no silent passthrough by default — see the refusal rationale above). */
+export function resignPassthroughEnabled(): boolean {
+    const v = process.env.BILI_RESIGN_PASSTHROUGH;
+    return v === "1" || v === "true";
+}
+
+export interface SignedRefusal {
+    status: number;
+    contentType: string;
+    body: string;
+}
+
+/** The 403 payload returned when a body-covering signature cannot be re-signed.
+ *  Protocol-native shapes (anthropic/openai wire) so real clients surface the
+ *  message instead of choking on it. */
+export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"): SignedRefusal {
+    const message = `bili refused to forward this ${scheme}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available. Fix one of: provide a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service, or BILI_CODEARTS_REF), set BILI_RESIGN_PASSTHROUGH=1 to forward signed requests byte-untouched without compression, or set BILI_RESIGN=0 to restore pre-resign handling.`;
+    if (protocol === "anthropic") {
+        return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
+    }
+    return { status: 403, contentType: "application/json", body: JSON.stringify({ error: { type: "signed_request_requires_resign", code: "bili_resign_unavailable", message, retryable: false } }) };
 }
 
 function sha256Hex(data: Uint8Array): string {

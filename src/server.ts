@@ -79,7 +79,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, resignEnabled } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, resignEnabled, resignPassthroughEnabled, signedRefusal } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -2930,18 +2930,31 @@ async function handle(
             // rewrite: prepare* injects the compress tool + system notes, and
             // the compress loop re-sends rebuilt rounds, so the upstream
             // rejects every mutated request with 401 (APIG.0301 body-hash
-            // mismatch). Forward the client's raw bytes untouched — no
-            // session, no compression, signature intact. This is the
-            // /bili/-prefix twin of the native lane's #1886 direct fallback;
-            // BILI_RESIGN=0 keeps it (the switch only disables the re-sign
-            // arm, never the byte-untouched escape).
+            // mismatch). Default: REFUSE (403, actionable message) — silently
+            // forwarding byte-untouched would silently disable compression;
+            // the user opted into bili, not into a pass-through tunnel.
+            // BILI_RESIGN_PASSTHROUGH=1 opts in to byte-untouched forwarding
+            // (no session, no compression, signature intact — the /bili/-
+            // prefix twin of the native lane's #1886 fallback);
+            // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
+            // handling: the request rides the normal rewrite path).
+            const guardScheme = inboundSignedScheme(req.headers);
             if (
-                inboundSignedScheme(req.headers) !== undefined &&
-                String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") !== APIG_RESIGN_SCHEME
+                guardScheme !== undefined &&
+                String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") !== APIG_RESIGN_SCHEME &&
+                resignEnabled()
             ) {
-                log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884)`);
+                if (resignPassthroughEnabled()) {
+                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884, BILI_RESIGN_PASSTHROUGH)`);
+                    forwarded = true;
+                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
+                    return;
+                }
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without the re-sign arm — refusing instead of silently dropping compression. Set BILI_RESIGN_PASSTHROUGH=1 for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
-                await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
+                res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
+                res.end(refusal.body);
                 return;
             }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
