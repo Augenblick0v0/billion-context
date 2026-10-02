@@ -1743,7 +1743,10 @@ export function mergeSqliteSet(overlay: string, realHome: string, base: string):
             console.error(
                 `bili: both ${overlay} and ${realHome} held a distinct ${base} — kept the newer generation (${winner}), ` +
                     `the other side is preserved as .bili-conflict. Concurrent plain/bili runs diverge by design (#1917); ` +
-                    `check the conflict file if you expect rows from both.`,
+                    `check the conflict file if you expect rows from both.` +
+                    (stale && !dropped
+                        ? " Removing the verified-stale copy only partially succeeded (locked members) — those are preserved as .bili-conflict too."
+                        : ""),
             );
         }
     }
@@ -1855,7 +1858,7 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
             // never merge it back into the real home.
             if (generatedFiles.has(entry) || entry === SQLITE_ORIGIN_FILE) continue;
             const overlayPath = path.join(overlay, entry);
-            if (isGeneratedDraft(entry)) {
+            if (isGeneratedDraft(entry) || entry === `${SQLITE_ORIGIN_FILE}.tmp`) {
                 try {
                     fs.unlinkSync(overlayPath);
                 } catch {}
