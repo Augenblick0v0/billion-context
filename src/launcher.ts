@@ -2930,6 +2930,28 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
     return args;
 }
 
+/** #1887: ask a candidate Windows `node.exe` which real Node executable it runs.
+ *  A plain node prints its own execPath; a re-exec wrapper (mise/asdf/fnm-style
+ *  native shim) prints the real node behind it. Runs with the caller's env/cwd
+ *  so the wrapper's version selection matches what the actual spawn would get.
+ *  Any failure (timeout, non-node, empty output) yields undefined so the caller
+ *  falls back to the candidate unchanged — never worse than today. */
+export function probeNodeWrapperTarget(candidate: string, env: NodeJS.ProcessEnv): string | undefined {
+    try {
+        const out = execFileSync(candidate, ["-p", "process.execPath"], {
+            windowsHide: true,
+            timeout: 5000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+        });
+        const p = out.trim();
+        return p.length > 0 ? p : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #819: resolve the executable that runs the proxy entry script. In a plain
  *  Node CLI, process.execPath is correct; inside a host process (the opencode
  *  or pi native binary) it is the HOST executable — spawning it with a .js
@@ -2946,11 +2968,31 @@ export function resolveNodeRuntime(
     platform: NodeJS.Platform = process.platform,
     existsImpl: (p: string) => boolean = fs.existsSync,
     electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
+    probeWrapper: (candidate: string, env: NodeJS.ProcessEnv) => string | undefined = probeNodeWrapperTarget,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
     const override = typeof env.BILLION_CONTEXT_NODE === "string" ? env.BILLION_CONTEXT_NODE.trim() : "";
     if (override.length > 0 && existsImpl(override)) return override;
+    // #1887: a PATH-resolved `node.exe` may be a re-exec wrapper (mise/asdf/fnm
+    // native shim) that spawns the real Node as a CHILD — detached+windowsHide
+    // hide only the direct child, so the wrapper's child keeps a visible console
+    // for the proxy's whole life. Follow such a wrapper to the real node it runs
+    // (one hop), so we spawn a directly-controllable executable. Live-node and
+    // explicit-override paths above are deliberately NOT probed: a running node
+    // is already real, and an explicit user choice is honored verbatim.
+    const resolveDiscovered = (candidate: string): string => {
+        if (platform !== "win32") return candidate;
+        const target = probeWrapper(candidate, env);
+        if (target && target.trim().length > 0) {
+            const resolved = target.trim();
+            if (existsImpl(resolved) && resolved.toLowerCase() !== candidate.toLowerCase()) {
+                teeLog("info", `bili: ${candidate} is a Windows node wrapper resolving to ${resolved} — spawning the real Node directly (#1887)`);
+                return resolved;
+            }
+        }
+        return candidate;
+    };
     // join with the SIMULATED platform's separators: a posix-style PATH on
     // win32 (and vice versa) must not be normalized through the host's
     // path.join, or the candidates no longer match what existsImpl expects.
@@ -2984,7 +3026,7 @@ export function resolveNodeRuntime(
             // would rewrite a posix-style entry on a win32 host (or the
             // reverse), missing the file existsImpl would find.
             const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
-            if (existsImpl(candidate)) return candidate;
+            if (existsImpl(candidate)) return resolveDiscovered(candidate);
         }
     }
     // #1429: last resort inside an Electron host — its own binary runs as plain
