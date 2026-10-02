@@ -89,8 +89,8 @@ export interface PreflightDeps {
     proxyUrl?: string;
     signal?: AbortSignal;
     log: (level: string, msg: string) => void;
-    /** Constant floor on the forwarded-payload size for this request (image bytes, #488). Folding only ever removes images, so adding this to every text estimate keeps the fit decision sound for multimodal payloads. */
-    imageFloor?: number;
+    /** #1843: the image reserve for this request — the billed cost of the images riding the payload verbatim (#488). Folding never removes them, so every TEXT-channel decision compares the text estimate against `limit − reserve` instead of adding the reserve to each total; an image-estimate error can no longer move a fold decision. Kernel-facing quantities keep the total view (reserve added back), which is the conservative direction. */
+    imageReserve?: number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
     /** #553: the caller knows this session's input size is unmeasured AND its
@@ -832,8 +832,18 @@ function noEmergencyTruncate(config: Config): Config {
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
-    let target = Math.min(limit, deps.compressionTarget ?? limit);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
+    // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
+    // text estimate vs `target − imageReserve`. Algebraically the same firing
+    // set as the old total-view check (max(B, T+R) >= C  <=>  max(max(0,B−R), T)
+    // >= max(0,C−R)), but an image-estimate error can no longer start or stop
+    // folding. Images ride the payload verbatim through every round, so the
+    // reserve is constant for this invocation. Kernel-facing quantities below
+    // keep the total view (reserve added back): conservative direction, and the
+    // kernel's own truncation/absorb behavior stays byte-identical.
+    const imageReserve = deps.imageReserve ?? 0;
+    const wireOverhead = deps.wireOverhead ?? 0;
+    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + imageReserve + wireOverhead, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -851,6 +861,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const baselineKnown = deps.unknownBaseline !== true;
     const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
     let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    let decisionTokens = 0;
     let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
@@ -916,19 +927,25 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const baselineFloor = messages.length > 0
             ? ((deps.session.stats.lastInputTokensSource === "usage" || deps.session.stats.lastInputTokensSource === "overflow-arm") ? deps.session.stats.lastInputTokens : 0)
             : deps.session.stats.lastInputTokens;
-        currentTokens = Math.max(baselineFloor, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
+        const roundText = estimateCoreMessages(turn.messages) + wireOverhead;
+        currentTokens = Math.max(baselineFloor, roundText + imageReserve);
+        // #1843: the TEXT-channel judgment quantity — the usage-grade baseline
+        // bills images too, so project it onto the text channel by subtracting
+        // the reserve (floored at zero).
+        decisionTokens = Math.max(Math.max(0, baselineFloor - imageReserve), roundText);
         if (!baselineKnown) {
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove
             // (#470/#488 postdate this PR's fork point).
-            finalUpper = estimateCoreMessagesUpper(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
+            finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
+            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
-        result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
+        result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (currentTokens < target) break;
+        if (decisionTokens < textTarget) break;
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
@@ -954,7 +971,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
-                target = limit;
+                textTarget = Math.max(0, limit - imageReserve);
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -973,7 +990,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
         for (const range of ordered) {
-            if (currentTokens < target) break;
+            if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
                 break;
@@ -1007,7 +1024,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // exactly those cases. Bounded by the per-regime call budget below.
             const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
             while (spans.length > 0) {
-                if (currentTokens < target) break;
+                if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
                     break;
@@ -1251,7 +1268,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (text + overhead only). A bytes-mode floor (b64/4) overestimates
         // pixel-billing upstreams ~100× and would poison the upward window
         // self-heal and close the #496 escape hatch permanently.
-        const textBaseline = result.payloadEstimate - (deps.imageFloor ?? 0);
+        const textBaseline = result.payloadEstimate - imageReserve;
         if (textBaseline > deps.session.stats.lastInputTokens) {
             deps.session.stats.lastInputTokens = textBaseline;
             deps.session.stats.lastInputTokensSource = "estimate";
