@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCacheReport, type CacheSample, type FoldEvent, type CompressionBlock } from "acp-kernel";
-import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample } from "../src/cache-ledger.ts";
+import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
 import type { Session } from "../src/session.ts";
 
 let seq = 0;
@@ -664,4 +664,108 @@ test("handleAcpCache renders the CACHE INVALIDATION breakdown incl. unmeasured (
     assert.match(text, /upstream switch:/);
     assert.match(text, /restart\/refork:/);
     assert.match(text, /unmeasured .*excluded from hit rate/);
+});
+
+test("per-cause buckets partition a multi-flag sample's residual (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000, protocol: "anthropic", upstream: "https://a.example" });
+    // one request where model AND wire AND upstream all change at once, cold prefix
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 0, protocol: "openai", upstream: "https://b.example" });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.totals.ttlRepay, 10000);
+    // charged exactly ONCE, to the highest-priority dimension (model > wire > upstream)
+    assert.equal(r.invalidation.model, 10000);
+    assert.equal(r.invalidation.wire, 0);
+    assert.equal(r.invalidation.upstream, 0);
+    assert.equal(r.invalidation.restart, 0);
+    const named = r.invalidation.model + r.invalidation.wire + r.invalidation.upstream + r.invalidation.restart;
+    assert.equal(named, r.totals.ttlRepay, "buckets are a partition: named + remaining closes exactly");
+    assert.equal(r.invalidation.remaining, 0);
+    // event counts still reflect every observed change (only the CHARGING is deduped)
+    assert.equal(r.modelSwitches.count, 1);
+    assert.equal(r.wireSwitches.count, 1);
+    assert.equal(r.upstreamSwitches.count, 1);
+    assert.equal(r.totals.balanced, true);
+});
+
+test("switch is detected across an unmeasured boundary line (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000 });
+    // client switches model but this request reports NO cache tokens (unmeasurable)
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10500, cached: null });
+    // next MEASURED request on the new model: cold prefix re-bill
+    recordCacheSample(session, { at: T0 + 3000, input: 11000, cached: 0 });
+    const r = buildSessionCacheReport(session);
+    assert.ok(r.modelSwitches.count >= 1, "the switch is observed");
+    assert.ok(r.invalidation.model > 0, "cold tail after an unmeasured switch is charged to the switch");
+    assert.ok(r.invalidation.remaining < r.totals.ttlRepay, "not everything is left unattributed");
+});
+
+test("post-switch cold rounds are attributed within a bounded window and stopped by a warm round (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 10000 });   // warm baseline
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 0 });        // switch, cold
+    recordCacheSample(session, { at: T0 + 3000, input: 10000, cached: 0 });        // still cold (continuation)
+    recordCacheSample(session, { at: T0 + 4000, input: 10000, cached: 10000 });    // warm -> retires the window
+    recordCacheSample(session, { at: T0 + 5000, input: 10000, cached: 0 });        // later TTL miss, NOT the switch
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.invalidation.model, 20000, "switch line + exactly one continuation round");
+    assert.equal(r.invalidation.remaining, 10000, "the post-warm miss stays provider-side");
+    assert.equal(r.totals.balanced, true);
+});
+
+test("unmeasured lines store a null hit rate, not a falsifiable 0% (#1847)", () => {
+    const session = makeSession();
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: null });
+    const led = (session.metadata as Record<string, { lines: Array<{ unk?: number; hitPct: number | null }> }> & object)["cacheLedger"]!;
+    const unkLine = led.lines.find((l) => l.unk === 1)!;
+    assert.equal(unkLine.hitPct, null, "unmeasured hit rate is null, not 0");
+    const r = buildSessionCacheReport(session);
+    assert.ok(!r.lines.some((l) => l.seq === 2), "still quarantined out of the rendered set");
+});
+
+test("a large never-caused unattributed residual gets an explicit provider-side hint, not silence (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    for (let i = 0; i < 5; i++) {
+        recordCacheSample(session, { at: T0 + 1000 * (i + 1), input: 100000, cached: 90000 });
+    }
+    const text = handleAcpCache(session);
+    assert.match(text, /CACHE INVALIDATION/);
+    assert.match(text, /no observable cause|no cause observed/i);
+    assert.match(text, /NOT a bili bug|not a bili bug/i);
+});
+
+test("post-switch cold-tail rounds stay attributed, not flagged as seam suspects (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    settleUsageReport(session, { total: 40000, reportedCached: 40000 });   // warm baseline
+    session.metadata.lastModel = "claude-opus";
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // the switch itself (flagged)
+    settleUsageReport(session, { total: 40000, reportedCached: 0 });       // cold-tail continuation
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.seam.suspects, 0, "a cause-attributed cold-tail round is not a seam candidate");
+    assert.equal(r.invalidation.model, 80000, "both cold rounds stay charged to the switch");
+});
+
+test("pre-#1847 ledger lines keep their historical per-event attribution (#1847)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 40000, cached: 40000 });
+    session.metadata.lastModel = "claude-opus";
+    recordCacheSample(session, { at: T0 + 2000, input: 40000, cached: 0 });
+    // Emulate a ledger persisted before #1847: drop the new per-line `cause` field.
+    const meta = (session.metadata as Record<string, { lines: Array<{ cause?: string }> }> & object)["cacheLedger"]!;
+    delete meta.lines[1].cause;
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.modelSwitches.events.length, 1);
+    assert.equal(r.modelSwitches.events[0].attributed, 40000, "legacy sw line keeps its historical charge display");
+    assert.doesNotMatch(handleAcpCache(session), /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
 });
