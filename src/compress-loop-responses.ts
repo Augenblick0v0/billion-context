@@ -3,6 +3,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import { noteForwardedBody } from "./cache-ledger.js";
 import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
@@ -186,10 +187,15 @@ export async function compressLoopResponsesJson(
             inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
         }
         requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
+        // #1894: this re-request's usage settles in the caller (server.ts
+        // non-streaming lane), so note the exact bytes IT sent — same contract
+        // as loop/core.ts fetchUpstream.
+        const wireBytes = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        noteForwardedBody(ctx.session, wireBytes);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
-            body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody),
+            body: wireBytes,
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
             // #189: correlate the rejection with the rewrite that preceded it.
