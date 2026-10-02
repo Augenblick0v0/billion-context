@@ -178,34 +178,59 @@ test("#1849 apply(): an host without llm.resolveModelInfo warns", async () => {
     }
 });
 
-test("#1849 apply(): a resolver that REJECTS warns with the host's own error (live headless flavor)", async () => {
+test("#1849 apply(): a resolver that REJECTS warns after three consecutive failures (live headless flavor)", async () => {
     // Live-machine finding (2026-10-02): the real dsh headless host HAS a
     // resolveModelInfo but its promise rejects on EVERY call — master's
     // .catch(() => cached={provider,model}) committed a windowless cache
     // silently, so none of the other three branches ever fired. The reject
     // path must carry the host's own error so the #1849 web-profile root
-    // cause becomes visible on the client surface.
+    // cause becomes visible on the client surface. Threshold: THREE
+    // consecutive rejects (review on #1929) — a boot-race reject that
+    // recovers must not leave a misleading "NOT reaching the proxy" line.
     const proxy = await startMockProxy();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ww4-"));
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ww4-state-"));
     const logFile = path.join(stateHome, "billion-context", "bili.log");
     _setSpawnForTest(async () => undefined);
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_MODEL_INFO_RETRY_MS: "10", BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
             _resetRegisterForTest(proxy.origin);
             _resetWindowWarningForTest();
+            let attempts = 0;
+            let fail = true;
             const ctx = mockCtx();
             ctx.setModelServices(
-                { resolveModelInfo: async () => { throw new Error("catalog unavailable in this host"); } },
+                { resolveModelInfo: async () => { attempts += 1; if (fail) throw new Error("catalog unavailable in this host"); return { context: { contextWindow: 262144 }, defaultMaxTokens: 32768 }; } },
                 { currentSelection: () => ({ provider: "local-vllm", model: "qwen-ww4" }) },
             );
             apply(ctx);
             await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (ww4)");
             ctx.setInitiator({ session: { id: "session-ww4" } });
+            // reject #1 (apply()'s initial selection refresh) and #2: the
+            // structural-failure guard must stay silent
+            await waitFor(() => attempts >= 1, "initial resolve");
+            await new Promise((r) => setTimeout(r, 60));
+            _stateHeadersForTest()?.(HEADER_TARGET);
+            await waitFor(() => attempts >= 2, "resolve attempt 2");
+            await new Promise((r) => setTimeout(r, 60));
+            assert.equal(windowWarnLines(logFile).length, 0);
+            // reject #3: the warn lands, carrying the host's own error
+            _stateHeadersForTest()?.(HEADER_TARGET);
+            await waitFor(() => attempts >= 3, "resolve attempt 3");
             await waitFor(() => windowWarnLines(logFile).length === 1, "reject-path warn line");
             const line = windowWarnLines(logFile)[0];
-            assert.match(line, /resolveModelInfo rejected for local-vllm\/qwen-ww4: catalog unavailable in this host \(retries continue\)/);
+            assert.match(line, /resolveModelInfo rejected for local-vllm\/qwen-ww4 \(x3 consecutive\): catalog unavailable in this host \(retries continue\)/);
             assert.match(line, /x-bili-plugin-context-window goes unstamped/);
+            await _stateToolsReadyForTest();
+
+            // recovery: a successful resolve stamps the window (and resets the
+            // consecutive-failure counter — with a window cached, no further
+            // resolves fire at all, so no new warn can appear)
+            fail = false;
+            _stateHeadersForTest()?.(HEADER_TARGET);
+            await waitFor(() => attempts >= 4, "recovery resolve");
+            await waitFor(() => _stateHeadersForTest()?.(HEADER_TARGET)?.["x-bili-plugin-context-window"] === "262144", "recovery stamped the window");
+            assert.equal(windowWarnLines(logFile).length, 1);
             await _stateToolsReadyForTest();
         });
     } finally {

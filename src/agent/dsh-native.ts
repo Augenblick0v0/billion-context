@@ -237,6 +237,7 @@ function refreshModelInfo(origin: string | undefined): void {
             };
             if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
             else warnNoClientWindow(`host model info for ${provider}/${model} carries no context window`);
+            consecutiveResolveFailures = 0;
         })
         .catch((err: unknown) => {
             if (!selectionStillCurrent(svc, provider, model)) return;
@@ -245,9 +246,13 @@ function refreshModelInfo(origin: string | undefined): void {
             // #1849: this reject path used to commit the windowless cache
             // SILENTLY — the live headless flavor rejects EVERY resolve, so
             // the header stays unstamped forever with zero client-side signal.
-            // Surface the host's own error once; retries continue regardless
-            // (the retryAt cooldown drives them, #1812).
-            warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model}: ${errMessage(err)} (retries continue)`);
+            // Surface the host's own error after THREE consecutive rejects
+            // (review on #1929): a single boot-race reject that later recovers
+            // must not leave a misleading "NOT reaching the proxy" line; the
+            // counter resets on any successful resolve, and retries continue
+            // regardless (the retryAt cooldown drives them, #1812).
+            consecutiveResolveFailures += 1;
+            if (consecutiveResolveFailures >= 3) warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model} (x${consecutiveResolveFailures} consecutive): ${errMessage(err)} (retries continue)`);
             modelInfo.cached = { provider, model };
         })
         .finally(() => {
@@ -278,6 +283,9 @@ function errMessage(err: unknown): string {
 // persistClientEvent.
 let warnedNoClientWindow = false;
 let unstampedStamps = 0;
+// #1929 review: rejects must be STRUCTURAL before they warn — a boot-race
+// reject that recovers on the next cooldown retry is noise, not #1849.
+let consecutiveResolveFailures = 0;
 function warnNoClientWindow(reason: string): void {
     if (warnedNoClientWindow) return;
     warnedNoClientWindow = true;
@@ -999,4 +1007,5 @@ export function _resetWebProfileWarningForTest(): void {
 export function _resetWindowWarningForTest(): void {
     warnedNoClientWindow = false;
     unstampedStamps = 0;
+    consecutiveResolveFailures = 0;
 }
