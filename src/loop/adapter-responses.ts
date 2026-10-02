@@ -477,6 +477,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         if (nf && args) { nf.argsLen = args.length; nf.frags++; }
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     }
+                } else if (type === "response.custom_tool_call_input.delta" || type === "response.custom_tool_call_input.done") {
+                    // #1864: forward every round like the function_call_arguments siblings (the catch-all drops them in re-request rounds).
+                    yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
