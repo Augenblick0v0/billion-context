@@ -3861,6 +3861,7 @@ async function prepareOpenai(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4127,6 +4128,7 @@ async function prepareGoogle(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4402,6 +4404,10 @@ async function prepareResponses(
             else item.type = type;
         }
         responsesProjection = projection;
+        // Client's own system text captured BEFORE the anchor reconciliation
+        // below can replace systemParts — fingerprinting the post-anchor value
+        // would track bili's managed text and hide client-side drift (#1930-3).
+        const responsesClientSystem = projection.systemParts.join("\n\n---\n\n");
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
         if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
@@ -4428,6 +4434,7 @@ async function prepareResponses(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isCompactionTrigger) noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
