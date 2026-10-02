@@ -106,7 +106,7 @@ test("#1911: no usage baseline → shrinkRatio is the view coverage, never 0 or 
     assert.ok(obs!.includes("postCtx≈6250"), `post-fold context measured from the view, not the billed baseline: ${obs}`);
 });
 
-test("#1911: stale-low baseline cannot produce shrink>100%, postCtx≈0 artifact, or a frozen nudge baseline", () => {
+test("#1911: stale-low baseline cannot produce shrink>100% or postCtx≈0 artifacts", () => {
     const ctx = makeCompressibleCtx();
     ctx.session.stats.lastInputTokens = 1000;
     const out = runApply(ctx, COMPRESS_ARGS);
@@ -118,7 +118,7 @@ test("#1911: stale-low baseline cannot produce shrink>100%, postCtx≈0 artifact
     assert.ok(obs!.includes("postCtx≈6250"), `postCtx from the view, not clamped to 0: ${obs}`);
     assert.ok(!ctx.logs.some((l) => l.includes("[warn: degenerate-fold]")), "a partial fold is not a degenerate reset");
     assert.equal(ctx.session.stats.compressCreditTokens, 10000, "credit still accumulates for the usage netting");
-    assert.equal(ctx.session.stats.lastInputTokens, 6250, "stale baseline falls back to the post-fold estimate instead of clamping to 0 (#728 freeze)");
+    assert.equal(ctx.session.stats.lastInputTokens, 0, "billed baseline keeps master's plain netting clamp — a post-fold estimate must not enter the usage-grade field (#1592/#1839 provenance)");
 });
 
 test("#1911: healthy baseline keeps the exact old netting", () => {

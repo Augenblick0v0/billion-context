@@ -556,13 +556,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // so the next nudge decision sees post-compress reality instead of
         // re-firing on the stale pre-compress number (#252 double-inject).
         ctx.session.stats.compressCreditTokens = (ctx.session.stats.compressCreditTokens ?? 0) + r.tokensCompressed;
-        // #1911: when the baseline is already below the folded mass itself
-        // (stale-netted or clobbered — see above), plain netting clamps to 0
-        // and freezes the nudge baseline (#728 failure mode). Fall back to the
-        // post-fold local estimate instead; the next usage report overwrites
-        // both. Healthy baselines keep the exact old behavior.
-        const netted = ctx.session.stats.lastInputTokens - r.tokensCompressed;
-        ctx.session.stats.lastInputTokens = netted > 0 ? netted : Math.max(0, viewTokens - r.tokensCompressed);
+        // #1911: deliberately NO estimate fallback here. Writing viewTokens − S
+        // into lastInputTokens would leave an estimate-grade value in a
+        // usage-grade field (source stays "usage") and arm kernel context-space
+        // truncation differently from master — mid-history rewrites that break
+        // the #1592 render contract (proven by A/B on fold-round2-shape).
+        // Zero-baseline sessions are handled by the existing #728 machinery.
+        ctx.session.stats.lastInputTokens = Math.max(0, ctx.session.stats.lastInputTokens - r.tokensCompressed);
         // #1387: post-compress snapshot / stop signal ride on the netted
         // (post-compress) token count, matching what the next turn sees.
         const tail = postCompressTail(ctx, r.errors.length === 0);
