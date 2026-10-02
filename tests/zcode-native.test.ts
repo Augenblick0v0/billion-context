@@ -670,3 +670,84 @@ test("handoffZcodeRoutingOnExit reverts to direct when no replacement lives (#16
         rmrf(dir);
     }
 });
+
+// #1892: the zero-wrapped path must explain itself instead of leaving the
+// client a bare "Connection closed". An empty personal store is NOT "no
+// provider" — this build sources active providers from the built-in/account
+// layer, not the legacy file — so the diagnostic names that basis, and the
+// suite also pins the resulting bootstrap state (active + routed undefined).
+
+const EMPTY_NEW_STORE = JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [] } } }) + "\n";
+
+test("#1892: empty personal store names the built-in/account basis, not a missing-provider verdict", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-emptynew-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    writeFileSync(newFile, EMPTY_NEW_STORE);
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /no explicit provider rule/);
+        assert.match(joined, /built-in\/account layer/);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: empty personal store with legacy records notes them as migration leftovers, not targets", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-emptynew-legacy-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    const legacyFile = zcodeStoreCandidates(dir, "legacy", {})[0];
+    const legacyOriginal = JSON.stringify({ provider: { "custom:other-vendor": { options: { baseURL: "https://api.other.example/v1" } } } }) + "\n";
+    writeFileSync(newFile, EMPTY_NEW_STORE);
+    writeFileSync(legacyFile, legacyOriginal);
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /no explicit provider rule/);
+        assert.match(joined, /does not read it as a provider source/);
+        assert.match(joined, /migration/);
+        assert.equal(readFileSync(newFile, "utf8"), EMPTY_NEW_STORE);
+        assert.equal(readFileSync(legacyFile, "utf8"), legacyOriginal);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: every personal rule behind the #1621 signing wall names cert-MITM", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-signingwall-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    const newFile = zcodeStoreCandidates(dir, "new", {})[0];
+    writeFileSync(newFile, JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [{ providerId: "account:bigmodel-individual-coding-plan", config: { api: { baseUrl: UPSTREAM } } }] } } }) + "\n");
+    try {
+        const logs: string[] = [];
+        assert.equal(await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env: {}, log: (m) => logs.push(m) }), undefined);
+        const joined = logs.join(" ");
+        assert.match(joined, /client-signing/);
+        assert.match(joined, /#1621/);
+        assert.match(joined, /every provider rule/);
+        assert.match(joined, /cert-MITM/);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("#1892: bootstrap on an empty personal store degrades to active-with-no-route (MCP exits pre-init)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-bootstrap-empty-"));
+    mkdirSync(path.join(dir, "v2"), { recursive: true });
+    writeFileSync(zcodeStoreCandidates(dir, "new", {})[0], EMPTY_NEW_STORE);
+    try {
+        await withHealthServer(async (origin) => {
+            const out = await bootstrapZcodeNative({ env: { BILLION_CONTEXT_ATTACH: origin }, dataDir: dir, log: () => {} });
+            assert.equal(out.mode, "active");
+            if (out.mode !== "active") return;
+            assert.equal(out.attached, true);
+            assert.equal(out.routed, undefined);
+        });
+    } finally {
+        rmrf(dir);
+    }
+});
