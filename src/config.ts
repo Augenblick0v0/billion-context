@@ -5,7 +5,7 @@ import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
-import { resolveOutputHeadroomCap } from "./util.js";
+import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import type { ImageBillingMode } from "./image-tokens.js";
@@ -46,6 +46,16 @@ export type ProviderRoute = {
      *  (for upstreams that cannot coexist with a declared tools field).
      *  Default / "tools" = native function tools. */
     compressProtocol?: "tools" | "marker";
+    /** Custom wire-protocol path table (#1909) for upstreams that hang their
+     *  model endpoint off a non-standard path (relays, private protocols).
+     *  A rule matches when the request path ENDS WITH its `suffix` (same
+     *  semantics as the built-in table); the FIRST matching rule in array
+     *  order wins and outranks the built-in suffixes — an unmatched path
+     *  falls back to the built-in table, then to verbatim passthrough. The
+     *  body must still be a real conversation of the declared protocol;
+     *  non-conversation bodies are relayed verbatim (#1284). Malformed rules
+     *  reject the whole config load loudly (no silent drop). */
+    wirePaths?: WirePathRule[];
     /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
     compress?: CompressSettings;
     /** Per-provider wire-compat overrides. `roles` maps message roles to the
@@ -557,6 +567,64 @@ export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: str
     return findRoute(routes, upstreamUrl)?.compressProtocol;
 }
 
+/** #1909: one entry of a provider route's custom wire-path table. */
+export type WirePathRule = {
+    /** Request-path suffix selecting this rule (endsWith semantics, like the
+     *  built-in table). Must start with "/". */
+    suffix: string;
+    protocol: WireProtocol;
+};
+
+const WIRE_PROTOCOLS: readonly WireProtocol[] = ["anthropic", "openai", "responses", "google"];
+
+function isWireProtocol(v: unknown): v is WireProtocol {
+    return v === "anthropic" || v === "openai" || v === "responses" || v === "google";
+}
+
+/** #1909: user-declared suffix→protocol table for the route owning upstreamUrl
+ *  (longest-prefix match, same keying as every other provider field). First
+ *  matching rule in array order wins; null when the route declares no rules or
+ *  none match — callers then fall back to the built-in path table. */
+export function resolveCustomWireProtocol(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    urlPath: string,
+): WireProtocol | null {
+    const rules = findRoute(routes, upstreamUrl)?.wirePaths;
+    if (!rules) return null;
+    for (const rule of rules) {
+        if (urlPath.endsWith(rule.suffix)) return rule.protocol;
+    }
+    return null;
+}
+
+/** Strict wirePaths validation: malformed entries THROW (config-load failure /
+ *  web 400) instead of being silently dropped — a dropped rule would leave the
+ *  user staring at "unrecognized path" logs with no signal about why their
+ *  config had no effect (#1909). */
+function parseWirePaths(v: unknown): WirePathRule[] | undefined {
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v) || v.length === 0) {
+        throw new Error("[acp-config] providers.wirePaths must be a non-empty array of {suffix, protocol} objects");
+    }
+    const out: WirePathRule[] = [];
+    for (let i = 0; i < v.length; i++) {
+        const entry = v[i];
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            throw new Error(`[acp-config] providers.wirePaths[${i}] must be an object {suffix, protocol}`);
+        }
+        const e = entry as Record<string, unknown>;
+        if (typeof e.suffix !== "string" || !e.suffix.startsWith("/")) {
+            throw new Error(`[acp-config] providers.wirePaths[${i}].suffix must be a string starting with "/"`);
+        }
+        if (!isWireProtocol(e.protocol)) {
+            throw new Error(`[acp-config] providers.wirePaths[${i}].protocol must be one of: ${WIRE_PROTOCOLS.join(", ")}`);
+        }
+        out.push({ suffix: e.suffix, protocol: e.protocol });
+    }
+    return out;
+}
+
 export type ProxyOptions = {
     port: number;
     host: string;
@@ -688,7 +756,7 @@ export type ProxyOptions = {
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
  *  WITHOUT `bind` they are inert (longest-prefix matching never hits a name),
  *  so loadRoutes warns loudly instead of letting them sit dead (#1469). */
-const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "compat", "imageBilling"] as const;
+const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "wirePaths", "compat", "imageBilling"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
 // the same named-provider warning (same pattern as the absorb warnings below).
@@ -1344,10 +1412,12 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; wirePaths?: unknown; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
+        const wirePaths = parseWirePaths(obj.wirePaths);
+        if (wirePaths) route.wirePaths = wirePaths;
         if (obj.compress) route.compress = obj.compress;
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };

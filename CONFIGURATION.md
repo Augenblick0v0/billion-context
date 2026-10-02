@@ -174,7 +174,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a custom wire-path table (`wirePaths`), compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
 ```jsonc
 {
   "providers": {
@@ -223,7 +223,7 @@ The two schemes never overlap: a `mitm://` key targets only MITM (login-client) 
 A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its own it is routing-inert — longest-prefix match never hits it — and carries only agent-side identity such as [`compactionOptIn`](#compactionoptin). With a `bind` field it becomes a pure **alias** of another lane:
 
 - **Type:** `string` — the http(s) base URL of the lane to alias.
-- Resolution happens **purely at config-load time**: the entry's routing fields (`compress`, `models`, `proxy`, `passthrough`, `compressProtocol`, `compat`, `imageBilling`) are deep-merged onto the bound URL's route and apply exactly as if written under that URL key. The name itself never appears in the request path or on the wire; the proxy keeps its single URL-prefix routing.
+- Resolution happens **purely at config-load time**: the entry's routing fields (`compress`, `models`, `proxy`, `passthrough`, `compressProtocol`, `wirePaths`, `compat`, `imageBilling`) are deep-merged onto the bound URL's route and apply exactly as if written under that URL key. The name itself never appears in the request path or on the wire; the proxy keeps its single URL-prefix routing.
 - **Precedence (per field):** an explicit URL-key entry beats any alias field; between sources the external `ACP_PROVIDERS` file beats inline config at every level (aliases fold in source order, first-set wins). Objects merge per key; arrays/scalars are taken wholesale from the winner — no element-wise merging.
 - A named key without `bind` that still carries routing fields is dead config: bili logs a startup warning naming the key and the inert fields ("add `bind`, or move these under the URL entry") instead of silently ignoring them. Invalid `bind` values (non-string, non-http(s) URL) warn and leave the entry inert; `bind` on a URL key warns and is ignored (the key is already a lane).
 
@@ -263,6 +263,26 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 - **Default:** `"tools"`
 - **Status:** ACTIVE
 - **Description:** How compression tools are injected into the request. `"tools"` (default) injects them as native function-call tools. `"marker"` uses a text-trigger protocol instead — use this for upstreams that cannot coexist with a declared `tools` field.
+
+### `wirePaths`
+
+- **Type:** `Array<{ suffix: string; protocol: "anthropic" | "openai" | "responses" | "google" }>`
+- **Default:** *(none — only the built-in path table applies)*
+- **Status:** ACTIVE
+- **Description:** Custom wire-protocol path table (#1909) for upstreams that hang their model endpoint off a non-standard path (relays/gateways, private protocols). By default bili recognizes a request as a model conversation only when the path ends in a built-in suffix (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/messages`, `/responses`, `/responses/compact`, or a Google `:generateContent`-style path); everything else is forwarded unchanged. A rule matches when the request path **ends with** `suffix` (same `endsWith` semantics as the built-in table, so dynamic segments like `/sessions/<id>/messages` work); the FIRST matching rule in array order wins, and user rules outrank the built-in table. Paths matching no rule fall back to the built-in table, then to verbatim passthrough, exactly as before. The body must still be a real conversation of the declared protocol — non-conversation bodies are relayed verbatim instead of rejected (#1284). Malformed rules (non-array/empty array, suffix not starting with `/`, unknown protocol) reject the config load loudly; nothing is silently dropped:
+
+  ```jsonc
+  {
+    "providers": {
+      "https://relay.example.com": {
+        "wirePaths": [
+          { "suffix": "/my/custom/complete", "protocol": "openai" },
+          { "suffix": "/api/v1/messages", "protocol": "anthropic" }
+        ]
+      }
+    }
+  }
+  ```
 
 ### `compress`
 

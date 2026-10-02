@@ -8,10 +8,10 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
-import type { CompressSettings, ProxyOptions } from "./config.js";
+import type { CompressSettings, ProxyOptions, WirePathRule } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveCustomWireProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
@@ -1407,8 +1407,24 @@ async function handle(
             }
         }
         upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
+        // #1909: user-declared suffix→protocol table (providers[url].wirePaths)
+        // outranks the built-in heuristics — explicit intent beats inference.
+        // The /bili/ explicit-protocol marker still wins over both; a path
+        // matching neither falls through to verbatim passthrough as before.
+        // Looked up by the FULL destination URL (route.rewrittenUrl keeps the
+        // mitm:// scheme for MITM lanes, mirroring buildForwardTarget pre-strip)
+        // so path-prefixed keys and mitm:// keys match like every other
+        // provider field.
+        const customProtocol = req.method === "POST" && bodyBuffer.length > 0
+            ? resolveCustomWireProtocol(
+                opts.routes,
+                route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${url}`,
+                urlPath,
+            )
+            : null;
         protocol =
             route?.explicitProtocol
+            ?? customProtocol
             ?? (req.method === "POST" && bodyBuffer.length > 0
                 ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
                     ? "openai"
@@ -4681,9 +4697,21 @@ function logUpstreamProxyDecision(opts: ProxyOptions, upstreamUrl: string | unde
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
- *  checks in handleRequest; returns null when unknown (no rewrite). */
-function inferWireProtocol(path: string): "openai" | "responses" | "google" | null {
+ *  checks in handleRequest; returns null when unknown (no rewrite). #1909:
+ *  user-declared rules (customRules) are consulted first and win over the
+ *  built-in checks WITHOUT fall-through — a rule mapping a path onto a
+ *  protocol this site does not act on (anthropic has no rewrite surface here)
+ *  suppresses the built-in match, exactly as it does in handleRequest. */
+function inferWireProtocol(path: string, customRules?: WirePathRule[]): "openai" | "responses" | "google" | null {
     const p = path.split("?", 2)[0];
+    if (customRules) {
+        for (const rule of customRules) {
+            if (!p.endsWith(rule.suffix)) continue;
+            return rule.protocol === "openai" || rule.protocol === "responses" || rule.protocol === "google"
+                ? rule.protocol
+                : null;
+        }
+    }
     if (p.endsWith("/chat/completions") || p.endsWith("/llm_raw_chat")) return "openai";
     if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
     if (googlePathKind(p) !== null) return "google";
@@ -5349,7 +5377,9 @@ async function forward(
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
         const roles = { ...configured, ...learned };
-        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
+        // #1909: same user table as handleRequest — a custom-path endpoint must
+        // get the same compat/steering treatment as its built-in counterpart.
+        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "", findRoute(opts.routes, upstreamUrl)?.wirePaths);
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
         if (protocol === "openai" || protocol === "responses") {

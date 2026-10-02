@@ -134,7 +134,8 @@ export async function handleConfigPut(
         if (next.providers !== undefined) {
             if (typeof next.providers !== "object" || Array.isArray(next.providers)) return sendError(res, 400, "providers must be an object");
             for (const [url, value] of Object.entries(next.providers as Record<string, unknown>)) {
-                const route = parseRouteEntry(value);
+                let route: ReturnType<typeof parseRouteEntry>;
+                try { route = parseRouteEntry(value); } catch (error) { return sendError(res, 400, `provider "${url}": ${String(error)}`); }
                 if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
                 try { validateHttpProxy(route.proxy, biliPort); } catch (error) { return sendError(res, 400, `invalid provider proxy for ${url}: ${String(error)}`); }
             }
@@ -172,7 +173,8 @@ export async function handleConfigPut(
             try { rejectLegacyRoute(url, value); } catch (error) {
                 return sendError(res, 400, String(error));
             }
-            const route = parseRouteEntry(value);
+            let route: ReturnType<typeof parseRouteEntry>;
+            try { route = parseRouteEntry(value); } catch (error) { return sendError(res, 400, `provider "${url}": ${String(error)}`); }
             if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
             try { validateHttpProxy(route.proxy, biliPort); } catch (error) {
                 return sendError(res, 400, `invalid provider proxy for ${url}: ${String(error)}`);

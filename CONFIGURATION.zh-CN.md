@@ -174,7 +174,7 @@
 
 ## Providers
 
-`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、压缩覆盖项、图片计费模式、按路由的透传开关，以及客户端侧直连豁免。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
+`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、自定义 wire 路径表（`wirePaths`）、压缩覆盖项、图片计费模式、按路由的透传开关，以及客户端侧直连豁免。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
 ```jsonc
 {
   "providers": {
@@ -223,7 +223,7 @@
 一个不是 URL 的键（如 `"claude-bridge"`）是**命名**条目。它本身对路由惰性无效——最长前缀匹配永远命中不了它——只承载 [`compactionOptIn`](#compactionoptin) 之类的 agent 侧身份。加上 `bind` 字段后，它成为另一条 lane 的纯**别名**：
 
 - **类型：** `string` —— 被别名 lane 的 http(s) base URL。
-- 解析**纯粹发生在配置加载时**：条目的路由字段（`compress`、`models`、`proxy`、`passthrough`、`compressProtocol`、`compat`、`imageBilling`）被深合并到绑定 URL 的路由上，效果与直接写在该 URL 键下完全一致。名称本身绝不出现在请求路径或线上；代理保持单一 URL 前缀路由。
+- 解析**纯粹发生在配置加载时**：条目的路由字段（`compress`、`models`、`proxy`、`passthrough`、`compressProtocol`、`wirePaths`、`compat`、`imageBilling`）被深合并到绑定 URL 的路由上，效果与直接写在该 URL 键下完全一致。名称本身绝不出现在请求路径或线上；代理保持单一 URL 前缀路由。
 - **优先级（按字段）：** 显式 URL 键条目胜过任何别名字段；跨来源时外部 `ACP_PROVIDERS` 文件在每一层都胜过内联配置（别名按来源顺序折叠，先设者胜）。对象按键合并；数组/标量整体取自胜者——不做逐元素合并。
 - 没有 `bind` 却仍携带路由字段的命名键是死配置：bili 打印启动警告，点名该键与失效字段（"add `bind`, or move these under the URL entry"），而不是静默忽略。非法 `bind` 值（非字符串、非 http(s) URL）警告并让条目保持无效；URL 键上的 `bind` 被忽略并警告（该键已是 lane）。
 
@@ -261,6 +261,26 @@
 - **默认值：** `"tools"`
 - **状态：** ACTIVE
 - **说明：** 压缩工具注入请求的方式。`"tools"`（默认）将它们作为原生函数调用工具注入。`"marker"` 改用文本触发协议 —— 用于那些无法与已声明的 `tools` 字段共存的下游上游。
+
+### `wirePaths`
+
+- **类型：** `Array<{ suffix: string; protocol: "anthropic" | "openai" | "responses" | "google" }>`
+- **默认值：** *（无 —— 仅内置路径表生效）*
+- **状态：** ACTIVE
+- **说明：** 自定义 wire 协议路径表（#1909），用于把模型端点挂在非标准路径上的上游（中转站/网关、私有协议）。默认情况下 bili 只在请求路径以内置后缀结尾时（`/chat/completions`、`/llm_raw_chat`、`/v1/messages`、`/messages`、`/responses`、`/responses/compact`，或 Google 的 `:generateContent` 风格路径）才把它识别为模型会话；其余路径一律原样转发。规则按「请求路径 **ends with** `suffix`」匹配（与内置表相同的 `endsWith` 语义，因此 `/sessions/<id>/messages` 这类动态段也能命中）；数组内**首个**命中的规则生效，且用户规则优先于内置表。未命中任何规则的路径回退到内置表，再回退到原样转发，与之前完全一致。body 仍须是所声明协议的真实会话 —— 非会话 body 走原样 relay 而非拒绝（#1284）。规则非法（非数组/空数组、suffix 不以 `/` 开头、未知 protocol）会在配置加载时响亮报错，不做静默丢弃：
+
+  ```jsonc
+  {
+    "providers": {
+      "https://relay.example.com": {
+        "wirePaths": [
+          { "suffix": "/my/custom/complete", "protocol": "openai" },
+          { "suffix": "/api/v1/messages", "protocol": "anthropic" }
+        ]
+      }
+    }
+  }
+  ```
 
 ### `compress`
 
