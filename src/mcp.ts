@@ -226,6 +226,12 @@ async function handleMessage(msg: {
                 sendError(id, -32002, "server not initialized");
                 return;
             }
+            if (degradedReason !== undefined) {
+                // #1892: idle shim — advertise nothing rather than blocking on
+                // (or erroring against) an origin that is not there.
+                sendResult(id, { tools: [] });
+                return;
+            }
             try {
                 await ensureManifest();
                 sendResult(id, { tools: manifestTools });
@@ -239,6 +245,10 @@ async function handleMessage(msg: {
             const rawArgs: Record<string, unknown> = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
             if (!tool) {
                 sendError(id, ERR_TOOL, "params.name is required");
+                return;
+            }
+            if (degradedReason !== undefined) {
+                sendResult(id, { content: [{ type: "text", text: `bili is idle: ${degradedReason}` }], isError: true });
                 return;
             }
             // #760: per-call conversation_id — the model copies the id the
@@ -305,8 +315,16 @@ async function mcpMain(): Promise<void> {
     process.stdin.on("end", () => process.exit(0));
 }
 
+/** Set when this shim serves WITHOUT a live proxy behind it (#1892,
+ *  zcode mcp-entry): tools/list answers an empty list instead of timing out
+ *  against a dead origin, and tools/call returns a loud isError explaining
+ *  why. The process stays a valid MCP server so the host handshake completes
+ *  instead of seeing the child die pre-initialize. */
+let degradedReason: string | undefined;
+
 /** CLI entry (`bili mcp`): the stdio loop keeps the process alive. */
-export function runMcpStdio(): void {
+export function runMcpStdio(opts: { degraded?: string } = {}): void {
+    degradedReason = opts.degraded;
     void mcpMain();
 }
 
