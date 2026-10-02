@@ -8,6 +8,7 @@ import { maxShrinkPerCompress } from "../src/fetch-util.ts";
 import { withStagedCompressGuidance } from "../src/compress-tool.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { getCacheLedger } from "../src/cache-ledger.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -139,6 +140,18 @@ test("#1911: full-context fold reports honest 100%/postCtx≈0 and gets the dege
     const warn = ctx.logs.find((l) => l.includes("[warn: degenerate-fold]"));
     assert.ok(warn, "degenerate reset carries its own warn marker for host-side auditing");
     assert.ok(warn!.includes("covers 100% of the live context"), warn);
+});
+
+test("#1911: cache ledger fold stores live-view geometry (V/Vp), never the billed baseline", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 100000; // billed scalar — pre-fix code stored this as V
+    getCacheLedger(ctx.session); // production: ledger predates its first compress (bootstrap lastBlockId below the new block)
+    runApply(ctx, COMPRESS_ARGS);
+    const folds = getCacheLedger(ctx.session).folds;
+    assert.equal(folds.length, 1, "one fold recorded");
+    assert.equal(folds[0].S, 10000, "S = tokens removed from the view");
+    assert.equal(folds[0].V, 16250, "V is the pre-fold LIVE view size, not the billed baseline");
+    assert.equal(folds[0].Vp, 6250, "Vp is the post-fold live view");
 });
 
 test("#189: failed compress records no lastCompress", () => {
