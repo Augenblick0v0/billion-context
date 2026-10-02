@@ -20,9 +20,13 @@ export type BlockContent = {
 
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
- *  context rewrite that preceded it. `shrinkRatio` is the fraction of the
- *  pre-compress context removed by this compress; `foldPoint` is the start ref
- *  of the earliest folded range (where the prefix structure rewrites). */
+ *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
+ *  the CURRENT request's live context removed by this compress — counted with
+ *  the kernel's own per-message counter over the folded view (capped at 1),
+ *  never derived from the billed usage baseline, which can be stale-netted,
+ *  clobbered by concurrent streams, or absent after an aborted turn;
+ *  `foldPoint` is the start ref of the earliest folded range (where the prefix
+ *  structure rewrites). */
 export type LastCompressInfo = {
     at: number;
     shrinkRatio: number;

@@ -93,12 +93,52 @@ test("#189: fold point picks the EARLIEST range start across multiple ranges", (
     assert.equal(ctx.session.lastCompress?.foldPoint, "m00001", "earliest start wins regardless of arg order");
 });
 
-test("#189: no pre-compress context → shrinkRatio 0 (no div-by-zero), still records", () => {
+test("#1911: no usage baseline → shrinkRatio is the view coverage, never 0 or >1", () => {
     const ctx = makeCompressibleCtx();
     ctx.session.stats.lastInputTokens = 0;
     const out = runApply(ctx, COMPRESS_ARGS);
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
-    assert.equal(ctx.session.lastCompress?.shrinkRatio, 0, "shrinkRatio 0 when preContext is 0");
+    const ratio = ctx.session.lastCompress?.shrinkRatio;
+    assert.ok(ratio !== undefined && ratio > 0 && ratio <= 1, `coverage-based ratio in (0,1] (got ${ratio})`);
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("~10000/16250"), `view-space denominator in obs: ${obs}`);
+    assert.ok(obs!.includes("postCtx≈6250"), `post-fold context measured from the view, not the billed baseline: ${obs}`);
+});
+
+test("#1911: stale-low baseline cannot produce shrink>100%, postCtx≈0 artifact, or a frozen nudge baseline", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 1000;
+    const out = runApply(ctx, COMPRESS_ARGS);
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
+    assert.equal(Math.round(ctx.session.lastCompress!.shrinkRatio * 100), 62, "ratio is coverage of the live view (10000/16250), never 1000%");
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("shrink 62%"), `impossible ratio gone: ${obs}`);
+    assert.ok(obs!.includes("~10000/16250"), obs);
+    assert.ok(obs!.includes("postCtx≈6250"), `postCtx from the view, not clamped to 0: ${obs}`);
+    assert.ok(!ctx.logs.some((l) => l.includes("[warn: degenerate-fold]")), "a partial fold is not a degenerate reset");
+    assert.equal(ctx.session.stats.compressCreditTokens, 10000, "credit still accumulates for the usage netting");
+    assert.equal(ctx.session.stats.lastInputTokens, 6250, "stale baseline falls back to the post-fold estimate instead of clamping to 0 (#728 freeze)");
+});
+
+test("#1911: healthy baseline keeps the exact old netting", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.session.stats.lastInputTokens = 100000;
+    runApply(ctx, COMPRESS_ARGS);
+    assert.equal(ctx.session.stats.lastInputTokens, 90000, "netted below the folded mass → unchanged behavior");
+});
+
+test("#1911: full-context fold reports honest 100%/postCtx≈0 and gets the degenerate-reset warn marker", () => {
+    const ctx = makeCompressibleCtx();
+    ctx.config.preserveRecentMessages = 0;
+    ctx.config.preserveRecentTokens = 0;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00007", summary: "OBS-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));
+    assert.ok(obs!.includes("shrink 100%"), `full coverage reported honestly: ${obs}`);
+    assert.ok(obs!.includes("postCtx≈0"), obs);
+    const warn = ctx.logs.find((l) => l.includes("[warn: degenerate-fold]"));
+    assert.ok(warn, "degenerate reset carries its own warn marker for host-side auditing");
+    assert.ok(warn!.includes("covers 100% of the live context"), warn);
 });
 
 test("#189: failed compress records no lastCompress", () => {

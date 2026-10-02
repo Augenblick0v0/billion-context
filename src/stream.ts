@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
@@ -301,6 +301,12 @@ function applyErrorNote(r: { errors: string[] }): string {
     return ` Errors: ${errs}`;
 }
 
+// #1911: coverage at or above which one fold counts as a degenerate reset —
+// the entire live context rewritten into the new block(s), prefix cache
+// restarting from scratch. Hardcoded by design (config-surface discipline);
+// hosts that want to penalize this shape grep the warn marker below.
+const DEGENERATE_FOLD_COVERAGE = 0.8;
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -446,15 +452,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
-        // preContext is read BEFORE the credit netting below (lastInputTokens
-        // still holds the pre-compress context at this point).
-        const preContext = ctx.session.stats.lastInputTokens;
-        // #1839: an estimate-grade (or zero) baseline makes the ratio and the
-        // #695 ceiling physically meaningless — a poisoned baseline used to
-        // print shrink=10527% and "cache ceiling ≥0%". Mark the observation
-        // untrustworthy instead of emitting impossible numbers.
-        const trustworthy = preContext > 0 && r.tokensCompressed <= preContext;
-        const shrinkRatio = trustworthy ? r.tokensCompressed / preContext : 0;
+        // #1911: the denominator must live in the SAME space as the numerator.
+        // r.tokensCompressed is a fresh kernel count over THIS request's view;
+        // stats.lastInputTokens is a session scalar from the previous request's
+        // usage report — stale-netted by unconsumed compress credits, clobbered
+        // by concurrent streams sharing the session id, or absent after an
+        // aborted turn. Mixing the two produced impossible "shrink 287%" lines
+        // and postCtx≈0 artifacts that also froze the nudge baseline (#728
+        // shape) and poisoned the cache ledger (#1839). Count the current view
+        // with the kernel's own per-message counter instead — a same-space
+        // denominator makes the ratio structurally ≤1, so #1839's
+        // "trustworthy baseline" gate is subsumed and no longer needed.
+        const viewMessages = ctx.compressMessages ?? ctx.messages;
+        let viewTokens = 0;
+        for (const m of viewMessages) viewTokens += countMessageTokens(m);
+        const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
         ctx.session.stats.pendingFoldUsage = true;
@@ -464,19 +476,24 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // [acp-usage] line reports the real cached, separating physics from
         // upstream eviction.
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
-        const postCtx = Math.max(0, preContext - r.tokensCompressed);
+        const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
+        const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        if (trustworthy) {
-            ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${res.state.blocks.filter((b) => b.active).length} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
-        } else {
-            ctx.log(`[acp-compress-obs] baseline untrustworthy (~${r.tokensCompressed} folded vs baseline ${preContext}) — ratio/postCtx suppressed (#1839) foldPoint=${foldPoint} blocks=${r.blocksCreated}`);
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        // #1911: a fold covering most of the live context is a degenerate reset —
+        // legitimate as a marathon-session strategy, but it rewrites the whole
+        // prefix and leaves only the anchor summaries. Hosts need a
+        // machine-greppable marker to audit/penalize it (the obs line alone is
+        // indistinguishable from a normal fold's).
+        if (shrinkRatio >= DEGENERATE_FOLD_COVERAGE) {
+            ctx.log(`[warn: degenerate-fold] [acp-compress-obs] covers ${Math.round(shrinkRatio * 100)}% of the live context (~${r.tokensCompressed}/${viewTokens} tok) leaving ${activeBlockCount} active block(s), anchor≈${anchorTok} tok — the whole prefix rewrites and the prefix cache restarts from scratch on the next request`);
         }
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
         recordCacheFoldsFromBlocks(
             ctx.session,
             res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
-            { V: preContext, Vp: postCtx },
+            { V: viewTokens, Vp: postCtx },
         );
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
@@ -539,7 +556,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // so the next nudge decision sees post-compress reality instead of
         // re-firing on the stale pre-compress number (#252 double-inject).
         ctx.session.stats.compressCreditTokens = (ctx.session.stats.compressCreditTokens ?? 0) + r.tokensCompressed;
-        ctx.session.stats.lastInputTokens = Math.max(0, ctx.session.stats.lastInputTokens - r.tokensCompressed);
+        // #1911: when the baseline is already below the folded mass itself
+        // (stale-netted or clobbered — see above), plain netting clamps to 0
+        // and freezes the nudge baseline (#728 failure mode). Fall back to the
+        // post-fold local estimate instead; the next usage report overwrites
+        // both. Healthy baselines keep the exact old behavior.
+        const netted = ctx.session.stats.lastInputTokens - r.tokensCompressed;
+        ctx.session.stats.lastInputTokens = netted > 0 ? netted : Math.max(0, viewTokens - r.tokensCompressed);
         // #1387: post-compress snapshot / stop signal ride on the netted
         // (post-compress) token count, matching what the next turn sees.
         const tail = postCompressTail(ctx, r.errors.length === 0);
