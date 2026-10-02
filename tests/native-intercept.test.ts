@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, hasBodySignature, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -847,4 +847,136 @@ test("#1365 observeRoutedOrigin: pre-set evidence skips the window; expiry clean
         if (saved === undefined) delete process.env.BILI_ATTACH_EVIDENCE_GRACE_MS;
         else process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = saved;
     }
+});
+
+// #1884: body-signature guard — a request whose body is covered by an upstream
+// signature (Huawei APIG SDK-HMAC-SHA256, AWS SigV4, HMAC-SHA256) must never be
+// rewritten: bili's re-serialization breaks the signature and the gateway
+// rejects with 401 (APIG.0301 body-hash mismatch). Such requests go direct.
+
+test("#1884 hasBodySignature: recognizes signature-covered bodies in all header forms", () => {
+    const url = "http://127.0.0.1:8199/v1/messages";
+    // init headers — plain object / Headers instance / entries array
+    assert.equal(hasBodySignature(url, { method: "POST", headers: { authorization: "SDK-HMAC-SHA256 ak=abc sig=def" } }), true);
+    assert.equal(hasBodySignature(url, { method: "POST", headers: new Headers({ Authorization: "AWS4-HMAC-SHA256 Credential=AKA/20261002/cn-north-4/apig/aws4_request, SignedHeaders=host;x-sdk-content-sha256, Signature=abc" }) }), true);
+    assert.equal(hasBodySignature(url, { method: "POST", headers: [["Authorization", "HMAC-SHA256 token=xyz"]] }), true);
+    // content-hash headers are decisive on their own
+    assert.equal(hasBodySignature(url, { method: "POST", headers: { "x-sdk-content-sha256": "e3b0c44298fc1c149afbf4c8996fb924" } }), true);
+    assert.equal(hasBodySignature(url, { method: "POST", headers: { "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb924" } }), true);
+    // header names and schemes match case-insensitively
+    assert.equal(hasBodySignature(url, { headers: { AUTHORIZATION: "sdk-hmac-sha256 x=1" } }), true);
+    assert.equal(hasBodySignature(url, { headers: { "X-AMZ-CONTENT-SHA256": "aa" } }), true);
+    // Request-object input carries the markers too
+    assert.equal(hasBodySignature(new Request(url, { method: "POST", headers: { Authorization: "SDK-HMAC-SHA256 x=1" }, body: "{}" })), true);
+});
+
+test("#1884 hasBodySignature: ordinary auth never trips the guard", () => {
+    const url = "http://127.0.0.1:8199/v1/messages";
+    assert.equal(hasBodySignature(url, { method: "POST", headers: { authorization: "Bearer sk-ant-api03-xxx" } }), false);
+    assert.equal(hasBodySignature(url, { method: "POST", headers: { authorization: "Basic dXNlcjpwYXNz" } }), false);
+    assert.equal(hasBodySignature(new Request(url, { method: "POST", headers: { authorization: "Bearer t" }, body: "{}" })), false);
+    assert.equal(hasBodySignature(url), false);
+    assert.equal(hasBodySignature(url, { method: "POST" }), false);
+    // scheme-boundary: a name that merely starts with HMAC-SHA256 is not one
+    assert.equal(hasBodySignature(url, { headers: { authorization: "HMAC-SHA2560 x=1" } }), false);
+});
+
+test("#1884 install: SDK-HMAC-SHA256-signed model request goes DIRECT and fires onSignedModelUrl", async () => {
+    const signed: string[] = [];
+    const dispatches: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        onSignedModelUrl: (u) => { signed.push(u); },
+        onDispatch: (_u, action) => dispatches.push(action),
+    };
+    const codearts = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions";
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch(codearts, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-sdk-content-sha256": "e3b0c44298fc1c149afbf4c8996fb924",
+                authorization: "SDK-HMAC-SHA256 ak=AKA sig=DEADBEEF",
+            },
+            body: "{}",
+        });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, [codearts], "signed request never touches the proxy");
+    assert.deepEqual(signed, [codearts], "hook reports the direct send");
+    assert.deepEqual(dispatches, ["direct"]);
+});
+
+test("#1884 install: SigV4-signed request goes direct while Bearer requests keep routing", async () => {
+    const signed: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        onSignedModelUrl: (u) => { signed.push(u); },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        await fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            headers: { "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb924", authorization: "AWS4-HMAC-SHA256 Credential=AKA/x" },
+            body: "{}",
+        });
+        await fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            headers: { authorization: "Bearer sk-test" },
+            body: "{}",
+        });
+    });
+    assert.deepEqual(sink, [
+        "http://127.0.0.1:8199/v1/messages",
+        "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+    ], "signed direct, bearer routed");
+    assert.deepEqual(signed, ["http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#1884 install: signature guard decides before takeoverGate is consulted", async () => {
+    const signed: string[] = [];
+    let gateCalls = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        takeoverGate: () => { gateCalls += 1; return true; },
+        onSignedModelUrl: (u) => { signed.push(u); },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { authorization: "HMAC-SHA256 s=1" }, body: "{}" });
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+    assert.deepEqual(signed, ["http://127.0.0.1:8199/v1/messages"], "reported as signed-direct even though attribution would allow takeover");
+    assert.equal(gateCalls, 0, "guard decides before the attribution gate");
+});
+
+test("#1884 install: Request-object input with signed headers goes direct", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const req = new Request("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            headers: { authorization: "SDK-HMAC-SHA256 ak=a sig=b" },
+            body: "{}",
+        });
+        await fetch(req);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+});
+
+test("#1884 install: signed NON-model URLs stay direct without firing onSignedModelUrl", async () => {
+    const signed: string[] = [];
+    const unrouted: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        onSignedModelUrl: (u) => { signed.push(u); },
+        onUnroutedModelUrl: (u) => { unrouted.push(u); },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        await fetch("https://example.com/some/tool", { method: "POST", headers: { authorization: "SDK-HMAC-SHA256 x=1" }, body: "{}" });
+    });
+    assert.deepEqual(sink, ["https://example.com/some/tool"]);
+    assert.equal(signed.length, 0, "hook is model-endpoint scoped");
+    assert.deepEqual(unrouted, ["https://example.com/some/tool"], "existing unrouted reporting unchanged");
 });

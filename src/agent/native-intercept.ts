@@ -88,6 +88,16 @@ export interface NativeInterceptState {
      *  real failure lines. Called per request; hosts dedup once-per-process-
      *  per-endpoint like takeoverGate. Undefined hosts stay silent. */
     onUnroutedModelUrl?: (url: string) => void;
+
+    /** #1884: observability hook — fired for every model-API request the fetch
+     *  patch sends DIRECT (uncompressed) because its headers prove the body is
+     *  covered by a signature the upstream verifies (Huawei APIG
+     *  SDK-HMAC-SHA256, AWS SigV4, HMAC-SHA256): rewriting such a body would
+     *  break the signature and the gateway rejects with 401, so the request
+     *  never enters the proxy pipeline. Same shape/cadence as
+     *  onUnroutedModelUrl — called per request; hosts dedup once-per-process-
+     *  per-endpoint. Undefined hosts stay silent. */
+    onSignedModelUrl?: (url: string) => void;
 }
 
 /** Ownership marker for bili's own chain links (#1410). Every function
@@ -264,6 +274,38 @@ function fetchMethodOf(input: string | URL | Request, init?: RequestInit): strin
         // fallthrough
     }
     return "GET";
+}
+
+// #1884: Authorization schemes whose signature covers the request BODY —
+// Huawei APIG SDK-HMAC-SHA256, AWS SigV4, and the generic HMAC-SHA256 form.
+const SIGNED_BODY_AUTH_SCHEME = /^(SDK-HMAC-SHA256|AWS4-HMAC-SHA256|HMAC-SHA256)\b/i;
+
+export function hasBodySignature(input: string | URL | Request, init?: RequestInit): boolean {
+    const scan = (h: unknown): boolean => {
+        let entries: Array<[string, string]> = [];
+        try {
+            if (h instanceof Headers) {
+                h.forEach((v, k) => entries.push([k, v] as [string, string]));
+            } else if (Array.isArray(h)) {
+                entries = (h as Array<[unknown, unknown]>).map(([k, v]): [string, string] => [String(k), String(v)]);
+            } else if (typeof h === "object" && h !== null) {
+                entries = Object.entries(h as Record<string, unknown>).map(([k, v]): [string, string] => [k, String(v)]);
+            }
+        } catch {
+            return false;
+        }
+        for (const [k, v] of entries) {
+            const lk = k.toLowerCase();
+            if (lk === "x-sdk-content-sha256" || lk === "x-amz-content-sha256") return true;
+            if (lk === "authorization" && SIGNED_BODY_AUTH_SCHEME.test(v.trim())) return true;
+        }
+        return false;
+    };
+    if (input !== null && typeof input === "object" && !(input instanceof URL)) {
+        const r = input as Request;
+        if (r.headers != null && typeof (r.headers as Headers).forEach === "function" && scan(r.headers)) return true;
+    }
+    return scan(init?.headers);
 }
 
 /** Merge extra headers into a (input, init) pair, preserving all three
@@ -644,6 +686,16 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // catalog JSONs, git refs and the rest of the host's tooling are
             // GET and would otherwise fire the hook once per boot per endpoint.
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
+            return send(input, init);
+        }
+        // #1884: the body is covered by a signature the upstream verifies
+        // (Huawei APIG SDK-HMAC-SHA256, AWS SigV4, HMAC-SHA256) — NEVER rewrite
+        // it: the proxy's compression re-serializes the entity and the gateway
+        // rejects the stale signature with 401 (APIG.0301 body-hash mismatch).
+        // Send direct (uncompressed) and report it, mirroring onUnroutedModelUrl.
+        if (hasBodySignature(input, init)) {
+            state.onSignedModelUrl?.(url);
+            state.onDispatch?.(url, "direct");
             return send(input, init);
         }
         // #1117: URL shape alone cannot claim a request — every model call in
