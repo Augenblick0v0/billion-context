@@ -127,7 +127,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
+import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -2431,13 +2431,45 @@ async function handle(
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
+        // #1897: omp-style hosts register bili's ACP tools as first-class extension
+        // tools and include them in EVERY model request — including side requests
+        // (title-gen), which carry no host action tools of their own. omp titles with
+        // max_tokens=1024 (> the 200 budget gate) and stamps no persona header, so
+        // neither existing signal sees the request and the title payload rides
+        // processTurn under the main session id (refs/usage pollution + ~4K of billed
+        // tool tokens per session start). A request whose ENTIRE tools array is bili's
+        // own context-management set has no action surface: it is a side request with
+        // leaked bili tools, not an agent turn — except when its output budget is
+        // starved (<=200), which per #546 must stay a main turn so
+        // restoreOutputBudget can rescue it. The signal is plugin-lane-only: the
+        // leak mechanism (host registers bili's tools as extension tools) cannot
+        // exist in proxy mode, where an all-bili array means the client itself
+        // declared those tools — such manually-configured clients keep their
+        // #546/#1665 rescue semantics untouched. Strip the leak BEFORE
+        // restoreOutputBudget and route demoted requests through the side
+        // passthrough below.
+        // #1197/#1086: all-bili tools alone cannot mean "side request" — a live
+        // plugin session also re-sends its compression artifacts in HISTORY and must
+        // run through the kernel. Veto on real history artifacts (detectAcpArtifacts
+        // is history-scoped, never the top-level tools declarations), so a fresh
+        // title-gen still demotes. Read-only; ordered BEFORE the mutating strip.
+        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
+            && detectAcpArtifacts(bodyBuffer, parsed) === null
+            && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
         // best-known model output ceiling (runtime-info > launcher > declared >
         // registry — resolveKnownOutputCeiling) floors the restore target; a
         // warn fires when no source knows one at all.
-        restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
+        // #1897: demoted side requests are skipped entirely — their budget sizes a
+        // utility call (omp titles at a fixed 1024), not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved restore
+        // (title requests arrive FIRST, at session start). Starved all-bili requests
+        // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
+        if (!demotedSide) {
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
+        }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
@@ -2475,7 +2507,7 @@ async function handle(
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
         const requestAgent = pluginRequestAgentHeader(req.headers);
-        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed, requestAgent)) {
+        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || isSideRequest(parsed, requestAgent))) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2498,7 +2530,7 @@ async function handle(
                         error: {
                             type: "server_error",
                             code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
                             retryable: false,
                         },
                     }));
@@ -2506,8 +2538,11 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
-            let sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            const sideReason = demotedSide ? "leaked bili tools stripped (#1897)" : requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`;
+            log("info", `[${session.id}] side request (${sideReason}) → passthrough + tag strip only, kernel state untouched`);
+            // #1897: a demoted request was mutated (tools stripped) — re-serialize
+            // the parsed body so the leak is actually gone from the wire.
+            let sideBody = scrubAnthropicPck(protocol, demotedSide ? Buffer.from(JSON.stringify(parsed)) : bodyBuffer, log);
             const sideInput = (parsed as ResponsesRequestBody).input;
             if (protocol === "responses" && Array.isArray(sideInput)) {
                 const { items, replaced, dropped } = replaceBiliCompactionItems(sideInput);
@@ -6969,5 +7004,5 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
+export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
