@@ -98,6 +98,7 @@ stripImages: pick("stripImages"),
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
+        reconcile: pick("reconcile"),
         promptPack: pick("promptPack"),
     };
 }
