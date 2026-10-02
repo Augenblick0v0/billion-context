@@ -58,6 +58,11 @@ export function resolvePiBinary(
 ): string {
     const override = env.BILI_PI_BIN?.trim();
     if (override && override.length > 0) return override;
+    // Probe both binary names: `pi` is the canonical UX name (what users and
+    // distros link), but a stock `npm install -g pi-stable` only lays down
+    // `pi-stable`(.cmd) — the npm package's declared bin name. Probing just
+    // `pi` misses every stock npm install.
+    const probeNames = ["pi", "pi-stable"];
     const sep = platform === "win32" ? ";" : ":";
     const extensions = platform === "win32"
         ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map((e) => e.trim().toLowerCase()).filter((e) => e.length > 0)
@@ -69,10 +74,12 @@ export function resolvePiBinary(
         : [nodeDir, "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", home ? home + "/.local/bin" : ""];
     for (const dir of [...(env.PATH ?? "").split(sep), ...extraDirs]) {
         if (!dir) continue;
-        for (const ext of extensions) {
-            const name = ext === "" ? "pi" : `pi${ext}`;
-            const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
-            if (existsImpl(candidate)) return candidate;
+        for (const name of probeNames) {
+            for (const ext of extensions) {
+                const fileName = ext === "" ? name : `${name}${ext}`;
+                const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + fileName : dir + "/" + fileName;
+                if (existsImpl(candidate)) return candidate;
+            }
         }
     }
     return "pi";
