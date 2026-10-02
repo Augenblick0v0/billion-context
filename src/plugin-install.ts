@@ -65,12 +65,16 @@ import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
  *     argument after it the whole command dies at parse time, and alone it
  *     exits 0 having run nothing — a silent no-op, worse than an error.
  *
- *     No spelling covers a spaced command path in all three, so the only
- *     question is which shell to keep working. Claude Code runs hooks through
- *     PowerShell on Windows (probe-verified: a cmd-only builtin writes nothing,
- *     a PowerShell-only one writes its file), so `&` is what keeps the real
- *     path alive. cmd never sees a spaced command here — the kimi hook resolves
- *     a bare `node` through PATH, so it is never quoted. Exported for tests. */
+ *     No spelling covers a spaced command path in all three, and the client's
+ *     shell is not stable across versions anyway: #1376 probe-verified
+ *     PowerShell on Claude Code 2.1.282, while #1902 measured cmd.exe on
+ *     2.1.284 (`& was unexpected at this time.` — the lane silently never
+ *     started). So shipped hooks must never emit a spaced COMMAND token at
+ *     all: claude and kimi both pass a bare `node`, which every shell resolves
+ *     through PATH — and claude cannot run without `node` on PATH in the first
+ *     place (its npm shim invokes bare `node` itself, in the very environment
+ *     the hook later inherits). The `&` fallback below stays for hypothetical
+ *     spaced-head callers, but no shipped hook uses it. Exported for tests. */
 export function portableHookCommand(exe: string, args: string[] = []): string {
     const fwd = (p: string): string => p.replaceAll("\\", "/");
     const quoteArg = (p: string): string => (/\s/.test(p) ? `"${p}"` : p);
@@ -523,7 +527,8 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const settings = readJson(file);
     const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
-    const hookCommand = portableHookCommand(process.execPath, [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
     const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
@@ -671,14 +676,44 @@ function runClaudeCli(claude: string, args: string[]): void {
  *  would ENOENT before runClaudeCli ever sees the .cmd. Uses where.exe; on
  *  failure or non-Windows the input is returned untouched (the original
  *  ENOENT error stays truthful). The resolver is injectable so tests never
- *  depend on a real where.exe spawn finishing in time (#1445). */
-export function resolveClaudeCli(claude: string, where?: (name: string) => { stdout: string | null }): string {
+ *  depend on a real where.exe spawn finishing in time (#1445).
+ *
+ *  #1902: npm's global dir ships three shims side by side — the extensionless
+ *  POSIX script FIRST, then .cmd, then .ps1 — and Node cannot spawn the
+ *  extensionless one (ENOENT), so taking the raw first hit breaks MCP
+ *  registration. Hits are now ranked the way cmd.exe itself resolves them:
+ *  PATH order first, PATHEXT order within each directory. When nothing
+ *  carries a PATHEXT extension the old first-hit behavior stands. */
+export function resolveClaudeCli(
+    claude: string,
+    where?: (name: string) => { stdout: string | null },
+    pathext?: string,
+): string {
     if (/[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
     const run = where ?? (process.platform === "win32" ? defaultWhereRunner : undefined);
     if (!run) return claude;
     try {
-        const first = (run(claude).stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
-        return first && first.length > 0 ? first : claude;
+        const hits = (run(claude).stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+        if (hits.length === 0) return claude;
+        const exts = (pathext ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+            .split(";")
+            .map((e) => e.trim().toLowerCase())
+            .filter((e) => e.startsWith("."));
+        const dirs = new Map<string, string[]>();
+        for (const hit of hits) {
+            const base = /[^\\/]+$/.exec(hit)?.[0] ?? hit;
+            const dir = hit.slice(0, hit.length - base.length);
+            const list = dirs.get(dir) ?? [];
+            list.push(hit);
+            dirs.set(dir, list);
+        }
+        for (const perDir of dirs.values()) {
+            for (const ext of exts) {
+                const hit = perDir.find((h) => h.toLowerCase().endsWith(ext));
+                if (hit) return hit;
+            }
+        }
+        return hits[0];
     } catch {
         return claude;
     }
@@ -710,7 +745,8 @@ function claudeInstall(): string {
     const nativePort = resolveClaudeNativePort() ?? lanePreferredPort("claude");
     const file = claudeSettingsFile();
     const settings = readJson(file);
-    const hookCommand = portableHookCommand(process.execPath, [bootstrapJs]);
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    const hookCommand = portableHookCommand("node", [bootstrapJs]);
     const { data, notes } = applyClaudeManagedBlock(settings, {
         baseUrl: claudeNativeBaseUrl(),
         hookCommand,

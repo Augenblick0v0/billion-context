@@ -589,6 +589,29 @@ test("resolveClaudeCli: bare names resolve via where.exe on Windows, untouched e
         resolveClaudeCli("claude", where("C:\\tools\\nodejs\\claude.cmd\r\nC:\\other\\claude.exe\n")),
         "C:\\tools\\nodejs\\claude.cmd",
     );
+    // #1902: npm's global dir lists the extensionless POSIX shim FIRST — Node
+    // cannot spawn it (ENOENT), so the .cmd must win over list position.
+    assert.equal(
+        resolveClaudeCli(
+            "claude",
+            where("C:\\Users\\u\\AppData\\Roaming\\npm\\claude\r\nC:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd\r\nC:\\Users\\u\\AppData\\Roaming\\npm\\claude.ps1\n"),
+        ),
+        "C:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd",
+    );
+    // Within one directory PATHEXT order decides: a real .exe outranks the shim.
+    assert.equal(
+        resolveClaudeCli("claude", where("C:\\bin\\claude\r\nC:\\bin\\claude.cmd\r\nC:\\bin\\claude.exe\n")),
+        "C:\\bin\\claude.exe",
+    );
+    // PATH order still beats extension: an earlier dir's .cmd wins over a later dir's .exe.
+    assert.equal(
+        resolveClaudeCli("claude", where("C:\\first\\claude.cmd\r\nC:\\second\\claude.exe\n")),
+        "C:\\first\\claude.cmd",
+    );
+    // Nothing carries a PATHEXT extension → old first-hit behavior stands.
+    assert.equal(resolveClaudeCli("claude", where("C:\\x\\claude\r\nC:\\y\\claude.ps1\n")), "C:\\x\\claude");
+    // Injectable PATHEXT for exotic environments/tests.
+    assert.equal(resolveClaudeCli("claude", where("C:\\x\\claude\r\nC:\\x\\claude.ps1\n"), ".PS1;.CMD"), "C:\\x\\claude.ps1");
     assert.equal(resolveClaudeCli("claude", where("\r\n   \n")), "claude");
     assert.equal(resolveClaudeCli("claude", where(null)), "claude");
     assert.equal(resolveClaudeCli("claude", () => { throw new Error("where.exe ETIMEDOUT"); }), "claude");
@@ -613,6 +636,14 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.equal(after.env?.ANTHROPIC_BASE_URL, baseUrlForPort(ZONE_PORT_BASE));
         assert.equal(after.env?.DISABLE_AUTO_COMPACT, "1");
         assert.equal(claudeNativeInstalled(), true);
+        // #1902: the emitted hook must carry a bare `node` head — parseable by
+        // whichever shell Claude Code runs hooks through (cmd on 2.1.284,
+        // PowerShell on 2.1.282), never a spaced absolute node path.
+        const hookEntries = (after.hooks as { SessionStart?: Array<{ hooks: Array<{ type: string; command: string }> }> })?.SessionStart ?? [];
+        assert.equal(hookEntries.length, 1);
+        const hookCmd = hookEntries[0].hooks[0].command;
+        assert.ok(hookCmd.startsWith("node "), hookCmd);
+        assert.ok(hookCmd.endsWith("claude-native-bootstrap.js"), hookCmd);
         // #1660: install no longer persists claude.nativePort — the hook
         // resolves the same zone preference, and its repin pass follows any
         // drift. The bili config may not even exist.
