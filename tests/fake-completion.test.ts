@@ -12,6 +12,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { applyCompatRoles } from "../src/compat-roles.ts";
 import {
     isFakeCompletion,
     hasToolBlock,
@@ -22,6 +23,9 @@ import {
 // Hex escapes so no literal tag sequence appears in this file's source.
 const LT = "\x3c";
 const GT = "\x3e";
+
+// First tokens of the corrective hint (FAKE_COMPLETION_HINT in src/fake-completion.ts).
+const HINT_MARK = "[billion-context]";
 
 // The #361 shape: the model echoed a tool call as TEXT — an opening invoke
 // plus closing tags — with no real tool block. A distinctive marker lets the
@@ -141,7 +145,7 @@ function anthropicSse(event: string, data: unknown): string {
     return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-function startHarness(scripts: string[][]): Promise<Harness> {
+function startHarness(scripts: string[][], extra?: Partial<ProxyOptions>): Promise<Harness> {
     const captured: { body: string }[] = [];
     let call = 0;
     const upstream = http.createServer((req, res) => {
@@ -166,17 +170,19 @@ function startHarness(scripts: string[][]): Promise<Harness> {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
-            routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
+            routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 }, "resp-test": { context: 400_000 } } } },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),
-            compress: { injectTool: false, injectNudge: false },
-            sessionHeader: "x-acp-session",
-            log: false,
-            debug: false,
-            passthrough: false,
-            autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
-        } as ProxyOptions);
+        compress: { injectTool: false, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        ...extra,
+    } as ProxyOptions);
         await once(proxy, "listening");
         const proxyPort = proxy.address().port;
         return {
@@ -198,6 +204,43 @@ async function callAnthropic(h: Harness, session: string, messages: Array<{ role
         method: "POST",
         headers: { "content-type": "application/json", "x-acp-session": session },
         body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: "You are a test assistant.", messages }),
+    });
+    assert.equal(resp.status, 200);
+    let raw = "";
+    for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+    return raw;
+}
+
+// The #1900 scenarios run on the Responses wire: unlike the OpenAI chat
+// adapter (whose prepare pass normalizes developer→system before the wire),
+// Responses carries the client's `developer` role verbatim (codex's native
+// shape) — so only here can a compat-role rewrite or a learned mid-request
+// hop actually change the outbound bytes the hinted retry must preserve.
+function responsesSse(obj: unknown): string {
+    return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+function responsesFakeScript(): string[] {
+    return [
+        responsesSse({ type: "response.output_item.added", output_index: 0, item: { id: "msg_fc_f", type: "message", status: "in_progress", role: "assistant", content: [] } }),
+        responsesSse({ type: "response.output_text.delta", item_id: "msg_fc_f", output_index: 0, content_index: 0, delta: FAKE_XML }),
+        responsesSse({ type: "response.completed", response: { id: "resp_fc_f", status: "completed" } }),
+    ];
+}
+
+function responsesRealScript(): string[] {
+    return [
+        responsesSse({ type: "response.output_item.added", output_index: 0, item: { id: "fc_call_1", type: "function_call", status: "in_progress", name: "real_tool_ok", arguments: "" } }),
+        responsesSse({ type: "response.function_call_arguments.done", item_id: "fc_call_1", output_index: 0, arguments: "{}" }),
+        responsesSse({ type: "response.completed", response: { id: "resp_fc_r", status: "completed" } }),
+    ];
+}
+
+async function callResponses(h: Harness, session: string, input: unknown[]): Promise<string> {
+    const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": session },
+        body: JSON.stringify({ model: "resp-test", stream: true, input }),
     });
     assert.equal(resp.status, 200);
     let raw = "";
@@ -270,4 +313,126 @@ test("e2e #371: legit prose with a single closing tag does NOT trigger a retry",
     } finally {
         await h.close();
     }
+});
+
+test("e2e #1900: hinted retry derives from wire bytes — configured compat role rewrite survives into the retry", async () => {
+    const h = await startHarness([responsesFakeScript(), responsesRealScript()], {
+        compat: { roles: { developer: "system" } },
+    });
+    try {
+        const raw = await callResponses(h, "fc-1900-roles", [
+            { type: "message", role: "developer", content: [{ type: "input_text", text: "you are terse" }] },
+            { type: "message", role: "user", content: [{ type: "input_text", text: "read the file" }] },
+        ]);
+        assert.equal(h.captured.length, 2, `expected original + 1 retry, got ${h.captured.length}`);
+        assert.ok(h.captured[0]!.body.includes('"role":"system"'), "compat.roles applied developer→system on the main send");
+        assert.ok(!h.captured[0]!.body.includes('"role":"developer"'), "main attempt carries the rewritten role");
+        assert.ok(!h.captured[1]!.body.includes('"role":"developer"'), "#1900: hinted retry must NOT re-send the pre-rewrite role");
+        assert.ok(h.captured[1]!.body.includes(HINT_MARK), "hint present in the retry");
+        assert.ok(raw.includes("real_tool_ok"), "client received the recovered function_call");
+        assert.ok(!raw.includes("/fake/completion/marker"), "fake-completion text must not leak to the client");
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e #1900: role learned mid-request (400 → hop) — hinted retry carries the accepted role, not the rejected one", async () => {
+    const captured: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const bodyText = Buffer.concat(chunks).toString("utf8");
+            captured.push(bodyText);
+            if (bodyText.includes('"role":"developer"')) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: "Invalid role: developer" } }));
+                return;
+            }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            const script = bodyText.includes(HINT_MARK) ? responsesRealScript() : responsesFakeScript();
+            for (const line of script) res.write(line);
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "resp-test": { context: 400_000 } } } },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: false, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+    try {
+        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "fc-1900-learn" },
+            body: JSON.stringify({ model: "resp-test", stream: true, input: [
+                { type: "message", role: "developer", content: [{ type: "input_text", text: "you are terse" }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: "read the file" }] },
+            ] }),
+        });
+        assert.equal(resp.status, 200);
+        let raw = "";
+        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        assert.equal(captured.length, 3, `expected main + role-hop + hinted retry, got ${captured.length}`);
+        assert.ok(captured[0]!.includes('"role":"developer"'), "main attempt sends the client's original role");
+        assert.ok(!captured[1]!.includes('"role":"developer"'), "role hop rewrote developer→system before re-sending");
+        assert.ok(!captured[2]!.includes('"role":"developer"'), "#1900: hinted retry must carry the hopped (accepted) role, not the rejected one");
+        assert.ok(captured[2]!.includes(HINT_MARK), "hint present in the retry");
+        assert.ok(raw.includes("real_tool_ok"), "client received the recovered function_call");
+        assert.ok(!raw.includes("/fake/completion/marker"), "fake-completion text must not leak to the client");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("#1900 unit: injectFakeCompletionHint works on a compat-role-rewritten openai body", () => {
+    const raw = JSON.stringify({ model: "m", messages: [
+        { role: "developer", content: "sys" },
+        { role: "user", content: "hi" },
+    ] });
+    const wire = applyCompatRoles(raw, "openai", { developer: "system" });
+    assert.equal(wire.rewritten, true);
+    const out = injectFakeCompletionHint("openai", wire.body);
+    assert.ok(out !== null, "hint injection must handle the transformed openai shape");
+    const parsed = JSON.parse(out!) as { messages: Array<{ role: string; content: string }> };
+    assert.equal(parsed.messages[0]!.role, "system", "rewrite must survive hint injection");
+    const last = parsed.messages[parsed.messages.length - 1]!;
+    assert.equal(last.role, "user");
+    assert.ok(last.content.includes("tool-calling mechanism"));
+});
+
+test("#1900 unit: injectFakeCompletionHint works on a compat-role-rewritten responses body", () => {
+    const raw = JSON.stringify({ model: "m", input: [
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "sys" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    ] });
+    const wire = applyCompatRoles(raw, "responses", { developer: "system" });
+    assert.equal(wire.rewritten, true);
+    const out = injectFakeCompletionHint("responses", wire.body);
+    assert.ok(out !== null, "hint injection must handle the transformed responses shape");
+    const parsed = JSON.parse(out!) as { input: Array<{ role: string; content: Array<{ type: string; text?: string }> }> };
+    assert.equal(parsed.input[0]!.role, "system", "rewrite must survive hint injection");
+    const last = parsed.input[parsed.input.length - 1]!;
+    const texts = last.content.map((c) => c.text ?? "").join("");
+    assert.ok(texts.includes("tool-calling mechanism"));
 });
