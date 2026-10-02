@@ -72,6 +72,24 @@ jobs:
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Verify release-notes entry (#1870)
+        # Visibility gate: every stable release must carry a tiered,
+        # user-meaningful entry in release-notes/package.json (the entry is
+        # part of the release prep PR, model-written, tier routine|recommended).
+        # Fails BEFORE tagging/publishing so nothing ships invisible.
+        if: steps.check.outputs.is_release == 'true' && steps.pre.outputs.prerelease == 'false'
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          node -e "
+            const notes = require('./release-notes/package.json').billionContextReleaseNotes;
+            const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
+            if (!entry) {
+              console.error('release ' + process.argv[1] + ' has no release-notes entry (tier + model-written summary). Add it to release-notes/package.json in the release PR — see release-notes/README.md (#1870).');
+              process.exit(1);
+            }
+            console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
+          " "$VER"
+
       - name: Create tag
         if: steps.check.outputs.is_release == 'true'
         run: |
