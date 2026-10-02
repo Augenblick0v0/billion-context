@@ -94,6 +94,7 @@ export {
     resolveHermesHome,
     readDshConfig,
     parseDshSettingsYaml,
+    parseDshContextWindows,
     resolveDshHome,
     resolveCodexHome,
     resolveTraeHome,

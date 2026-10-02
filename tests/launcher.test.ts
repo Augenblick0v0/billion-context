@@ -52,6 +52,7 @@ import {
     readHermesConfig,
     resolveHermesHome,
     parseDshSettingsYaml,
+    parseDshContextWindows,
     readDshConfig,
     resolveTraeHome,
     readTraeConfig,
@@ -6284,4 +6285,37 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
         ),
         /did not become healthy/,
     );
+});
+
+test("parseDshContextWindows (#1849): model ids under `models:` blocks map to their contextWindow", () => {
+    const win = (text: string) => Object.fromEntries(parseDshContextWindows(text));
+    const full = [
+        "llm-pi-ai:",
+        "  providers:",
+        "    local-vllm:",
+        "      api: openai-completions",
+        "      baseURL: http://127.0.0.1:8199/v1",
+        "      models:",
+        "        - id: qwen3.8-27b",
+        "          contextWindow: 262144",
+        "        - id: \"deepseek-flash\"   # quoted alias",
+        "          contextWindow: 65536",
+        "    relay:",
+        "      baseURL: https://relay.example.com",
+        "      models:",
+        "        - id: glm-5",
+        "          contextWindow: 1048576 # inline comment",
+        "agent-default-model:",
+        "  provider: local-vllm",
+        "  model: qwen3.8-27b",
+        "",
+    ].join("\n");
+    assert.deepEqual(win(full), { "qwen3.8-27b": 262144, "deepseek-flash": 65536, "glm-5": 1048576 });
+    // window before any id in the block is skipped, not misattributed
+    assert.deepEqual(win("models:\n  contextWindow: 999\n  - id: m1\n    contextWindow: 111\n"), { m1: 111 });
+    // non-numeric / zero / negative windows are ignored
+    assert.deepEqual(win("models:\n  - id: bad1\n    contextWindow: abc\n  - id: bad2\n    contextWindow: 0\n  - id: bad3\n    contextWindow: -8\n"), {});
+    // a `models:` block closed by a same-indent sibling key stops collecting
+    assert.deepEqual(win("a:\n  models:\n    - id: in-block\n      contextWindow: 42\n  other: 1\n- id: outside\n  contextWindow: 77\n"), { "in-block": 42 });
+    assert.deepEqual(parseDshContextWindows(""), new Map());
 });

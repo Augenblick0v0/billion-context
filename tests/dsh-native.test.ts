@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetWindowWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -351,7 +351,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined, runtimeInfo?: Array<Record<string, unknown>>): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -364,6 +364,20 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
         if (url === "/__bili/plugin/manifest") {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            return;
+        }
+        if (url === "/__bili/plugin/runtime-info") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                try {
+                    runtimeInfo?.push(JSON.parse(body) as Record<string, unknown>);
+                } catch {
+                    // not JSON — ignore
+                }
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            });
             return;
         }
         if (url.startsWith("/__bili/plugin/tool")) {
@@ -393,12 +407,13 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void; runtimeInfo: Array<Record<string, unknown>> }> {
+    const runtimeInfo: Array<Record<string, unknown>> = [];
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, runtimeInfo));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
-            resolve({ origin: `http://127.0.0.1:${addr.port}`, close: () => server.close() });
+            resolve({ origin: `http://127.0.0.1:${addr.port}`, close: () => server.close(), runtimeInfo });
         });
     });
 }
@@ -980,6 +995,140 @@ test("apply() runtime-info (#1812): a failed window resolve retries after the co
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+    }
+});
+
+function writeSettingsFixture(home: string, model: string, window: number): void {
+    fs.writeFileSync(
+        path.join(home, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            "    local-vllm:",
+            "      api: openai-completions",
+            "      baseURL: http://127.0.0.1:8199/v1",
+            "      models:",
+            `        - id: ${model}`,
+            `          contextWindow: ${window}`,
+            "agent-default-model:",
+            "  provider: local-vllm",
+            `  model: ${model}`,
+            "",
+        ].join("\n"),
+    );
+}
+
+test("settings.yaml window fallback (#1849): a rejecting llm service still stamps and reports the file's window", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-swf-"));
+    writeSettingsFixture(home, "qwen-swf", 131072);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            const warns: string[] = [];
+            const origWarn = console.warn;
+            console.warn = (line: string) => {
+                warns.push(line);
+            };
+            try {
+                const ctx = mockCtx();
+                // the live headless flavor's resolver: present, but EVERY call
+                // rejects (model catalog never initialized)
+                ctx.setModelServices(
+                    { resolveModelInfo: async () => {
+                        throw new Error("Cannot read properties of undefined (reading 'resolveModelInfoFor')");
+                    } },
+                    { currentSelection: () => ({ provider: "local-vllm", model: "qwen-swf" }) },
+                );
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (swf)");
+                ctx.setInitiator({ session: { id: "session-swf" } });
+                const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "131072", "settings fallback stamped the window header");
+                await waitFor(() => proxy.runtimeInfo.some((r) => r.agent === "dsh" && r.model === "qwen-swf" && r.contextWindow === 131072), "runtime-info report carries the file window");
+                assert.equal(warns.filter((w) => w.includes("#1849")).length, 0, "no degradation warn when the file supplies the window");
+            } finally {
+                console.warn = origWarn;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+    }
+});
+
+test("settings.yaml window fallback (#1849): no llm service at all still stamps and reports the file's window", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-swn-"));
+    writeSettingsFixture(home, "qwen-swn", 65536);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            const ctx = mockCtx();
+            // NEITHER model service ever binds (web-profile flavor): the
+            // mock's inject only fires when both are present, so
+            // modelInfo.services stays undefined exactly like the real host
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (swn)");
+            ctx.setInitiator({ session: { id: "session-swn" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "65536", "no-service fallback stamped the window header");
+            await waitFor(() => proxy.runtimeInfo.some((r) => r.agent === "dsh" && r.model === "qwen-swn" && r.contextWindow === 65536), "runtime-info report carries the file window");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+    }
+});
+
+test("settings.yaml window fallback (#1849): a model the file does not declare keeps the degradation warn", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-swm-"));
+    writeSettingsFixture(home, "qwen-swf", 131072);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            const warns: string[] = [];
+            const origWarn = console.warn;
+            console.warn = (line: string) => {
+                warns.push(line);
+            };
+            try {
+                const ctx = mockCtx();
+                ctx.setModelServices(
+                    { resolveModelInfo: async () => {
+                        throw new Error("catalog boom");
+                    } },
+                    { currentSelection: () => ({ provider: "local-vllm", model: "qwen-undeclared" }) },
+                );
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (swm)");
+                ctx.setInitiator({ session: { id: "session-swm" } });
+                const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                await waitFor(() => stamp()?.["x-bili-plugin-model"] === "qwen-undeclared", "failure-shaped cache stamped the model id");
+                // three consecutive rejects (1ms cooldown) with no file entry;
+                // each stamp() poll drives another headersFor → refresh cycle
+                await waitFor(() => {
+                    stamp();
+                    return warns.some((w) => w.includes("#1849"));
+                }, "degradation warn still fires for an undeclared model");
+                assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined, "no window header invented for an undeclared model");
+            } finally {
+                console.warn = origWarn;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
     }
 });
 

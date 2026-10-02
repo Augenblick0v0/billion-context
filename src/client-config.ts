@@ -505,6 +505,91 @@ export function readDshConfig(dshHome: string): DshConfig {
     return { baseUrls: parseDshSettingsYaml(text) };
 }
 
+/** Line-based scanner for dsh settings.yaml model windows (#1849): maps
+ *  every model id declared under a `models:` list to its contextWindow. The
+ *  dsh plugin uses this as the client-side fallback when the host's
+ *  llm.resolveModelInfo service cannot serve (the headless flavor's model
+ *  catalog is never initialized) — the file is the same source of truth the
+ *  host itself launches models from. Narrow shape; anything else is skipped
+ *  silently. */
+export function parseDshContextWindows(text: string): Map<string, number> {
+    const out = new Map<string, number>();
+    let modelsIndent = -1;
+    let current: string | undefined;
+    for (const raw of text.split(/\r?\n/)) {
+        const line = raw.replace(/\s+#.*$/, "");
+        if (line.trim().length === 0) continue;
+        const indent = line.length - line.trimStart().length;
+        if (modelsIndent >= 0) {
+            if (indent <= modelsIndent) {
+                modelsIndent = -1;
+                current = undefined;
+            } else {
+                const idm = /^\s*-\s+id:\s*(\S+)\s*$/.exec(line);
+                if (idm) {
+                    current = idm[1].replace(/^["']|["']$/g, "");
+                    continue;
+                }
+                const wm = /^\s*contextWindow:\s*(\d+)\s*$/.exec(line);
+                if (wm && current !== undefined) {
+                    const n = Math.floor(Number(wm[1]));
+                    if (n > 0) out.set(current, n);
+                    current = undefined;
+                }
+                continue;
+            }
+        }
+        if (/^\s*models:\s*$/.test(line)) {
+            modelsIndent = indent;
+            current = undefined;
+        }
+    }
+    return out;
+}
+
+/** Read DSH_HOME/settings.yaml model windows; an unreadable file yields an
+ *  empty map (the caller stays on the live-service path). */
+export function readDshContextWindows(dshHome: string): Map<string, number> {
+    try {
+        return parseDshContextWindows(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"));
+    } catch {
+        return new Map();
+    }
+}
+
+/** The dsh agent-default-model selection with its declared window (#1849):
+ *  the last-resort client-side source when the host exposes no model
+ *  services at all (the web-profile flavor binds neither llm nor
+ *  agentDefaultModel, so the plugin cannot even learn WHICH model it is
+ *  running — the file is the only place that is still true). */
+export function readDshSelectionWindow(dshHome: string): { provider: string; model: string; contextWindow: number } | undefined {
+    let text: string;
+    try {
+        text = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
+    } catch {
+        return undefined;
+    }
+    let inBlock = false;
+    let provider: string | undefined;
+    let model: string | undefined;
+    for (const raw of text.split(/\r?\n/)) {
+        const line = raw.replace(/\s+#.*$/, "");
+        if (line.trim().length === 0) continue;
+        if (/^[^\s:][^:]*:\s*$/.test(line)) {
+            inBlock = /^agent-default-model:\s*$/.test(line);
+            continue;
+        }
+        if (!inBlock) continue;
+        const pm = /^\s+provider:\s*(\S+)\s*$/.exec(line);
+        if (pm) provider = pm[1].replace(/^["']|["']$/g, "");
+        const mm = /^\s+model:\s*(\S+)\s*$/.exec(line);
+        if (mm) model = mm[1].replace(/^["']|["']$/g, "");
+    }
+    if (provider === undefined || model === undefined) return undefined;
+    const contextWindow = parseDshContextWindows(text).get(model);
+    return contextWindow === undefined ? undefined : { provider, model, contextWindow };
+}
+
 /** Default model API gateways for Trae CLI (ByteDance). The CLI is a Go
  *  binary that honors HTTPS_PROXY (Go net/http) and resolves its API host
  *  from TRAE_CLI_API_HOST (chatmodel.resolveBaseURL); without it the

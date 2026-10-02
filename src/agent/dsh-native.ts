@@ -34,6 +34,7 @@
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { readDshContextWindows, readDshSelectionWindow, resolveDshHome } from "../client-config.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
@@ -215,8 +216,12 @@ function refreshModelInfo(origin: string | undefined): void {
     }
     const resolve = svc.llm?.resolveModelInfo;
     if (resolve === undefined) {
-        modelInfo.cached = { provider, model };
-        warnNoClientWindow(`llm.resolveModelInfo is unavailable in this host for ${provider}/${model}`);
+        // #1849 delivery: no service at all — the file still knows this
+        // session's model window, and that is all the proxy needs.
+        const window = settingsWindowFor(model);
+        modelInfo.cached = { provider, model, ...(window !== undefined ? { contextWindow: window } : {}) };
+        if (window !== undefined) noteSettingsWindowFallback(provider, model, window);
+        else warnNoClientWindow(`llm.resolveModelInfo is unavailable in this host for ${provider}/${model}`);
         return;
     }
     modelInfo.refreshing = true;
@@ -229,14 +234,20 @@ function refreshModelInfo(origin: string | undefined): void {
             // cache (and report) the OLD model's numbers — the next
             // headersFor refresh re-resolves the new one (review on #956).
             if (!selectionStillCurrent(svc, provider, model)) return;
+            const svcWindow = typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined;
+            const svcMax = typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined;
+            // #1849 delivery: the service resolved but carried no window —
+            // fall back to settings.yaml for THIS model before warning.
+            const fallbackWindow = svcWindow === undefined ? settingsWindowFor(model) : undefined;
             modelInfo.cached = {
                 provider,
                 model,
-                contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
-                maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
+                ...(svcWindow !== undefined ? { contextWindow: svcWindow } : fallbackWindow !== undefined ? { contextWindow: fallbackWindow } : {}),
+                ...(svcMax !== undefined ? { maxOutput: svcMax } : {}),
             };
             if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
             else warnNoClientWindow(`host model info for ${provider}/${model} carries no context window`);
+            if (fallbackWindow !== undefined) noteSettingsWindowFallback(provider, model, fallbackWindow);
             consecutiveResolveFailures = 0;
         })
         .catch((err: unknown) => {
@@ -252,8 +263,16 @@ function refreshModelInfo(origin: string | undefined): void {
             // counter resets on any successful resolve, and retries continue
             // regardless (the retryAt cooldown drives them, #1812).
             consecutiveResolveFailures += 1;
-            if (consecutiveResolveFailures >= 3) warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model} (x${consecutiveResolveFailures} consecutive): ${errMessage(err)} (retries continue)`);
-            modelInfo.cached = { provider, model };
+            // #1849 delivery: the live headless flavor rejects EVERY resolve
+            // (its model catalog is never initialized) — before committing a
+            // windowless cache, try settings.yaml for THIS model. A window
+            // found there is final (the fast-path stops retrying the broken
+            // service), and the degradation warn only fires when even the
+            // file cannot supply a number.
+            const window = settingsWindowFor(model);
+            modelInfo.cached = { provider, model, ...(window !== undefined ? { contextWindow: window } : {}) };
+            if (window !== undefined) noteSettingsWindowFallback(provider, model, window);
+            else if (consecutiveResolveFailures >= 3) warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model} (x${consecutiveResolveFailures} consecutive): ${errMessage(err)} (retries continue)`);
         })
         .finally(() => {
             modelInfo.refreshing = false;
@@ -286,6 +305,42 @@ let unstampedStamps = 0;
 // #1929 review: rejects must be STRUCTURAL before they warn — a boot-race
 // reject that recovers on the next cooldown retry is noise, not #1849.
 let consecutiveResolveFailures = 0;
+// #1849 delivery: settings.yaml window cache for the CURRENT selection's
+// model. Read once per process — the file is the host's own launch config;
+// mid-session edits are picked up by the live llm service when the host can
+// serve it at all, which is exactly the path this fallback supplements.
+let settingsWindows: Map<string, number> | undefined;
+let settingsWindowLoggedFor = "";
+function settingsWindowFor(model: string): number | undefined {
+    if (settingsWindows === undefined) settingsWindows = readDshContextWindows(resolveDshHome(process.env));
+    return settingsWindows.get(model);
+}
+function noteSettingsWindowFallback(provider: string, model: string, window: number): void {
+    const key = `${provider}/${model}`;
+    if (settingsWindowLoggedFor === key) return;
+    settingsWindowLoggedFor = key;
+    const msg = `settings.yaml contextWindow ${window} for ${key} used as fallback — the host's llm service could not serve it (#1849)`;
+    persistClientEvent(msg);
+    console.log(`bili-native-dsh: ${msg}`);
+}
+// #1849 delivery, no-services shape: when NEITHER model service ever binds
+// (web-profile flavor) the plugin cannot even learn which model it runs —
+// settings.yaml's agent-default-model is then the only true statement of
+// "this session's model + window". Applied once per process; a later live
+// binding that resolves a different selection overwrites it as usual.
+let settingsSelectionDone = false;
+function settingsSelectionFallback(origin: string | undefined): boolean {
+    if (settingsSelectionDone) return modelInfo.cached?.contextWindow !== undefined;
+    settingsSelectionDone = true;
+    const sel = readDshSelectionWindow(resolveDshHome(process.env));
+    if (sel === undefined) return false;
+    modelInfo.cached = { provider: sel.provider, model: sel.model, contextWindow: sel.contextWindow };
+    noteSettingsWindowFallback(sel.provider, sel.model, sel.contextWindow);
+    if (origin !== undefined) {
+        void reportRuntimeInfo(origin, { agent: "dsh", model: sel.model, contextWindow: sel.contextWindow, source: "client-config" }).catch(() => {});
+    }
+    return true;
+}
 function warnNoClientWindow(reason: string): void {
     if (warnedNoClientWindow) return;
     warnedNoClientWindow = true;
@@ -853,7 +908,12 @@ export function apply(ctx: PluginContext): void {
         const sid = sessionIdOf(ctx);
         if (sid === undefined) return undefined;
         refreshModelInfo(register.base);
-        if (modelInfo.services === undefined) noteUnstampedStamp();
+        if (modelInfo.services === undefined) {
+            // #1849 delivery: no model services at all — settings.yaml still
+            // states this session's model and its window; only when even the
+            // file cannot supply a number does the degradation warn fire.
+            if (!settingsSelectionFallback(register.base)) noteUnstampedStamp();
+        }
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
         if (modelInfo.cached !== undefined) {
             headers["x-bili-plugin-model"] = modelInfo.cached.model;
@@ -1008,4 +1068,7 @@ export function _resetWindowWarningForTest(): void {
     warnedNoClientWindow = false;
     unstampedStamps = 0;
     consecutiveResolveFailures = 0;
+    settingsWindows = undefined;
+    settingsWindowLoggedFor = "";
+    settingsSelectionDone = false;
 }
