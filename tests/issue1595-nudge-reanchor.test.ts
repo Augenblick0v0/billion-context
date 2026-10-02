@@ -287,7 +287,16 @@ test("#1595 I-A: real usage report retires a phantom-high nudge reference armed 
         const s2 = listSessions().find((x) => x.id === s!.id)!;
         assert.equal(s2.stats.lastInputTokens, 5000, "real usage report overwrote the armed estimate");
         assert.equal(s2.stats.lastInputTokensSource, "usage", "provenance flipped back to usage");
-        assert.ok(logs.some((l) => l.includes("nudge reference re-anchored 600000 -> 5000")), `re-anchor log missing: ${JSON.stringify(logs.filter((l) => l.includes("re-anchor")))}`);
+        // Phantom retirement can now happen on EITHER side: acp-kernel >= 0.0.100
+        // (ak#479 / ak#478) re-anchors the shown reference inside the nudge node
+        // the moment the incoming count drops below it, BEFORE bc's usage-settle
+        // hook runs — in that case there is no bc log line. bc's reanchorNudge-
+        // OnUsageDrop stays as defense-in-depth and still logs when it is the
+        // one that retires the reference. The invariant under test is the END
+        // STATE: the phantom never survives a real usage report.
+        if (s2.state.nudge.lastNudgeShownTokens !== 0 || Number(s2.state.nudge.lastPerMessageNudgeTokens) !== 5000) {
+            assert.ok(logs.some((l) => l.includes("nudge reference re-anchored 600000 -> 5000")), `re-anchor log missing: ${JSON.stringify(logs.filter((l) => l.includes("re-anchor")))}`);
+        }
         assert.equal(s2.state.nudge.lastNudgeShownTokens, 0, "phantom shown reference retired");
         assert.equal(s2.state.nudge.lastPerMessageNudgeTokens, 5000, "baseline re-anchored to reality");
         assert.deepEqual(s2.state.nudge.lastShownByTier, {}, "per-tier stamps cleared");
