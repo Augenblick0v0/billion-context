@@ -108,6 +108,10 @@ export class ResponsesWsHistory {
         this.checkpoint = { id: response.id, request, output: response.output };
     }
 
+    retainedBytes(): number {
+        return this.checkpoint ? Buffer.byteLength(JSON.stringify(this.checkpoint.request)) + Buffer.byteLength(JSON.stringify(this.checkpoint.output)) : 0;
+    }
+
     clear(): void {
         this.checkpoint = undefined;
     }
@@ -124,6 +128,14 @@ export class ResponsesWsUpstream {
     private resetHistory(reason: string): void {
         this.history.clear();
         this.log("debug", `upstream checkpoint reset reason=${reason}`);
+    }
+
+    get retainedBytes(): number {
+        return this.history.retainedBytes();
+    }
+
+    get socketOpen(): boolean {
+        return this.socket?.readyState === UpstreamWebSocket.OPEN;
     }
 
     close(reason = "transport-close"): void {
@@ -365,13 +377,44 @@ class ResponsesWsResponse extends http.ServerResponse {
     }
 }
 
+export interface ResponsesWsPeerStat {
+    conn: number;
+    session: string;
+    connectedAt: number;
+    lastActivityAt: number;
+    idleSeconds: number;
+    active: boolean;
+    requests: number;
+    upstreamConnected: boolean;
+    retainedBytes: number;
+}
+
+export interface ResponsesWsLaneStats {
+    peers: ResponsesWsPeerStat[];
+    peerCount: number;
+    activePeers: number;
+    totalRetainedBytes: number;
+}
+
+interface PeerRecord {
+    conn: number;
+    session: string;
+    transport: ResponsesWsUpstream;
+    history: ResponsesWsHistory;
+    connectedAt: number;
+    lastActivityAt: number;
+    requests: number;
+    busy: boolean;
+}
+
 export function installResponsesWebSocket(
     server: http.Server,
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
     log: (level: string, message: string) => void,
-): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
+): { upgrade: (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean; stats: () => ResponsesWsLaneStats } {
     const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
     const transports = new Set<ResponsesWsUpstream>();
+    const peers = new Set<PeerRecord>();
     let connectionId = 0;
     const close = server.close.bind(server);
     server.close = callback => {
@@ -384,7 +427,7 @@ export function installResponsesWebSocket(
         for (const peer of wss.clients) peer.terminate();
         wss.close();
     });
-    return (source, socket, head) => {
+    const upgrade: (source: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean = (source, socket, head) => {
         const match = /^\/bili\/responses\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(source.url ?? "");
         const conversation = source.headers["x-bili-plugin-conversation"];
         if (!match || !isLoopbackAddress(source.socket.remoteAddress) || source.headers["x-bili-plugin"] !== "opencode" || typeof conversation !== "string" || conversation.trim().length === 0) return false;
@@ -397,25 +440,29 @@ export function installResponsesWebSocket(
             }
             if (socket.destroyed) return;
             wss.handleUpgrade(source, socket, head, peer => {
-                const label = `[responses-ws] [conn=${++connectionId}] [session=${JSON.stringify(conversation.slice(0, 128))}]`;
+                const conn = ++connectionId;
+                const label = `[responses-ws] [conn=${conn}] [session=${JSON.stringify(conversation.slice(0, 128))}]`;
                 const trace: DiagnosticLog = (level, message) => log(level, `${label} ${message}`);
                 const transport = new ResponsesWsUpstream(trace);
-                transports.add(transport);
                 const history = new ResponsesWsHistory();
+                const record: PeerRecord = { conn, session: conversation.slice(0, 128), transport, history, connectedAt: Date.now(), lastActivityAt: Date.now(), requests: 0, busy: false };
+                transports.add(transport);
+                peers.add(record);
                 let active: ResponsesWsResponse | undefined;
-                let busy = false;
                 peer.on("error", () => {});
                 peer.on("close", code => {
-                    trace("debug", `client closed phase=${busy ? "active" : "idle"} close_code=${code}`);
+                    trace("debug", `client closed phase=${record.busy ? "active" : "idle"} close_code=${code}`);
                     active?.destroy();
                     transport.close("client-close");
                     history.clear();
                     trace("debug", "client checkpoint reset reason=client-close");
                     transports.delete(transport);
+                    peers.delete(record);
                 });
                 peer.on("message", (data, binary) => {
+                    record.lastActivityAt = Date.now();
                     if (binary) { peer.close(1003, "Responses requires text frames"); return; }
-                    if (busy) { trace("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
+                    if (record.busy) { trace("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
                     let frame: unknown;
                     let body: JsonObject;
                     try {
@@ -430,7 +477,8 @@ export function installResponsesWebSocket(
                         peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
                         return;
                     }
-                    busy = true;
+                    record.busy = true;
+                    record.requests += 1;
                     const req = new http.IncomingMessage(source.socket);
                     req.complete = true;
                     req.method = "POST";
@@ -457,7 +505,8 @@ export function installResponsesWebSocket(
                             if (!res.writableEnded) res.end();
                         } finally {
                             active = undefined;
-                            busy = false;
+                            record.busy = false;
+                            record.lastActivityAt = Date.now();
                         }
                     });
                 });
@@ -469,4 +518,25 @@ export function installResponsesWebSocket(
         });
         return true;
     };
+    const stats = (): ResponsesWsLaneStats => {
+        const now = Date.now();
+        const peerStats = [...peers].map(record => ({
+            conn: record.conn,
+            session: record.session,
+            connectedAt: record.connectedAt,
+            lastActivityAt: record.lastActivityAt,
+            idleSeconds: Math.max(0, Math.round((now - record.lastActivityAt) / 1000)),
+            active: record.busy,
+            requests: record.requests,
+            upstreamConnected: record.transport.socketOpen,
+            retainedBytes: record.history.retainedBytes() + record.transport.retainedBytes,
+        }));
+        return {
+            peers: peerStats,
+            peerCount: peerStats.length,
+            activePeers: peerStats.filter(stat => stat.active).length,
+            totalRetainedBytes: peerStats.reduce((sum, stat) => sum + stat.retainedBytes, 0),
+        };
+    };
+    return { upgrade, stats };
 }

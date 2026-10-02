@@ -42,6 +42,12 @@ generic opaque WebSocket passthrough, or change the user's OpenCode configuratio
   full/delta request mode, and checkpoint reset/recovery reason. They omit
   authorization headers, URLs, close-reason text, payloads, and upstream error
   messages. Normal lifecycle/recovery details use debug; failures use warn.
+- Lane observability is on-demand: GET /__bili/stats reports live Responses
+  WebSocket peers under responsesWs - per-peer connection id, session prefix,
+  connected/idle age, activity state, request count, upstream socket liveness,
+  and retained checkpoint bytes (both legs), plus lane totals. It reads live
+  state only: no timers, no configuration surface, and nothing beyond the
+  session prefix already logged at connect time.
 - No configuration field, environment variable, package version, persistence
   format, or acp-kernel version is added or changed. Socket checkpoints are
   connection-local; ACP persistence remains unchanged. The ws implementation is

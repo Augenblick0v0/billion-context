@@ -127,7 +127,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { installResponsesWebSocket } from "./responses-ws.js";
+import { installResponsesWebSocket, type ResponsesWsLaneStats } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
@@ -428,7 +428,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             res.on("finish", () => { connRec.lastResponseEndAt = Date.now(); });
         }
         try {
-            await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid);
+            await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, responsesWsStats);
         } catch (err) {
             const msg = String(err);
             const e = err as { name?: string; message?: string };
@@ -452,7 +452,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     };
     const server = http.createServer(dispatch);
-    const responsesUpgrade = installResponsesWebSocket(server, dispatch, log);
+    const { upgrade: responsesUpgrade, stats: responsesWsStats } = installResponsesWebSocket(server, dispatch, log);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -1168,6 +1168,7 @@ async function handle(
     instanceStartedAt: number,
     proxyWatchers: Set<number>,
     initialWatcherPid: number | null,
+    responsesWsStats: () => ResponsesWsLaneStats,
 ): Promise<void> {
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
@@ -1208,7 +1209,7 @@ async function handle(
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
     }
-    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res, responsesWsStats);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
@@ -6866,7 +6867,7 @@ function reapOrphansLogged(session: Session, msgs: CoreMessage[], log: (level: s
     recordConflict(session, "orphan-reap", `${reaped.length} block(s) deactivated: ${reaped.join(", ")}`);
 }
 
-function sendStats(res: http.ServerResponse): void {
+function sendStats(res: http.ServerResponse, responsesWs: () => ResponsesWsLaneStats): void {
     const all = listSessions();
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
@@ -6896,7 +6897,7 @@ function sendStats(res: http.ServerResponse): void {
         };
     });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all), responsesWs: responsesWs() }, null, 2));
 }
 
 /** Stale-install state for the web UI badge (#811): whether the on-disk

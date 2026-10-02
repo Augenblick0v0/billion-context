@@ -721,3 +721,79 @@ test(`Responses WS: actual fold and successive tool results survive ${terminalOu
     } finally { await f.close(); }
 });
 }
+
+test("WS checkpoints expose retained bytes for lane observability", () => {
+    const history = new ResponsesWsHistory();
+    assert.equal(history.retainedBytes(), 0);
+    const request = { model: "m", input: [user("bytes")] };
+    const output = [{ type: "message", role: "assistant", content: "ok", status: "completed" }];
+    history.commit(request, { id: "resp_b", status: "completed", output });
+    assert.equal(history.retainedBytes(), Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(output)));
+    history.clear();
+    assert.equal(history.retainedBytes(), 0);
+    const upstream = new ResponsesWsUpstream();
+    assert.equal(upstream.socketOpen, false);
+    assert.equal(upstream.retainedBytes, 0);
+});
+
+interface LaneStat { conn: number; session: string; connectedAt: number; lastActivityAt: number; idleSeconds: number; active: boolean; requests: number; upstreamConnected: boolean; retainedBytes: number; }
+interface LaneStats { peers: LaneStat[]; peerCount: number; activePeers: number; totalRetainedBytes: number; }
+
+test("Responses WS: lane observability reports peers, idle age and retained bytes via /__bili/stats", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        const readLane = async (): Promise<LaneStats> => ((await (await fetch(`${f.proxyOrigin}/__bili/stats`)).json()) as { responsesWs: LaneStats }).responsesWs;
+        const waitForLane = async (what: string, cond: () => Promise<boolean>): Promise<void> => {
+            const deadline = Date.now() + 5000;
+            for (;;) {
+                if (await cond()) return;
+                if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+        };
+        f.peer.terminate();
+        await waitForLane("lane drain", async () => (await readLane()).peerCount === 0);
+        assert.deepEqual(await readLane(), { peers: [], peerCount: 0, activePeers: 0, totalRetainedBytes: 0 });
+        const client = await f.openPeer();
+        const first = completed(await f.turn([user("observability baseline")], undefined, {}, client));
+        let lane = await readLane();
+        lane = await readLane();
+        assert.equal(lane.peerCount, 1);
+        assert.equal(lane.activePeers, 0);
+        assert.equal(lane.peers.length, 1);
+        assert.equal(lane.peers[0].session, f.sid.slice(0, 128));
+        assert.equal(lane.peers[0].requests, 1);
+        assert.equal(lane.peers[0].active, false);
+        assert.equal(lane.peers[0].upstreamConnected, true);
+        assert.ok(Number.isInteger(lane.peers[0].conn) && lane.peers[0].conn >= 1);
+        assert.ok(lane.peers[0].connectedAt > 0 && lane.peers[0].lastActivityAt >= lane.peers[0].connectedAt);
+        assert.ok(lane.peers[0].idleSeconds >= 0 && lane.peers[0].idleSeconds < 60);
+        assert.ok(lane.peers[0].retainedBytes > 0);
+        assert.equal(lane.totalRetainedBytes, lane.peers[0].retainedBytes);
+        const retainedAfterFirst = lane.peers[0].retainedBytes;
+        f.setTerminalMode("hold");
+        const held = f.turn([user("held exchange")], first.id as string, {}, client);
+        await waitForLane("active peer", async () => (await readLane()).activePeers === 1);
+        assert.equal((await readLane()).peers[0].active, true);
+        f.finishHeld();
+        f.setTerminalMode("completed");
+        await held;
+        lane = await readLane();
+        assert.equal(lane.peerCount, 1);
+        assert.equal(lane.activePeers, 0);
+        assert.equal(lane.peers[0].requests, 2);
+        assert.ok(lane.peers[0].retainedBytes > retainedAfterFirst, `${lane.peers[0].retainedBytes} !> ${retainedAfterFirst}`);
+        const other = await f.openPeer();
+        lane = await readLane();
+        assert.equal(lane.peerCount, 2);
+        assert.equal(lane.activePeers, 0);
+        assert.deepEqual(lane.peers.map(stat => stat.requests).sort((a, b) => a - b), [0, 2]);
+        other.terminate();
+        await waitForLane("peer removal", async () => (await readLane()).peerCount === 1);
+        lane = await readLane();
+        assert.equal(lane.peerCount, 1);
+        assert.equal(lane.peers[0].requests, 2);
+        assert.equal(lane.totalRetainedBytes, lane.peers[0].retainedBytes);
+        assert.doesNotMatch(JSON.stringify(lane), /observability baseline|held exchange|fake-credential/);
+    } finally { await f.close(); }
+});
