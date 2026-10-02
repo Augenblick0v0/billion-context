@@ -13,7 +13,7 @@ import { runMcpStdio } from "../mcp.js";
 import { fetchManifest } from "../agent/shared.js";
 import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
 import { resolveZcodeNativePort } from "../config.js";
-import { configureLogger, log as teeLog } from "../logger.js";
+import { closeLogger, configureLogger, log as teeLog } from "../logger.js";
 import { defaultLogFile } from "../paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import type { ZcodeRoutePolicy } from "./json-edit.js";
@@ -110,12 +110,17 @@ export async function main(): Promise<void> {
     } catch (err) {
         log(`bootstrap failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    // Every early exit below must drain the log tee first: process.exit drops
+    // the async file-stream buffer, and zcode captures none of this child's
+    // stderr — an unflushed final line exists nowhere (#1892).
     if (!bootstrap || bootstrap.mode === "off") {
         unrouteZcode({ log });
+        await closeLogger();
         process.exit(0);
     }
     const applied = bootstrap.routed;
     if (!applied) {
+        await closeLogger();
         process.exit(0);
     }
     process.env.BILI_MCP_PROXY = applied.origin;
@@ -125,6 +130,7 @@ export async function main(): Promise<void> {
     } catch (err) {
         log(`ACP manifest unavailable — leaving plugin mode off: ${err instanceof Error ? err.message : String(err)}`);
         unrouteZcode({ log });
+        await closeLogger();
         process.exit(0);
     }
     await activateZcodePluginMode(applied, { log });
@@ -137,8 +143,9 @@ export async function main(): Promise<void> {
 }
 
 if (process.argv[1] && /(?:^|[\\/])mcp-entry\.(?:ts|js)$/.test(process.argv[1])) {
-    main().catch((err) => {
+    main().catch(async (err) => {
         process.stderr.write(`[bili-zcode] fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+        await closeLogger();
         process.exit(1);
     });
 }
