@@ -213,7 +213,13 @@ function refreshModelInfo(origin: string | undefined): void {
         if (modelInfo.cached.contextWindow !== undefined) return;
         if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
     }
-    const resolve = svc.llm?.resolveModelInfo;
+    // #1942: dsh registers resolveModelInfo as a class method that delegates
+    // through its receiver (this.resolveModelInfoFor(this.registration(provider), …)).
+    // Extracting it as a bare property detaches `this` (undefined in strict mode),
+    // so every resolve rejects and the failure cache strips x-bili-plugin-context-window
+    // for 100% of providers/models. Bind the receiver at the extraction site; harmless
+    // if a host ever supplies a plain function that ignores `this`.
+    const resolve = svc.llm?.resolveModelInfo?.bind(svc.llm);
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;

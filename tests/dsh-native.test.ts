@@ -975,6 +975,52 @@ test("apply() runtime-info (#1812): a failed window resolve retries after the co
     }
 });
 
+test("apply() runtime-info (#1942): a receiver-dependent resolver is bound, not called detached", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-bind-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // dsh registers resolveModelInfo as a class method that delegates
+            // through its receiver; the other suites' object-literal stubs never
+            // depend on `this`, which is why they pass even when the call is
+            // detached. This fixture reproduces the real host shape.
+            class ReceiverLlm {
+                resolveModelInfo(_provider: string, _model: string): Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> {
+                    return Promise.resolve(this.inner());
+                }
+                inner(): { context: { contextWindow: number }; defaultMaxTokens: number } {
+                    return { context: { contextWindow: 1_000_000 }, defaultMaxTokens: 65536 };
+                }
+            }
+            const llmService = new ReceiverLlm();
+            // the fixture genuinely needs its receiver: a bare-property call
+            // detaches `this` and rejects before any catalog logic runs
+            const detached = llmService.resolveModelInfo;
+            await assert.rejects(Promise.resolve().then(() => detached("workbuddy", "space-bunny")), /Cannot read properties of undefined/);
+            ctx.setModelServices(llmService, { currentSelection: () => ({ provider: "workbuddy", model: "space-bunny" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (bind)");
+            ctx.setInitiator({ session: { id: "session-bind" } });
+            // pre-fix the detached call threw, latched the failure-shaped cache,
+            // and the window header never appeared; bound, the first resolve commits it
+            await waitFor(() => {
+                const h = _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                return h?.["x-bili-plugin-context-window"] === "1000000";
+            }, "bound resolver stamped the context-window header");
+            const headers = _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            assert.equal(headers?.["x-bili-plugin-model"], "space-bunny");
+            assert.equal(headers?.["x-bili-plugin-context-window"], "1000000");
+            assert.equal(headers?.["x-bili-plugin-max-output"], "65536");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("apply() /acp pre-first-request (#955): renders the runtime-table entry before any model request", async () => {
     const pre = {
         ok: true,
