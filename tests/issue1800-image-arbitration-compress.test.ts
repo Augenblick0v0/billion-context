@@ -28,6 +28,9 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // upstream + startServer e2e). Window 200K; one screenshot whose BYTES-mode
 // cost (b64/4) alone exceeds the window so no amount of text folding can make
 // the payload fit — forcing the post-compress image-arbitration forward.
+// #1843 made auto resolve to pixels for every host, so this scenario pins
+// imageBilling:"bytes" explicitly — the conservative over-estimate class that
+// still exists as an opt-in and is exactly what the arbitration path serves.
 
 const WINDOW = 200_000;
 const MODEL = "llama-flash-1800";
@@ -81,7 +84,7 @@ async function startProxy(upstreamPort: number): Promise<{ proxy: http.Server; p
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW } }, imageBilling: "bytes" } },
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW),
         compress: { injectTool: true, injectNudge: true },

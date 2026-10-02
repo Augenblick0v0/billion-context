@@ -27,7 +27,7 @@
  * (not owned). Otherwise a detached proxy child is spawned on that port (or a
  * free one) and OWNED — it is killed when the client exits.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -1474,6 +1474,165 @@ function sqliteSetMembers(base: string): string[] {
     return [base, `${base}-wal`, `${base}-shm`, `${base}-journal`];
 }
 
+/** True when a top-level home entry names a SQLite main database: a known db
+ *  extension, or a live sidecar sibling (-wal/-shm/-journal) that only SQLite
+ *  produces next to its main db. Sidecar-named entries never qualify. The
+ *  suffix list must stay broader than ".db" — codex keeps its databases as
+ *  *.sqlite, and missing one re-opens the per-file splice (#1917). */
+export function isSqliteMain(name: string, siblings: ReadonlySet<string>): boolean {
+    const lower = name.toLowerCase();
+    if (lower.endsWith("-wal") || lower.endsWith("-shm") || lower.endsWith("-journal")) return false;
+    if (lower.endsWith(".db") || lower.endsWith(".sqlite") || lower.endsWith(".sqlite3")) return true;
+    return siblings.has(`${name}-wal`) || siblings.has(`${name}-shm`) || siblings.has(`${name}-journal`);
+}
+
+/** Overlay-local provenance of the private SQLite copies (#1919). Maps each
+ *  base db name to the sha256 + size of every set member at the moment
+ *  copySqliteSet copied it into the overlay, so mergeSqliteSet can tell "this
+ *  side is bili's own unmodified generation from the previous launch" — the
+ *  NORMAL steady state under copy-on-launch — from "this side advanced on its
+ *  own" (a concurrent plain run), which is the only true divergence. */
+export const SQLITE_ORIGIN_FILE = ".bili-sqlite-origin.json";
+type SqliteOriginMap = Record<string, Record<string, { h: string; s: number }>>;
+
+function readSqliteOrigin(overlay: string): SqliteOriginMap {
+    try {
+        const raw: unknown = JSON.parse(fs.readFileSync(path.join(overlay, SQLITE_ORIGIN_FILE), "utf8"));
+        if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) return raw as SqliteOriginMap;
+    } catch {}
+    return {};
+}
+
+function writeSqliteOrigin(overlay: string, map: SqliteOriginMap): void {
+    try {
+        const dst = path.join(overlay, SQLITE_ORIGIN_FILE);
+        const tmp = `${dst}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(map));
+        fs.renameSync(tmp, dst);
+    } catch {}
+}
+
+function sha256File(p: string): string | undefined {
+    const hash = createHash("sha256");
+    let fd: number | undefined;
+    try {
+        fd = fs.openSync(p, "r");
+        const buf = Buffer.allocUnsafe(8 * 1024 * 1024);
+        for (;;) {
+            const n = fs.readSync(fd, buf, 0, buf.length, null);
+            if (n <= 0) break;
+            hash.update(n === buf.length ? buf : buf.subarray(0, n));
+        }
+        return hash.digest("hex");
+    } catch {
+        return undefined;
+    } finally {
+        if (fd !== undefined) {
+            try {
+                fs.closeSync(fd);
+            } catch {}
+        }
+    }
+}
+
+/** Record what now sits in the overlay for this base (post-copy) so the next
+ *  merge-back can recognize bili's own unmodified generations (#1919). Only a
+ *  recorded MAIN makes the entry usable; sidecar entries are best-effort. */
+function recordSqliteOrigin(overlay: string, base: string): void {
+    const members: Record<string, { h: string; s: number }> = {};
+    for (const m of sqliteSetMembers(base)) {
+        let st: fs.Stats;
+        try {
+            st = fs.lstatSync(path.join(overlay, m));
+        } catch {
+            continue;
+        }
+        if (!st.isFile()) continue;
+        const h = sha256File(path.join(overlay, m));
+        if (h === undefined) continue;
+        members[m] = { h, s: st.size };
+    }
+    if (members[base] === undefined) return;
+    const map = readSqliteOrigin(overlay);
+    map[base] = members;
+    writeSqliteOrigin(overlay, map);
+}
+
+/** True when every currently-present member of `loserDir`'s SQLite set still
+ *  matches the origin snapshot bili recorded when it copied the set into the
+ *  overlay (#1919): the loser is then bili's own unmodified generation,
+ *  redundant with the winner's, safe to drop without a conflict file or a
+ *  warning. A recorded sidecar may be ABSENT now — an external plain run that
+ *  checkpointed an empty WAL deletes it without touching the main — but a
+ *  present member that was never recorded, or whose size/hash changed since
+ *  the copy, means the side advanced independently: not stale. The same
+ *  snapshot serves both sides because the copy is byte-exact. Missing or
+ *  corrupt record (e.g. upgrade mid-cycle) → false → conservative fallback. */
+function sqliteLoserIsStaleCopy(overlay: string, loserDir: string, base: string): boolean {
+    const rec = readSqliteOrigin(overlay)[base];
+    if (rec === undefined || rec[base] === undefined) return false;
+    const matches = (m: string, st: fs.Stats): boolean => {
+        const info = rec[m];
+        if (info === undefined) return false;
+        if (st.size !== info.s) return false;
+        const h = sha256File(path.join(loserDir, m));
+        return h !== undefined && h === info.h;
+    };
+    let mainSt: fs.Stats;
+    try {
+        mainSt = fs.lstatSync(path.join(loserDir, base));
+    } catch {
+        return false;
+    }
+    if (!mainSt.isFile() || !matches(base, mainSt)) return false;
+    for (const m of sqliteSetMembers(base)) {
+        if (m === base) continue;
+        let st: fs.Stats;
+        try {
+            st = fs.lstatSync(path.join(loserDir, m));
+        } catch {
+            continue;
+        }
+        if (!st.isFile() || !matches(m, st)) return false;
+    }
+    return true;
+}
+
+/** Copy a real-home SQLite set into the overlay as PRIVATE regular files
+ *  (#1917). A main db must never be file-linked across the two homes: SQLite
+ *  names its -wal/-shm relative to the path it was opened through, so two
+ *  paths over one inode grow independent WALs that do not coordinate —
+ *  concurrent writers lose committed rows and crash recovery corrupts the db
+ *  (sqlite.org/howtocorrupt.html#multiple_links_to_the_same_file). Copying the
+ *  whole set keeps a crashed launch's WAL recoverable against its exact main
+ *  db; the set merges back as a unit on exit (mergeSqliteSet). On success the
+ *  copied bytes are recorded as the set's origin snapshot (#1919). Returns
+ *  false when the base db could not be copied. */
+function copySqliteSet(realHome: string, overlay: string, base: string): boolean {
+    let ok = true;
+    for (const m of sqliteSetMembers(base)) {
+        let st: fs.Stats;
+        try {
+            st = fs.lstatSync(path.join(realHome, m));
+        } catch {
+            continue;
+        }
+        if (!st.isFile()) continue;
+        try {
+            fs.copyFileSync(path.join(realHome, m), path.join(overlay, m));
+        } catch {
+            ok = false;
+        }
+    }
+    let mainInOverlay = false;
+    try {
+        mainInOverlay = fs.lstatSync(path.join(overlay, base)).isFile();
+    } catch {}
+    if (!mainInOverlay) ok = false;
+    else recordSqliteOrigin(overlay, base);
+    return ok;
+}
+
 /** A `<name>.bili-conflict` target that does not already exist, so a retry
  *  round never silently overwrites a previous round's preserved loser (#381
  *  review): renameSync clobbers an existing target, so append `.1`, `.2`, …
@@ -1498,13 +1657,20 @@ function freeConflictName(dst: string): string {
  *  mtime — a WAL/journal is only valid against its exact main db, so the whole
  *  set must come from a single side: per-member mtime adjudication could splice
  *  a newer main db with a newer WAL from the other side and corrupt the
- *  database. The winner's members become the real home's active set; every
- *  losing member is preserved as `<name>.bili-conflict` (never overwritten). A
+ *  database. The winner's members become the real home's active set. When BOTH
+ *  sides hold a main, the loser is checked against the origin snapshot recorded
+ *  at copy time (#1919): still byte-identical → bili's own unmodified generation,
+ *  dropped silently; different (or no snapshot) → true divergence, preserved as
+ *  `<name>.bili-conflict` (never overwritten). A
  *  set with no main db on either side (orphan sidecars) is stale residue and is
  *  preserved wholesale as conflicts, never moved in as an active db. If any
  *  rename fails (real db open/locked on Windows) the moved ones roll back and
- *  the set stays for the next launch. */
-function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
+ *  the set stays for the next launch. Pre-fix overlays file-linked the main db
+ *  into the overlay (symlink, or write-through hardlink on Windows): such a
+ *  shared link is dropped here — its per-path -wal/-shm sidecars cannot be
+ *  replayed against a main the other path may have advanced, so they are
+ *  quarantined as conflicts, never merged (#1917). */
+export function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
     const members = sqliteSetMembers(base);
     const statFile = (dir: string, m: string): fs.Stats | undefined => {
         try {
@@ -1514,13 +1680,83 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
             return undefined;
         }
     };
-    const oMain = statFile(overlay, base);
+    let oMain = statFile(overlay, base);
     const rMain = statFile(realHome, base);
+    // Legacy shared-main migration (#1917), see doc above. The overlay entry
+    // IS the real main (same inode / same target) — dropping the link loses
+    // nothing; only the untrusted sidecars are quarantined below.
+    let sharedLink: "symlink" | "hardlink" | undefined;
+    try {
+        const lst = fs.lstatSync(path.join(overlay, base));
+        if (lst.isSymbolicLink()) {
+            // Compare RESOLVED paths, not the raw link string: relative or
+            // differently-spelled targets ("../real/state_5.sqlite") still name
+            // the same file and must be migrated, not silently kept.
+            try {
+                if (fs.realpathSync(path.join(overlay, base)) === fs.realpathSync(path.join(realHome, base))) sharedLink = "symlink";
+            } catch {}
+        } else if (lst.isFile() && rMain !== undefined && isWriteThroughHardlink(path.join(overlay, base), path.join(realHome, base), lst)) {
+            sharedLink = "hardlink";
+        }
+    } catch {}
+    if (sharedLink !== undefined) {
+        try {
+            fs.unlinkSync(path.join(overlay, base));
+        } catch {
+            console.error(`bili: could not drop the ${sharedLink}-shared ${path.join(overlay, base)} (likely locked) — retry on the next launch.`);
+            return false;
+        }
+        oMain = undefined;
+        console.error(
+            `bili: ${path.join(overlay, base)} was shared with ${realHome} via a ${sharedLink} (legacy layout, #1917) — dropped; ` +
+                `its -wal/-shm sidecars left in the overlay are quarantined as .bili-conflict, not replayed onto the shared main.`,
+        );
+    }
     let winner: "overlay" | "real" | "orphan";
     if (oMain && rMain) winner = rMain.mtimeMs >= oMain.mtimeMs ? "real" : "overlay";
     else if (oMain) winner = "overlay";
     else if (rMain) winner = "real";
     else winner = "orphan";
+    // Both sides hold a main. Under copy-on-launch that is the NORMAL steady
+    // state (#1919), not a divergence signal: every launch's copy phase leaves
+    // a fresh overlay copy next to the previous launch's merged-back db, so
+    // after the first launch both sides ALWAYS hold a main — even when nothing
+    // ran concurrently. Provenance decides: the loser still byte-identical to
+    // the origin snapshot (sqliteLoserIsStaleCopy) is bili's own unmodified
+    // generation, redundant with the winner's — drop it silently. Only a loser
+    // that differs from what bili copied is a true divergence (concurrent plain
+    // run) and keeps the loud warning + conflict preservation. Any failure of
+    // the stale check or of the silent drop falls through to that conservative
+    // path: no data loss, at worst one extra warning/conflict file.
+    if (oMain !== undefined && rMain !== undefined) {
+        const stale = sqliteLoserIsStaleCopy(overlay, winner === "real" ? overlay : realHome, base);
+        let dropped = true;
+        if (stale) {
+            const loserDir = winner === "real" ? overlay : realHome;
+            for (const m of members) {
+                let st: fs.Stats | undefined;
+                try {
+                    st = fs.lstatSync(path.join(loserDir, m));
+                } catch {}
+                if (st === undefined || !st.isFile()) continue;
+                try {
+                    fs.unlinkSync(path.join(loserDir, m));
+                } catch {
+                    dropped = false;
+                }
+            }
+        }
+        if (!stale || !dropped) {
+            console.error(
+                `bili: both ${overlay} and ${realHome} held a distinct ${base} — kept the newer generation (${winner}), ` +
+                    `the other side is preserved as .bili-conflict. Concurrent plain/bili runs diverge by design (#1917); ` +
+                    `check the conflict file if you expect rows from both.` +
+                    (stale && !dropped
+                        ? " Removing the verified-stale copy only partially succeeded (locked members) — those are preserved as .bili-conflict too."
+                        : ""),
+            );
+        }
+    }
     const undo: (() => void)[] = [];
     const rollback = (): void => {
         for (const step of undo.reverse()) {
@@ -1570,7 +1806,7 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
     }
 }
 
-function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
+export function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -1599,33 +1835,37 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
         } catch {
             overlayEntries = [];
         }
-        // SQLite sets in the overlay root move as a unit (#381). A set whose
-        // main db is a write-through hardlink keeps its -wal/-shm in the
-        // overlay (SQLite recovers them in place on next open) and only
-        // re-points the db; any other set moves wholesale.
-        const dbSets: { base: string; keepSidecars: boolean }[] = [];
+        // SQLite sets in the overlay root take this path WHOLESALE (#381/#1917),
+        // whatever sidecars exist right now: a cleanly closed launch leaves a
+        // lone main db, a crashed one leaves the full set, and neither may reach
+        // the per-file merge loop below — that loop would splice a newer main db
+        // with a newer WAL from the other side and corrupt the database.
+        // Membership is by name (isSqliteMain), not by sidecar presence. Legacy
+        // file-linked mains are migrated inside mergeSqliteSet (link dropped,
+        // sidecars quarantined as conflicts).
+        const overlayEntrySet = new Set(overlayEntries);
+        const dbSets: string[] = [];
         for (const entry of overlayEntries) {
-            if (!entry.endsWith(".db") || generatedFiles.has(entry)) continue;
-            const members = sqliteSetMembers(entry);
-            if (!members.some((m) => m !== entry && overlayEntries.includes(m))) continue;
-            let mainSt: fs.Stats | undefined;
+            if (generatedFiles.has(entry) || !isSqliteMain(entry, overlayEntrySet)) continue;
+            let st: fs.Stats;
             try {
-                mainSt = fs.lstatSync(path.join(overlay, entry));
-            } catch {}
-            const keepSidecars =
-                mainSt !== undefined && isWriteThroughHardlink(path.join(overlay, entry), path.join(realHome, entry), mainSt);
-            dbSets.push({ base: entry, keepSidecars });
+                st = fs.lstatSync(path.join(overlay, entry));
+            } catch {
+                continue;
+            }
+            if (!st.isFile() && !st.isSymbolicLink()) continue;
+            dbSets.push(entry);
         }
         const skipEntries = new Set<string>();
-        for (const { base, keepSidecars } of dbSets) {
-            for (const m of sqliteSetMembers(base)) {
-                if (keepSidecars ? m !== base : true) skipEntries.add(m);
-            }
+        for (const base of dbSets) {
+            for (const m of sqliteSetMembers(base)) skipEntries.add(m);
         }
         for (const entry of overlayEntries) {
-            if (generatedFiles.has(entry)) continue;
+            // SQLITE_ORIGIN_FILE is bili's own overlay-local metadata (#1919) —
+            // never merge it back into the real home.
+            if (generatedFiles.has(entry) || entry === SQLITE_ORIGIN_FILE) continue;
             const overlayPath = path.join(overlay, entry);
-            if (isGeneratedDraft(entry)) {
+            if (isGeneratedDraft(entry) || entry === `${SQLITE_ORIGIN_FILE}.tmp`) {
                 try {
                     fs.unlinkSync(overlayPath);
                 } catch {}
@@ -1664,14 +1904,36 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                 }
             }
         }
-        for (const { base, keepSidecars } of dbSets) {
-            if (keepSidecars) continue;
+        for (const base of dbSets) {
             if (!mergeSqliteSet(overlay, realHome, base)) {
                 console.error(
                     `bili: could not merge the SQLite set ${base} / ${base}-wal / ${base}-shm into ${realHome} ` +
                         `(the real db is likely open/locked) — kept in the overlay, retry on the next launch.`,
                 );
             }
+        }
+        // Real-home SQLite sets are COPIED into the overlay, never file-linked
+        // (#1917, see copySqliteSet). Their sidecars travel with the base: an
+        // individually linked/copied sidecar would share state across the two
+        // paths again, so sidecars are skipped here entirely.
+        // Regular files only: a DIRECTORY named like a db must be mirrored by
+        // the ordinary link path below, not routed into copySqliteSet where it
+        // would fail and land in linkFailures.
+        const realDbBases = new Set<string>();
+        for (const entry of realEntries) {
+            if (generatedFiles.has(entry) || !isSqliteMain(entry, realEntries)) continue;
+            let st: fs.Stats;
+            try {
+                st = fs.lstatSync(path.join(realHome, entry));
+            } catch {
+                continue;
+            }
+            if (!st.isFile()) continue;
+            realDbBases.add(entry);
+        }
+        const realDbMembers = new Set<string>();
+        for (const base of realDbBases) {
+            for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
         }
         let accessible = 0;
         let total = 0;
@@ -1692,6 +1954,12 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                 accessible += 1;
                 continue;
             }
+            if (realDbBases.has(entry)) {
+                if (copySqliteSet(realHome, overlay, entry)) accessible += 1;
+                else linkFailures.push(entry);
+                continue;
+            }
+            if (realDbMembers.has(entry)) continue;
             if (linkOverlayEntry(realHome, overlay, entry)) {
                 accessible += 1;
             } else {
@@ -2189,8 +2457,12 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  launcher injected proxy routing (manageRouting), a generated .env pinning
  *  exactly that routing, so the user's own $CODEX_HOME/.env can no longer
  *  override it after spawn (#1802). Every other real-home entry is shared
- *  (auth.json, sessions, model settings survive); generated files are
- *  rewritten each launch and never linked back nor merged into the real home.
+ *  (auth.json, sessions, model settings survive) EXCEPT SQLite databases
+ *  (*.db / *.sqlite / *.sqlite3 at the home root), which get a private
+ *  per-launch copy merged back as a unit on exit — file-linking them across
+ *  the two homes lets two paths grow independent WALs over one inode and lose
+ *  committed writes (#1917). Generated files are rewritten each launch and
+ *  never linked back nor merged into the real home.
  *  The overlay's .env is refresh-protected on EVERY launch, so a stale
  *  generated copy can never merge back into the real home even when a later
  *  launch does not manage it (#1802 review).

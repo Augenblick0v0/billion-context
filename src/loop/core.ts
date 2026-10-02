@@ -4,8 +4,11 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import { estimateCoreMessages } from "../preflight.js";
+import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
-import { handleAcpCache, noteForwardedBody, settleUsageReport } from "../cache-ledger.js";
+import { handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
@@ -159,6 +162,11 @@ export interface LoopCtx {
      *  silently left zero bytes on disk to diagnose. Name is decided here;
      *  the callback must be best-effort (never throw into the stream path). */
     dumpSse?: (name: string, stream: ReadableStream<Uint8Array>) => void;
+    /** #1843 L1: route identity for image-cost learning, resolved by the host
+     *  at loop setup (the loop has no access to the provider route table):
+     *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
+     *  present, each sent round captures its image facts alongside the body. */
+    imageLearn?: { host: string; fp: string };
 }
 
 export interface RequestOptions {
@@ -328,7 +336,22 @@ export async function* runCompressLoop(
     const fetchUpstream = (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
-        noteForwardedBody(ctx.session, JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body));
+        const wireBodyStr = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body);
+        noteForwardedBody(ctx.session, wireBodyStr);
+        // #1843 L1: capture the round's image facts for the learning layer — the
+        // text side must mirror what outboundPayloadBreakdown bills (messages +
+        // wire overhead) so observed image mass = billed total - textSide.
+        if (ctx.imageLearn && ctx.protocol) {
+            const nImages = countImagesInRawBody(ctx.protocol, wireBodyStr);
+            if (nImages > 0) {
+                noteForwardedImageFacts(ctx.session, {
+                    nImages,
+                    textSide: estimateCoreMessages(coreMessages) + estimateWireOverhead(ctx.protocol, wireBodyStr),
+                    host: ctx.imageLearn.host,
+                    fp: ctx.imageLearn.fp,
+                });
+            }
+        }
         return fetchWithRetry(
             requestOptions.url,
             {
