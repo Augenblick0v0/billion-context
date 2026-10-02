@@ -211,6 +211,23 @@ Rules:
   a hosted runner cannot reach `127.0.0.1` upstreams, and events without
   secret access (fork PRs) skip the run gracefully instead of failing.
 
+### E2E: Real-Image Billing Lane (`npm run test:e2e:image`)
+
+`tests/e2e/e2e-image-billing.test.ts` is the hermetic twin of the manual
+verification that cleared PR #1857 (#1843/#1848): a corpus of structurally
+real images (valid PNG/JPEG/WebP/GIF containers, real dimensions, a 4.7MB
+4032x3024 photo, EXIF-orientation, truncated and pure-garbage blobs) is
+synthesized deterministically in pure Node — no PIL/ImageMagick, no network,
+zero tokens — and driven through the real billing pipeline against a mock
+upstream that bills the Qwen2-VL formula. It pins the three failure classes
+#1857 fixed: header-parser truth for every container, the >=700x bytes-prior
+poison ratio, and the learned-cost rescue (arbitrated 12.6MB forward ->
+usage report teaches the per-image cost -> stale-high usage baseline no
+longer bricks the session -> baseline regresses to real billing) plus the
+default auto->pixels route riding a malformed blob. CI:
+`.github/workflows/ci-image.yml` auto-runs on PRs touching the image/
+window-gate surfaces; it always runs ungated (needs nothing external), ~1s.
+
 ### E2E: Hermetic Local Registry (`ACP_TEST_REGISTRY`)
 
 `tests/e2e/e2e-registry.test.ts` brings its own verdaccio instance (random
