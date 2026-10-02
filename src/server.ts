@@ -79,6 +79,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, resignEnabled } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -2923,6 +2924,26 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
+            // #1884 (un-armed signed traffic): a request that already carries a
+            // body-covering signature (SDK-HMAC-SHA256 family — CodeArts APIG)
+            // and arrives WITHOUT the re-sign arm cannot survive any body
+            // rewrite: prepare* injects the compress tool + system notes, and
+            // the compress loop re-sends rebuilt rounds, so the upstream
+            // rejects every mutated request with 401 (APIG.0301 body-hash
+            // mismatch). Forward the client's raw bytes untouched — no
+            // session, no compression, signature intact. This is the
+            // /bili/-prefix twin of the native lane's #1886 direct fallback;
+            // BILI_RESIGN=0 keeps it (the switch only disables the re-sign
+            // arm, never the byte-untouched escape).
+            if (
+                inboundSignedScheme(req.headers) !== undefined &&
+                String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") !== APIG_RESIGN_SCHEME
+            ) {
+                log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884)`);
+                forwarded = true;
+                await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
+                return;
+            }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
                 forwarded = true;
@@ -4919,6 +4940,9 @@ function buildForwardTarget(
     for (const [k, v] of Object.entries(req.headers)) {
         const lower = k.toLowerCase();
         if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
+        // #1884: loopback re-sign markers are internal to the bili tunnel —
+        // they must never reach the upstream (they carry the credential).
+        if (lower === APIG_RESIGN_HEADER || lower === APIG_RESIGN_CREDENTIAL_HEADER) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     // #300: stamp the chain marker AFTER copying inbound headers so it wins
@@ -5596,6 +5620,29 @@ async function forward(
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    // #1884 re-sign arm: the native lane tunneled this request with the
+    // signing credential (x-bili-resign markers — stripped in
+    // buildForwardTarget, they must never reach the upstream). Every egress
+    // body below — initial send, role-ladder retry, overflow refold,
+    // compress-loop rounds, degenerate continuation refetch — is re-signed
+    // just before it hits the wire, so the rewritten body and the signature
+    // always agree. A failed re-sign logs and sends the previous signature:
+    // the upstream's 401 stays visible instead of a synthetic bili error.
+    const resignCtx =
+        resignEnabled() && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
+            ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
+            : undefined;
+    if (resignCtx !== undefined) {
+        log("info", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign arm active (${APIG_RESIGN_SCHEME}) — every egress body is re-signed (#1884)`);
+    }
+    const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
+        if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;
+        try {
+            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr);
+        } catch (err) {
+            log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
+        }
+    };
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
     // The kernel decides (turn kind / verbosity / lower-effort); bili only lands it.
@@ -5782,6 +5829,10 @@ async function forward(
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
+    // #1884: sign the FINAL wire body right before the send — everything
+    // upstream of this point (prepare* injection, compat, steering) already
+    // mutated it, so any inbound signature is stale here.
+    if (req.method !== "GET" && req.method !== "HEAD") applyResign(headers, wireBody);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -5919,6 +5970,7 @@ async function forward(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
+                        applyResign(headers, fixed.body);
                         r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
@@ -6059,6 +6111,7 @@ async function forward(
                 const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
                 if (refolded) {
                     try {
+                        applyResign(headers, refolded);
                         const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
@@ -6285,7 +6338,7 @@ async function forward(
                     protocol: prepared.protocol,
                     wireBody,
                     upstreamUrl,
-                    reqHeaders: buildForwardHeaders(headers),
+                    reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                     proxyUrl,
                     signal: clientAbort.signal,
                     session: prepared.session,
@@ -6307,7 +6360,7 @@ async function forward(
                             protocol: "responses",
                             body,
                             upstreamUrl,
-                            reqHeaders: buildForwardHeaders(headers),
+                            reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
                             dispatcher,
                             signal: clientAbort.signal,
@@ -6331,7 +6384,7 @@ async function forward(
                             protocol: prepared.protocol,
                             body,
                             upstreamUrl,
-                            reqHeaders: buildForwardHeaders(headers),
+                            reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
                             dispatcher,
                             signal: clientAbort.signal,
@@ -6365,7 +6418,7 @@ async function forward(
                     firstResponse: upstream,
                     clearFirstTimer: clearUpstreamTimer,
                     upstreamUrl,
-                    reqHeaders: buildForwardHeaders(headers),
+                    reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                     dispatcher,
                     originalBody: wireBody,
                     signal: clientAbort.signal,
@@ -6396,7 +6449,7 @@ async function forward(
                 protocol: prepared.protocol,
                 wireBody,
                 upstreamUrl,
-                reqHeaders: buildForwardHeaders(headers),
+                reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                 proxyUrl,
                 signal: clientAbort.signal,
                 session: prepared.session,
@@ -6434,7 +6487,7 @@ async function forward(
                         protocol: "responses",
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6474,7 +6527,7 @@ async function forward(
                         protocol: "responses",
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6493,7 +6546,7 @@ async function forward(
                         protocol: p.protocol,
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6631,7 +6684,7 @@ async function forward(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform },
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -6781,6 +6834,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #1884: re-sign the retry body before it hits the wire (armed
+         *  re-sign lane only; undefined on unsigned traffic). */
+        resign?: (headers: Record<string, string>, body: string | Buffer) => void;
     },
 ): Promise<Buffer> {
     let buffer = await readStreamToBuffer(stream, fakeBufCap());
@@ -6794,6 +6850,7 @@ async function resolveFakeCompletion(
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
+                opts.resign?.(opts.reqHeaders, hinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {

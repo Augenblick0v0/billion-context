@@ -10,6 +10,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, resignEnabled } from "../apig-resign.js";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -88,6 +89,16 @@ export interface NativeInterceptState {
      *  real failure lines. Called per request; hosts dedup once-per-process-
      *  per-endpoint like takeoverGate. Undefined hosts stay silent. */
     onUnroutedModelUrl?: (url: string) => void;
+    /** #1884: observability hook — fired for every model-API request that
+     *  carries a body-covering signature (SDK-HMAC-SHA256 family). Hosts
+     *  dedup; undefined hosts stay silent. */
+    onSignedModelUrl?: (url: string, scheme: string) => void;
+    /** #1884 re-sign arm: called when a signed model request is about to be
+     *  routed. A returned credential arms the server-side re-signer (the
+     *  request tunnels with the x-bili-resign markers and every egress body
+     *  bili produces is re-signed); undefined falls back to the #1886 direct
+     *  send — bytes untouched, inbound signature intact, no compression. */
+    resignCredentialFor?: (url: string, scheme: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
 }
 
 /** Ownership marker for bili's own chain links (#1410). Every function
@@ -209,6 +220,31 @@ export function isModelApiUrl(url: string): boolean {
         return false;
     }
 }
+
+/** True when a request's headers carry a body-covering signature (#1884).
+ *  Detected from either init.headers or a Request-object input — the two
+ *  forms a dispatch can arrive in. Returns the scheme token (e.g.
+ *  "sdk-hmac-sha256") or undefined for unsigned traffic. */
+export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+    let headers: Headers | undefined;
+    if (init?.headers !== undefined) headers = new Headers(init.headers);
+    else if (input !== null && typeof input === "object" && !(input instanceof URL)) {
+        try {
+            headers = new Headers((input as Request).headers);
+        } catch {
+            headers = undefined;
+        }
+    }
+    if (headers === undefined) return undefined;
+    const auth = (headers.get("authorization") ?? "").trim();
+    const match = BODY_SIGNED_AUTH.exec(auth);
+    if (match !== null) return match[0].toLowerCase();
+    if (headers.has("x-sdk-content-sha256")) return "x-sdk-content-sha256";
+    if (headers.has("x-amz-content-sha256")) return "x-amz-content-sha256";
+    return undefined;
+}
+
+const BODY_SIGNED_AUTH = /^(?:SDK-HMAC-SHA256|AWS4-HMAC-SHA256|HMAC-SHA256)\b/i;
 
 /** True when the URL addresses bili's own control plane (`/__bili/*`,
  *  `/__acp/*`, or a `/bili/<protocol>/<url>` tunnel) — expected direct
@@ -646,6 +682,36 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
+        // #1884: a body-covering signature cannot survive a rewrite — routing
+        // these through the proxy un-armed makes the upstream reject every
+        // request with 401 (APIG.0301 body hash mismatch / SigV4
+        // SignatureDoesNotMatch). When the host can supply the signing
+        // credential (dsh credential service), the request tunnels WITH a
+        // re-sign arm: bili re-signs every egress body it produces. Without a
+        // credential (or for schemes we cannot re-sign) the request goes
+        // direct — bytes unchanged, inbound signature intact, no compression
+        // (#1886 fallback).
+        let resignExtra: Record<string, string> | undefined;
+        const signedScheme = bodySignedSchemeOf(input, init);
+        if (signedScheme !== undefined) {
+            state.onSignedModelUrl?.(url, signedScheme);
+            let cred: { ak: string; sk: string; token?: string } | undefined;
+            if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined && resignEnabled()) {
+                try {
+                    cred = await state.resignCredentialFor(url, signedScheme);
+                } catch {
+                    cred = undefined;
+                }
+            }
+            if (cred === undefined) {
+                state.onDispatch?.(url, "direct");
+                return send(input, init);
+            }
+            resignExtra = {
+                [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
+                [APIG_RESIGN_CREDENTIAL_HEADER]: encodeApigCredential(cred),
+            };
+        }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an
         // attribution gate, an unattributed caller keeps its original URL and
@@ -681,7 +747,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
-            const stamped = withHeaders(first, init, state.headersFor?.(url));
+            const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
             return await send(stamped.input, stamped.init);
         } catch (err) {
             // The proxy can die mid-session (its parent watchdog fires when
@@ -696,7 +762,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
-                    const stamped = withHeaders(retried, init, state.headersFor?.(url));
+                    const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
                     return await send(stamped.input, stamped.init);
                 }
                 // No replacement available — this session runs direct for its
