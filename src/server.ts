@@ -5531,8 +5531,14 @@ async function forward(
     // previous request's body. Loop re-fetches re-note their own rebuilt bodies
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
+    // #1894: effective outbound bytes for the rest of this request — the
+    // re-send hops below (compat ladder / overflow refold / fake-completion)
+    // each re-note on success so every settle pairs with the send whose usage
+    // report it is, never the rejected first attempt.
+    let seamBody: string | undefined;
     if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
-        noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+        seamBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+        noteForwardedBody(prepared.session, seamBody);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
@@ -5625,6 +5631,12 @@ async function forward(
                         upstreamResult.clearTimer();
                         remember(target, fixed.rewritten);
                         upstreamResult = r;
+                        // #1894: THIS send's bytes produced the settled usage —
+                        // not the role-rejected first attempt.
+                        if (seamBody !== undefined && prepared?.session) {
+                            seamBody = fixed.body;
+                            noteForwardedBody(prepared.session, seamBody);
+                        }
                         return "ok";
                     }
                     let errText: string | null = null;
@@ -5748,6 +5760,13 @@ async function forward(
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             upstreamResult = retried;
+                            // #1894: the settled sample pairs with the refolded
+                            // bytes that were actually accepted, not the
+                            // overflow-rejected first attempt.
+                            if (seamBody !== undefined) {
+                                seamBody = typeof refolded === "string" ? refolded : refolded.toString("utf8");
+                                noteForwardedBody(prepared.session, seamBody);
+                            }
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
                         } else {
                             let retryErrText: string | null = null;
@@ -6380,11 +6399,12 @@ async function forward(
                 const reportedCached: number | null = typeof cached === "number" ? cached : null;
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
-                    // wireBody — not prepared.body — is what actually went out
-                    // (compat-role / steering / chain-stamp rewrites apply after
-                    // prepare); the main chokepoint above already noted it, this
-                    // keeps the pair byte-exact if that ever moves (#1891).
-                    noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+                    // #1894: deliberately NO note here — this site runs AFTER
+                    // the re-send hops, so pinning first-attempt bytes would
+                    // clobber their re-notes. Every send path notes its own
+                    // bytes at send time (main chokepoint, compat/refold hops,
+                    // fake-completion retry, loop re-fetches); the settle pairs
+                    // with whatever was last noted.
                     settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
@@ -6476,6 +6496,9 @@ async function resolveFakeCompletion(
                     break;
                 }
                 buffer = await readStreamToBuffer(r.response.body, fakeBufCap());
+                // #1894: the presented (and settled) bytes came from THIS
+                // hinted re-send, not the fake-completing first attempt.
+                noteForwardedBody(opts.session, hinted);
             } finally {
                 r.clearTimer();
             }
