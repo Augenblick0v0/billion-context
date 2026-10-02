@@ -275,7 +275,9 @@ export function loadConversations(): void {
 
 /** Index a plugin session by its conversation id (the key the plugin uses on
  *  the tool API). Re-inserting moves the entry to the end so plain Map
- *  insertion order doubles as an LRU clock. */
+ *  insertion order doubles as an LRU clock. Keys that name a resident session
+ *  — or already carry a self-binding — are reserved: binding them to another
+ *  session is forced back to the self-binding (#1895). */
 export function recordPluginSession(conversationId: string, sessionId: string): void {
     if (conversationId !== sessionId && (peekSession(conversationId) || conversations.get(conversationId)?.sessionId === conversationId)) {
         sessionId = conversationId;
