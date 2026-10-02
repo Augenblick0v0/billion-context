@@ -3429,9 +3429,13 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     // overlay home — loopback rewrites are pending here, so the overlay
     // exists). Keeps the bare-entry assertion deterministic on trees without
     // a build: runLaunch's own writeDshClientShim only overwrites the fixture
-    // with real dist symlinks when bili's dist bundles exist.
-    const hostFixture = path.join(home, "host-bundle.js");
-    const clientFixture = path.join(home, "client-bundle.js");
+    // with real dist symlinks when bili's dist bundles exist. The fixture
+    // files MUST be named agent/dsh-native.js / -client.js: dshPluginEntry's
+    // identity check requires the resolved root's realpath to end with
+    // agent/dsh-native.js — mere resolvability is not enough (#1889).
+    const hostFixture = path.join(home, "agent", "dsh-native.js");
+    const clientFixture = path.join(home, "agent", "dsh-native-client.js");
+    fs.mkdirSync(path.dirname(hostFixture), { recursive: true });
     fs.writeFileSync(hostFixture, "// host\n");
     fs.writeFileSync(clientFixture, "// client\n");
     assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169"), true);
