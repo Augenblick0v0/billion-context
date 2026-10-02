@@ -3,6 +3,7 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -29,6 +30,79 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!field) return false;
     const raw = readOutputBudget(p, field);
     return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
+}
+
+// #1897: hosts like omp register bili's ACP tools as first-class extension tools
+// and include them in EVERY model request — including side requests (title-gen),
+// which carry no host action tools of their own. The title request defeats both
+// existing signals at once: omp titles with max_tokens=1024 (> the budget gate)
+// AND the leaked bili tools make the #546 "non-empty tools = main turn" rule fire,
+// so the title payload rides processTurn under the main session id (refs/usage
+// pollution + ~4K of billed tool tokens per session start). Structural signal: a
+// request whose ENTIRE tools array is bili's own context-management set has no
+// action surface — it is a side request with leaked bili tools, not an agent turn
+// (an agent turn needs a world to act in). Renamed opt-in tools (absorb.toolName
+// / ccr.toolName) stay out of the set on purpose: only the kernel-fixed names are
+// guaranteed bili-owned, and any host tool vetoes the demotion.
+export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
+    ...ACP_TOOL_NAMES,
+    ABSORB_TOOL_NAME,
+    RULE_TOOL_NAME,
+    RETRIEVE_TOOL_NAME,
+    IMAGE_FULL_TOOL_NAME,
+]);
+
+/** Tool names declared by `parsed.tools`, proto-agnostically. null when the
+ *  array is absent/empty or any entry is unparseable (a veto, not an error):
+ *  openai `{type:"function",function:{name}}`, responses/anthropic `{name}`,
+ *  google `{functionDeclarations:[{name}]}` (one entry may declare many). */
+function biliToolNamesIn(parsed: Record<string, unknown>): string[] | null {
+    const tools = parsed.tools;
+    if (!Array.isArray(tools) || tools.length === 0) return null;
+    const names: string[] = [];
+    for (const t of tools) {
+        if (!t || typeof t !== "object") return null;
+        const o = t as Record<string, unknown>;
+        const decls = o.functionDeclarations;
+        if (Array.isArray(decls)) {
+            for (const d of decls) {
+                if (!d || typeof d !== "object" || typeof (d as Record<string, unknown>).name !== "string") return null;
+                names.push((d as Record<string, unknown>).name as string);
+            }
+            continue;
+        }
+        let name = o.name;
+        if (typeof name !== "string") {
+            const fn = o.function;
+            if (fn && typeof fn === "object" && typeof (fn as Record<string, unknown>).name === "string") name = (fn as Record<string, unknown>).name;
+        }
+        if (typeof name !== "string") return null;
+        names.push(name);
+    }
+    return names;
+}
+
+/** #1897: true when `parsed` carries ONLY bili's own tools (no host action
+ *  surface) — the caller must route the request through the side passthrough.
+ *  On a match the leaked `tools` key is deleted, restoring the pre-bili wire
+ *  shape upstream expects for a tool-less utility call. Any host tool,
+ *  unparseable entry, or missing/empty tools leaves the body untouched. A
+ *  STARVED output budget (<= SIDE_REQUEST_MAX_TOKENS) also vetoes: per #546 a
+ *  starved tool-carrying request is the death-spiral rescue path —
+ *  restoreOutputBudget must run so the model regains the output room to emit
+ *  compress — so such requests stay main turns even when every tool is bili's. */
+export function stripLeakedBiliTools(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const p = parsed as Record<string, unknown>;
+    const names = biliToolNamesIn(p);
+    if (names === null || !names.every((n) => BILI_TOOL_NAMES.has(n))) return false;
+    const field = outputBudgetField(p);
+    if (field) {
+        const raw = readOutputBudget(p, field);
+        if (typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS) return false;
+    }
+    delete p.tools;
+    return true;
 }
 
 export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
@@ -164,8 +238,13 @@ export function sideRequestGuard(
     protocol: WireProtocol,
     modelContextLimit: number,
     imageBilling: ResolvedImageBilling = "bytes",
+    configuredCap?: number,
     headroomCap: number = 1,
     armedLimit: number = 0,
+    /** #1843 L1: pre-resolved image reserve (learned truth when fresh, else the
+     *  prior) — replaces the internal billing-based estimate when provided so
+     *  the guard sees the same image channel every other gate consumes. */
+    imageReserve?: number,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -177,6 +256,7 @@ export function sideRequestGuard(
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
+    const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
+    const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }

@@ -70,6 +70,26 @@ jobs:
               ;;
           esac
 
+      - name: Verify release-notes entry (#1870)
+        # Fail at DISPATCH time, not publish time: the version being released
+        # must already have a tiered entry (model-written summary) in
+        # release-notes/package.json — part of the release prep, same PR as
+        # the version bump. Prereleases (dev channel) are exempt.
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          case "$VER" in
+            *-*) echo "prerelease $VER — release-notes gate skipped"; exit 0 ;;
+          esac
+          node -e "
+            const notes = require('./release-notes/package.json').billionContextReleaseNotes;
+            const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
+            if (!entry) {
+              console.error('release ' + process.argv[1] + ' has no release-notes entry (tier + model-written summary). Add it to release-notes/package.json and merge to master BEFORE dispatching the release — see release-notes/README.md (#1870).');
+              process.exit(1);
+            }
+            console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
+          " "$VER"
+
       - name: Bump version
         run: |
           node -e '

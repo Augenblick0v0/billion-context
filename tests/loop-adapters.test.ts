@@ -746,6 +746,24 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
 });
 
+test("F7b (#1876): anthropic buildRequest keeps client system blocks byte-exact, appends prompt as trailing unmarked block", () => {
+    const clientSystem = [
+        { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
+        { type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "EXTRA_CONTEXT_BLOCK" },
+    ];
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
+    const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
+    const system = rebuilt.system;
+    assert.ok(Array.isArray(system), "system stays a structured array");
+    const blocks = system as Array<Record<string, unknown>>;
+    assert.equal(blocks.length, 4, "3 client blocks + 1 appended prompt block — no merge into one block");
+    assert.deepEqual(blocks.slice(0, 3), clientSystem, "client blocks byte-exact in order, cache_control stays on its own (non-first) block");
+    assert.equal(blocks[3]?.text, systemPrompt, "appended block carries the compress prompt verbatim (no '---' separator)");
+    assert.equal(blocks[3]?.cache_control, undefined, "appended block carries no breakpoint (client-managed caching wins)");
+});
+
 function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
         start(controller) {

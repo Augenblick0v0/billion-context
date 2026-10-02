@@ -19,6 +19,7 @@ import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
@@ -275,8 +276,13 @@ export function loadConversations(): void {
 
 /** Index a plugin session by its conversation id (the key the plugin uses on
  *  the tool API). Re-inserting moves the entry to the end so plain Map
- *  insertion order doubles as an LRU clock. */
+ *  insertion order doubles as an LRU clock. Keys that name a resident session
+ *  — or already carry a self-binding — are reserved: binding them to another
+ *  session is forced back to the self-binding (#1895). */
 export function recordPluginSession(conversationId: string, sessionId: string): void {
+    if (conversationId !== sessionId && (peekSession(conversationId) || conversations.get(conversationId)?.sessionId === conversationId)) {
+        sessionId = conversationId;
+    }
     conversations.delete(conversationId);
     conversations.set(conversationId, { sessionId, lastSeen: Date.now() });
     conversationsDirty = true;
@@ -660,20 +666,18 @@ function conversationIdForSession(sessionId: string): string | undefined {
     return bestId;
 }
 
-/** Resolve a caller-supplied conversation id to a resident session through every
- *  known channel, in precedence order: (1) the persisted conversation→session map
- *  (plugin binding / prior calls), (2) the verbatim session id (#760 — the id IS
- *  the client-provided conversation value), (3) the proxy-derived canonical pfa-*
- *  alias (#760b — every session exposes a stable canonical id the model echoes
- *  back from the wire notes). Paths 2/3 record the resolved mapping so later
- *  calls hit path 1 directly. Read-only w.r.t. creation: an unknown id finds
- *  nothing and creates nothing. */
+/** Native session ids outrank lookup aliases: shared prompt_cache_key values
+ *  must not redirect a parent to a child. Repair legacy conflicting mappings
+ *  on lookup; unknown ids still create no session. */
 export function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
-    const entry = conversations.get(conversationId);
-    let session = entry ? peekSession(entry.sessionId) : undefined;
+    let entry = conversations.get(conversationId);
+    let session = peekSession(conversationId) ?? (entry ? peekSession(entry.sessionId) : undefined);
     if (!session) {
-        session = peekSession(conversationId) ?? findSessionByCanonicalId(conversationId);
-        if (session) recordPluginSession(conversationId, session.id);
+        session = findSessionByCanonicalId(conversationId);
+    }
+    if (session && entry?.sessionId !== session.id) {
+        recordPluginSession(conversationId, session.id);
+        entry = conversations.get(conversationId);
     }
     return { session, entry };
 }
@@ -861,6 +865,13 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
+    }
+    const upd = getUpdateVisibility(VERSION);
+    if (upd.visible) {
+        // #1870: visibility for the silent courier — one line, same
+        // before-footer slot as the advisory (remote-doc text; the $-escape
+        // below already covers it).
+        preFooter.push(describeUpdateReady(upd));
     }
     const webUrl = webSessionUrl(deps.webOrigin, session.id);
     if (webUrl !== undefined) {

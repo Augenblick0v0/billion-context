@@ -80,6 +80,7 @@ import {
     findFreePort,
     ensureProxyRunning,
     resolveNodeRuntime,
+    probeNodeWrapperTarget,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
@@ -1165,6 +1166,83 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
         ...over,
     };
 }
+
+// #1903: post-exit re-discovery. A spawned child dying before healthy PROVES
+// the port it wanted is held; when the holder's identity record published
+// AFTER our one-shot discovery snapshot (manual `bili start`: TCP accept
+// precedes the 'listening' callback that writes proxy-origin), the launcher
+// must attach on a bounded retry instead of failing from a stale view — and
+// throw the original error when nothing republishes within the budget.
+function makeFastExitChild(code: number): SpawnChild {
+    const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
+    return {
+        pid: 42423,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on(event, listener) {
+            const list = handlers.get(event) ?? [];
+            list.push(listener);
+            handlers.set(event, list);
+            // synchronous emit: the death lands before the spawn poll loop's
+            // first tick, so the failure path is reached without burning SPAWN_WAIT_MS
+            if (event === "exit") listener(code, null);
+        },
+    };
+}
+
+test("ensureProxyRunning: attaches a late-publishing instance after the spawned child dies (#1903)", async () => {
+    const PORT = 38991;
+    const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+    let reads = 0;
+    const registrations: Array<[string, number]> = [];
+    let t = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+        {
+            spawnImpl: () => makeFastExitChild(1),
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+            readInstanceFile: () => (++reads > 1 ? late : undefined),
+            now: () => t,
+            sleep: async (ms) => { t += ms; },
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
+            attachDiag: () => {},
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
+    assert.equal(handle.origin, late.origin);
+    assert.equal(handle.refusedWatcher, true, "manual daemon refuses watchers — #1322 flag carried through the retry path");
+    assert.deepEqual(registrations, [[late.origin, process.pid]]);
+    assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+});
+
+test("ensureProxyRunning: throws the original child-death error when nothing republishes within the budget (#1903)", async () => {
+    let reads = 0;
+    let t = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 38992, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
+                readInstanceFile: () => { reads++; return undefined; },
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "failed",
+                attachDiag: () => {},
+                scriptPath: FP_SCRIPT,
+            },
+        ),
+        /exited before becoming healthy \(code 1\)/,
+    );
+    // exactly one initial discovery + POST_EXIT_REDISCOVERY_MS / HEALTH_POLL_INTERVAL_MS
+    // re-discovery ticks — the budget is bounded and honored under the injected clock
+    assert.equal(reads, 1 + Math.round(3000 / 200));
+});
 
 test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
     let spawnCalls = 0;
@@ -2478,7 +2556,7 @@ test("resolveNonHttpProviders: providers-table compactionOptIn ∪ env list, ded
         assert.deepEqual(resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "claude-bridge,z" }), ["claude-bridge", "https://api.anthropic.com", "z"]);
     } finally {
         if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3152,9 +3230,9 @@ test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", (
         assert.ok(file);
         const txt = fs.readFileSync(file, "utf8");
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: billion-context$/m);
-        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+        rmrf(`${dir}-bili`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3209,7 +3287,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // No shim at all: the same fallback.
-        fs.rmSync(shimDir, { recursive: true, force: true });
+        rmrf(shimDir);
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // Missing dist bundles: nothing written, existing content untouched.
@@ -3219,7 +3297,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
         assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3238,7 +3316,7 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         const repoPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
         assert.equal(shimPkg.version, repoPkg.version);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3428,9 +3506,13 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     // overlay home — loopback rewrites are pending here, so the overlay
     // exists). Keeps the bare-entry assertion deterministic on trees without
     // a build: runLaunch's own writeDshClientShim only overwrites the fixture
-    // with real dist symlinks when bili's dist bundles exist.
-    const hostFixture = path.join(home, "host-bundle.js");
-    const clientFixture = path.join(home, "client-bundle.js");
+    // with real dist symlinks when bili's dist bundles exist. The fixture
+    // files MUST be named agent/dsh-native.js / -client.js: dshPluginEntry's
+    // identity check requires the resolved root's realpath to end with
+    // agent/dsh-native.js — mere resolvability is not enough (#1889).
+    const hostFixture = path.join(home, "agent", "dsh-native.js");
+    const clientFixture = path.join(home, "agent", "dsh-native-client.js");
+    fs.mkdirSync(path.dirname(hostFixture), { recursive: true });
     fs.writeFileSync(hostFixture, "// host\n");
     fs.writeFileSync(clientFixture, "// client\n");
     assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169"), true);
@@ -3689,6 +3771,92 @@ test("resolveNodeRuntime: non-Electron host still throws when no Node resolves (
         () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/nonexistent" }, "linux", () => false, undefined),
         /BILLION_CONTEXT_NODE/,
     );
+});
+
+test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves to the real Node (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const real = "C:/Users/x/scoop/apps/nodejs-lts/current/node.exe";
+    const probed: string[] = [];
+    const probe = (c: string): string | undefined => { probed.push(c); return real; };
+    const exists = (p: string): boolean => p === shim || p === real;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        real,
+    );
+    // the discovered candidate is consulted exactly once, on the wrapper itself
+    assert.deepEqual(probed, [shim]);
+});
+
+test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unchanged (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => undefined;
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back to the shim (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => "C:/gone/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 real node whose probe reports itself is left unchanged (#1887)", () => {
+    const node = "C:/Program Files/nodejs/node.exe";
+    const probe = (c: string): string | undefined => c;
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        node,
+    );
+});
+
+test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () => {
+    const node = "/opt/host/bin/node";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        node,
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a live Node executable is returned without probing (#1887)", () => {
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    assert.equal(
+        resolveNodeRuntime("C:/nodejs/node.exe", { PATH: "C:/whatever" }, "win32", () => false, undefined, probe),
+        "C:/nodejs/node.exe",
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored verbatim, not probed (#1887)", () => {
+    const override = "C:/pinned/node.exe";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    const exists = (p: string): boolean => p === override || p === "C:/shim/node.exe";
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { BILLION_CONTEXT_NODE: override, PATH: "C:/shim" }, "win32", exists, undefined, probe),
+        override,
+    );
+    assert.equal(calls, 0);
+});
+
+test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
+    const out = probeNodeWrapperTarget(process.execPath, { ...process.env });
+    assert.ok(typeof out === "string" && out.length > 0, "expected a non-empty path");
+    assert.ok(fs.existsSync(out), `expected an existing path, got ${out}`);
+    const lower = out.toLowerCase();
+    assert.ok(lower.endsWith("node") || lower.endsWith("node.exe"), `expected a node path, got ${out}`);
 });
 
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {

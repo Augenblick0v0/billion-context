@@ -601,7 +601,7 @@ test("apply() /acp (#1677): resolves the invoking agent's session id from the ho
             }
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -634,7 +634,7 @@ test("apply() /acp-cache (#1677): binds acp_cache to the invoking agent's sessio
             }
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -692,7 +692,7 @@ test("apply() /acp (#1677): invocation wins over ALS attribution; unresolvable s
             }
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -841,8 +841,8 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     } finally {
         _setSpawnForTest(undefined);
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(stateHome, { recursive: true, force: true });
+        rmrf(home);
+        rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
     }

@@ -158,6 +158,13 @@ const PROBE_TIMEOUT_MS = 1500;
 // A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
 // disks and client teardown before it clears the marker.
 const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
+// #1903: budget for the post-exit re-discovery below. A spawned child dying
+// before becoming healthy is evidence the port it wanted is HELD — but our
+// one-shot discovery snapshot may predate the holder publishing its identity
+// record (a manual `bili start` accepts TCP before its 'listening' callback
+// writes proxy-origin / registry markers). Refresh the snapshot on this
+// bounded retry instead of failing from a stale view.
+const POST_EXIT_REDISCOVERY_MS = 3000;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
 
@@ -3202,6 +3209,28 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
     return args;
 }
 
+/** #1887: ask a candidate Windows `node.exe` which real Node executable it runs.
+ *  A plain node prints its own execPath; a re-exec wrapper (mise/asdf/fnm-style
+ *  native shim) prints the real node behind it. Runs with the caller's env/cwd
+ *  so the wrapper's version selection matches what the actual spawn would get.
+ *  Any failure (timeout, non-node, empty output) yields undefined so the caller
+ *  falls back to the candidate unchanged — never worse than today. */
+export function probeNodeWrapperTarget(candidate: string, env: NodeJS.ProcessEnv): string | undefined {
+    try {
+        const out = execFileSync(candidate, ["-p", "process.execPath"], {
+            windowsHide: true,
+            timeout: 5000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+        });
+        const p = out.trim();
+        return p.length > 0 ? p : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #819: resolve the executable that runs the proxy entry script. In a plain
  *  Node CLI, process.execPath is correct; inside a host process (the opencode
  *  or pi native binary) it is the HOST executable — spawning it with a .js
@@ -3218,11 +3247,31 @@ export function resolveNodeRuntime(
     platform: NodeJS.Platform = process.platform,
     existsImpl: (p: string) => boolean = fs.existsSync,
     electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
+    probeWrapper: (candidate: string, env: NodeJS.ProcessEnv) => string | undefined = probeNodeWrapperTarget,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
     const override = typeof env.BILLION_CONTEXT_NODE === "string" ? env.BILLION_CONTEXT_NODE.trim() : "";
     if (override.length > 0 && existsImpl(override)) return override;
+    // #1887: a PATH-resolved `node.exe` may be a re-exec wrapper (mise/asdf/fnm
+    // native shim) that spawns the real Node as a CHILD — detached+windowsHide
+    // hide only the direct child, so the wrapper's child keeps a visible console
+    // for the proxy's whole life. Follow such a wrapper to the real node it runs
+    // (one hop), so we spawn a directly-controllable executable. Live-node and
+    // explicit-override paths above are deliberately NOT probed: a running node
+    // is already real, and an explicit user choice is honored verbatim.
+    const resolveDiscovered = (candidate: string): string => {
+        if (platform !== "win32") return candidate;
+        const target = probeWrapper(candidate, env);
+        if (target && target.trim().length > 0) {
+            const resolved = target.trim();
+            if (existsImpl(resolved) && resolved.toLowerCase() !== candidate.toLowerCase()) {
+                teeLog("info", `bili: ${candidate} is a Windows node wrapper resolving to ${resolved} — spawning the real Node directly (#1887)`);
+                return resolved;
+            }
+        }
+        return candidate;
+    };
     // join with the SIMULATED platform's separators: a posix-style PATH on
     // win32 (and vice versa) must not be normalized through the host's
     // path.join, or the candidates no longer match what existsImpl expects.
@@ -3256,7 +3305,7 @@ export function resolveNodeRuntime(
             // would rewrite a posix-style entry on a win32 host (or the
             // reverse), missing the file existsImpl would find.
             const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
-            if (existsImpl(candidate)) return candidate;
+            if (existsImpl(candidate)) return resolveDiscovered(candidate);
         }
     }
     // #1429: last resort inside an Electron host — its own binary runs as plain
@@ -3530,11 +3579,42 @@ export async function ensureProxyRunning(
                 }
             }
         }
+        // #1903: bounded re-discovery after a fast child death — same
+        // discovery+attach decision as the one-shot probe above, re-run on a
+        // short budget so a listener whose identity record published during
+        // our spawn attempt is still attachable instead of mistaken for air.
+        const rediscoverAfterChildExit = async (): Promise<ProxyHandle | undefined> => {
+            console.error(
+                `bili: spawned proxy exited before becoming healthy — re-checking for a late-publishing listener on port ${port} before failing`,
+            );
+            const rediscoveryDeadline = now() + POST_EXIT_REDISCOVERY_MS;
+            while (now() < rediscoveryDeadline) {
+                await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+                const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, refusedLog, attachDiag);
+                if (late) {
+                    console.error(`bili: attached to ${late.origin} (pid ${late.pid}) — it published its instance record after the initial discovery`);
+                    return attachTo(late);
+                }
+            }
+            return undefined;
+        };
         if (childError !== undefined) {
             const detail = childError instanceof Error ? childError.message : String(childError);
             throw new Error(`bili: proxy spawn failed (${detail}) (log: ${logPath})`);
         }
         if (childExit) {
+            // #1903: the child died before becoming healthy. Under strictPort
+            // that death is almost certainly EADDRINUSE — proof the pinned port
+            // is held by a listener our one-shot discovery above missed because
+            // its identity record published AFTER that snapshot (a manual
+            // `bili start` accepts TCP before its 'listening' callback writes
+            // proxy-origin / registry markers; CI flake on PR #1896). The spawn
+            // attempt just proved occupancy: refresh the stale snapshot on a
+            // bounded budget and attach if the late publisher shows up; when
+            // nothing appears, fall through to the original error below.
+            const retried = await rediscoverAfterChildExit();
+            if (retried) return retried;
             const detail = childExit.code !== null
                 ? `code ${childExit.code}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";

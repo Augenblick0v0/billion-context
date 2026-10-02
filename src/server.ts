@@ -73,11 +73,11 @@ import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, noteClientAbort, noteForwardedBody, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
-import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
+import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -114,7 +114,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -127,7 +127,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
+import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -1004,15 +1004,47 @@ type Prepared = {
 };
 
 
-// #767: per-request image billing mode — env BILI_IMAGE_BILLING (live, like
-// BILI_IMAGE_TOKEN_CAP) wins over the per-provider route entry, which wins over
-// the global config level; "auto"/unset classifies known first-party pixel-tile
-// hosts by upstream URL. Every payload-size decision below consults this so one
-// over-estimate cannot block all of them at once.
+// #767/#1843: per-request image billing mode — env BILI_IMAGE_BILLING (live)
+// wins over the per-provider route entry, which wins over the global config
+// level; "auto"/unset resolves to pixels for every host (#1843 L2). Every
+// payload-size decision below consults this so one over-estimate cannot block
+// all of them at once.
 function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResolvedImageBilling {
     const env = process.env.BILI_IMAGE_BILLING;
     const configured = env === "pixels" || env === "bytes" ? env : findRoute(opts.routes, upstreamUrl)?.imageBilling ?? opts.imageBilling ?? "auto";
     return resolveImageBilling(configured, upstreamUrl);
+}
+
+// #1843 L3: per-request per-image token ceiling — per-route imageTokenCap wins
+// over the global config level; env BILI_IMAGE_TOKEN_CAP wins over both (the
+// env tier is applied inside image-tokens.ts so callers only resolve config).
+// 0 = no cap.
+function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undefined): number {
+    return findRoute(opts.routes, upstreamUrl)?.imageTokenCap ?? opts.imageTokenCap ?? 0;
+}
+
+// #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
+// (pixels/bytes per the resolved billing + cap) upgraded to LEARNED truth when
+// this session holds fresh usage-learned evidence for this route (per-image
+// cost x current image count), else the prior unchanged. Every window gate
+// consumes its image mass through here so one learning layer serves them all.
+function imageReserveFor(
+    session: Session,
+    protocol: "anthropic" | "openai" | "responses" | "google",
+    body: unknown,
+    opts: ProxyOptions,
+    upstreamUrl: string | undefined,
+): number {
+    const billing = imageBillingFor(opts, upstreamUrl);
+    const cap = imageTokenCapFor(opts, upstreamUrl);
+    const raw = typeof body === "string" || Buffer.isBuffer(body);
+    const prior = raw
+        ? imageTokensInRawBody(protocol, body as string | Buffer, billing, cap)
+        : imageTokensInParsedBody(protocol, body, billing, cap);
+    if (prior <= 0) return prior;
+    const nImages = raw ? countImagesInRawBody(protocol, body as string | Buffer) : countImagesInParsedBody(protocol, body);
+    if (nImages <= 0) return prior;
+    return learnedImageReserve(session, upstreamHost(upstreamUrl), nImages, `${billing}:${cap}`, cap) ?? prior;
 }
 
 // #1537: reduce a Host-header value or a URL hostname to its bare lowercase
@@ -2138,7 +2170,7 @@ async function handle(
         // and shrinks after native compaction boundaries, which is when the
         // re-send really gets cheaper.
         if (parsed !== null && typeof parsed === "object") {
-            session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
+            session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
@@ -2431,13 +2463,45 @@ async function handle(
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
+        // #1897: omp-style hosts register bili's ACP tools as first-class extension
+        // tools and include them in EVERY model request — including side requests
+        // (title-gen), which carry no host action tools of their own. omp titles with
+        // max_tokens=1024 (> the 200 budget gate) and stamps no persona header, so
+        // neither existing signal sees the request and the title payload rides
+        // processTurn under the main session id (refs/usage pollution + ~4K of billed
+        // tool tokens per session start). A request whose ENTIRE tools array is bili's
+        // own context-management set has no action surface: it is a side request with
+        // leaked bili tools, not an agent turn — except when its output budget is
+        // starved (<=200), which per #546 must stay a main turn so
+        // restoreOutputBudget can rescue it. The signal is plugin-lane-only: the
+        // leak mechanism (host registers bili's tools as extension tools) cannot
+        // exist in proxy mode, where an all-bili array means the client itself
+        // declared those tools — such manually-configured clients keep their
+        // #546/#1665 rescue semantics untouched. Strip the leak BEFORE
+        // restoreOutputBudget and route demoted requests through the side
+        // passthrough below.
+        // #1197/#1086: all-bili tools alone cannot mean "side request" — a live
+        // plugin session also re-sends its compression artifacts in HISTORY and must
+        // run through the kernel. Veto on real history artifacts (detectAcpArtifacts
+        // is history-scoped, never the top-level tools declarations), so a fresh
+        // title-gen still demotes. Read-only; ordered BEFORE the mutating strip.
+        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
+            && detectAcpArtifacts(bodyBuffer, parsed) === null
+            && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
         // best-known model output ceiling (runtime-info > launcher > declared >
         // registry — resolveKnownOutputCeiling) floors the restore target; a
         // warn fires when no source knows one at all.
-        restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
+        // #1897: demoted side requests are skipped entirely — their budget sizes a
+        // utility call (omp titles at a fixed 1024), not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved restore
+        // (title requests arrive FIRST, at session start). Starved all-bili requests
+        // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
+        if (!demotedSide) {
+            restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, route?.rewrittenUrl, opts.sessionHeader));
+        }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
@@ -2475,7 +2539,7 @@ async function handle(
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
         const requestAgent = pluginRequestAgentHeader(req.headers);
-        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed, requestAgent)) {
+        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || isSideRequest(parsed, requestAgent))) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2489,7 +2553,7 @@ async function handle(
             // model's real window. overflowArmTokens is set ONLY by an upstream
             // context-overflow 400 and cleared by the next real usage report.
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin));
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -2498,7 +2562,7 @@ async function handle(
                         error: {
                             type: "server_error",
                             code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
                             retryable: false,
                         },
                     }));
@@ -2506,8 +2570,11 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            log("info", `[${session.id}] side request (${requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`}) → passthrough + tag strip only, kernel state untouched`);
-            let sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
+            const sideReason = demotedSide ? "leaked bili tools stripped (#1897)" : requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`;
+            log("info", `[${session.id}] side request (${sideReason}) → passthrough + tag strip only, kernel state untouched`);
+            // #1897: a demoted request was mutated (tools stripped) — re-serialize
+            // the parsed body so the leak is actually gone from the wire.
+            let sideBody = scrubAnthropicPck(protocol, demotedSide ? Buffer.from(JSON.stringify(parsed)) : bodyBuffer, log);
             const sideInput = (parsed as ResponsesRequestBody).input;
             if (protocol === "responses" && Array.isArray(sideInput)) {
                 const { items, replaced, dropped } = replaceBiliCompactionItems(sideInput);
@@ -3401,7 +3468,7 @@ async function prepareAnthropic(
         // #1320: signature-only thinking blocks bill restored thinking tokens upstream
         // but project as empty text locally — attribute the provider-vs-local residual
         // to them so every meter sees the billed context (metering-only, wire untouched).
-        const inboundImageTokens = imageTokensInParsedBody("anthropic", parsed, imageBillingFor(opts, upstreamOrigin));
+        const inboundImageTokens = imageReserveFor(session, "anthropic", parsed, opts, upstreamOrigin);
         projectThinkingMass(msgs, {
             providerInputTokens: session.stats.lastInputTokens,
             measured: session.stats.lastInputTokensSource === "usage",
@@ -3495,7 +3562,7 @@ async function prepareAnthropic(
         // [#1095] downscale screenshot-like images ONCE at arrival (kernel routing
         // decision + recipe; originals cached for the image_full restore channel).
         // Deterministic encode ⇒ re-runs are byte-stable for the prefix cache.
-        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), cap: imageTokenCapFor(opts, upstreamOrigin), log });
         // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
         // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
         // upstream failure drops-and-logs it instead of vanishing it).
@@ -3585,7 +3652,7 @@ async function prepareAnthropic(
     // blinded to a system+tools-only floor.
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
-        + imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin));
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
@@ -3667,7 +3734,7 @@ async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("openai", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -3727,7 +3794,7 @@ async function prepareOpenai(
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic) — one
         // deterministic encode per fingerprint; byte-stable re-runs.
-        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), cap: imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin), log });
         // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
         // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
         // upstream failure drops-and-logs it instead of vanishing it).
@@ -3801,7 +3868,7 @@ async function prepareOpenai(
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -3831,7 +3898,7 @@ async function prepareOpenai(
     if (!isTitleGen) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageTokensInParsedBody("openai", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin));
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -3918,7 +3985,7 @@ async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -3964,7 +4031,7 @@ async function prepareGoogle(
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
-        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), cap: imageTokenCapFor(opts, upstreamOrigin), log });
         rebuiltContents = coreToGoogle(processedMessages as BiliMessage[]);
 
         // ONLY the static compress prompt joins the client's system text — the
@@ -4010,7 +4077,7 @@ async function prepareGoogle(
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("google", rebuilt) }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin) }, sessionId, log);
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
@@ -4211,7 +4278,7 @@ async function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageTokensInParsedBody("responses", parsed, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -4256,7 +4323,7 @@ async function prepareResponses(
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
-        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), cap: imageTokenCapFor(opts, billingUpstream ?? upstreamOrigin), log });
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // Fallback path: when the echo did NOT come back this turn (client
@@ -4379,7 +4446,7 @@ async function prepareResponses(
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin)) }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -4432,7 +4499,7 @@ async function prepareResponses(
     if (!isCompactionTrigger) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
-            + imageTokensInParsedBody("responses", rebuilt, imageBillingFor(opts, billingUpstream ?? upstreamOrigin));
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -4667,13 +4734,13 @@ function injectSystem(
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
     // (which changes every turn) is appended as a trailing user message by
     // the caller (prepareAnthropic), never merged into system.
-    const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
-    const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
-    return buildSystem(full, parsed.system);
+    // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)
+    // instead of merging everything into one block via kernel buildSystem.
+    return appendSystemText(parts.join("\n\n"), parsed.system);
 }
 
 // #920: in proxy mode bili OWNS the compression tool names. Agent-side tools
@@ -5075,7 +5142,7 @@ function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body, imageBillingFor(opts, billingUpstream));
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
@@ -5156,7 +5223,23 @@ async function preflightCompressIfNeeded(
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
         : Math.max(baselineFloor, payloadEstimate);
-    if (limit <= 0 || !model || tokenCount < compressionTarget) return prepared;
+    // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
+    // text vs `target − imageReserve`. Exact algebraic rewrite of the old
+    // total-view trigger: subtracting the constant reserve from both sides of
+    // max(B, T + R) >= C gives max(B − R, T) >= C − R, and flooring the
+    // baseline projection at zero only matters when C − R < 0 — a case where
+    // the old trigger fired unconditionally anyway (images alone clear the
+    // whole window). Which requests fire is unchanged; what changes is what
+    // can MOVE the decision: an image-estimate error (±15x on non-pixel-tile
+    // upstreams, #1800) can no longer arm preflight over a text payload that
+    // fits, nor keep it armed after the text has been folded down.
+    const textChannel = unknownBaseline
+        ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate
+        : textEstimate + overheadEstimate;
+    const textBudget = Math.max(0, compressionTarget - imageTokens);
+    const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
+    const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    if (limit <= 0 || !model || !triggerFires) return prepared;
     const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
@@ -5177,17 +5260,18 @@ async function preflightCompressIfNeeded(
     // estimate and fall through to fold / fail-fast below.
     const noOverflowEvidence = session.stats.lastInputTokens < limit
         || (session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm");
-    // #1800: images are the sole over-window component and we hold no overflow
-    // evidence → the base64/4 (or pixels-fallback) image cost clears the window on
-    // ESTIMATE alone while the real bill is far smaller, so we let the upstream
-    // arbitrate billing instead of fail-fast'ing. But do NOT unconditionally
+    // #1800/#1843: the TEXT channel fits the window but `text + imageReserve`
+    // does not, and we hold no overflow evidence → the image reserve clears the
+    // window on ESTIMATE alone while the real bill may be far smaller (pixel-tile
+    // upstreams charge ~3K/screenshot, not the bytes-billing estimate), so we let
+    // the upstream arbitrate billing instead of fail-fast'ing. But do NOT unconditionally
     // short-circuit here: that permanently disabled auto-compression — preflight
     // never ran while the inflated estimate sat over-window, so a growing text
     // payload was folded 0× for the whole session (#1800). Only take the immediate
     // forward when there is literally NOTHING compressible; otherwise remember the
     // arbitration and let preflightCompress fold the text portion first, re-applying
     // this same forward-instead-of-fail-fast decision after compression (below).
-    const imageArbitration = imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence;
+    const imageArbitration = imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
     if (imageArbitration && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
@@ -5314,7 +5398,7 @@ async function preflightCompressIfNeeded(
                 proxyUrl,
                 signal: clientAbort.signal,
                 log,
-                imageFloor: imageTokens,
+                imageReserve: imageTokens,
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
             },
@@ -5667,6 +5751,27 @@ async function forward(
         body: req.method === "GET" || req.method === "HEAD" ? undefined : wireBody,
     };
     if (dispatcher) init.dispatcher = dispatcher;
+    // #1843 L1: capture this round's image facts at the SEND chokepoint so the
+    // turn's usage settle pairs with the bytes actually sent — streamed turns
+    // settle in plugin.ts's SSE handler and never revisit the request body, so
+    // a settle-site-only capture would miss every streamed turn. textSide
+    // mirrors outboundPayloadBreakdown (messages + wire overhead) so observed
+    // image mass = billed total - textSide. Retries within this forward
+    // (#5708/#5835 refolds) re-send near-identical image sets — first-send
+    // facts stay the pairing source, same as noteForwardedBody's semantics.
+    if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+        const nImages = countImagesInRawBody(prepared.protocol, wireBody);
+        if (nImages > 0) {
+            const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
+            const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            noteForwardedImageFacts(prepared.session, {
+                nImages,
+                textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
+                host: upstreamHost(learnUpstream),
+                fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
+            });
+        }
+    }
     // Must be created before fetchWithTimeout: the signal aborts the upstream
     // request when the client disconnects (IDE cancel), otherwise the proxy
     // keeps reading upstream and holds the per-session lock. Also passed to
@@ -5685,6 +5790,15 @@ async function forward(
             if (prepared?.session) noteClientAbort(prepared.session);
         }
     });
+    // #1891: seam forensics for the MAIN send path — every lane (streaming,
+    // plugin pipe, non-streaming) funnels through this one chokepoint, so the
+    // next settleUsageReport pairs this exact outbound byte string with the
+    // previous request's body. Loop re-fetches re-note their own rebuilt bodies
+    // (loop/core.ts fetchUpstream); side requests never settle usage and must
+    // not clobber the slot.
+    if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+        noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
         upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -5774,6 +5888,11 @@ async function forward(
                     }
                     if (r.response.ok) {
                         upstreamResult.clearTimer();
+                        // #1900: the hop's bytes are now the accepted wire base —
+                        // keep wireBody tracking the last successful send so every
+                        // later same-request re-send (fake-completion hint retry)
+                        // derives from what upstream actually accepted.
+                        wireBody = fixed.body;
                         remember(target, fixed.rewritten);
                         upstreamResult = r;
                         return "ok";
@@ -5906,6 +6025,7 @@ async function forward(
                         const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
+                            wireBody = refolded; // #1900: track the accepted re-send as the wire base
                             upstreamResult = retried;
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
                         } else {
@@ -6117,9 +6237,16 @@ async function forward(
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             if (prepared.stream && maxFakeCompletionRetries() > 0) {
+                // #1900: retry from wireBody — the exact bytes this request's main
+                // attempt shipped (post wireTransform and any same-request re-send),
+                // never the raw client body: upstream may have rejected those raw
+                // bytes earlier in this session, and a 400'd hint would present the
+                // fake completion. The agent owning compression does not change this:
+                // the retry is a proxy→upstream HTTP call whose base must be what
+                // upstream just accepted (aligned with the proxy lane below).
                 const resolvedBuf = await resolveFakeCompletion(pluginBody, {
                     protocol: prepared.protocol,
-                    body,
+                    wireBody,
                     upstreamUrl,
                     reqHeaders: buildForwardHeaders(headers),
                     proxyUrl,
@@ -6223,9 +6350,14 @@ async function forward(
     // timer plus its socket for the full window.
     try {
         if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+            // #1900: retry from wireBody — the exact bytes this request's main
+            // attempt shipped (post wireTransform and any same-request re-send),
+            // never the raw client body: upstream may have rejected those raw
+            // bytes earlier in this session, and a 400'd hint would present the
+            // fake completion instead of a corrected turn.
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
-                body,
+                wireBody,
                 upstreamUrl,
                 reqHeaders: buildForwardHeaders(headers),
                 proxyUrl,
@@ -6446,7 +6578,7 @@ async function forward(
                     // model saw (deterministic encode + per-fingerprint cache) —
                     // applied after the ordering repair, matching the steady
                     // paths' sequence.
-                    await applyImageCompressionPass(prepared.session, ordered as BiliMessage[], { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), log: ctx.log });
+                    await applyImageCompressionPass(prepared.session, ordered as BiliMessage[], { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), cap: imageTokenCapFor(opts, route?.rewrittenUrl), log: ctx.log });
                     const imgNote = imageFullTrailingNote(prepared.session);
                     if (imgNote) (ordered as BiliMessage[]).push({ id: "bili_image_full_note", role: "user", contentType: "text", text: imgNote });
                     return ordered;
@@ -6454,9 +6586,13 @@ async function forward(
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
             const loopDumpDir = opts.dumpSse;
+            // #1843 L1: route identity for image-cost learning, resolved here —
+            // the loop has no access to the provider route table. Same billing
+            // upstream expression as outboundPayloadBreakdown.
+            const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform },
                 adapter,
@@ -6539,7 +6675,11 @@ async function forward(
                 const reportedCached: number | null = typeof cached === "number" ? cached : null;
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
-                    noteForwardedBody(prepared.session, typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+                    // wireBody — not prepared.body — is what actually went out
+                    // (compat-role / steering / chain-stamp rewrites apply after
+                    // prepare); the main chokepoint above already noted it, this
+                    // keeps the pair byte-exact if that ever moves (#1891).
+                    noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
                     settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
@@ -6586,11 +6726,18 @@ async function forward(
 // (the retry's response when a retry recovered, else the original). The session
 // streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
 // turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
+// #1900 contract: `wireBody` must be the EXACT bytes this request's main attempt
+// shipped upstream (post wireTransform — compat roles / output steering /
+// dropFields / chain stamp — and post any same-request re-send such as the #552
+// role hop or the #1195 overflow refold). The hinted retry derives from the base
+// upstream just accepted; pre-transform client bytes may have been rejected
+// earlier in the same session, which would 400 the hint and present the fake
+// completion to the user.
 async function resolveFakeCompletion(
     stream: ReadableStream<Uint8Array>,
     opts: {
         protocol: WireProtocol;
-        body: string | Buffer;
+        wireBody: string | Buffer;
         upstreamUrl: string;
         reqHeaders: Record<string, string>;
         proxyUrl?: string;
@@ -6605,7 +6752,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.body);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
             if (hinted === null) break;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
@@ -6669,6 +6816,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;
     opts.imageBilling = reloaded.imageBilling;
+    opts.imageTokenCap = reloaded.imageTokenCap;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
@@ -6931,5 +7079,5 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
+export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
