@@ -5774,6 +5774,11 @@ async function forward(
                     }
                     if (r.response.ok) {
                         upstreamResult.clearTimer();
+                        // #1900: the hop's bytes are now the accepted wire base —
+                        // keep wireBody tracking the last successful send so every
+                        // later same-request re-send (fake-completion hint retry)
+                        // derives from what upstream actually accepted.
+                        wireBody = fixed.body;
                         remember(target, fixed.rewritten);
                         upstreamResult = r;
                         return "ok";
@@ -5906,6 +5911,7 @@ async function forward(
                         const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
+                            wireBody = refolded; // #1900: track the accepted re-send as the wire base
                             upstreamResult = retried;
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
                         } else {
@@ -6117,9 +6123,16 @@ async function forward(
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             if (prepared.stream && maxFakeCompletionRetries() > 0) {
+                // #1900: retry from wireBody — the exact bytes this request's main
+                // attempt shipped (post wireTransform and any same-request re-send),
+                // never the raw client body: upstream may have rejected those raw
+                // bytes earlier in this session, and a 400'd hint would present the
+                // fake completion. The agent owning compression does not change this:
+                // the retry is a proxy→upstream HTTP call whose base must be what
+                // upstream just accepted (aligned with the proxy lane below).
                 const resolvedBuf = await resolveFakeCompletion(pluginBody, {
                     protocol: prepared.protocol,
-                    body,
+                    wireBody,
                     upstreamUrl,
                     reqHeaders: buildForwardHeaders(headers),
                     proxyUrl,
@@ -6223,9 +6236,14 @@ async function forward(
     // timer plus its socket for the full window.
     try {
         if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+            // #1900: retry from wireBody — the exact bytes this request's main
+            // attempt shipped (post wireTransform and any same-request re-send),
+            // never the raw client body: upstream may have rejected those raw
+            // bytes earlier in this session, and a 400'd hint would present the
+            // fake completion instead of a corrected turn.
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
-                body,
+                wireBody,
                 upstreamUrl,
                 reqHeaders: buildForwardHeaders(headers),
                 proxyUrl,
@@ -6586,11 +6604,18 @@ async function forward(
 // (the retry's response when a retry recovered, else the original). The session
 // streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
 // turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
+// #1900 contract: `wireBody` must be the EXACT bytes this request's main attempt
+// shipped upstream (post wireTransform — compat roles / output steering /
+// dropFields / chain stamp — and post any same-request re-send such as the #552
+// role hop or the #1195 overflow refold). The hinted retry derives from the base
+// upstream just accepted; pre-transform client bytes may have been rejected
+// earlier in the same session, which would 400 the hint and present the fake
+// completion to the user.
 async function resolveFakeCompletion(
     stream: ReadableStream<Uint8Array>,
     opts: {
         protocol: WireProtocol;
-        body: string | Buffer;
+        wireBody: string | Buffer;
         upstreamUrl: string;
         reqHeaders: Record<string, string>;
         proxyUrl?: string;
@@ -6605,7 +6630,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.body);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
             if (hinted === null) break;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
