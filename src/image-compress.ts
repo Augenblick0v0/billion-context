@@ -276,9 +276,15 @@ function invalidateForRef(session: Session, ref: string): void {
  *  unreferenced messages (ephemeral), never throws (per-slot catch →
  *  pass-through). Idempotent: recorded refs re-encode deterministically via
  *  the fingerprint cache. */
-export async function applyImageCompressionPass(session: Session, messages: BiliMessage[], opts: { config: Config; billing: ResolvedImageBilling; log?: LogFn }): Promise<void> {
+export async function applyImageCompressionPass(session: Session, messages: BiliMessage[], opts: { config: Config; billing: ResolvedImageBilling; cap?: number; log?: LogFn }): Promise<void> {
     if (!imageCompressionEnabled(session)) return;
     const log: LogFn = opts.log ?? ((level, msg) => loggerLog(level, msg));
+    // #1843-L3: the saved-token stat must agree with the window accounting —
+    // an operator-declared imageTokenCap bounds every billed cost, so bound
+    // the recorded before/after too. The ROUTING decision stays uncapped: the
+    // cap is a billing ceiling, not a statement about the image's physical
+    // size, and shrinking bytes is still worth doing.
+    const capCost = (n: number): number => (opts.cap !== undefined && opts.cap > 0 ? Math.min(n, opts.cap) : n);
     let shrunkThisPass = 0;
     let bytesSaved = 0;
     let tokensSaved = 0;
@@ -336,8 +342,8 @@ export async function applyImageCompressionPass(session: Session, messages: Bili
                 if (imageShrinksForRef(session.state, ref).length === 0) {
                     const dimBefore = parseImageDimensionsFromBase64(origB64);
                     const dimAfter = parseImageDimensionsFromBase64(shrunk.b64);
-                    const tokensBefore = estimateImageTokens({ mediaType: origMediaType, base64Length: origB64.length, width: dimBefore?.width, height: dimBefore?.height, billing: opts.billing, base64: origB64 });
-                    const tokensAfter = estimateImageTokens({ mediaType: shrunk.mediaType, base64Length: shrunk.b64.length, width: dimAfter?.width, height: dimAfter?.height, billing: opts.billing, base64: shrunk.b64 });
+                    const tokensBefore = capCost(estimateImageTokens({ mediaType: origMediaType, base64Length: origB64.length, width: dimBefore?.width, height: dimBefore?.height, billing: opts.billing, base64: origB64 }));
+                    const tokensAfter = capCost(estimateImageTokens({ mediaType: shrunk.mediaType, base64Length: shrunk.b64.length, width: dimAfter?.width, height: dimAfter?.height, billing: opts.billing, base64: shrunk.b64 }));
                     const originalBytes = Math.ceil(origB64.length * 3 / 4);
                     const shrunkBytes = Math.ceil(shrunk.b64.length * 3 / 4);
                     session.state = recordImageShrink(session.state, {

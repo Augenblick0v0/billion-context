@@ -456,9 +456,13 @@ test("e2e #583 G: mid-list assistant→system 400s on a placement-strict backend
         });
         assert.equal(res1.status, 200, "client sees a transparent 200 after the second-chance retry");
         assert.equal(seen.length, 3, `expected 3 upstream hits (asst→sys→user), got ${JSON.stringify(seen)}`);
+        // #1881: bili's own injected head system (ACP-TAGS prohibition, present
+        // even with injectTool=false) is legitimate at index 0 — the ladder
+        // mechanism is about MID-LIST placement, so scope the checks past it.
+        const midListSystem = (roles: string[]) => roles.slice(1).includes("system");
         assert.ok(seen[0].includes("assistant"), "hit 1 carries an assistant role → rejected");
-        assert.ok(!seen[1].includes("assistant") && seen[1].includes("system"), "hit 2: primary hop rewrote assistant→system (mid-list → placement 400)");
-        assert.ok(!seen[2].includes("assistant") && !seen[2].includes("system"), "hit 3: second-chance rewrote assistant→user → accepted");
+        assert.ok(!seen[1].includes("assistant") && midListSystem(seen[1]), "hit 2: primary hop rewrote assistant→system (mid-list → placement 400)");
+        assert.ok(!seen[2].includes("assistant") && !midListSystem(seen[2]), "hit 3: second-chance rewrote assistant→user → accepted");
         // Second request: the session learned assistant→user, so every assistant
         // is pre-rewritten BEFORE fetch — no 400 round-trip.
         const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
@@ -468,7 +472,7 @@ test("e2e #583 G: mid-list assistant→system 400s on a placement-strict backend
         });
         assert.equal(res2.status, 200);
         assert.equal(seen.length, 4, `expected 4 upstream hits total (3 + 1), got ${JSON.stringify(seen)}`);
-        assert.ok(!seen[3].includes("assistant") && !seen[3].includes("system"), "second request pre-rewritten via learned map");
+        assert.ok(!seen[3].includes("assistant") && !midListSystem(seen[3]), "second request pre-rewritten via learned map");
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");
     } finally {

@@ -83,7 +83,10 @@ const NAME = ACP_NAME_ALT;
 // flag-free by construction — case folding lives inside ACP_NAME_ALT's letter
 // classes (#1731) — so every .source reconstruction below preserves behavior
 // verbatim; an `i` flag would be silently dropped at each rebuild site.
-const PAIRED = new RegExp("\x3c" + NAME + "\\s[^<>]*>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
+// Attrs are OPTIONAL: the kernel always emits them, but models imitate the
+// bare form <name>mNNNNN</name> (#1881) — whole-span strip must cover it or
+// the interior ref leaks as residue after the lone tags go.
+const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
 const REF_LIKE = /^\s*m\d{4,}\s*$/;
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
@@ -532,6 +535,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
      *  wrapped-turn imitation, which is attested by shape and whose payload must
      *  never reach the client. */
     let swallowReleases = true;
+    /** Whether the current swallow started from a BARE opening (<name>, no
+     *  attribute list). Only bare opens may be prose wearing a tag (#1881);
+     *  an attrs-bearing open's tail is tag content even when never closed. */
+    let swallowBareOpen = false;
     let droppedAny = false;
     let notified = false;
     let inputChars = 0;
@@ -642,9 +649,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             out += buf.slice(0, m.index);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
-            // span — only an attrs-bearing LONE_OPEN leaves the stream
-            // mid-tag and needs to swallow until its close arrives.
-            if (m === o && OPEN_WITH_ATTRS.test(m[0])) {
+            // span — only a LONE_OPEN leaves the stream mid-tag and needs to
+            // swallow until its close arrives. An attrs-bearing opening always
+            // swallows (its attribute list may still be growing). A BARE
+            // opening swallows too — its close may arrive in a later chunk
+            // (the bare-pair imitation, #1881) — UNLESS more tag structure
+            // follows in this same chunk: then the bare open wraps or sits
+            // beside inner markup, so drop it alone and let the loop decide
+            // the inner structure on its own merits (#1720 nesting).
+            if (m === o) {
+                const bare = !OPEN_WITH_ATTRS.test(m[0]);
+                if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) continue;
                 // An odd number of quotes means the opening's attribute list
                 // never closed: the model wrapped its turn inside the value (the
                 // sibling shape opens with such a value and then runs into a `<`,
@@ -656,6 +671,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 swallowUntilClose = true;
                 swallowLimit = wrapped ? IMITATION_SWALLOW_CAP : SWALLOW_CAP;
                 swallowReleases = !wrapped;
+                swallowBareOpen = bare;
                 swallowed = "";
             }
         }
@@ -677,11 +693,30 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             held = "";
             swallowUntilClose = false;
             let result: string;
-            if (wasSwallowing) {
-                // Stream ended inside an unclosed render tag: the held content
-                // is tag content (a ref), not prose.
+            if (wasSwallowing && (!swallowReleases || !swallowBareOpen)) {
+                // Stream ended inside an unclosed render tag: a wrapped-turn
+                // imitation (never released, #1720), or an attrs-bearing
+                // opening whose tail never closed — that tail is tag content
+                // (a ref, possibly truncated), not prose (#644 EOF rule).
                 if (rest.length > 0) drop(rest);
                 result = "";
+            } else if (wasSwallowing) {
+                // A BARE opening (#1881): prose may genuinely wear one, so an
+                // over-budget-or-EOF tail is content unless it is exactly a
+                // ref; only a truncated open/close tail is dead markup.
+                const t = new RegExp(TRUNC_OPEN.source).exec(rest);
+                if (t) {
+                    drop(t[0]);
+                    result = rest.slice(0, t.index);
+                } else {
+                    const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
+                    if (tc) {
+                        drop(tc[0]);
+                        result = rest.slice(0, tc.index);
+                    } else {
+                        result = rest;
+                    }
+                }
             } else {
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {

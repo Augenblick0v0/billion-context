@@ -11,7 +11,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -215,6 +215,74 @@ export function noteClientAbort(session: Session): void {
  *  the next settleUsageReport pairs it with the usage report it produced. */
 export function noteForwardedBody(session: Session, body: string): void {
     seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
+}
+
+// #1843 L1: learned per-route image cost. The prior (pixel tile model or bytes)
+// can be off by up to 15x per image on non-OpenAI vision encoders; the upstream
+// usage report is the ground truth, so derive the observed image mass as
+// (billed input - text-side estimate of the SAME forwarded payload) and learn
+// an EMA per image count, keyed by upstream host (the encoder is a property of
+// the route). Persisted in session.metadata like #626's learnedCompatRoles so a
+// restart keeps the converged value; invalidated by TTL or by a billing/cap
+// fingerprint change (a reconfigured route may bill differently).
+export interface LearnedImageCostEntry {
+    /** EMA of observed billed tokens per image for this host. */
+    cost: number;
+    /** Samples absorbed into the EMA. */
+    seen: number;
+    /** Last sample wall-clock ms — entries older than the TTL are ignored. */
+    ts: number;
+    /** `${billing}:${cap}` fingerprint captured with the sample. */
+    fp: string;
+}
+export interface ForwardedImageFacts {
+    nImages: number;
+    /** Text-side estimate of the forwarded payload (messages + wire overhead) —
+     *  whatever the usage total bills besides the images. */
+    textSide: number;
+    host: string;
+    fp: string;
+}
+const LEARNED_IMAGE_COST_TTL_MS = 24 * 60 * 60 * 1000;
+const LEARNED_IMAGE_COST_ALPHA = 0.5;
+const LEARNED_PER_IMAGE_MAX = 1_000_000;
+const imageFactsLastSent = new WeakMap<Session, ForwardedImageFacts>();
+
+/** Capture side of L1: called at the same send chokepoints as noteForwardedBody
+ *  with the image facts of the round about to be sent. The next settleUsageReport
+ *  consumes exactly this entry (same pairing guarantee as the seam forensics). */
+export function noteForwardedImageFacts(session: Session, facts: ForwardedImageFacts): void {
+    imageFactsLastSent.set(session, facts);
+}
+
+function settleImageLearning(session: Session, billedTotal: number): void {
+    const facts = imageFactsLastSent.get(session);
+    if (!facts) return;
+    imageFactsLastSent.delete(session);
+    if (facts.nImages <= 0 || billedTotal <= 0) return;
+    const observed = billedTotal - facts.textSide;
+    if (observed <= 0) return; // text estimate overshot the bill — no signal
+    const per = observed / facts.nImages;
+    if (!(per >= 1 && per <= LEARNED_PER_IMAGE_MAX)) return; // out-of-band sample
+    const store = (session.metadata.learnedImageCosts ?? {}) as Record<string, LearnedImageCostEntry>;
+    const prev = store[facts.host];
+    const cost = prev && typeof prev.cost === "number" ? prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA : per;
+    store[facts.host] = { cost, seen: (prev?.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
+    session.metadata.learnedImageCosts = store;
+    markDirty(session);
+}
+
+/** Consume side of L1: the learned reserve for THIS payload — learned per-image
+ *  cost x current image count, or undefined when no fresh matching evidence
+ *  exists (caller then falls back to the prior-based estimate). */
+export function learnedImageReserve(session: Session, host: string, nImages: number, fp: string, cap: number): number | undefined {
+    if (nImages <= 0) return undefined;
+    const entry = (session.metadata.learnedImageCosts as Record<string, LearnedImageCostEntry> | undefined)?.[host];
+    if (!entry || typeof entry.cost !== "number" || entry.seen < 1) return undefined;
+    if (Date.now() - entry.ts > LEARNED_IMAGE_COST_TTL_MS) return undefined;
+    if (entry.fp !== fp) return undefined; // billing/cap reconfigured since learning
+    const per = cap > 0 ? Math.min(entry.cost, cap) : entry.cost;
+    return per * nImages;
 }
 
 function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; prevMsgs: number; curMsgs: number } {
@@ -589,6 +657,10 @@ export function settleUsageReport(
         session.stats.cacheSamples += 1;
     }
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream });
+    // #1843 L1: the usage total is ground truth for what the route's vision
+    // encoder actually billed — fold any captured image facts into the learned
+    // per-route cost (no-op when the request carried no images or no capture).
+    settleImageLearning(session, s.total);
     // #1592-family seam forensics: pair this settle with the body that was
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.

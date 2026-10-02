@@ -24,6 +24,22 @@ import {
     type ReleaseNoteEntry,
 } from "../src/update-notes.ts";
 import { VERSION } from "../src/version.ts";
+import semver from "semver";
+
+// #1870 follow-up: the two SURFACE tests below exercise the real running
+// version (package.json at runtime), so their fixtures must be derived FROM
+// it — hardcoded 0.1.18x strings rotted the moment v0.1.180 shipped and put
+// master's CI red after the #1870 merge. The explicit-version unit tests
+// above keep hardcoded strings (they pin spanNotes logic, not this repo's
+// current version).
+const RUNNING = semver.valid(VERSION) ?? "0.0.1";
+const NEXT = semver.inc(RUNNING, "patch") ?? "0.0.2";
+const NEXT2 = semver.inc(NEXT, "patch") ?? "0.0.3";
+const SURFACE_ENTRIES: ReleaseNoteEntry[] = [
+    { version: NEXT2, tier: "routine", summary: "docs and log polish" },
+    { version: NEXT, date: "2026-10-02", tier: "recommended", summary: "OpenCode WebSocket traffic intercepted again (#1844)" },
+    { version: RUNNING, tier: "recommended", summary: "compression survives restart/resume forks (#1834)" },
+];
 
 const ENTRIES: ReleaseNoteEntry[] = [
     { version: "0.1.181", tier: "routine", summary: "docs and log polish" },
@@ -191,19 +207,19 @@ test("#1870 acp_status: UPDATE READY section lists the span; clean state stays b
         const clean = handleAcpStatus({}, ctx);
         assert.ok(!clean.includes("UPDATE READY") && !clean.includes("UPDATE AVAILABLE"), "no section on a clean install");
 
-        _setReleaseNotesStateForTest({ entries: ENTRIES, diskVersion: "0.1.181" });
+        _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const out = handleAcpStatus({}, ctx);
-        assert.ok(out.includes("UPDATE READY (instance-level): 0.1.181 downloaded — restart this agent's proxy to finish"), "actionable headline names the disk version");
+        assert.ok(out.includes(`UPDATE READY (instance-level): ${NEXT2} downloaded — restart this agent's proxy to finish`), "actionable headline names the disk version");
         assert.ok(out.includes(`(running ${VERSION})`), "names the running version for contrast");
-        assert.ok(out.includes("· 0.1.180 [recommended] OpenCode WebSocket traffic intercepted again (#1844)"), "span renders versions below disk but above running, tier-first");
-        assert.ok(out.includes("· 0.1.181 [routine] docs and log polish"), "span renders up to the disk version the restart will finish");
+        assert.ok(out.includes(`· ${NEXT} [recommended] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
+        assert.ok(out.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
         assert.ok(out.includes("GET /__bili/status → update"), "points at the live-state field");
 
         // No disk info (auto-update off): AVAILABLE wording + manual command.
-        _setReleaseNotesStateForTest({ entries: ENTRIES });
+        _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
         const avail = handleAcpStatus({}, ctx);
         assert.ok(avail.includes("UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
-        assert.ok(avail.includes("npm install -g billion-context@0.1.181"), "manual update command present");
+        assert.ok(avail.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
         assert.ok(!avail.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
     } finally {
         _resetReleaseNotesWatcherForTest();
@@ -228,11 +244,11 @@ test("#1870 /acp panel: one update line BEFORE the footer, stripper-safe, byte-e
         assert.ok(!p0.includes("Update ready") && !p0.includes("Update available"), "no update line when clean");
         assert.ok(p0.includes(PANEL_BOX_FOOTER), "footer present when clean");
 
-        _setReleaseNotesStateForTest({ entries: ENTRIES, diskVersion: "0.1.181" });
+        _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const r1 = mockRes();
         handlePluginStatus("never-seen", r1.res, deps, true);
         const p1 = JSON.parse(r1.body).panel as string;
-        assert.ok(p1.includes("Update ready: 0.1.181 — restart to finish."), "panel line present");
+        assert.ok(p1.includes(`Update ready: ${NEXT2} — restart to finish.`), "panel line present");
         assert.ok(p1.includes(PANEL_BOX_FOOTER), "footer still present with the update line");
         assert.ok(p1.indexOf("Update ready") < p1.indexOf(PANEL_BOX_FOOTER), "update line sits BEFORE the footer (stripper anchor)");
         const footerEsc = PANEL_BOX_FOOTER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -242,8 +258,8 @@ test("#1870 /acp panel: one update line BEFORE the footer, stripper-safe, byte-e
         // byte-exact (same escape the advisory line relies on).
         const dollarSummary = "saves $5 and echoes $& `$'` verbatim";
         _setReleaseNotesStateForTest({
-            entries: [{ version: "0.1.180", tier: "recommended", summary: dollarSummary }],
-            diskVersion: "0.1.180",
+            entries: [{ version: NEXT, tier: "recommended", summary: dollarSummary }],
+            diskVersion: NEXT,
         });
         const r2 = mockRes();
         handlePluginStatus("never-seen", r2.res, deps, true);
