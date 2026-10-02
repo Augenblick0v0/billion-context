@@ -270,3 +270,49 @@ test("e2e: mixed host+bili tools stay a MAIN turn through the pipeline (#546 dir
         await closeRig(rig);
     }
 });
+
+test("e2e: all-bili tools WITH history artifacts stay a MAIN turn (#1197 boundary)", async () => {
+    const rig = await startRig();
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers: Record<string, string> = {
+            "content-type": "application/json",
+            "x-acp-session": SESSION,
+            "x-bili-plugin": "omp",
+            "x-bili-plugin-conversation": SESSION,
+        };
+        // The #1197/#1086 boundary: the ENTIRE tools array is bili's set BUT the
+        // history re-sends real invocations of both ACP tools — a live plugin
+        // session replaying its own compression state, NOT a utility side request.
+        // All-bili tools alone cannot mean "side request"; history artifacts must
+        // veto the demotion so this runs through the kernel.
+        const body = {
+            model: MODEL, max_tokens: 1024, stream: true,
+            tools: [openAiTool("acp_status"), openAiTool("search_context")],
+            messages: [
+                { role: "system", content: "You are a test assistant." },
+                { role: "user", content: "hello world, please help me with a task" },
+                { role: "assistant", content: null, tool_calls: [
+                    { id: "call_1", type: "function", function: { name: "acp_status", arguments: "{}" } },
+                    { id: "call_2", type: "function", function: { name: "search_context", arguments: "{}" } },
+                ]},
+                { role: "tool", tool_call_id: "call_1", content: "ok" },
+                { role: "tool", tool_call_id: "call_2", content: "ok" },
+            ],
+        };
+        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+        assert.equal(r.status, 200);
+        await r.text();
+
+        const fwd = rig.lastBody as Record<string, unknown> | null;
+        assert.ok(fwd, "upstream received the request");
+        assert.ok(Array.isArray(fwd?.tools), "tools SURVIVE — history artifacts veto the demotion");
+        assert.ok(JSON.stringify(fwd?.tools).includes('"acp_status"'), "leak NOT stripped when the request is a live session");
+
+        const s = getSession(SESSION);
+        assert.equal(s.stats.requests, 1, "all-bili tools + history artifacts = live session → processed, not demoted (#1197)");
+        assert.notEqual(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state advanced by the main turn");
+    } finally {
+        await closeRig(rig);
+    }
+});

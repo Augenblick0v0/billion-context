@@ -2448,7 +2448,14 @@ async function handle(
         // #546/#1665 rescue semantics untouched. Strip the leak BEFORE
         // restoreOutputBudget and route demoted requests through the side
         // passthrough below.
-        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode && stripLeakedBiliTools(parsed);
+        // #1197/#1086: all-bili tools alone cannot mean "side request" — a live
+        // plugin session also re-sends its compression artifacts in HISTORY and must
+        // run through the kernel. Veto on real history artifacts (detectAcpArtifacts
+        // is history-scoped, never the top-level tools declarations), so a fresh
+        // title-gen still demotes. Read-only; ordered BEFORE the mutating strip.
+        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
+            && detectAcpArtifacts(bodyBuffer, parsed) === null
+            && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
