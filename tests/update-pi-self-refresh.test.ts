@@ -41,10 +41,17 @@ test("resolvePiBinary: finds a stock npm install's pi-stable(.cmd), prefers cano
     const win = resolvePiBinary({ PATH: binDir, APPDATA: appdata, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32", fs.existsSync, "C:\\nodejs\\node.exe");
     assert.equal(norm(win), norm(path.join(npmDir, "pi-stable.cmd")));
 
-    // Canonical `pi` wins when both exist (users and distros link it).
-    fs.writeFileSync(path.join(binDir, "pi"), "#!/bin/sh\n");
-    const posix = resolvePiBinary({ PATH: binDir }, "linux", fs.existsSync, process.execPath);
-    assert.equal(norm(posix), norm(path.join(binDir, "pi")));
+    // Canonical `pi` wins when both exist in one dir: `pi` is probed ahead of
+    // `pi-stable`. Synthetic dir + stubbed exists keeps this host-independent —
+    // a real temp path carries a drive-letter ':' on Windows, which the linux
+    // separator below would shred into non-matching fragments.
+    const pref = resolvePiBinary(
+        { PATH: "probedir" },
+        "linux",
+        (c) => c === "probedir/pi" || c === "probedir/pi-stable",
+        process.execPath,
+    );
+    assert.equal(pref, "probedir/pi");
 
     // The override short-circuits everything.
     assert.equal(resolvePiBinary({ PATH: binDir, BILI_PI_BIN: "/opt/weird/pi-nightly" }, "linux", fs.existsSync, process.execPath), "/opt/weird/pi-nightly");
