@@ -38,6 +38,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -187,7 +188,7 @@ async function drive(sessionId: string): Promise<string[]> {
         await closeServer(upstream);
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(tmp, { recursive: true, force: true });
+        rmrf(tmp);
     }
 }
 

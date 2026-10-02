@@ -2478,7 +2478,7 @@ test("resolveNonHttpProviders: providers-table compactionOptIn ∪ env list, ded
         assert.deepEqual(resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "claude-bridge,z" }), ["claude-bridge", "https://api.anthropic.com", "z"]);
     } finally {
         if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3152,9 +3152,9 @@ test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", (
         assert.ok(file);
         const txt = fs.readFileSync(file, "utf8");
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: billion-context$/m);
-        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+        rmrf(`${dir}-bili`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3209,7 +3209,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // No shim at all: the same fallback.
-        fs.rmSync(shimDir, { recursive: true, force: true });
+        rmrf(shimDir);
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // Missing dist bundles: nothing written, existing content untouched.
@@ -3219,7 +3219,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
         assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3238,7 +3238,7 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         const repoPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
         assert.equal(shimPkg.version, repoPkg.version);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

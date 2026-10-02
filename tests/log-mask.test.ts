@@ -522,6 +522,6 @@ test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async (
     } finally {
         configureLogger(undefined);
         setLogCapture(null);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

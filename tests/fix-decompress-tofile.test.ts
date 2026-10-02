@@ -14,6 +14,7 @@ import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
 
@@ -63,7 +64,7 @@ test("#1691 whole-block toFile: a small restore (would be inline) writes to the 
         const block = session.state.blocks.find((b) => b.blockId === blockId);
         assert.notEqual(block?.restoredInline, true, "toFile path does not flag restoredInline");
     } finally {
-        fs.rmSync(scratch, { recursive: true, force: true });
+        rmrf(scratch);
     }
 });
 
@@ -80,7 +81,7 @@ test("#1691 whole-block toFile: a large restore targets the caller path, not os.
         assert.match(disk, /Historical detail 0\./, "folded content present in the file");
         assert.doesNotMatch(disk, /Historical detail 13\./, "messages outside the folded span are not written");
     } finally {
-        fs.rmSync(scratch, { recursive: true, force: true });
+        rmrf(scratch);
     }
 });
 
@@ -98,7 +99,7 @@ test("#1691 default unchanged: no toFile leaves a small restore inline (no file)
     } finally {
         if (prevTmp === undefined) delete process.env.TMPDIR;
         else process.env.TMPDIR = prevTmp;
-        fs.rmSync(scratch, { recursive: true, force: true });
+        rmrf(scratch);
     }
 });
 
@@ -123,7 +124,7 @@ test("#1691 relative toFile resolves against the proxy cwd", () => {
         assert.ok(out.includes(resolved), "ack reports the resolved absolute path");
     } finally {
         process.chdir(prevCwd);
-        fs.rmSync(scratch, { recursive: true, force: true });
+        rmrf(scratch);
     }
 });
 
@@ -172,6 +173,6 @@ test("#1691 range toFile: writes the span to the caller path and queues only a l
         assert.ok(injs[0]!.text!.includes(target), "queued injection points at the file");
         assert.doesNotMatch(injs[0]!.text!, /Historical detail 1\./, "full body NOT injected (lean pointer keeps context flat)");
     } finally {
-        fs.rmSync(scratch, { recursive: true, force: true });
+        rmrf(scratch);
     }
 });

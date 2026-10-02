@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -13,6 +13,7 @@ import {
 } from "../src/config.js";
 import { handleConfigPut, readProviders } from "../src/web/api.js";
 import { setLogCapture } from "../src/logger.js";
+import { rmrf } from "./tmp-rm.ts";
 
 function withConfigFile(t: test.TestContext, providers: unknown): string {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-named-bind-"));
@@ -23,7 +24,7 @@ function withConfigFile(t: test.TestContext, providers: unknown): string {
     t.after(() => {
         if (prev === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prev;
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     });
     return p;
 }
