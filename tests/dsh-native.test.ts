@@ -1147,6 +1147,181 @@ test("bundled-catalog fallback (#1849): a declared selection without a file wind
     }
 });
 
+function writeRouteWindowFixture(home: string, provider: string, model: string, defaultWindow?: number): void {
+    fs.writeFileSync(
+        path.join(home, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            `    ${provider}:`,
+            "      api: openai-completions",
+            "      baseURL: http://127.0.0.1:8199/v1",
+            ...(defaultWindow !== undefined ? [`      defaultContextWindow: ${defaultWindow}`] : []),
+            "      models:",
+            `        - id: ${model}`,
+            "agent-default-model:",
+            `  provider: ${provider}`,
+            `  model: ${model}`,
+            "",
+        ].join("\n"),
+    );
+}
+
+test("route-default fallback (#1849): a declared windowless model gets the route's defaultContextWindow", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-rd1-"));
+    writeRouteWindowFixture(home, "route-a", "winless-model", 400000);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest(null);
+            const logs: string[] = [];
+            const origLog = console.log;
+            console.log = (line: string) => {
+                logs.push(line);
+            };
+            try {
+                const ctx = mockCtx();
+                ctx.setModelServices(
+                    { resolveModelInfo: async () => {
+                        throw new Error("catalog never initialized");
+                    } },
+                    { currentSelection: () => ({ provider: "route-a", model: "winless-model" }) },
+                );
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (rd1)");
+                ctx.setInitiator({ session: { id: "session-rd1" } });
+                const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "400000", "route default stamps the header");
+                await waitFor(() => proxy.runtimeInfo.some((r) => r.agent === "dsh" && r.model === "winless-model" && r.contextWindow === 400000), "runtime-info carries the route default");
+                assert.ok(logs.some((l) => l.includes("settings.yaml defaultContextWindow 400000 for route-a/winless-model")), "note names the route-default tier");
+            } finally {
+                console.log = origLog;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
+test("route-default fallback (#1849): an unset defaultContextWindow mirrors the host's 262144", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-rd2-"));
+    writeRouteWindowFixture(home, "route-b", "winless-model");
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest(null);
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                { resolveModelInfo: async () => {
+                    throw new Error("catalog never initialized");
+                } },
+                { currentSelection: () => ({ provider: "route-b", model: "winless-model" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (rd2)");
+            ctx.setInitiator({ session: { id: "session-rd2" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "262144", "unset route default mirrors DEFAULT_CONTEXT_WINDOW");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
+test("route-default fallback (#1849): the bundled catalog beats the route default for a catalog-known id", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-rd3-"));
+    writeRouteWindowFixture(home, "route-c", "deepseek-v4-flash", 400000);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            // memory resolves entry.contextWindow ?? builtin-by-id ?? route default —
+            // the catalog entry sits BETWEEN settings and the route default
+            _setBuiltinCatalogForTest([{ provider: "deepseek", model: "deepseek-v4-flash", window: 1000000 }]);
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                { resolveModelInfo: async () => {
+                    throw new Error("catalog never initialized");
+                } },
+                { currentSelection: () => ({ provider: "route-c", model: "deepseek-v4-flash" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (rd3)");
+            ctx.setInitiator({ session: { id: "session-rd3" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "builtin catalog wins over the route default");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
+test("route-default fallback (#1849): scoped declarations disambiguate one model id across providers", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-rd4-"));
+    fs.writeFileSync(
+        path.join(home, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            "    route-a:",
+            "      models:",
+            "        - id: shared-model",
+            "          contextWindow: 111",
+            "    route-b:",
+            "      models:",
+            "        - id: shared-model",
+            "          contextWindow: 222",
+            "agent-default-model:",
+            "  provider: route-b",
+            "  model: shared-model",
+            "",
+        ].join("\n"),
+    );
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest(null);
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                { resolveModelInfo: async () => {
+                    throw new Error("catalog never initialized");
+                } },
+                { currentSelection: () => ({ provider: "route-b", model: "shared-model" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (rd4)");
+            ctx.setInitiator({ session: { id: "session-rd4" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "222", "the selection provider's own declaration wins");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
 test("settings.yaml window fallback (#1849): a rejecting llm service still stamps and reports the file's window", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-swf-"));

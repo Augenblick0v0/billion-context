@@ -514,36 +514,118 @@ export function readDshConfig(dshHome: string): DshConfig {
  *  silently. */
 export function parseDshContextWindows(text: string): Map<string, number> {
     const out = new Map<string, number>();
+    for (const [key, window] of parseDshWindowSources(text).windows) {
+        if (!key.includes("/")) out.set(key, window);
+    }
+    return out;
+}
+
+// #1849 completion: mirror dsh-llm-pi-ai's in-memory window resolution chain
+// (entry.contextWindow ?? builtin-catalog-by-id ?? route defaultContextWindow,
+// dsh-llm-pi-ai resolveRouteModels) as far as the FILE can express it. The
+// provider-scoped view carries everything the flat map cannot:
+// - scoped "provider/model" windows (same model id under two routes),
+// - route-level defaultContextWindow (custom providers default to 262144
+//   in the host when unset — DEFAULT_CONTEXT_WINDOW),
+// - the set of models DECLARED under a provider without a per-model window
+//   (those resolve to the route default in memory).
+export interface DshWindowSources {
+    windows: Map<string, number>;
+    providerDefaults: Map<string, number>;
+    providerModels: Map<string, Set<string>>;
+}
+export function parseDshWindowSources(text: string): DshWindowSources {
+    const out: DshWindowSources = { windows: new Map(), providerDefaults: new Map(), providerModels: new Map() };
     let modelsIndent = -1;
+    let blockProvider: string | undefined;
     let current: string | undefined;
+    let providersIndent = -1;
+    let providerLevel = -1;
+    let provider: string | undefined;
+    let deepseekIndent = -1;
+    const sectionProvider = (): string | undefined => {
+        if (provider !== undefined) return provider;
+        if (deepseekIndent >= 0) return "deepseek-official";
+        return undefined;
+    };
+    const commitPending = (): void => {
+        if (current === undefined) return;
+        if (blockProvider !== undefined) {
+            const set = out.providerModels.get(blockProvider);
+            if (set !== undefined) set.add(current);
+            else out.providerModels.set(blockProvider, new Set([current]));
+        }
+        current = undefined;
+    };
     for (const raw of text.split(/\r?\n/)) {
         const line = raw.replace(/\s+#.*$/, "");
         if (line.trim().length === 0) continue;
         const indent = line.length - line.trimStart().length;
         if (modelsIndent >= 0) {
             if (indent <= modelsIndent) {
+                commitPending();
                 modelsIndent = -1;
                 current = undefined;
             } else {
                 const idm = /^\s*-\s+id:\s*(\S+)\s*$/.exec(line);
                 if (idm) {
+                    commitPending();
                     current = idm[1].replace(/^["']|["']$/g, "");
                     continue;
                 }
                 const wm = /^\s*contextWindow:\s*(\d+)\s*$/.exec(line);
                 if (wm && current !== undefined) {
                     const n = Math.floor(Number(wm[1]));
-                    if (n > 0) out.set(current, n);
+                    if (n > 0) {
+                        out.windows.set(current, n);
+                        if (blockProvider !== undefined) out.windows.set(`${blockProvider}/${current}`, n);
+                    }
                     current = undefined;
                 }
                 continue;
             }
         }
-        if (/^\s*models:\s*$/.test(line)) {
-            modelsIndent = indent;
-            current = undefined;
+        if (providersIndent >= 0 && indent <= providersIndent) {
+            providersIndent = -1;
+            providerLevel = -1;
+            provider = undefined;
+        }
+        if (deepseekIndent >= 0 && indent <= deepseekIndent) deepseekIndent = -1;
+        const header = /^\s*([\w."'-]+):\s*$/.exec(line);
+        if (header !== null) {
+            const key = header[1];
+            if (key === "providers" && providersIndent < 0) {
+                providersIndent = indent;
+                providerLevel = -1;
+                provider = undefined;
+                continue;
+            }
+            if (key === "llm-deepseek" && deepseekIndent < 0) {
+                deepseekIndent = indent;
+                continue;
+            }
+            if (providersIndent >= 0 && indent > providersIndent && indent === (providerLevel < 0 ? (providerLevel = indent) : providerLevel)) {
+                provider = key;
+                continue;
+            }
+            if (key === "models") {
+                modelsIndent = indent;
+                blockProvider = sectionProvider();
+                current = undefined;
+            }
+            continue;
+        }
+        const dm = /^\s*defaultContextWindow:\s*(\d+)\s*$/.exec(line);
+        if (dm !== null) {
+            const active = sectionProvider();
+            const inProviderFields = active !== undefined && ((provider !== undefined && providerLevel >= 0 && indent > providerLevel) || (provider === undefined && deepseekIndent >= 0 && indent > deepseekIndent));
+            if (inProviderFields) {
+                const n = Math.floor(Number(dm[1]));
+                if (n > 0) out.providerDefaults.set(active, n);
+            }
         }
     }
+    commitPending();
     return out;
 }
 
@@ -554,6 +636,17 @@ export function readDshContextWindows(dshHome: string): Map<string, number> {
         return parseDshContextWindows(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"));
     } catch {
         return new Map();
+    }
+}
+
+/** Provider-scoped window sources from the dsh global settings (#1849):
+ *  scoped windows, route-level defaultContextWindow, and windowless declared
+ *  model ids — everything the flat map above cannot express. */
+export function readDshWindowSources(dshHome: string): DshWindowSources {
+    try {
+        return parseDshWindowSources(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"));
+    } catch {
+        return { windows: new Map(), providerDefaults: new Map(), providerModels: new Map() };
     }
 }
 
@@ -587,8 +680,10 @@ export function readDshSelectionWindow(dshHome: string): { provider: string; mod
     }
     if (provider === undefined || model === undefined) return undefined;
     // #1849: a declared selection without a window is still a selection —
-    // the window may live in the host's bundled catalog tier instead.
-    const contextWindow = parseDshContextWindows(text).get(model);
+    // the window may live in the route default or the host's bundled catalog
+    // tier instead. Scoped declaration wins over a stray bare one.
+    const sources = parseDshWindowSources(text);
+    const contextWindow = sources.windows.get(`${provider}/${model}`) ?? sources.windows.get(model);
     return { provider, model, ...(contextWindow !== undefined ? { contextWindow } : {}) };
 }
 

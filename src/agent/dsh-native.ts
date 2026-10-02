@@ -35,7 +35,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { readDshContextWindows, readDshSelectionWindow, resolveDshHome } from "../client-config.js";
+import { readDshSelectionWindow, readDshWindowSources, resolveDshHome, type DshWindowSources } from "../client-config.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
@@ -312,11 +312,11 @@ let consecutiveResolveFailures = 0;
 // model. Read once per process — the file is the host's own launch config;
 // mid-session edits are picked up by the live llm service when the host can
 // serve it at all, which is exactly the path this fallback supplements.
-let settingsWindows: Map<string, number> | undefined;
+let settingsWindows: DshWindowSources | undefined;
 let settingsWindowLoggedFor = "";
-function settingsWindowFor(model: string): number | undefined {
-    if (settingsWindows === undefined) settingsWindows = readDshContextWindows(resolveDshHome(process.env));
-    return settingsWindows.get(model);
+function settingsSources(): DshWindowSources {
+    if (settingsWindows === undefined) settingsWindows = readDshWindowSources(resolveDshHome(process.env));
+    return settingsWindows;
 }
 // #1849 second tier: the host's in-memory value is the merge of the profile's
 // models list over dsh's bundled pi-ai catalog (dsh-llm-pi-ai resolveRouteModels
@@ -397,20 +397,29 @@ function walkUpCandidates(base: string, rel: string[]): string[] {
     }
     return out;
 }
-// #1849 file fallback, full chain: profile-declared truth first, then the
-// host's bundled catalog. Returns the window and which tier supplied it.
-function fileWindowFor(provider: string | undefined, model: string): { window: number; source: "settings" | "catalog" } | undefined {
-    const fromSettings = settingsWindowFor(model);
-    if (fromSettings !== undefined) return { window: fromSettings, source: "settings" };
+// #1849 file fallback, full chain mirroring dsh-llm-pi-ai's in-memory
+// resolution (entry.contextWindow ?? builtin-catalog-by-id ?? route
+// defaultContextWindow, resolveRouteModels): scoped settings window, bare
+// settings window, host's bundled catalog, then the route default — which
+// memory serves as defaultContextWindow ?? 262144 (DEFAULT_CONTEXT_WINDOW)
+// for models DECLARED under the provider, never as a blanket guess.
+function fileWindowFor(provider: string | undefined, model: string): { window: number; source: "settings" | "settings-default" | "catalog" } | undefined {
+    const scoped = provider !== undefined && provider.length > 0 ? settingsSources().windows.get(`${provider}/${model}`) : undefined;
+    if (scoped !== undefined) return { window: scoped, source: "settings" };
+    const bare = settingsSources().windows.get(model);
+    if (bare !== undefined) return { window: bare, source: "settings" };
     const fromCatalog = catalogWindowFor(provider, model);
     if (fromCatalog !== undefined) return { window: fromCatalog, source: "catalog" };
+    if (provider !== undefined && provider.length > 0 && settingsSources().providerModels.get(provider)?.has(model)) {
+        return { window: settingsSources().providerDefaults.get(provider) ?? 262144, source: "settings-default" };
+    }
     return undefined;
 }
-function noteSettingsWindowFallback(provider: string, model: string, window: number, source: "settings" | "catalog"): void {
+function noteSettingsWindowFallback(provider: string, model: string, window: number, source: "settings" | "settings-default" | "catalog"): void {
     const key = `${provider}/${model}`;
     if (settingsWindowLoggedFor === key) return;
     settingsWindowLoggedFor = key;
-    const originLine = source === "settings" ? "settings.yaml contextWindow" : "the host's bundled model catalog contextWindow";
+    const originLine = source === "settings" ? "settings.yaml contextWindow" : source === "settings-default" ? "settings.yaml defaultContextWindow" : "the host's bundled model catalog contextWindow";
     const msg = `${originLine} ${window} for ${key} used as fallback — the host's llm service could not serve it (#1849)`;
     persistClientEvent(msg);
     console.log(`bili-native-dsh: ${msg}`);
@@ -427,13 +436,14 @@ function settingsSelectionFallback(origin: string | undefined): boolean {
     const sel = readDshSelectionWindow(resolveDshHome(process.env));
     if (sel === undefined) return false;
     // The default-model entry carries its own window when the profile spells
-    // one; otherwise the same question as above: is this model served from the
-    // bundled catalog? readDshSelectionWindow without a window is undefined,
-    // so re-derive the window from the catalog tier here.
-    const window = sel.contextWindow ?? catalogWindowFor(sel.provider, sel.model);
+    // one (scoped declaration beats a stray bare one); otherwise run the SAME
+    // file chain as the resolve paths — catalog tier, then route default for
+    // declared windowless models.
+    const hit = fileWindowFor(sel.provider, sel.model);
+    const window = sel.contextWindow ?? hit?.window;
     if (window === undefined) return false;
     modelInfo.cached = { provider: sel.provider, model: sel.model, contextWindow: window };
-    noteSettingsWindowFallback(sel.provider, sel.model, window, sel.contextWindow !== undefined ? "settings" : "catalog");
+    noteSettingsWindowFallback(sel.provider, sel.model, window, sel.contextWindow !== undefined ? "settings" : hit?.source ?? "catalog");
     if (origin !== undefined) {
         void reportRuntimeInfo(origin, { agent: "dsh", model: sel.model, contextWindow: window, source: "client-config" }).catch(() => {});
     }
