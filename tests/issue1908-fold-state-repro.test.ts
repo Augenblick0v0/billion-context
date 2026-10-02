@@ -45,6 +45,15 @@ import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// F — fork the trailing history wholesale: keep the covered prefix
+// byte-identical, replace everything after the first third with fresh branch
+// content (a fork tool's divergence). Covered ids inside the replaced region
+// go permanently missing (dead roster entries); the block must survive via
+// the present prefix, the fork tail rides the wire as fresh unfolded
+// material, and no ghost of the dropped region re-enters (#1921 fork
+// semantics — inherited prefix block + independent branch tail).
+const FORK_MARKER = "Fork branch: redesigned module plan for the independent continuation";
+
 type Item = Record<string, unknown>;
 
 const SUMMARY_MARKER = "[Compressed conversation section]";
@@ -116,6 +125,7 @@ interface Scenario {
     editCoveredMessage: boolean; // one-byte edit of a covered old message before the probe turn
     churnCoveredMessage: boolean; // normalization-equivalent re-serialization of a covered message (#1921 R)
     switchModel: boolean; // send the probe turn under the second model
+    forkTail: boolean; // wholesale-replace the trailing history with fresh branch content (#1921 F)
 }
 
 interface ProbeResult {
@@ -253,6 +263,19 @@ async function runScenario(sc: Scenario): Promise<ProbeResult> {
             assert.ok(target, `${sc.label}: covered user message not found in client history`);
             target!.content = (target!.content as string).replace(COVERED_MARKER, CHURNED_MARKER);
         }
+        if (sc.forkTail) {
+            // Fork point sits inside the covered range (first user message
+            // after the first third of the resent history): the covered ids
+            // beyond it die with the branch, the ones before it stay present.
+            let forkAt = -1;
+            for (let i = Math.floor(hist.length / 3); i < hist.length; i++) {
+                if (hist[i]!.role === "user") { forkAt = i; break; }
+            }
+            assert.ok(forkAt >= 0, `${sc.label}: no user message found in the fork window`);
+            hist.splice(forkAt);
+            hist.push({ role: "user", content: `${FORK_MARKER}. ` + FILLER(90, 3) });
+            hist.push({ role: "assistant", content: "Fork reply: acknowledged the redesigned plan for the branch. " + FILLER(91, 0.2) });
+        }
         const probeModel = sc.switchModel ? "claude-other" : "claude-test";
         await sendTurn(t, probeModel);
         const probe = captured[captured.length - 1]!;
@@ -274,17 +297,17 @@ function assertFoldRetained(label: string, probe: ProbeResult): void {
 }
 
 test("#1908 M: model switch on an identified session RETAINS the fold (session id is model-independent)", { timeout: 120_000 }, async () => {
-    const probe = await runScenario({ label: "M", identified: true, editCoveredMessage: false, churnCoveredMessage: false, switchModel: true });
+    const probe = await runScenario({ label: "M", identified: true, editCoveredMessage: false, churnCoveredMessage: false, switchModel: true, forkTail: false });
     assertFoldRetained("M", probe);
 });
 
 test("#1908 M-ANON: model switch on an anonymous (prefix-affinity) session RETAINS the fold", { timeout: 120_000 }, async () => {
-    const probe = await runScenario({ label: "M-ANON", identified: false, editCoveredMessage: false, churnCoveredMessage: false, switchModel: true });
+    const probe = await runScenario({ label: "M-ANON", identified: false, editCoveredMessage: false, churnCoveredMessage: false, switchModel: true, forkTail: false });
     assertFoldRetained("M-ANON", probe);
 });
 
 test("#1908 E: a one-byte edit of a covered message silently LOSES the fold — summary AND original both on the wire", { timeout: 120_000 }, async () => {
-    const probe = await runScenario({ label: "E", identified: true, editCoveredMessage: true, churnCoveredMessage: false, switchModel: false });
+    const probe = await runScenario({ label: "E", identified: true, editCoveredMessage: true, churnCoveredMessage: false, switchModel: false, forkTail: false });
     // The summary stays (block still active — other ids still match)...
     assert.equal(countSummaries(probe.probeBody), 1, "E: summary must still be present (partial-match block stays active)");
     // ...AND the edited original re-enters the wire unfolded: double-count.
@@ -296,7 +319,7 @@ test("#1908 E: a one-byte edit of a covered message silently LOSES the fold — 
 });
 
 test("#1921 R: whitespace churn of a covered message is re-anchored — fold RETAINED under repair", { timeout: 120_000 }, async () => {
-    const probe = await runScenario({ label: "R", identified: true, editCoveredMessage: false, churnCoveredMessage: true, switchModel: false });
+    const probe = await runScenario({ label: "R", identified: true, editCoveredMessage: false, churnCoveredMessage: true, switchModel: false, forkTail: false });
     // The block re-anchored onto the churned id: summary survives...
     assert.equal(countSummaries(probe.probeBody), 1, "R: summary must survive the churn (block re-anchored)");
     // ...and the churned original stays STRIPPED — no re-entry in any spacing form.
@@ -304,4 +327,19 @@ test("#1921 R: whitespace churn of a covered message is re-anchored — fold RET
     // No re-inflation: the probe grew only by the new turn itself (~6 KB),
     // not by the ~6 KB churned original re-entering on top of it.
     assert.ok(probe.probeBytes <= probe.pinnedBytes + 8_000, `R: probe must not re-inflate (pinned ${probe.pinnedBytes}, probe ${probe.probeBytes})`);
+});
+
+test("#1921 F: wholesale fork of the trailing history — prefix fold inherited, branch tail unfolded, no ghost re-entry", { timeout: 120_000 }, async () => {
+    const probe = await runScenario({ label: "F", identified: true, editCoveredMessage: false, churnCoveredMessage: false, switchModel: false, forkTail: true });
+    // The block survives via the still-present prefix ids: summary stays.
+    assert.equal(countSummaries(probe.probeBody), 1, "F: summary must survive the fork (block alive via prefix ids)");
+    // The resent covered prefix stays stripped — the inherited fold is live.
+    assert.ok(!probe.probeBody.includes(COVERED_MARKER), "F: the resent covered prefix must stay stripped — inherited fold retained");
+    // The fork tail rides the wire as fresh unfolded material.
+    assert.ok(probe.probeBody.includes(FORK_MARKER), "F: the branch content must be on the wire (unfolded new material)");
+    // No ghost of the dropped region re-enters and no re-inflation: the wire
+    // lost the forked-away turns, so the probe must be SMALLER than the
+    // pinned baseline plus the new turn's ~6 KB.
+    assert.ok(probe.probeBytes <= probe.pinnedBytes + 8_000, `F: probe must not re-inflate (pinned ${probe.pinnedBytes}, probe ${probe.probeBytes})`);
+    assert.ok(probe.probeBytes < probe.pinnedBytes, "F: the forked-away tail must actually leave the wire (probe < pinned)");
 });
