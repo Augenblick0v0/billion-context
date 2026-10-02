@@ -33,6 +33,7 @@
 // /compact is rare and auto mode is off).
 
 import { appendFileSync, mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { readDshContextWindows, readDshSelectionWindow, resolveDshHome } from "../client-config.js";
 import { defaultLogFile } from "../paths.js";
@@ -218,9 +219,9 @@ function refreshModelInfo(origin: string | undefined): void {
     if (resolve === undefined) {
         // #1849 delivery: no service at all — the file still knows this
         // session's model window, and that is all the proxy needs.
-        const window = settingsWindowFor(model);
-        modelInfo.cached = { provider, model, ...(window !== undefined ? { contextWindow: window } : {}) };
-        if (window !== undefined) noteSettingsWindowFallback(provider, model, window);
+        const hit = fileWindowFor(provider, model);
+        modelInfo.cached = { provider, model, ...(hit !== undefined ? { contextWindow: hit.window } : {}) };
+        if (hit !== undefined) noteSettingsWindowFallback(provider, model, hit.window, hit.source);
         else warnNoClientWindow(`llm.resolveModelInfo is unavailable in this host for ${provider}/${model}`);
         return;
     }
@@ -237,8 +238,9 @@ function refreshModelInfo(origin: string | undefined): void {
             const svcWindow = typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined;
             const svcMax = typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined;
             // #1849 delivery: the service resolved but carried no window —
-            // fall back to settings.yaml for THIS model before warning.
-            const fallbackWindow = svcWindow === undefined ? settingsWindowFor(model) : undefined;
+            // fall back to the file chain for THIS model before warning.
+            const hit = svcWindow === undefined ? fileWindowFor(provider, model) : undefined;
+            const fallbackWindow = hit?.window;
             modelInfo.cached = {
                 provider,
                 model,
@@ -247,7 +249,7 @@ function refreshModelInfo(origin: string | undefined): void {
             };
             if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
             else warnNoClientWindow(`host model info for ${provider}/${model} carries no context window`);
-            if (fallbackWindow !== undefined) noteSettingsWindowFallback(provider, model, fallbackWindow);
+            if (hit !== undefined) noteSettingsWindowFallback(provider, model, hit.window, hit.source);
             consecutiveResolveFailures = 0;
         })
         .catch((err: unknown) => {
@@ -263,15 +265,16 @@ function refreshModelInfo(origin: string | undefined): void {
             // counter resets on any successful resolve, and retries continue
             // regardless (the retryAt cooldown drives them, #1812).
             consecutiveResolveFailures += 1;
-            // #1849 delivery: the live headless flavor rejects EVERY resolve
-            // (its model catalog is never initialized) — before committing a
-            // windowless cache, try settings.yaml for THIS model. A window
+            // #1849 delivery (both tiers): the live headless flavor rejects
+            // EVERY resolve (its model catalog is never initialized) — before
+            // committing a windowless cache, try the file chain (settings.yaml
+            // first, then the host's bundled catalog) for THIS model. A window
             // found there is final (the fast-path stops retrying the broken
-            // service), and the degradation warn only fires when even the
-            // file cannot supply a number.
-            const window = settingsWindowFor(model);
-            modelInfo.cached = { provider, model, ...(window !== undefined ? { contextWindow: window } : {}) };
-            if (window !== undefined) noteSettingsWindowFallback(provider, model, window);
+            // service), and the degradation warn only fires when neither tier
+            // can supply a number.
+            const hit = fileWindowFor(provider, model);
+            modelInfo.cached = { provider, model, ...(hit !== undefined ? { contextWindow: hit.window } : {}) };
+            if (hit !== undefined) noteSettingsWindowFallback(provider, model, hit.window, hit.source);
             else if (consecutiveResolveFailures >= 3) warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model} (x${consecutiveResolveFailures} consecutive): ${errMessage(err)} (retries continue)`);
         })
         .finally(() => {
@@ -315,11 +318,100 @@ function settingsWindowFor(model: string): number | undefined {
     if (settingsWindows === undefined) settingsWindows = readDshContextWindows(resolveDshHome(process.env));
     return settingsWindows.get(model);
 }
-function noteSettingsWindowFallback(provider: string, model: string, window: number): void {
+// #1849 second tier: the host's in-memory value is the merge of the profile's
+// models list over dsh's bundled pi-ai catalog (dsh-llm-pi-ai resolveRouteModels
+// serves the catalog unchanged for a route with no models list). settings.yaml
+// only carries the first half — models served purely from that catalog (a
+// provider route without a models block) are invisible to the file. Load the
+// SAME catalog the memory serves, from the host's own install, best effort.
+let builtinWindowIndex: Map<string, number> | undefined;
+function catalogWindowFor(provider: string | undefined, model: string): number | undefined {
+    if (builtinWindowIndex === undefined) builtinWindowIndex = loadBuiltinWindowIndex();
+    if (builtinWindowIndex.size === 0) return undefined;
+    const scoped = provider !== undefined && provider.length > 0 ? builtinWindowIndex.get(`${provider}/${model}`) : undefined;
+    return scoped ?? builtinWindowIndex.get(model);
+}
+function loadBuiltinWindowIndex(): Map<string, number> {
+    const index = new Map<string, number>();
+    const bases: Array<string | undefined> = [process.argv[1] !== undefined ? path.dirname(process.argv[1]) : undefined, process.cwd()];
+    for (const base of bases) {
+        if (typeof base !== "string" || base.length === 0) continue;
+        // pi-ai's exports map is import-only, so the specifier cannot be
+        // require()d — require the dist file by absolute path instead
+        // (bypasses exports; require(esm) needs Node 22+, which a host that
+        // loads this ESM catalog already runs).
+        for (const file of walkUpCandidates(base, ["@earendil-works", "pi-ai", "dist", "providers", "all.js"])) {
+            try {
+                const probe = createRequire(path.join(base, "probe.js"));
+                const all = probe(file) as {
+                    getBuiltinProviders?: () => string[];
+                    getBuiltinModels?: (provider: string) => Array<{ id: string; contextWindow?: number }>;
+                };
+                if (typeof all?.getBuiltinProviders !== "function" || typeof all?.getBuiltinModels !== "function") continue;
+                for (const providerId of all.getBuiltinProviders()) {
+                    for (const entry of all.getBuiltinModels(providerId) ?? []) {
+                        recordCatalogWindow(index, providerId, entry);
+                    }
+                }
+                if (index.size > 0) break;
+            } catch {
+                // try the next candidate
+            }
+        }
+        // dsh's OWN deepseek route is served by a bundled component whose
+        // model ids (deepseek-flash…) live outside the pi-ai catalog — the
+        // host's own resolver reads them through resolveAdapterOptions, so
+        // read the same live defaults from the same module the host runs.
+        for (const file of walkUpCandidates(base, ["@deepseek-ai", "dsh-llm-deepseek", "lib", "index.js"])) {
+            try {
+                const probe = createRequire(path.join(base, "probe.js"));
+                const mod = probe(file) as {
+                    resolveAdapterOptions?: (config: Record<string, unknown>, env: unknown) => { models?: Array<{ id: string; contextWindow?: number }> };
+                };
+                const opts = mod?.resolveAdapterOptions?.({}, undefined);
+                for (const entry of opts?.models ?? []) recordCatalogWindow(index, "deepseek-official", entry);
+                break;
+            } catch {
+                // try the next candidate
+            }
+        }
+    }
+    return index;
+}
+function recordCatalogWindow(index: Map<string, number>, providerId: string, entry: { id?: unknown; contextWindow?: unknown }): void {
+    if (typeof entry?.id !== "string") return;
+    const window = typeof entry.contextWindow === "number" && entry.contextWindow > 0 ? Math.floor(entry.contextWindow) : undefined;
+    if (window === undefined) return;
+    const scoped = `${providerId}/${entry.id}`;
+    if (!index.has(scoped)) index.set(scoped, window);
+    if (!index.has(entry.id)) index.set(entry.id, window);
+}
+function walkUpCandidates(base: string, rel: string[]): string[] {
+    const out: string[] = [];
+    let dir = path.resolve(base);
+    for (let i = 0; i < 6; i++) {
+        out.push(path.join(dir, "node_modules", ...rel));
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    return out;
+}
+// #1849 file fallback, full chain: profile-declared truth first, then the
+// host's bundled catalog. Returns the window and which tier supplied it.
+function fileWindowFor(provider: string | undefined, model: string): { window: number; source: "settings" | "catalog" } | undefined {
+    const fromSettings = settingsWindowFor(model);
+    if (fromSettings !== undefined) return { window: fromSettings, source: "settings" };
+    const fromCatalog = catalogWindowFor(provider, model);
+    if (fromCatalog !== undefined) return { window: fromCatalog, source: "catalog" };
+    return undefined;
+}
+function noteSettingsWindowFallback(provider: string, model: string, window: number, source: "settings" | "catalog"): void {
     const key = `${provider}/${model}`;
     if (settingsWindowLoggedFor === key) return;
     settingsWindowLoggedFor = key;
-    const msg = `settings.yaml contextWindow ${window} for ${key} used as fallback — the host's llm service could not serve it (#1849)`;
+    const originLine = source === "settings" ? "settings.yaml contextWindow" : "the host's bundled model catalog contextWindow";
+    const msg = `${originLine} ${window} for ${key} used as fallback — the host's llm service could not serve it (#1849)`;
     persistClientEvent(msg);
     console.log(`bili-native-dsh: ${msg}`);
 }
@@ -334,10 +426,16 @@ function settingsSelectionFallback(origin: string | undefined): boolean {
     settingsSelectionDone = true;
     const sel = readDshSelectionWindow(resolveDshHome(process.env));
     if (sel === undefined) return false;
-    modelInfo.cached = { provider: sel.provider, model: sel.model, contextWindow: sel.contextWindow };
-    noteSettingsWindowFallback(sel.provider, sel.model, sel.contextWindow);
+    // The default-model entry carries its own window when the profile spells
+    // one; otherwise the same question as above: is this model served from the
+    // bundled catalog? readDshSelectionWindow without a window is undefined,
+    // so re-derive the window from the catalog tier here.
+    const window = sel.contextWindow ?? catalogWindowFor(sel.provider, sel.model);
+    if (window === undefined) return false;
+    modelInfo.cached = { provider: sel.provider, model: sel.model, contextWindow: window };
+    noteSettingsWindowFallback(sel.provider, sel.model, window, sel.contextWindow !== undefined ? "settings" : "catalog");
     if (origin !== undefined) {
-        void reportRuntimeInfo(origin, { agent: "dsh", model: sel.model, contextWindow: sel.contextWindow, source: "client-config" }).catch(() => {});
+        void reportRuntimeInfo(origin, { agent: "dsh", model: sel.model, contextWindow: window, source: "client-config" }).catch(() => {});
     }
     return true;
 }
@@ -1071,4 +1169,10 @@ export function _resetWindowWarningForTest(): void {
     settingsWindows = undefined;
     settingsWindowLoggedFor = "";
     settingsSelectionDone = false;
+    builtinWindowIndex = undefined;
+}
+/** Test hook (#1849): inject/withdraw the bundled-catalog tier without a real
+ *  pi-ai install on the machine. */
+export function _setBuiltinCatalogForTest(entries: Array<{ provider: string; model: string; window: number }> | null): void {
+    builtinWindowIndex = null === entries ? new Map() : new Map(entries.flatMap((e) => [[`${e.provider}/${e.model}`, e.window], [e.model, e.window]] as Array<[string, number]>));
 }

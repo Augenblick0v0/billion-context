@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetWindowWarningForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _setBuiltinCatalogForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetWindowWarningForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -1017,6 +1017,135 @@ function writeSettingsFixture(home: string, model: string, window: number): void
         ].join("\n"),
     );
 }
+
+function writeSelectionOnlyFixture(home: string, provider: string, model: string): void {
+    fs.writeFileSync(
+        path.join(home, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            `    ${provider}:`,
+            "      api: openai-completions",
+            "      baseURL: http://127.0.0.1:8199/v1",
+            "agent-default-model:",
+            `  provider: ${provider}`,
+            `  model: ${model}`,
+            "",
+        ].join("\n"),
+    );
+}
+
+test("bundled-catalog fallback (#1849): a model settings.yaml does not declare still stamps from the host catalog", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cat-"));
+    writeSettingsFixture(home, "qwen-cat-settings", 131072);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest([{ provider: "deepseek", model: "deepseek-v4-flash", window: 1000000 }]);
+            const logs: string[] = [];
+            const origLog = console.log;
+            console.log = (line: string) => {
+                logs.push(line);
+            };
+            try {
+                const ctx = mockCtx();
+                ctx.setModelServices(
+                    { resolveModelInfo: async () => {
+                        throw new Error("catalog never initialized");
+                    } },
+                    { currentSelection: () => ({ provider: "deepseek", model: "deepseek-v4-flash" }) },
+                );
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (cat)");
+                ctx.setInitiator({ session: { id: "session-cat" } });
+                const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "catalog fallback stamped the window header");
+                await waitFor(() => proxy.runtimeInfo.some((r) => r.agent === "dsh" && r.model === "deepseek-v4-flash" && r.contextWindow === 1000000), "runtime-info report carries the catalog window");
+                assert.ok(logs.some((l) => l.includes("bundled model catalog contextWindow 1000000") && l.includes("deepseek/deepseek-v4-flash")), "fallback note names the catalog tier");
+            } finally {
+                console.log = origLog;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
+test("bundled-catalog fallback (#1849): settings.yaml wins over the catalog for the same model", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cat2-"));
+    writeSettingsFixture(home, "deepseek-v4-flash", 262144);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest([{ provider: "deepseek", model: "deepseek-v4-flash", window: 1000000 }]);
+            const logs: string[] = [];
+            const origLog = console.log;
+            console.log = (line: string) => {
+                logs.push(line);
+            };
+            try {
+                const ctx = mockCtx();
+                ctx.setModelServices(
+                    { resolveModelInfo: async () => {
+                        throw new Error("catalog never initialized");
+                    } },
+                    { currentSelection: () => ({ provider: "deepseek", model: "deepseek-v4-flash" }) },
+                );
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (cat2)");
+                ctx.setInitiator({ session: { id: "session-cat2" } });
+                const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+                await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "262144", "settings window beats the catalog entry");
+                assert.ok(logs.some((l) => l.includes("settings.yaml contextWindow 262144")), "note names the settings tier");
+            } finally {
+                console.log = origLog;
+            }
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
+
+test("bundled-catalog fallback (#1849): a declared selection without a file window resolves via the catalog", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cat3-"));
+    writeSelectionOnlyFixture(home, "deepseek", "deepseek-v4-flash");
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            _setBuiltinCatalogForTest([{ provider: "deepseek", model: "deepseek-v4-flash", window: 1000000 }]);
+            const ctx = mockCtx();
+            // NEITHER model service binds (web-profile flavor) and the
+            // selection's model has no models-list entry — only the catalog
+            // tier can state its window
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (cat3)");
+            ctx.setInitiator({ session: { id: "session-cat3" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "selection fallback stamped the catalog window");
+            await waitFor(() => proxy.runtimeInfo.some((r) => r.agent === "dsh" && r.model === "deepseek-v4-flash" && r.contextWindow === 1000000), "runtime-info report carries the catalog window");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+        _setBuiltinCatalogForTest(null);
+    }
+});
 
 test("settings.yaml window fallback (#1849): a rejecting llm service still stamps and reports the file's window", async () => {
     const proxy = await startMockProxy([]);

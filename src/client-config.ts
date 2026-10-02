@@ -562,7 +562,7 @@ export function readDshContextWindows(dshHome: string): Map<string, number> {
  *  services at all (the web-profile flavor binds neither llm nor
  *  agentDefaultModel, so the plugin cannot even learn WHICH model it is
  *  running — the file is the only place that is still true). */
-export function readDshSelectionWindow(dshHome: string): { provider: string; model: string; contextWindow: number } | undefined {
+export function readDshSelectionWindow(dshHome: string): { provider: string; model: string; contextWindow?: number } | undefined {
     let text: string;
     try {
         text = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
@@ -586,8 +586,10 @@ export function readDshSelectionWindow(dshHome: string): { provider: string; mod
         if (mm) model = mm[1].replace(/^["']|["']$/g, "");
     }
     if (provider === undefined || model === undefined) return undefined;
+    // #1849: a declared selection without a window is still a selection —
+    // the window may live in the host's bundled catalog tier instead.
     const contextWindow = parseDshContextWindows(text).get(model);
-    return contextWindow === undefined ? undefined : { provider, model, contextWindow };
+    return { provider, model, ...(contextWindow !== undefined ? { contextWindow } : {}) };
 }
 
 /** Default model API gateways for Trae CLI (ByteDance). The CLI is a Go
