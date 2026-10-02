@@ -5525,6 +5525,15 @@ async function forward(
             if (prepared?.session) noteClientAbort(prepared.session);
         }
     });
+    // #1891: seam forensics for the MAIN send path — every lane (streaming,
+    // plugin pipe, non-streaming) funnels through this one chokepoint, so the
+    // next settleUsageReport pairs this exact outbound byte string with the
+    // previous request's body. Loop re-fetches re-note their own rebuilt bodies
+    // (loop/core.ts fetchUpstream); side requests never settle usage and must
+    // not clobber the slot.
+    if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+        noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
         upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -6371,7 +6380,11 @@ async function forward(
                 const reportedCached: number | null = typeof cached === "number" ? cached : null;
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
-                    noteForwardedBody(prepared.session, typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+                    // wireBody — not prepared.body — is what actually went out
+                    // (compat-role / steering / chain-stamp rewrites apply after
+                    // prepare); the main chokepoint above already noted it, this
+                    // keeps the pair byte-exact if that ever moves (#1891).
+                    noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
                     settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
