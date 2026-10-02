@@ -3,10 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { rmrf } from "./tmp-rm.ts";
+import { _setRmImplForTest, rmrf } from "./tmp-rm.ts";
 
 function tmpRoot(): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), "bili-tmp-rm-"));
+}
+
+function errno(code: string): NodeJS.ErrnoException {
+    const err = new Error(`fake ${code}`) as NodeJS.ErrnoException;
+    err.code = code;
+    return err;
 }
 
 test("rmrf: removes a plain tree; missing target is a no-op (force)", () => {
@@ -18,14 +24,13 @@ test("rmrf: removes a plain tree; missing target is a no-op (force)", () => {
     rmrf(path.join(dir, "already-gone")); // must not throw ENOENT
 });
 
-test("rmrf: outlives a writer that keeps recreating the tree (#1646/#1910 ENOTEMPTY race)", () => {
+test("rmrf: cleans up while an in-process writer is armed (smoke)", () => {
+    // An in-process timer cannot interleave with the synchronous delete — one
+    // event loop — so this pass never triggers a retry and pins coexistence
+    // only; the retry loop itself is pinned through _setRmImplForTest below.
     const dir = tmpRoot();
     fs.mkdirSync(path.join(dir, "anthropic"), { recursive: true });
     fs.writeFileSync(path.join(dir, "anthropic", "seed.json"), "{}");
-    // Stand-in for the real racer: a debounced persist flush that lands after
-    // teardown began, recreating <tmp>/<provider>/ between rmSync's readdir
-    // and rmdir. 10ms cadence for ~250ms — well past the old flat 10×50ms
-    // inner budget once runner load stretches the interval.
     let ticks = 0;
     const writer = setInterval(() => {
         ticks += 1;
@@ -33,10 +38,59 @@ test("rmrf: outlives a writer that keeps recreating the tree (#1646/#1910 ENOTEM
         fs.writeFileSync(path.join(dir, "anthropic", `late-${ticks}.json`), "{}");
     }, 10);
     setTimeout(() => clearInterval(writer), 250).unref();
-    rmrf(dir); // writer is live here; backoff must outlive the burst
+    rmrf(dir);
     assert.equal(fs.existsSync(dir), false);
 });
 
-test("rmrf: non-transient errors still throw", () => {
+test("rmrf: rides the backoff over transient failures and recovers", () => {
+    const dir = tmpRoot();
+    fs.mkdirSync(path.join(dir, "anthropic"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "anthropic", "seed.json"), "{}");
+    let calls = 0;
+    _setRmImplForTest((target) => {
+        calls += 1;
+        if (calls <= 3) throw errno("ENOTEMPTY");
+        fs.rmSync(target, { recursive: true, force: true });
+    });
+    try {
+        rmrf(dir);
+    } finally {
+        _setRmImplForTest();
+    }
+    assert.equal(calls, 4, "three ENOTEMPTYs → three backoffs → quiet tree deletes");
+    assert.equal(fs.existsSync(dir), false);
+});
+
+test("rmrf: a transient storm past the budget throws after the full ladder", () => {
+    let calls = 0;
+    _setRmImplForTest(() => {
+        calls += 1;
+        throw errno("ENOTEMPTY");
+    });
+    const t0 = Date.now();
+    try {
+        assert.throws(() => rmrf("/definitely/not/a/path"), /fake ENOTEMPTY/);
+    } finally {
+        _setRmImplForTest();
+    }
+    assert.equal(calls, 8, "one attempt + all seven backoffs, then give up");
+    assert.ok(Date.now() - t0 >= 3100, "paid the 25..1600ms ladder (~3.2s)");
+});
+
+test("rmrf: non-transient errors throw at once, no backoff", () => {
+    let calls = 0;
+    _setRmImplForTest(() => {
+        calls += 1;
+        throw errno("ELOOP");
+    });
+    try {
+        assert.throws(() => rmrf("/definitely/not/a/path"), /fake ELOOP/);
+    } finally {
+        _setRmImplForTest();
+    }
+    assert.equal(calls, 1);
+});
+
+test("rmrf: invalid input still throws TypeError (default impl)", () => {
     assert.throws(() => rmrf(42 as unknown as string), TypeError);
 });

@@ -1,9 +1,9 @@
 import { rmSync } from "node:fs";
 
 // #1646: bare recursive rmSync throws ENOTEMPTY on loaded CI runners when a
-// spawned child recreates entries between readdir and rmdir; Node's rimraf
-// only retries transient errors (ENOTEMPTY/EACCES/EPERM/EMFILE/EBUSY) when
-// maxRetries is set. Do not simplify these options away.
+// spawned child recreates entries between readdir and rmdir. The delete may
+// only re-run on the transient set Node's rimraf retries
+// (ENOTEMPTY/EACCES/EPERM/EMFILE/EBUSY); anything else must surface.
 //
 // #1910 follow-up: a flat 10×50ms budget (~500ms) still lost the race on the
 // ubuntu-22 release-gate leg — the failing suite's late debounced session
@@ -19,11 +19,23 @@ function sleepSync(ms: number): void {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+const defaultRm = (target: string | URL): void =>
+    rmSync(target, { recursive: true, force: true });
+
+// Test seam (#1915 review): an in-process writer cannot interleave with the
+// synchronous delete (one event loop), so tmp-rm.test.ts drives the retry
+// loop through here instead of staging a fake race. The real #1910 racer is
+// cross-process (a spawned lane's debounced persist flush).
+let rmImpl: typeof defaultRm = defaultRm;
+export function _setRmImplForTest(impl?: typeof defaultRm): void {
+    rmImpl = impl ?? defaultRm;
+}
+
 export function rmrf(target: string | URL): void {
     let attempt = 0;
     for (;;) {
         try {
-            rmSync(target, { recursive: true, force: true });
+            rmImpl(target);
             return;
         } catch (err) {
             const code = (err as NodeJS.ErrnoException).code;
