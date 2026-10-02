@@ -25,6 +25,14 @@ on:
       - src/zcode/**
       - tests/zcode-*.test.ts
       - src/mcp.ts
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/ci-zcode-real.yml
+      - src/zcode/**
+      - tests/zcode-*.test.ts
+      - src/mcp.ts
 
 concurrency:
   group: zcode-real-${{ github.ref }}
