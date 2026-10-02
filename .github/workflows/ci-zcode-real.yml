@@ -57,6 +57,15 @@ jobs:
           node-version: 22
           cache: npm
 
+      # actions/cache restores at the start of its OWN step, so it must run
+      # BEFORE the download — otherwise the "unless cached" guard below never
+      # matches on a fresh runner and every run re-downloads the full AppImage.
+      - name: Cache zcode AppImage
+        uses: actions/cache@v4
+        with:
+          path: zcode-real/ZCode.AppImage
+          key: zcode-${{ env.ZCODE_VERSION }}-${{ env.ZCODE_SHA256 }}
+
       - name: Download zcode AppImage (unless cached)
         run: |
           mkdir -p zcode-real
@@ -72,12 +81,6 @@ jobs:
             echo "::error::zcode AppImage checksum mismatch: expected ${ZCODE_SHA256}, got ${actual}"
             exit 1
           fi
-
-      - name: Cache zcode AppImage
-        uses: actions/cache@v4
-        with:
-          path: zcode-real/ZCode.AppImage
-          key: zcode-${{ env.ZCODE_VERSION }}-${{ env.ZCODE_SHA256 }}
 
       - name: Extract CLI bundle
         run: |
