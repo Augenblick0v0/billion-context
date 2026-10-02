@@ -57,6 +57,34 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
     return !!addr && (addr.startsWith("127.") || addr === "::1" || addr.startsWith("::ffff:127."));
 }
 
+/** #1933: reduce an upstream URL/origin to a comparable route key
+ *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
+ *  from the forward path, full URLs with paths from resolveUpstream — and the
+ *  baseline-provenance / calibration checks compare keys, so both must land on
+ *  the same form. Unparseable input falls back to its trimmed raw value. */
+export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
+    if (!u) return undefined;
+    try {
+        return new URL(u).origin;
+    } catch {
+        const t = u.trim();
+        return t || undefined;
+    }
+}
+
+/** #1933 F1: apply the session's learned estimator scale k̂ to a raw local
+ *  text estimate. The chars/4 estimator is a proxy whose ratio to real billing
+ *  varies per upstream, so it may only decide on the route where k̂ was
+ *  learned: both origins known and equal → scaled; either unknown or the
+ *  routes differ → raw estimate unchanged (legacy behavior). */
+export function applyEstimateCalibration(raw: number, k: number | undefined, kOrigin: string | undefined, origin: string | undefined): number {
+    if (k === undefined || raw <= 0) return raw;
+    const a = normalizeUpstreamOrigin(origin);
+    const b = normalizeUpstreamOrigin(kOrigin);
+    if (a === undefined || b === undefined || a !== b) return raw;
+    return raw * k;
+}
+
 export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 
 /**

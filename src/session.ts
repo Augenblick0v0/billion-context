@@ -168,6 +168,50 @@ export type Session = {
          *  other baseline stats at native-compaction boundaries. Absent on
          *  legacy session files → legacy path. */
         lastUsageGradeTokens?: number;
+        /** #1933 F2: upstream origin (scheme://host[:port]) that measured
+         *  lastInputTokens — written by settleUsageReport alongside "usage".
+         *  The gate demotes a usage-grade baseline to untrusted when the
+         *  CURRENT request routes elsewhere: a billing scale learned on one
+         *  provider says nothing about whether another accepts the payload.
+         *  Absent on legacy session files → baseline keeps legacy behavior. */
+        lastInputTokensOrigin?: string;
+         /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
+          *  consistent same-route samples of (upstream-billed input ÷ local
+          *  text estimate), clamped to [0.25, 4]. A sample is only admitted
+          *  when it falls in the plausibility band [0.2, 5] — outside it the
+          *  report and the payload clearly don't correspond (placeholder
+          *  billing, relay echo, mock upstreams) and must not teach anything.
+          *  k̂ is published only once ≥2 admitted samples agree within ×2;
+          *  disagreement clears it again (fall back to the conservative raw
+          *  estimate). The chars/4 estimator is a proxy, not a measurement —
+          *  its ratio to real billing varies per upstream (observed 1.3–2.5×
+          *  on one relay, ~1.0× on another), and max()ing it against the
+          *  usage baseline let the systematically-high proxy fire preflight
+          *  while the provider billed 59–63% of the window. Applied ONLY
+          *  where the raw estimate currently decides (trigger, zero-range
+          *  fast-forward fit, folder exit, post-fold fit); absent or
+          *  route-mismatched → raw estimate (today's behavior). */
+         calibratedEstimate?: number;
+         /** #1933 F1: route the calibratedEstimate was learned on. A sample
+          *  from a different origin starts a fresh ring instead of blending
+          *  two providers' scales. */
+         calibratedEstimateOrigin?: string;
+         /** #1933 F1: evidence ring behind calibratedEstimate — the recent
+          *  admitted raw samples for ONE origin (max 3). Persisted so a
+          *  restart doesn't re-arm the warmup delay; reset at native-
+          *  compaction boundaries with the rest of the baseline stats. */
+         calibrationRing?: { origin: string; values: number[] };
+        /** #1933 F1: pending pairing input — local estimate of the LAST
+         *  prepared outbound in BILLED caliber (estimateCoreMessages +
+         *  system/tools overhead + image reserve, defaultCountTokens rate),
+         *  recorded in prepare*. settleUsageReport pairs it with the NEXT
+         *  usage report's billed total (same request) to sample k̂, then
+         *  overwrites it with the current turn's value. In-memory only — a
+         *  restart simply loses one pending pair. */
+        lastLocalTextEstimate?: number;
+        /** #1933 F1: route of the pending lastLocalTextEstimate; the pair is
+         *  only consumed when the settling report came from the same route. */
+        lastLocalTextEstimateOrigin?: string;
         /** #1097 content store: total acp_retrieve calls issued this session. */
         retrieveCalls: number;
         /** #1097: acp_retrieve calls that resolved to stored content. */
@@ -657,6 +701,15 @@ export function resetSessionCompression(session: Session): void {
     // #1569: pre-compaction billing evidence describes a payload lineage that
     // no longer exists — fall back to legacy sizing until a fresh report lands.
     delete session.stats.lastUsageGradeTokens;
+    // #1933: same rationale for the calibration pair and its provenance — k̂ was
+    // learned against the pre-compaction content class, and the baseline's
+    // measuring route no longer bounds this rebuilt session.
+    delete session.stats.lastInputTokensOrigin;
+    delete session.stats.calibratedEstimate;
+    delete session.stats.calibratedEstimateOrigin;
+    delete session.stats.calibrationRing;
+    delete session.stats.lastLocalTextEstimate;
+    delete session.stats.lastLocalTextEstimateOrigin;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
     session.metadata.nativeCompactionAt = Date.now();

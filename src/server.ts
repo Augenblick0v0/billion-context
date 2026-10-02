@@ -116,7 +116,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -3758,6 +3758,13 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
+    // char-count upper bound) — settleUsageReport pairs it with this turn's
+    // usage report to learn the per-route estimate-calibration factor k̂.
+    session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
@@ -4013,6 +4020,13 @@ async function prepareOpenai(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -4631,6 +4645,13 @@ async function prepareResponses(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -5331,7 +5352,7 @@ async function preflightCompressIfNeeded(
     // single source of truth for that size (#1493) — armFailureShrink measures
     // the same quantity so a no-usage failure can't arm lastInputTokens to raw-
     // history scale and fire preflight on a payload that actually fits.
-    const { textEstimate, overheadEstimate, imageTokens, payloadEstimate } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+    const { textEstimate, overheadEstimate, imageTokens } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
@@ -5356,12 +5377,35 @@ async function preflightCompressIfNeeded(
     // (#604) on a measured (folded) payload describes a different view and
     // must not pull preflight into multi-minute runs over a payload whose own
     // post-fold estimate fits the window.
-    const baselineFloor = prepared.processedMessages.length > 0
+    const baselineFloorRaw = prepared.processedMessages.length > 0
         ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
         : session.stats.lastInputTokens;
+    // #1933 F2: a usage baseline is only authoritative for the route that
+    // measured it — provider billing scales differ per upstream (the incident:
+    // ~257K local estimate vs 59-63% real usage on one route; after a mid-
+    // session model switch the stale cross-route baseline kept arming preflight
+    // on payloads the new upstream billed far below the window). Demote to
+    // untrusted when the request now routes elsewhere; the payload's own
+    // (calibrated) estimate then judges it. Unprovenanced baselines (sessions
+    // started before this field existed) keep the legacy behavior.
+    let baselineFloor = baselineFloorRaw;
+    const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
+    const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
+    if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${baselineOrigin}, request now routes to ${currentOrigin} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
+        baselineFloor = 0;
+    }
+    // #1933 F1: scale the local text estimate by the per-route calibration
+    // factor k̂ learned from this session's own usage reports (local estimate ÷
+    // what upstream actually billed, EMA, clamped 0.25–4; see settleUsageReport).
+    // Unknown/mismatched origin → raw estimate, i.e. today's behavior.
+    const kFactor = session.stats.calibratedEstimate;
+    const kOrigin = session.stats.calibratedEstimateOrigin;
+    const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
+    const calibratedPayload = calibratedText + imageTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
-        : Math.max(baselineFloor, payloadEstimate);
+        : Math.max(baselineFloor, calibratedPayload);
     // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
     // text vs `target − imageReserve`. Exact algebraic rewrite of the old
     // total-view trigger: subtracting the constant reserve from both sides of
@@ -5374,12 +5418,12 @@ async function preflightCompressIfNeeded(
     // fits, nor keep it armed after the text has been folded down.
     const textChannel = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate
-        : textEstimate + overheadEstimate;
+        : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
     if (limit <= 0 || !model || !triggerFires) return prepared;
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
+    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -5460,7 +5504,7 @@ async function preflightCompressIfNeeded(
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // Anonymous sessions need the conservative upper bound to prove that fit.
         if (payloadFitsWindow) {
-            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${payloadEstimate}/${limit}); forwarding as-is`);
+            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }
         if (unknownBaseline) {
@@ -5502,7 +5546,11 @@ async function preflightCompressIfNeeded(
     // nothing is foldable (no summarization call is spent in that case). The
     // old pre-check failed fast here on the normal-config compressibleRanges,
     // which excluded the soft zone — bricking the #330 livelock.
-    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}); preflight compressing before forward`);
+    // #1933 F4: the trigger line now carries both measurement scales — the
+    // provider-billed baseline and the (calibrated) local estimate — so a
+    // false trigger is diagnosable from the log alone instead of requiring a
+    // cross-reference between gate and nudge lines.
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
@@ -5540,6 +5588,7 @@ async function preflightCompressIfNeeded(
                 imageReserve: imageTokens,
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
+                upstreamOrigin: currentOrigin,
             },
             prepared.originalMessages,
         );
@@ -5566,9 +5615,11 @@ async function preflightCompressIfNeeded(
         // to this single client request.
         session.stats.requests -= 1;
         outbound = rebuilt;
+        // Same calibrated caliber as the trigger above — gate, per-round exit
+        // and this final fit must judge the payload on one scale (#1933 F1).
         const fits = unknownBaseline
             ? result.fitsWindow
-            : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
+            : applyEstimateCalibration(estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
