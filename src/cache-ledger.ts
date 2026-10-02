@@ -73,6 +73,11 @@ interface LedgerLine {
     rs?: 1;
     /** #1536: 1 when the provider reported NO cache tokens — unmeasurable, quarantined out of closure totals. */
     unk?: 1;
+    /** #1891: 1 iff this sample had NO previous ledger baseline (the session's
+     *  first measurable bill). Nothing was billed before, so nothing could have
+     *  expired: its uncached input is initial content, booked as newContent and
+     *  never a seam candidate. Sparse: omitted unless set. */
+    nb?: 1;
 }
 
 export interface CacheLedger {
@@ -102,6 +107,10 @@ export interface CacheLedger {
         attributedMissed: number;
         unknownSamples: number;
         unknownInput: number;
+        /** #1891: no-baseline first bills — samples booked as initial content
+         *  (their uncached input could not be a prefix re-pay) + billed input. */
+        nbSamples: number;
+        nbInput: number;
         seamSuspects: number;
         seamMissed: number;
         /** #1592 follow-up: misses whose current body was byte-stable vs the
@@ -213,6 +222,10 @@ function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; pr
 function detectSeam(session: Session, led: CacheLedger): void {
     const line = led.lines[led.lines.length - 1];
     if (!line || line.unk === 1 || line.missed <= 0) return;
+    // #1891: a no-baseline first bill has no prior prefix to break — its miss is
+    // initial content. The rebooking above already zeroes its tr; this guard also
+    // keeps it out of the rewind/provider-side body-pair classifications.
+    if (line.nb === 1) return;
     // Abort correlation is counted for EVERY missed sample, independent of
     // structural attribution — abort/retry churn is orthogonal evidence.
     const abortAt = lastClientAbort.get(session);
@@ -273,6 +286,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "switches", "switchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
+            "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
             "providerSideMisses", "providerSideMissed", "rewinds", "rewindMissed", "abortCorrelated",
         ] as const) {
@@ -291,7 +305,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -368,11 +382,22 @@ export function recordCacheSample(
     // bucket (line missed/nc/cr/tr forced to 0 + excluded from agg below).
     const known = s.cached !== null;
     const effCached: number = s.cached ?? 0;
-    const dec = decomposeSample(
+    const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
         pending,
     );
+    // #1891: a sample with NO previous baseline (the session's first measurable
+    // bill) has no prior prefix that could have expired — decomposeSample's
+    // prev=null path forces growth=0 and books the ENTIRE uncached input as
+    // ttlRepay, which detectSeam then misreads as an unexplained mid-history
+    // break (every field-flagged event in #1891 was exactly this shape). Rebook
+    // the residual as new content: missed === nc+cr+tr holds either way, so the
+    // closure stays balanced and only the bucket moves.
+    const noBaseline = !prevLine && known;
+    const dec = noBaseline
+        ? { ...rawDec, newContent: rawDec.newContent + rawDec.ttlRepay, ttlRepay: 0 }
+        : rawDec;
     let foldSeq: number | null = null;
     if (known && dec.foldIndex !== null) foldSeq = pendRefs[dec.foldIndex]?.seq ?? null;
     // Advance the fold-consume cursor only for measurable samples: an unknown
@@ -435,6 +460,7 @@ export function recordCacheSample(
         uw: upstreamSwitched ? 1 : undefined,
         rs: restarted ? 1 : undefined,
         unk: known ? undefined : 1,
+        nb: noBaseline ? 1 : undefined,
     });
     led.lastBoot = BOOT_ID;
     const agg = led.agg;
@@ -472,6 +498,10 @@ export function recordCacheSample(
         // Union residual charged to ≥1 named cause (buckets may overlap each
         // other; this one does not, keeping `remaining` non-negative).
         agg.attributedMissed += dec.ttlRepay;
+    }
+    if (noBaseline) {
+        agg.nbSamples += 1;
+        agg.nbInput += s.input;
     }
 }
 
@@ -571,6 +601,9 @@ export interface BiliCacheReport extends CacheReport {
     upstreamSwitches: ModelSwitchStats;
     restartDrops: ModelSwitchStats;
     unmeasured: { samples: number; inputTokens: number };
+    /** #1891: first-bill samples with no prior baseline — their uncached input
+     *  is booked as new content, never as a prefix re-pay. */
+    initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
     seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
 }
@@ -668,6 +701,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up) },
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
         unmeasured: { samples: a.unknownSamples, inputTokens: a.unknownInput },
+        initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
     };
@@ -775,6 +809,9 @@ function formatInvalidation(r: BiliCacheReport): string {
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
     if (r.unmeasured.samples > 0) {
         out.push(`  unmeasured (provider reported no cache tokens): ${r.unmeasured.samples} sample(s) · ${fmtTok(r.unmeasured.inputTokens)} tok — excluded from hit rate`);
+    }
+    if (r.initialBills.samples > 0) {
+        out.push(`  initial bills (no prior baseline): ${r.initialBills.samples} sample(s) · ${fmtTok(r.initialBills.inputTokens)} tok — first request(s) of a session; booked as new content, not a prefix re-pay`);
     }
     return out.join("\n");
 }
