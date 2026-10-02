@@ -24,7 +24,9 @@ import { bodySignedSchemeOf, installNativeFetchIntercept, _resetForTest, type Na
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { defaultConfig } from "acp-kernel";
+import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
+import { getSession } from "../src/session.ts";
+import { ACP_TEXT_CLOSE, ACP_TEXT_OPEN, createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 
 // #1884 (CodeArts APIG, SDK-HMAC-SHA256): bili rewrites bodies, which breaks
 // any body-covering signature. The re-sign arm tunnels signed requests with a
@@ -541,4 +543,120 @@ test("e2e #1884: signed without the arm + BILI_RESIGN_PASSTHROUGH=1 → byte-unt
             upstream.closeAllConnections?.();
         }
     });
+});
+
+// ---------------------------------------------------------------------------
+// #1884 review: re-sign contract exhaustiveness — gate armability + the
+// non-streaming Responses JSON loop egress
+// ---------------------------------------------------------------------------
+
+test("e2e #1884 review: armed but credential marker undecodable → REFUSED 403 by default (stale sig never reaches the wire)", async () => {
+    const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+    const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+        const bodyStr = chatBody("deepseek-v4.1-flash", "signed-broken-cred-1");
+        const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+        signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+        clientHeaders[APIG_RESIGN_HEADER] = APIG_RESIGN_SCHEME;
+        clientHeaders[APIG_RESIGN_CREDENTIAL_HEADER] = "::not-a-decodable-credential::";
+        const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+        const rBody = await r.text();
+        assert.equal(r.status, 403, `an arm whose credential does not decode is un-re-signable → refused, not forwarded into a guaranteed 401: ${rBody}`);
+        assert.equal(r.headers.get("x-bili-resign"), "unavailable");
+        const payload = JSON.parse(rBody) as { error: { code: string } };
+        assert.equal(payload.error.code, "bili_resign_unavailable");
+        assert.equal(calls.length, 0, "upstream never saw the request");
+    } finally {
+        proxy.close();
+        (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+        upstream.close();
+        upstream.closeAllConnections?.();
+    }
+});
+
+test("e2e #1884 review: armed but credential marker undecodable + BILI_RESIGN_PASSTHROUGH=1 → byte-untouched passthrough", async () => {
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "signed-broken-cred-2");
+            const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+            signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+            clientHeaders[APIG_RESIGN_HEADER] = APIG_RESIGN_SCHEME;
+            clientHeaders[APIG_RESIGN_CREDENTIAL_HEADER] = "::not-a-decodable-credential::";
+            const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+            assert.equal(r.status, 200, `opt-in passthrough keeps the original signature valid: ${await r.text()}`);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
+            assert.equal(String(calls[0].headers["authorization"]), clientHeaders["authorization"], "client signature preserved");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
+});
+
+test("e2e #1884 review: BILI_RESIGN=0 un-deploys the /bili/-lane guard too (pre-resign behavior: rewritten, upstream 401)", async () => {
+    await withEnv({ BILI_RESIGN: "0" }, async () => {
+        const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "signed-killswitch-1");
+            const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+            signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+            clientHeaders[APIG_RESIGN_HEADER] = APIG_RESIGN_SCHEME;
+            clientHeaders[APIG_RESIGN_CREDENTIAL_HEADER] = encodeApigCredential(CRED);
+            const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+            const rBody = await r.text();
+            assert.equal(r.status, 401, `kill switch leaves the guard silent — the rewrite proceeds and the stale signature fails upstream (documented pre-resign behavior): ${rBody}`);
+            assert.match(rBody, /APIG\.0301/, "the rejection is the UPSTREAM's, proving the request was rewritten and forwarded");
+            assert.equal(r.headers.get("x-bili-resign"), null, "not bili's local refusal");
+            assert.equal(calls.length, 1, "request WAS forwarded (rewritten)");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
+});
+
+test("#1884 review: non-streaming Responses JSON loop re-signs rebuilt rounds before egress", async () => {
+    const previousFetch = globalThis.fetch;
+    const sentBodies: string[] = [];
+    let sentInit: { body?: unknown; headers?: unknown } | undefined;
+    globalThis.fetch = (async (..._args: unknown[]) => {
+        sentInit = _args[1] as { body?: unknown; headers?: unknown } | undefined;
+        sentBodies.push(typeof sentInit?.body === "string" ? sentInit.body : "");
+        return new Response(JSON.stringify({ id: "r2", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const resignCalls: Array<{ headers: Record<string, string>; body: string }> = [];
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    try {
+        await compressLoopResponsesJson(
+            { id: "r1", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: `${ACP_TEXT_OPEN}{"content":[{"startId":"m00001","endId":"m00002","summary":"s"}]}${ACP_TEXT_CLOSE} tail` }] }] },
+            { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [] as CoreMessage[], session: getSession("apig-resign-responses-loop"), log: () => {}, textProtocol: true },
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "hi" }] },
+            {
+                url: "https://unused.example/responses",
+                headers,
+                resign: (h, b) => { h["x-test-sig"] = "signed"; resignCalls.push({ headers: h, body: b }); },
+            },
+        );
+        assert.equal(sentBodies.length, 1, "compress trigger caused exactly one re-request");
+        assert.equal(resignCalls.length, 1, "re-sign hook fired exactly once, on the re-request");
+        assert.equal(resignCalls[0].headers, headers, "hook receives the outgoing headers object");
+        assert.equal(headers["x-test-sig"], "signed", "hook mutation reaches the wire (same object is sent)");
+        assert.equal(String((sentInit?.headers as Record<string, string> | undefined)?.["x-test-sig"]), "signed", "sent headers carry the signature mutation");
+        assert.equal(resignCalls[0].body, sentBodies[0], "hook signed exactly the bytes that were sent");
+        const parsed = JSON.parse(sentBodies[0]) as { input: unknown[] };
+        assert.ok(Array.isArray(parsed.input) && parsed.input.length > 1, "re-request carries the REBUILT input, not the original body");
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
 });

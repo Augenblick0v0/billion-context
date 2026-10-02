@@ -2939,9 +2939,16 @@ async function handle(
             // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
             // handling: the request rides the normal rewrite path).
             const guardScheme = inboundSignedScheme(req.headers);
+            const resignMarker = String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "");
+            // An armed request is only ARMABLE when its credential marker decodes:
+            // a mangled/missing credential cannot be re-signed, so it must take
+            // the same refuse/opt-in-passthrough path as an un-armed signed
+            // request instead of entering the rewrite pipeline with a stale
+            // signature that is guaranteed to 401 upstream (APIG.0301).
+            const resignArmable = resignMarker === APIG_RESIGN_SCHEME && decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) !== undefined;
             if (
                 guardScheme !== undefined &&
-                String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") !== APIG_RESIGN_SCHEME &&
+                !resignArmable &&
                 resignEnabled()
             ) {
                 if (resignPassthroughEnabled()) {
@@ -2950,7 +2957,7 @@ async function handle(
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without the re-sign arm — refusing instead of silently dropping compression. Set BILI_RESIGN_PASSTHROUGH=1 for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set BILI_RESIGN_PASSTHROUGH=1 for byte-untouched forwarding, or provide a signing credential (#1884)`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
@@ -6750,7 +6757,7 @@ async function forward(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders, wireTransform },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +

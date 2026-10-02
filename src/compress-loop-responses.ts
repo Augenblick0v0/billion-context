@@ -37,6 +37,10 @@ interface RequestOptions {
     /** Final-stage wire transform (compat.roles, #552) — same contract as the
      *  unified loop's RequestOptions.wireTransform. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #1884: re-sign hook for the armed tunnel — same contract as the unified
+     *  loop's RequestOptions.resign (loop/core.ts): invoked with the outgoing
+     *  headers and the final round body right before egress. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 interface FunctionCallAccumulator {
@@ -186,10 +190,12 @@ export async function compressLoopResponsesJson(
             inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
         }
         requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
+        const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        requestOptions.resign?.(requestOptions.headers, roundBody);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
-            body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody),
+            body: roundBody,
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
             // #189: correlate the rejection with the rewrite that preceded it.
