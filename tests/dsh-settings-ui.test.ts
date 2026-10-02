@@ -8,6 +8,10 @@ import vm from "node:vm";
 import { apply, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// #1849: same rationale as dsh-native.test.ts — keep persistClientEvent
+// output out of the developer's real bili.log.
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-settings-state-"));
+
 // The node:test runner sets NODE_TEST_CONTEXT itself (see tests/e2e/README.md);
 // set it defensively so a direct single-file run also stands down the spawn
 // bootstrap and the global fetch intercept.

@@ -238,10 +238,16 @@ function refreshModelInfo(origin: string | undefined): void {
             if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
             else warnNoClientWindow(`host model info for ${provider}/${model} carries no context window`);
         })
-        .catch(() => {
+        .catch((err: unknown) => {
             if (!selectionStillCurrent(svc, provider, model)) return;
             // Resolution failed (transient catalog read, model offline): keep
             // the model id (usable for registry lookup) without window claims.
+            // #1849: this reject path used to commit the windowless cache
+            // SILENTLY — the live headless flavor rejects EVERY resolve, so
+            // the header stays unstamped forever with zero client-side signal.
+            // Surface the host's own error once; retries continue regardless
+            // (the retryAt cooldown drives them, #1812).
+            warnNoClientWindow(`host resolveModelInfo rejected for ${provider}/${model}: ${errMessage(err)} (retries continue)`);
             modelInfo.cached = { provider, model };
         })
         .finally(() => {

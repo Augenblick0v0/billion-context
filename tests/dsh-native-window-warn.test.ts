@@ -178,6 +178,46 @@ test("#1849 apply(): an host without llm.resolveModelInfo warns", async () => {
     }
 });
 
+test("#1849 apply(): a resolver that REJECTS warns with the host's own error (live headless flavor)", async () => {
+    // Live-machine finding (2026-10-02): the real dsh headless host HAS a
+    // resolveModelInfo but its promise rejects on EVERY call — master's
+    // .catch(() => cached={provider,model}) committed a windowless cache
+    // silently, so none of the other three branches ever fired. The reject
+    // path must carry the host's own error so the #1849 web-profile root
+    // cause becomes visible on the client surface.
+    const proxy = await startMockProxy();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ww4-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ww4-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWindowWarningForTest();
+            const ctx = mockCtx();
+            ctx.setModelServices(
+                { resolveModelInfo: async () => { throw new Error("catalog unavailable in this host"); } },
+                { currentSelection: () => ({ provider: "local-vllm", model: "qwen-ww4" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (ww4)");
+            ctx.setInitiator({ session: { id: "session-ww4" } });
+            await waitFor(() => windowWarnLines(logFile).length === 1, "reject-path warn line");
+            const line = windowWarnLines(logFile)[0];
+            assert.match(line, /resolveModelInfo rejected for local-vllm\/qwen-ww4: catalog unavailable in this host \(retries continue\)/);
+            assert.match(line, /x-bili-plugin-context-window goes unstamped/);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+        _resetRegisterForTest(undefined);
+        _resetWindowWarningForTest();
+    }
+});
+
 test("#1849 apply(): model services that never bind warn after three stamps; bound services never warn", async () => {
     const proxy = await startMockProxy();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ww3-"));

@@ -19,6 +19,14 @@ afterEach(() => { void _settleNativeForTest(); });
 // override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
+// #1849: persistClientEvent (and the attach diagnostics before it) appends to
+// stateDir()/bili.log — resolved from XDG_STATE_HOME at CALL time. Without a
+// redirect, every suite that drives headersFor past the degradation branches
+// (or a bounced attach chain) writes into the developer's REAL bili.log —
+// 40+ stray [dsh-client] lines per full run. Point the whole suite at a
+// throwaway state home; nothing here reads the real one.
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-native-state-"));
+
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
 
