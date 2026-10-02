@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { appendSystemText } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -252,9 +253,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // (coreToAnthropic) — a marker present on the trigger turn must be
             // present here too or the byte prefix breaks at that element.
             const messages = coreToAnthropic(coreMessages, cacheMarks);
-            const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
-            const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
-            const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
+            // #1876: same append-not-merge rebuild as the steady path's
+            // injectSystem — both must emit byte-identical system (F2 seam).
+            const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
             const withNotes = notes && notes.length > 0
                 ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]

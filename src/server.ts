@@ -114,7 +114,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -4667,13 +4667,13 @@ function injectSystem(
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
     // (which changes every turn) is appended as a trailing user message by
     // the caller (prepareAnthropic), never merged into system.
-    const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
-    const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
-    return buildSystem(full, parsed.system);
+    // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)
+    // instead of merging everything into one block via kernel buildSystem.
+    return appendSystemText(parts.join("\n\n"), parsed.system);
 }
 
 // #920: in proxy mode bili OWNS the compression tool names. Agent-side tools
