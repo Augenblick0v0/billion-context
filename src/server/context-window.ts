@@ -65,6 +65,31 @@ export function launcherContextWindow(model: string): number | undefined {
 
 export const windowSourceLogged = new Set<string>();
 
+// #1849: window credibility — which resolution sources carry deployment
+// truth (the host's own number, an operator declaration, or the client's
+// runtime tier negotiation) vs published guesses (registry peek, table,
+// default). Guesses are fine to size against, but every downstream number
+// (nudge denominator, preflight target, progress percentages) is then
+// estimate-grade, and that fact must be a first-class state — not one warn
+// line in the log.
+const AUTHORITATIVE_WINDOW_SOURCES: ReadonlySet<string> = new Set(["plugin", "runtime-info", "launcher", "configured", "anthropic-beta", "model-suffix"]);
+
+export function isAuthoritativeWindowSource(source: string | null | undefined): boolean {
+    return typeof source === "string" && AUTHORITATIVE_WINDOW_SOURCES.has(source);
+}
+
+/** #1849: session-window credibility for display paths — prefers the
+ *  per-request flag stamped at resolution time (which also accounts for an
+ *  operator's compress.modelContextLimit tuning and a codex clamp, neither
+ *  of which appear in the source string); sessions persisted before the flag
+ *  existed are classified from their recorded source. */
+export function sessionWindowAuthoritative(metadata: Record<string, unknown>): boolean {
+    const flag = metadata["lastWindowAuthoritative"];
+    if (flag === true) return true;
+    if (flag === false) return false;
+    return isAuthoritativeWindowSource(typeof metadata["lastWindowSource"] === "string" ? metadata["lastWindowSource"] as string : undefined);
+}
+
 // Security cap on the beta-negotiated window: unbounded, a hostile
 // `context-<N>m` header would drive the effective window (and thus every
 // compression threshold) toward infinity, disabling all triggers until a real

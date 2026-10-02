@@ -756,10 +756,14 @@ export const WEB_CLIENT = `(function () {
         // #1839: mark estimate-grade context numbers so a bounded local estimate
         // is never read as a measured value (the ghost-denominator incident).
         const ctxEstMark = d.contextTokensSource === "estimate" ? ' <span class="hint">' + t("common.ctx_est") + "</span>" : "";
+        // #1849: same discipline for the DENOMINATOR — a window the host never
+        // reported (registry-peek/table/default guess) makes every percentage
+        // estimate-grade; badge it and name the source in the tooltip.
+        const winEstMark = d.windowAuthoritative === false ? ' <span class="hint" title="' + escapeHtml(t("common.win_est_tip", { source: d.windowSource || "unknown" })) + '">' + t("common.win_est") + "</span>" : "";
         if (d.contextWindow && d.contextWindow > 0) {
             const pct = Math.min(100, Math.round((d.contextTokens / d.contextWindow) * 100));
             const cls = pct >= 90 ? "bar-fill danger" : pct >= 70 ? "bar-fill warn" : "bar-fill";
-            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxEstMark + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(d.contextTokens) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)" + ctxEstMark + "</span></div>");
+            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxEstMark + " / " + t("common.window") + winEstMark + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(d.contextTokens) + " / " + fmtW(d.contextWindow) + winEstMark + " (" + pct + "%)" + ctxEstMark + "</span></div>");
         } else {
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxEstMark + ": " + fmtW(d.contextTokens || 0) + "</div>");
         }

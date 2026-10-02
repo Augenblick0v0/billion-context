@@ -2,6 +2,7 @@ import { listSessions, type Session } from "../session.js";
 import { SessionStore } from "../persist.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { sessionWindowAuthoritative } from "../server/context-window.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 
@@ -31,6 +32,11 @@ export interface WebSessionSummary {
     cacheHitPct: number | null;
     blocks: number;
     contextWindow?: number;
+    /** #1849: source that sized contextWindow (plugin/launcher/configured vs
+     *  registry-peek/table-or-registry/default) and whether it is deployment
+     *  truth — display should badge estimate-grade windows. */
+    windowSource?: string;
+    windowAuthoritative?: boolean;
     lastSeen: string;
     restored?: boolean;
     /** true when the per-request cache ledger holds samples — the token
@@ -248,6 +254,8 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
         cacheHitPct: hitPct(inputTokens, cachedTokens),
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
+        ...(typeof s.metadata.lastWindowSource === "string" ? { windowSource: s.metadata.lastWindowSource } : {}),
+        ...(s.metadata.effectiveContextLimit !== undefined ? { windowAuthoritative: sessionWindowAuthoritative(s.metadata) } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),

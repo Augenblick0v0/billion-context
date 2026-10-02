@@ -125,7 +125,7 @@ import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSyst
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "./compat-drop.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
+import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, isAuthoritativeWindowSource, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, sessionWindowAuthoritative, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
@@ -1674,6 +1674,7 @@ async function handle(
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
+    let windowAuthoritativeForLog: boolean | undefined;
     // [#1097] host-only CCR policy for this request scope (three-level
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
@@ -1764,16 +1765,22 @@ async function handle(
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
+                windowAuthoritativeForLog = isAuthoritativeWindowSource(wsSource) || operatorWindowTuned;
                 if (!windowSourceLogged.has(model)) {
                     windowSourceLogged.add(model);
                     log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} effective=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
-                    // #1569: a cooperating plugin is present but its configured
-                    // window never arrived — the host's own limit.context is not
-                    // reaching us, and nudge bands / emergency depth are being
-                    // sized against a guessed denominator. Say so once per model
-                    // instead of degrading silently into registry-peek.
-                    if (runtimeAgent !== undefined && pluginWindow === undefined && runtimeWindow === undefined) {
-                        log("warn", `[window] model=${model} agent=${runtimeAgent} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource}`);
+                    // #1569/#1849: window-absence visibility splits on whether a
+                    // cooperating plugin is on the session. Present (header OR a
+                    // conversation-bound runtime entry — omp-style identity agents
+                    // never send the header) but silent is an actionable defect:
+                    // the host's own limit is not reaching the proxy. Absent means
+                    // a plain client — registry guessing is the designed fallback,
+                    // so that branch stays info-grade with distinct wording.
+                    const pluginPresent = runtimeAgent !== undefined || runtimeEntry !== undefined;
+                    if (pluginPresent && pluginWindow === undefined && runtimeWindow === undefined) {
+                        log("warn", `[window] model=${model}${runtimeAgent !== undefined ? ` agent=${runtimeAgent}` : ""} sent no context window (x-bili-plugin-context-window absent, no matching runtime-info) — host-configured limit not reaching the proxy; sizing against ${wsSource} (#1849)`);
+                    } else if (!pluginPresent && !isAuthoritativeWindowSource(wsSource) && !operatorWindowTuned) {
+                        log("info", `[window] model=${model} no cooperative plugin on this session — sizing against ${wsSource} (a published guess, not host truth); declare a per-model window in providers or launch via bili <client> for authoritative sizing (#1849)`);
                     }
                 }
             }
@@ -1795,6 +1802,7 @@ async function handle(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                windowAuthoritativeForLog = true;
                 windowShrinkReason = "codex";
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
@@ -2687,6 +2695,7 @@ async function handle(
         // post-hoc forensics can tell which source sized the window.
         if (reqModelId !== undefined) session.metadata.lastModel = reqModelId;
         session.metadata.lastWindowSource = wsSourceForLog ?? null;
+        session.metadata.lastWindowAuthoritative = windowAuthoritativeForLog ?? null;
         // #833: remember the FINAL resolved Config (post self-heal + headroom,
         // same instant as effectiveContextLimit above) so request-context-free
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
@@ -6802,6 +6811,12 @@ function sendStats(res: http.ServerResponse): void {
             cacheSamples: s.stats.cacheSamples,
             cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
             lastModel: typeof s.metadata.lastModel === "string" ? s.metadata.lastModel : undefined,
+            // #1849: window credibility as first-class state — the source that
+            // sized this session's window and whether it is deployment truth
+            // (plugin/launcher/operator/beta) or a published guess
+            // (registry-peek/table-or-registry/default).
+            windowSource: typeof s.metadata.lastWindowSource === "string" ? s.metadata.lastWindowSource : undefined,
+            windowAuthoritative: sessionWindowAuthoritative(s.metadata),
             modelSwitches: sw?.count ?? 0,
             switchMissedTokens: sw?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the

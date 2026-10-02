@@ -216,6 +216,7 @@ function refreshModelInfo(origin: string | undefined): void {
     const resolve = svc.llm?.resolveModelInfo;
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
+        warnNoClientWindow(`llm.resolveModelInfo is unavailable in this host for ${provider}/${model}`);
         return;
     }
     modelInfo.refreshing = true;
@@ -235,6 +236,7 @@ function refreshModelInfo(origin: string | undefined): void {
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
             };
             if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
+            else warnNoClientWindow(`host model info for ${provider}/${model} carries no context window`);
         })
         .catch(() => {
             if (!selectionStillCurrent(svc, provider, model)) return;
@@ -259,6 +261,29 @@ function refreshModelInfo(origin: string | undefined): void {
 
 function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
+}
+
+// #1849: client-side degradation warning (the opencode lanes got theirs in
+// #1569). When the host structurally cannot produce a window — no resolver,
+// a resolver that carries no contextWindow, or the llm/agentDefaultModel
+// services never arriving (web-profile flavor) — the proxy silently sizes
+// against registry guesses. Say so once on the client surface too. GUI hosts
+// swallow stderr (#1158), so the line is ALSO persisted to bili.log via
+// persistClientEvent.
+let warnedNoClientWindow = false;
+let unstampedStamps = 0;
+function warnNoClientWindow(reason: string): void {
+    if (warnedNoClientWindow) return;
+    warnedNoClientWindow = true;
+    const line = `bili-native-dsh: ${reason} — x-bili-plugin-context-window goes unstamped and the bili proxy sizes against registry/configured windows; the host's model config is NOT reaching the proxy (#1849)`;
+    console.warn(line);
+    persistClientEvent(line);
+}
+function noteUnstampedStamp(): void {
+    // 3 model requests stamped without the model-info services ever binding —
+    // past the inject-callback boot race, so the host really lacks them.
+    unstampedStamps += 1;
+    if (unstampedStamps >= 3) warnNoClientWindow("model-info services (llm/agentDefaultModel) never became available");
 }
 
 // #1158: GUI hosts swallow process stderr, so a bootstrap failure that only
@@ -814,6 +839,7 @@ export function apply(ctx: PluginContext): void {
         const sid = sessionIdOf(ctx);
         if (sid === undefined) return undefined;
         refreshModelInfo(register.base);
+        if (modelInfo.services === undefined) noteUnstampedStamp();
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
         if (modelInfo.cached !== undefined) {
             headers["x-bili-plugin-model"] = modelInfo.cached.model;
@@ -960,4 +986,11 @@ export function _resetRoutedForTest(): void {
 /** Test hook (#1772): reset the once-per-process web-profile warning flag. */
 export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
+}
+
+/** Test hook (#1849): reset the once-per-process no-client-window warning
+ *  state so suites can exercise each degradation branch afresh. */
+export function _resetWindowWarningForTest(): void {
+    warnedNoClientWindow = false;
+    unstampedStamps = 0;
 }

@@ -1,5 +1,5 @@
 import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens } from "acp-kernel";
-import { buildStatusPanel } from "acp-kernel/panel";
+import { buildStatusPanel, formatCompactTokens } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
@@ -10,6 +10,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
+import { sessionWindowAuthoritative } from "./server/context-window.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
@@ -859,6 +860,14 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     // users actually see — the /acp panel — via the same before-footer slot the
     // Web UI link uses (the footer anchors the LLM-context stripper).
     const preFooter: string[] = [];
+    // #1849: window credibility as first-class state — when the denominator is
+    // a published guess (registry/table/default, or a plugin that never
+    // reported a window), the panel's percentages are estimate-grade and must
+    // say so on the panel itself, not only in bili.log.
+    if (typeof limit === "number" && limit > 0 && !sessionWindowAuthoritative(session.metadata)) {
+        const src = typeof session.metadata.lastWindowSource === "string" ? session.metadata.lastWindowSource : "unknown";
+        preFooter.push(`⚠️ Window ${formatCompactTokens(limit)} is an ESTIMATE (source: ${src}) — no authoritative context window reached the proxy; percentages size against a guess (#1849)`);
+    }
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
@@ -888,6 +897,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         pluginAgent: session.metadata.pluginAgent ?? null,
         model: session.metadata.lastModel ?? null,
         windowSource: session.metadata.lastWindowSource ?? null,
+        windowAuthoritative: sessionWindowAuthoritative(session.metadata),
         runtimeInfo: pluginRuntimeInfoFor(typeof session.metadata.pluginAgent === "string" ? session.metadata.pluginAgent : undefined, typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
             ?? pluginRuntimeInfoForConversation(conversationIdForSession(session.id), typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
             ?? null,
