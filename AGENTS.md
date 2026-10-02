@@ -1,6 +1,8 @@
 # billion-context Development Specification
 
 > **This document is the highest-priority specification. All developers (including AI Agents) MUST comply.**
+>
+> **How to read this:** the rules and invariants below are loaded every session and are the operative contract. Long procedures, file listings, and test/release/git mechanics live in [`reference/`](reference/) and are **not** auto-loaded — follow the inline `→ reference/…` pointers when you hit that task; don't guess at a procedure, open the file.
 
 ## 1. Project Overview
 
@@ -28,122 +30,44 @@
 
 ### Module Map
 
-```
-billion-context/
-├── src/
-│   ├── index.ts                  # Entry: runs cli.ts main()
-│   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launchers
-│   ├── server.ts                 # HTTP proxy server, request pipeline
-│   ├── config.ts                 # Config loading (file + env + CLI flags)
-│   ├── logger.ts                 # Tee logger: file (~/.local/state/) + stderr
-│   ├── paths.ts                  # XDG paths (config/cache/state dirs)
-│   ├── session.ts                # Session model + in-memory store
-│   ├── session-id.ts             # Session ID generation
-│   ├── persist.ts                # On-disk session persistence (kernel StateStore)
-│   ├── update.ts                 # Auto-update: checks npm, auto-installs latest
-│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/codebuddy/qoder/trae/jcode/kimi/zcode)
-│   ├── client-config.ts          # READ-only discovery of each client's upstream config
-│   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
-│   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)
-│   ├── plugin.ts / plugin-install.ts # Cooperative plugin protocol + `bili plugin install`
-│   ├── registry.ts               # models.dev context-window registry (snapshot-first)
-│   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
-│   ├── upstream-proxy.ts         # undici ProxyAgent routing (https_proxy for registry fetch)
-│   ├── stream.ts                 # SSE stream utilities + tag patching
-│   ├── stream-openai.ts          # OpenAI-format stream processing
-│   ├── stream-responses.ts       # Responses-API stream processing
-│   ├── stream-error.ts           # Stream error handling
-│   ├── sse-util.ts               # SSE parsing helpers
-│   ├── loop/                     # Unified compress loop (wire-agnostic core)
-│   │   ├── core.ts               #   protocol-neutral event model + tool adjudication
-│   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter (buffer-to-finish tool calls)
-│   │   ├── adapter-openai.ts     #   OpenAI chat adapter (buffer-to-finish, raw passthrough)
-│   │   └── adapter-responses.ts  #   Responses API adapter
-│   ├── compress-loop.ts          # Compress loop (OpenAI chat format)
-│   ├── compress-loop-responses.ts # Compress loop (Responses API format)
-│   ├── compress-settings.ts      # Three-level compress config merge
-│   ├── compress-tool.ts          # compress tool parsing (kernel parseCompressArgs)
-│   ├── decompress-shared.ts      # Shared decompress logic
-│   ├── orphan-gc.ts              # Orphaned block cleanup
-│   ├── agent/                    # Thin agent-side plugins (pi/omp/opencode; opencode-acp-command.ts = shared /acp hooks V1+V2, opencode-native.ts = self-spawn native, V1 `.server()` + V2 `setup`)
-│   ├── web/                      # Web UI (config + context windows)
-│   ├── fetch-util.ts             # HTTP fetch with timeout
-│   └── util.ts                   # Misc utilities
-├── tests/                        # 399 test files
-├── tsup.config.ts
-└── package.json
-```
+The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy**. Orientation at a glance: `src/server.ts` (+ `src/loop/**` adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `tests/e2e/` holds the real-client regression suites.
 
 ### Key Design Decisions
 
 1. **acp-kernel is bundled inline** — tsup does NOT list it in `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
-2. **Tags use XML format** `<acp tokens="2" type="text">m00001</acp>` — written with hex escapes (`\x3c`, `\x3e`) to avoid Write/Edit tool stripping
-3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`), first check per process ignores throttle
+2. **Tags use XML format** — messages carry ACP tags like `<acp tokens="2" type="text">m00001</acp>` (an opening element with `tokens=`/`type=` attributes wrapping a ref id, closed by its end element). In **source files** these angle brackets MUST be written as hex escapes (`\x3c`, `\x3e`) to avoid tooling that strips well-formed tags.
+3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`); first check per process ignores throttle.
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
 5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
-6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi/hermes/zcode) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids.
-7. **Two compression modes with different summary carriers** — `pluginMode` (the `x-bili-plugin` header / registered agent, e.g. `bili pi`) means the ACP-native agent OWNS compression: it executes `compress` locally, the call+result live in its own re-sent history, and the summary carrier on the wire is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`). Proxy mode (plain client, no header) means the proxy executes `compress` server-side: the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the summary carrier is the **`acp_summary` message**, which the kernel renders as role `system` but `systemToUser` (`src/util.ts`) re-voices as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache. The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See TECHNICAL-NOTES.md "Two compression modes".
-
-8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; the window-percentage scaling was deliberately removed — kernel #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or re-introduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. bili exposes the user escape hatch as `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Gentle growth nudges are advisory by design; prompt wording is kernel-owned (`src/nudge-text.ts`).
+6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
+7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
+   - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
+   - **proxy mode** (plain client, no header): the proxy executes `compress` server-side; the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the carrier is the **`acp_summary` message** — the kernel renders it role `system`, but `systemToUser` (`src/util.ts`) re-voices it as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache.
+   - The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See TECHNICAL-NOTES.md "Two compression modes".
+8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; window-percentage scaling was deliberately removed — #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or reintroduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. User escape hatch: `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Prompt wording is kernel-owned (`src/nudge-text.ts`).
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 
-Every bili presence on a machine follows ONE contract — decide changes
-against it, not ad hoc:
+Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:
 
-1. **One writer per copy, chosen by the install SOURCE.** A copy installed
-   through a host's own channel (dsh plugin market, opencode/pi managers,
-   pnpm store) is owned by that host: bili NEVER writes it in place (#991,
-   `hostManagedInstall`). `bili plugin install <agent>` only ever DRIVES the
-   host's channel (e.g. `dsh plugin add`), never installs a second bili-owned
-   copy beside it (#966).
-2. **Every copy must have a LIVE update path** — this is the actual fix for
-   the "frozen forever" bug class (#1196). Exactly one of:
+1. **One writer per copy, chosen by the install SOURCE.** A copy installed through a host's own channel (dsh plugin market, opencode/pi managers, pnpm store) is owned by that host: bili NEVER writes it in place (#991, `hostManagedInstall`). `bili plugin install <agent>` only ever DRIVES the host's channel (e.g. `dsh plugin add`), never installs a second bili-owned copy beside it (#966).
+2. **Every copy must have a LIVE update path** — the actual fix for the "frozen forever" bug class (#1196). Exactly one of:
    - it IS the global install (npm `i -g`): self-updates in place;
-   - it is a reference lane (omp/claude/codex/kimi/zcode/hermes entries): no
-     copy at all, points at the global dist, follows it automatically;
-   - it lives in a host world (dsh profile bundle, opencode/pi tree): updated
-     through the HOST's channel — driven by a global self-update AND, when no
-     global ever runs (market-only users), by the copy's own periodic check
-     (`refreshDshProfileCopy`, #1196). Self-heal goes THROUGH the owner's
-     sanctioned channel, never around it.
-3. **Terminal users get the one-copy experience via launchers** (`bili dsh`
-   overlay mode loads the global dist, no persistent copy); market users get
-   self-contained per-context copies. Both are first-class; the user picks by
-   entry point, and the two modes never mix for one lane (duplicate
-   `bili-native` loader ids hard-fail dsh boot).
-4. **Local pins stay manual.** `link:`/`file:` dev pins are never refreshed
-   (`isRegistryDepSpec` gate) — dev lanes track a live checkout by design.
-5. **Transient drift is acceptable and bounded**: lanes converge to the
-   registry version within one check cycle (~3 min) plus a host restart.
-   Permanent divergence is a bug — file it under this contract.
+   - it is a reference lane (omp/claude/codex/kimi/zcode/hermes entries): no copy at all, points at the global dist, follows it automatically;
+   - it lives in a host world (dsh profile bundle, opencode/pi tree): updated through the HOST's channel — driven by a global self-update AND, when no global ever runs (market-only users), by the copy's own periodic check (`refreshDshProfileCopy`, #1196). Self-heal goes THROUGH the owner's sanctioned channel, never around it.
+3. **Terminal users get the one-copy experience via launchers** (`bili dsh` overlay mode loads the global dist, no persistent copy); market users get self-contained per-context copies. Both are first-class; the user picks by entry point, and the two modes never mix for one lane (duplicate `bili-native` loader ids hard-fail dsh boot).
+4. **Local pins stay manual.** `link:`/`file:` dev pins are never refreshed (`isRegistryDepSpec` gate) — dev lanes track a live checkout by design.
+5. **Transient drift is acceptable and bounded**: lanes converge to the registry version within one check cycle (~3 min) plus a host restart. Permanent divergence is a bug — file it under this contract.
 
-Machine-global facilities stay SHARED across all copies (deliberately):
-`~/.local/state/billion-context/` (log + sessions, #394 multi-instance
-warning), `~/.cache/billion-context/` (update throttle + cross-process
-update lock), `~/.config/billion-context/` (providers/compress config).
+Machine-global facilities stay SHARED across all copies (deliberately): `~/.local/state/billion-context/` (log + sessions, #394 multi-instance warning), `~/.cache/billion-context/` (update throttle + cross-process update lock), `~/.config/billion-context/` (providers/compress config).
 
 ### Kernel Contract: Message Ids Are Never Reused
 
-The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a
-session, a raw content-hash id and a ref number (`mNNNNN`) denote exactly one
-message forever — **never reused, never duplicated**, even after the message
-dies (edited/truncated/folded). The model can cite any number it has ever
-seen (summaries cite tags across turns), so a re-issued number silently
-misattributes on decompress. Consequences for this repo:
+The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a session, a raw content-hash id and a ref number (`mNNNNN`) denote exactly one message forever — **never reused, never duplicated**, even after the message dies (edited/truncated/folded). The model can cite any number it has ever seen (summaries cite tags across turns), so a re-issued number silently misattributes on decompress. Consequences for this repo:
 
-- Host code must NOT prune/repack `session.state.messageRefs` in ways that
-  let a freed number be re-issued (kernel `assignRefsNode` computes its
-  cursor as `highestUsedIndex(map)+1`, so shrinking the map can drop the
-  cursor and re-issue numbers).
-- Known residual: `applyCompactionArchive` (#421, `src/session.ts`) prunes
-  `byRaw/byRef` to live raw ids on native-compaction boundaries. In practice
-  the highest-numbered (newest) messages stay resident so the cursor does not
-  drop, but this is a theoretical re-issue window — drop the map-prune once
-  the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
-- Historical note: kernel 0.0.48/0.0.49 briefly contained ref-slot
-  reclamation (reverted in kernel #191, see `persist/store.ts`). The guard
-  "do not bump past 0.0.47" is obsolete — master pins 0.0.100.
+- Host code must NOT prune/repack `session.state.messageRefs` in ways that let a freed number be re-issued (kernel `assignRefsNode` computes its cursor as `highestUsedIndex(map)+1`, so shrinking the map can drop the cursor and re-issue numbers).
+- Known residual: `applyCompactionArchive` (#421, `src/session.ts`) prunes `byRaw/byRef` to live raw ids on native-compaction boundaries. In practice the highest-numbered (newest) messages stay resident so the cursor does not drop, but this is a theoretical re-issue window — drop the map-prune once the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
+- master pins acp-kernel 0.0.100 (the old "do not bump past 0.0.47" guard is obsolete).
 
 ## 3. Development Standards
 
@@ -155,661 +79,123 @@ npm run typecheck      # tsc --noEmit --project tsconfig.build.json
 npm test               # node --import tsx --test tests/*.test.ts
 ```
 
-### Local Testing
+### Local Testing & Install
 
-```bash
-npm run build
-npm install -g billion-context@latest   # install from registry
-bili start --port 8787
-```
-
-`npm install -g . --install-links` also works (installs a real copy of the
-local build — the `--install-links` flag is REQUIRED: npm ≥ 9 defaults
-local-directory global installs to a SYMLINK (`install-links=false`), which
-leaks dev-tree edits into the "installed" tool and silently re-links on
-reinstall; see #1225). Verify with
-`readlink $(npm root -g)/billion-context` — empty output means a real copy.
-The registry install remains preferred for testing the real published
-artifact.
+Test against the REAL published artifact: `npm run build && npm install -g billion-context@latest && bili start --port 8787`. `npm install -g . --install-links` also works, but `--install-links` is REQUIRED on npm ≥ 9 (without it the global install is a SYMLINK to the dev tree — leaks edits and silently re-links on reinstall, #1225). Verify: `readlink $(npm root -g)/billion-context` — empty = real copy. Full recipe: [reference/testing.md](reference/testing.md).
 
 ### E2E Regression (real client through bili)
 
-`tests/e2e/e2e-codex.test.ts` drives the **real `codex` CLI** through a built
-proxy against a real Responses-compatible upstream and asserts the full
-context lifecycle end-to-end: warmup → load growth → ACP compress → purity →
-native-compact interception (last phase gated by `E2E_FORGE=1`). Full phase
-details, env vars, and mechanics: `tests/e2e/README.md`.
+The suites below cover the full context lifecycle plus the hermetic billing/advisory lanes — the real-client ones are the only coverage that exercises real client behavior (UA, wire quirks, retry loops):
 
-```bash
-# zero-token preflight (codex binary + dist + upstream reachable)
-E2E_CHECK=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+- `tests/e2e/e2e-codex.test.ts` — real `codex` CLI through a Responses-compatible upstream (warmup → growth → ACP compress → purity → native-compact). Skips by default behind `ACP_TEST_E2E=1`; **never remove the gate**.
+- `tests/e2e/e2e-image-billing.test.ts` (`npm run test:e2e:image`) — hermetic real-image billing lane (#1843/#1857): deterministic image corpus driven through the real billing pipeline against a mock upstream; ungated, ~1s, always runs in CI (`.github/workflows/ci-image.yml`).
+- `tests/e2e/e2e-registry.test.ts` — hermetic local verdaccio exercising the real self-update chain; `tests/e2e/e2e-advisory-rollback.test.ts` shares its gate and fixture infra, asserting the #1588 rollback-form advisory contract end-to-end. Gated by `ACP_TEST_REGISTRY=1`.
 
-# full run (defaults to local sglang at http://127.0.0.1:8199/v1, zero cost)
-npm run build
-ACP_TEST_E2E=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
-
-# + native-compact interception phase
-ACP_TEST_E2E=1 E2E_FORGE=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
-```
-
-Rules:
-
-- The suite **skips by default** so `npm test` stays free; never remove the
-  `ACP_TEST_E2E` gate.
-- Run it (at least the 4-phase core) before merging changes to the request
-  pipeline — `server.ts`, `src/loop/`, adapters, preflight/compact paths.
-  It is the only coverage that exercises real client behavior (codex UA,
-  wire quirks, retry loops).
-- Any Responses-compatible upstream works via `E2E_UPSTREAM_URL` /
-  `E2E_UPSTREAM_KEY`; the provider is configured as `name = "OpenAI"` so codex
-  stays on the remote compaction (V2) path — do not "fix" this.
-- CI (`.github/workflows/ci-e2e.yml`) auto-runs on PRs whose diff touches the
-  request-pipeline hot files (`src/server.ts`, `src/server/**`, `src/loop/**`,
-  `src/agent/**`, adapters/stream/persist, `tests/e2e/**`, `package-lock.json`
-  — an acp-kernel pin bump IS a pipeline change) plus manual dispatch for
-  anything else. It needs repo secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`;
-  a hosted runner cannot reach `127.0.0.1` upstreams, and events without
-  secret access (fork PRs) skip the run gracefully instead of failing.
-
-### E2E: Real-Image Billing Lane (`npm run test:e2e:image`)
-
-`tests/e2e/e2e-image-billing.test.ts` is the hermetic twin of the manual
-verification that cleared PR #1857 (#1843/#1848): a corpus of structurally
-real images (valid PNG/JPEG/WebP/GIF containers, real dimensions, a 4.7MB
-4032x3024 photo, EXIF-orientation, truncated and pure-garbage blobs) is
-synthesized deterministically in pure Node — no PIL/ImageMagick, no network,
-zero tokens — and driven through the real billing pipeline against a mock
-upstream that bills the Qwen2-VL formula. It pins the three failure classes
-#1857 fixed: header-parser truth for every container, the >=700x bytes-prior
-poison ratio, and the learned-cost rescue (arbitrated 12.6MB forward ->
-usage report teaches the per-image cost -> stale-high usage baseline no
-longer bricks the session -> baseline regresses to real billing) plus the
-default auto->pixels route riding a malformed blob. CI:
-`.github/workflows/ci-image.yml` auto-runs on PRs touching the image/
-window-gate surfaces; it always runs ungated (needs nothing external), ~1s.
-
-### E2E: Hermetic Local Registry (`ACP_TEST_REGISTRY`)
-
-`tests/e2e/e2e-registry.test.ts` brings its own verdaccio instance (random
-loopback port read back from `listen(0)`, isolated storage/config/home) and
-exercises the REAL self-update chain end-to-end — dist-tag resolve → tarball
-download → sha512 verify → staged extract → in-place install → disk flip —
-plus post-update `plugin install opencode`. Loopback only; zero external
-network, zero secrets, zero tokens.
-
-`tests/e2e/e2e-advisory-rollback.test.ts` (same gate, same fixture infra)
-drives a resident `bili start` against a rollback-form advisory document and
-asserts the #1588 contract end-to-end: control self-update, forced rollback
-to the older target + persistent restart banner, no ping-pong across cycles
-(pre-restart), and the candidate gate refusing the affected latest
-(post-restart).
-
-```bash
-npm run build
-ACP_TEST_REGISTRY=1 node --import tsx --test \
-  tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
-```
-
-Rules:
-
-- Gated by `ACP_TEST_REGISTRY=1`; skips by default, and the `npm test` glob
-  does not cover `tests/e2e/` anyway. CI job: `.github/workflows/ci-registry.yml`.
-- Run it before merging changes to `src/update.ts`, `src/advisory.ts`, or the
-  install/uninstall pipeline (`src/plugin-install.ts`).
-- The updater's registry base URL and check interval are overridable via
-  `BILI_UPDATE_REGISTRY` / `BILI_UPDATE_CHECK_INTERVAL_MS` (defaults unchanged
-  when unset) — these seams exist for this suite (#1153); keep them
-  default-invariant.
-- The fixture MUST bring its own registry instance — never point it at an
-  external (even internal) registry service.
+Rules: run the codex suite (at least the 4-phase core) before merging changes to the request pipeline (`src/server.ts`, `src/loop/**`, adapters, preflight/compact paths); run the registry suite before changing `src/update.ts`, `src/advisory.ts`, or `src/plugin-install.ts`. Exact env vars, phases, and the CI trigger file-list: [reference/testing.md](reference/testing.md).
 
 ### Configuration Surface Discipline (owner-gated)
 
 The config surface — every field of `~/.config/billion-context/config.json`, every `BILI_*` env var, every CLI flag, mirrored across CONFIGURATION.md en/zh — is **owner-design territory**. Hard rules:
 
-1. **Any change that adds, renames, or re-semantics a config field MUST report it explicitly** in the PR description under a "config surface" heading: what is added/changed, why the existing surface cannot express it, which existing mechanisms were considered (providers table and its key species, the three-level `compress` hierarchy, env-var conventions, launcher↔extension channels), and the compat/migration story. A PR touching config without this section is incomplete by definition.
-2. **Agents do NOT invent new config shapes on their own initiative.** A new section/field proposed merely because it is locally convenient — without mapping it onto the existing system — is rejected on principle: **don't even build it**. File the proposal (issue, with the mapping above) and wait.
+1. **Any change that adds, renames, or re-semantics a config field MUST report it explicitly** in the PR under a "config surface" heading: what is added/changed, why the existing surface cannot express it, which existing mechanisms were considered (providers table + its key species, the three-level `compress` hierarchy, env-var conventions, launcher↔extension channels), and the compat/migration story. A PR touching config without this section is incomplete by definition.
+2. **Agents do NOT invent new config shapes on their own initiative.** A new section/field proposed merely because locally convenient — without mapping it onto the existing system — is rejected on principle: **don't even build it**. File the proposal (issue, with the mapping above) and wait.
 3. **The only exception is explicit owner sign-off in the issue/PR thread, given BEFORE implementation**, recorded alongside the design rationale. "The agent thought it was a good idea" is never sufficient reason.
 
-Canonical cautionary case (#1437 → #1469): a one-off `plugin.nonHttpProviders` section was drafted alongside the existing `providers` table instead of inside it, collided with the table's design, and had to be reworked into `providers[<name>].compactionOptIn`. The first shape should never have existed.
+Canonical cautionary case (#1437 → #1469): a one-off `plugin.nonHttpProviders` section drafted alongside the existing `providers` table collided with the table's design and had to be reworked into `providers[<name>].compactionOptIn`. The first shape should never have existed.
 
 ### Code Quality
 
 - **No `as any`**, **No `@ts-ignore`**
 - **No comments unless absolutely necessary**
-- Hex escapes required for any `<acp>` XML in source files
-- **No `console.error` in server-side modules** — use `loggerLog(level, msg)` from `src/logger.ts`. The only exceptions are `src/cli.ts` (user-facing CLI errors) and `src/index.ts` (pre-logger startup crash).
+- Hex escapes required for any ACP-tag XML in source files (see KDD #2)
+- **No `console.error` in server-side modules** — use `loggerLog(level, msg)` from `src/logger.ts`. Exceptions: `src/cli.ts` (user-facing CLI errors) and `src/index.ts` (pre-logger startup crash).
 
 ## 4. Git Safety Rules (MANDATORY)
 
 | Rule | Enforcement |
 |------|-------------|
-| **NEVER force-push to `master`** | Under no circumstances. (GitHub branch protection also blocks this.) |
-| **NEVER merge PRs** | PR merges are human-only. The Agent MUST NEVER merge. |
-| **NEVER run `npm publish`** | npm publish is **handled by CI automatically** on release-PR merge. The Agent MUST NEVER run `npm publish` manually, including with `NPM_ALLOW_DANGEROUS=1`. (See §5.) |
-| **NEVER print the GitHub PAT** | The token stays in a shell variable only. See "Opening PRs without the `gh` CLI" below. |
+| **NEVER force-push to `master`** | Under no circumstances (GitHub branch protection also blocks it). |
+| **NEVER merge PRs** | Human-only. If asked to merge, reply: "I can't merge PRs — AGENTS.md forbids Agents from merging. Please merge yourself: [PR URL]." |
+| **NEVER run `npm publish`** | CI handles it on release-PR merge. Never manually — incl. `NPM_ALLOW_DANGEROUS=1` or `npm pack` workarounds. If asked, reply: "I can't publish to npm — releases publish automatically via CI. See §5." |
+| **NEVER print the GitHub PAT** | Token stays in a shell variable only. |
 | **Branch naming** | `YYYY-MM-DD_short-title` |
-| **NEVER modify `version` on non-release branches** | The `"version"` field in `package.json` is touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. (See §4 Version Bumps below.) |
+| **NEVER modify `version` off release branches** | `"version"` touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. See Version Bumps below. |
 
-### PR Merge — Absolute Prohibition
+**Opening a PR** (no `gh` CLI — push + credential helper + GitHub REST API): the full token/curl recipe is in [reference/git-pr.md](reference/git-pr.md). Summary: `git push origin HEAD`, extract the token from `git credential fill` (shell var only, never print), POST to `/repos/ranxianglei/billion-context/pulls` with base `master`. Merging stays human-only.
 
-PR merges are a **human-only operation**. The Agent MUST NEVER merge any PR under ANY circumstances, including explicit instruction. If a human instructs merge, reply:
+**External contributors' PRs — fix directly, don't replace.** Per the owner rule (小问题直接修, 2026-10-01), fixes are pushed as **additive commits to the contributor's PR branch**, whoever authored the PR — same as any other branch. What stays off-limits is REPLACING the contribution: no rebase-and-replace with an Agent-owned PR, no closing a still-mergeable contribution in favor of a new one (#1765) — the contributor's commits, diff and authorship stay in the merged history. Before assuming it's broken: a deleted head branch does NOT kill an open PR (GitHub freezes `refs/pull/N/head`; check `mergeable`/`mergeStateStatus` first), and `BEHIND` is not a blocker. Mechanics: [reference/git-pr.md](reference/git-pr.md).
 
-> I can't merge PRs — AGENTS.md forbids Agents from merging. Please merge yourself: [PR URL].
+**Post-merge supplements** → a small follow-up PR whose body references the original PR number; never append to / rebase the merged PR. Verify a supplement is actually needed first (replaying the same commit on newer master is verification, not content).
 
-### Opening PRs without the `gh` CLI
+### Issue & Problem Tracking (MANDATORY)
 
-This environment has **no `gh` CLI** — but `git push` works (credential
-helper) and the same credential can open PRs through the GitHub REST API:
+One issue = one scope; open a PR, never just push a branch; never bundle unrelated changes or mass whitespace/reformatting into a fix. When an Agent works an issue, deliverables are mandatory:
 
-```bash
-# 1. push the branch (auth is automatic via the git credential helper)
-git push origin HEAD
+1. **Finished development → PR.** Open a PR referencing the CURRENT issue (`Closes #N`) and reply in-thread with the PR link. An issue is never "done" without a PR.
+2. **Problems DISCOVERED while working** (bug / data-loss / security / architectural) → report in the current thread AND file a separate new issue (repro, impact, suggested fix) in the project the problem belongs to.
+3. **Problems FIXED** → leave a trace: an issue recording the problem + how it was fixed; if shipped as a PR, the PR references its issue (`Fixes #N`). A bare PR without an issue is not acceptable — file the issue first, then link it.
+4. **Minor problems → fix directly（小问题直接修）** (owner rule, 2026-10-01): small issues (typos, cosmetic defects, indentation/log-wording quirks, minor UX wrinkles) found while working — including during a PR review — are fixed RIGHT AWAY in the same branch (a tiny follow-up commit on the PR's own branch is fine), with a one-line note in the thread. Do NOT open separate issues for them, and do NOT leave them as "noted, not fixed". Applies to ANY branch, including external contributors' PR branches.
 
-# 2. get a token from the credential helper (shell variable only — never print it)
-TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' \
-  | git credential fill | sed -n 's/^password=//p')
-
-# 3. write the PR payload to a file (safe for multi-line markdown bodies)
-cat > /tmp/pr.json <<'EOF'
-{
-  "title": "fix: short summary",
-  "head": "YYYY-MM-DD_short-title",
-  "base": "master",
-  "body": "what changed, why, and pre-flight results (typecheck / test / build)"
-}
-EOF
-
-# 4. open the PR (base is master)
-curl -sS -f -X POST \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  -H "Content-Type: application/json" \
-  https://api.github.com/repos/ranxianglei/billion-context/pulls \
-  -d @/tmp/pr.json
-```
-
-A successful response contains `"state": "open"` and the `html_url` to post
-back to the issue; `-f` makes API errors (401/422) fail loudly instead of
-exiting 0 with an error JSON body. The credential helper is
-non-interactive — it either serves the token or fails, so if `git push`
-worked, the token extraction works. Never print the token; keep it in the
-variable only. Merging the PR stays human-only (see above).
-
-### External Contributors' PRs — Fix Directly, Don't Replace
-
-The owner rule (小问题直接修, 2026-10-01) applies regardless of authorship:
-fixes are pushed as **additive commits to the contributor's PR branch**,
-whoever authored the PR — same as any other branch. What stays off-limits
-is REPLACING the contribution: no rebase-and-replace with an Agent-owned
-PR, no closing a still-mergeable contribution in favor of a new one
-(#1765) — the contributor's commits, diff and authorship stay in the
-merged history.
-
-Two mechanics to check before assuming a contributor's PR is broken:
-
-- **A deleted head branch does NOT kill an open PR.** GitHub freezes the PR
-  head at `refs/pull/N/head`; recreating the branch does not re-attach it,
-  but the frozen head can still be `MERGEABLE` with green checks. Check
-  `mergeable`/`mergeStateStatus` first.
-- **`BEHIND` is not a blocker.** The PR does not need to contain the latest
-  master; the merge button (or an owner's merge commit) handles it.
-
-### Supplements After a Merge — Follow-up PR, Never the Merged PR
-
-When something is missing or wrong AFTER a PR was merged, the supplement
-goes into a **small follow-up PR whose body references the original PR
-number** — never pushed into, rebased onto, or appended to the merged PR.
-Keep the original contribution history intact (its commits, its diff, its
-author). Verify first that a supplement is actually needed: a review that
-replays the same commit on newer master is verification, not content.
-
-### Issue Work — Required Deliverables
-
-When an Agent picks up an issue, these deliverables are MANDATORY:
-
-1. **Finished development → PR.** When the development for an issue is
-   complete, open a PR (recipe above). An issue is NEVER "done" without a PR —
-   always reply in the issue thread with the PR link.
-2. **Major problems / big bugs found while working → report + open an issue.**
-   Significant defects (broken functionality, data-loss risk, security issues,
-   architectural problems) must be (a) reported in the current issue thread AND
-   (b) filed as a separate new issue with repro, impact, and a suggested fix.
-3. **Minor problems → fix directly（小问题直接修）.** Small issues (typos,
-   cosmetic defects, indentation/log-wording quirks, minor UX wrinkles)
-   found while working — including during a PR review — are fixed RIGHT AWAY
-   in the same branch (a tiny follow-up commit on the PR's own branch is
-   fine), with a one-line note in the PR/issue thread. Do NOT open separate
-   issues for them, and do NOT leave them as "noted, not fixed". Applies to
-   ANY branch, including external contributors' PR branches (see "External
-   Contributors' PRs"). (Owner rule, 2026-10-01.)
-
-### Problem Discovery & Fix Reporting (MANDATORY)
-
-Problems discovered or fixed while working MUST leave a trace in the issue
-tracker — never fixed silently and moved on.
-
-1. **Discovered a problem** (bug, defect, wrong behavior, spec violation) —
-   whether while working on this project or any sibling project — file an
-   issue in the project the problem belongs to: repro/steps, impact, root
-   cause (if known), suggested fix.
-2. **Fixed a problem** — after the fix, submit an issue to the owning project
-   recording the problem and how it was fixed. For problems in this project:
-   https://github.com/ranxianglei/billion-context/issues . If the fix ships as
-   a PR, the PR MUST reference its issue (`Fixes #N`); a bare PR without an
-   issue is not acceptable — file the issue first, then link it. An existing
-   PR for the fix counts, but it should carry an accompanying issue.
-
-### npm Publish — Absolute Prohibition
-
-`npm publish` is **handled by CI automatically** (see §5). The Agent MUST
-NEVER run `npm publish` manually under ANY circumstances. This includes:
-
-- **NEVER** use `NPM_ALLOW_DANGEROUS=1 npm publish` to bypass the guard
-- **NEVER** use `npm pack` + manual install as a workaround
-- **NEVER** bypass or attempt to bypass any npm guard or safety mechanism
-
-If a human instructs manual publish, reply:
-
-> I can't publish to npm — AGENTS.md forbids manual publishing. Releases are
-> published automatically by CI when a release PR is merged. See §5. If you
-> need a manual fallback, please run `npm publish` yourself.
+Split extra findings into their own issues/PRs rather than expanding this one's scope.
 
 ### Version Bumps — One Version, One Commit, One Branch
 
-The `"version"` field in `package.json` is the **single source of truth** for
-what gets published. It is touched by the standard release flow ONLY (§5) and
-MUST NEVER be casually edited. Two hard rules:
+`"version"` in `package.json` is the single source of truth for what gets published. Touched by the standard release flow ONLY (§5). Two hard rules:
 
-1. **`version` changes ONLY on release branches** (named `*_release-v*`).
-   Feature/fix/refactor/docs commits leave `version` untouched. If you find
-   yourself editing `version` on a content branch, **stop** — you are on the
-   wrong branch.
+1. **`version` changes ONLY on release branches** (`*_release-v*`). Feature/fix/refactor/docs commits leave it untouched — if you find yourself editing it on a content branch, **stop**, you're on the wrong branch.
+2. **A release commit changes ONLY `version`** (+ `package-lock.json` if it drifts). Never bundle a bump into a content commit or content into a release commit. One bump = one isolated commit `release v{VERSION}`.
 
-2. **A release commit changes ONLY `version`** (+ `package-lock.json` if it
-   drifts). Never bundle a version bump into a content commit, and never
-   bundle content changes into a release commit. One version bump = one
-   isolated commit with message `release v{VERSION}`.
-
-**Why this is load-bearing:** CI (`release.yml`) detects a release by matching
-the branch name (`*_release-v*`) AND the commit message (`release v{VERSION}`).
-Bundling version into a content commit breaks the trigger and causes
-three-way merge conflicts on `package.json` when the release branch lands.
-
-If a human asks to "just bump the version" inside a feature/fix change,
-reply:
-
-> Version bumps go through the standard release flow (§5): a dedicated
-> `*_release-v*` branch with an isolated `release v{VERSION}` commit. I can't
-> bundle it into this change.
-
-### Local Install
-
-When testing locally, install from the **registry** to test the real
-published artifact:
-
-```bash
-npm install -g billion-context@latest
-```
-
-`npm install -g . --install-links` is also acceptable — it copies the local
-package into the global `node_modules`. The `--install-links` flag is
-REQUIRED on npm ≥ 9: without it the install is a SYMLINK to this working
-tree (`install-links=false` default), so dev-tree changes leak into the
-global `bili` and a reinstall silently re-links (#1225). Verify with
-`readlink $(npm root -g)/billion-context` (empty = real copy). Just be aware
-the installed version reflects whatever is in the project directory at
-install time, not the registry.
+**Why load-bearing:** CI (`release.yml`) detects a release by matching branch name AND commit message; bundling breaks the trigger and causes 3-way conflicts on `package.json`. If asked to "just bump the version" inside a feature change, decline and route it through §5.
 
 ## 5. Release Workflow
 
-Releases are **fully automated via CI** (`.github/workflows/release.yml`).
-The Agent prepares a release PR; merging it triggers CI which builds, tests,
-publishes to npm, creates a git tag, and creates a GitHub Release. For
-routine patch releases there is also a one-click fast path — see
-“One-click manual release” below.
+Releases are fully automated via CI (`.github/workflows/release.yml`): the Agent prepares a release PR; merging it builds, tests, publishes to npm, tags, and creates a GitHub Release. There's also a one-click fast path for routine patches. Hard rules (exact steps + internals in [reference/release.md](reference/release.md)):
 
-### Branch Naming
-
-Release branches: `YYYY-MM-DD_release-v{VERSION}` (e.g., `2026-08-08_release-v0.1.17`)
-
-### Process (exact steps)
-
-The Agent does steps 1–6, the human does step 7 (merge).
-
-1. **Sync master**:
-   ```bash
-   git checkout master && git pull --ff-only origin master
-   ```
-2. **Create the release branch** from master:
-   ```bash
-   git checkout -b $(date +%Y-%m-%d)_release-v{VERSION}
-   ```
-3. **Bump version** — edit ONLY the `"version"` field in `package.json`:
-   ```diff
-   -    "version": "0.1.16",
-   +    "version": "0.1.17",
-   ```
-4. **Add the release-notes entry (#1870)** — in the SAME release PR, as its
-   own commit (never bundled into the release commit): prepend an entry to
-   the `releases` array in `release-notes/package.json`:
-   ```json
-   {
-     "version": "0.1.17",
-     "date": "2026-08-08",
-     "tier": "recommended",
-     "summary": "what changes FOR THE USER, one line, issue/PR refs"
-   }
-   ```
-   - `tier`: `routine` (default) or `recommended` (worth restarting soon —
-     correctness/cache/self-heal fixes; marketing is NEVER recommended).
-     Critical defects go to `advisories/`, never here.
-   - The summary is model-written, ≤400 chars, newest-first order, cap 20
-     entries. NEVER hand-edit the companion package's own `"version"` field —
-     CI bumps it on publish.
-   - Full rules: `release-notes/README.md`. Enforcement: `release.yml` fails
-     the publish if the version being released has no entry.
-5. **Local pre-flight** — run the same checks CI runs:
-   ```bash
-   npm run typecheck
-   npm test
-   npm run build
-   ```
-6. **Commit, push, open PR** — release-commit convention:
-   - Message: `release v{VERSION}`
-   - The commit changes ONLY `package.json` (+ `package-lock.json` if it
-     drifts). Never bundle other changes into a release commit.
-   - PR title: `release v{VERSION}`; body lists changes since last tag.
-7. **Human merges the PR** (Agent MUST NOT merge).
-8. **CI publishes automatically** — no manual `npm publish`:
-   - On merge, `release.yml` detects the `*_release-v*` branch name +
-     `release v{VERSION}` commit message.
-   - It runs `npm ci` + `typecheck` + `test` + `build`, then
-     `npm publish --tag latest` (using the `NPM_TOKEN` repo secret),
-     creates git tag `v{VERSION}`, and creates a GitHub Release.
-9. **Verify** the published version is live:
-   ```bash
-   npm view billion-context version
-   ```
-
-### One-click manual release (fast path)
-
-For routine patch releases, skip the branch/PR dance: **Actions →
-"Release (one-click)" → Run workflow** (`.github/workflows/release-manual.yml`).
-The `version` input is optional — blank means auto next-patch over the npm
-latest; type a full semver for minor/major/prerelease bumps.
-
-**Prerequisite (#1870):** the version being released must ALREADY have a
-release-notes entry merged to master (`release-notes/package.json`, same
-shape as §5 step 4) — the workflow checks this at dispatch time and aborts
-with a pointer to `release-notes/README.md` if the entry is missing. So for
-one-click releases the agent adds the entry in a tiny docs PR (or the owner
-commits it) BEFORE dispatching. Prereleases (dev channel) are exempt.
-The workflow then:
-
-1. **Drift guard**: master's `package.json` version must equal the npm latest,
-   else it aborts (never release off a drifted tree). It also rejects a target
-   version that is already published. A separate dispatch-time step then
-   verifies the release-notes entry exists for the target version (#1870) —
-   see the prerequisite above.
-2. Bumps ONLY `package.json` + `package-lock.json` and commits
-   `release v{VERSION}` — the same one-version-one-commit discipline as the
-   Version Bumps section above.
-3. Runs the full pre-flight gate (`npm ci` + typecheck + test + build).
-  4. Pushes the release commit directly to `master` (GITHUB_TOKEN, fast-forward
-     only). If branch protection blocks direct pushes, the release lands on a
-     release branch instead and the run tries to open the release PR itself
-     (best-effort — if the account forbids Actions-created PRs the run still
-     finishes green with a one-click "open the release PR" link in the job
-     summary). The fallback PR body carries a generated changelog (`git log`
-     since the last release tag); the same notes appear in the job summary as
-     a paste-ready block for opening the PR manually. Merging that PR publishes
-      via the standard flow; red is reserved for real failures (guard trips,
-      gate failures, or a failed branch push). GitHub suppresses push-event
-      delivery for ref updates made with GITHUB_TOKEN, so the push trigger
-      never fires on the fallback branch; instead the run explicitly
-      dispatches `ci.yml` on that branch (`POST …/actions/workflows/ci.yml/dispatches`,
-      ref = branch; requires the `workflow_dispatch` trigger that `ci.yml`
-      declares for exactly this purpose). Those check runs land on the same
-      head sha — once green, required checks pass and the auto-PR is mergeable
-      without approving its `action_required` pull_request runs (bot-authored
-      PRs are gated there) (#772, #1744). If the dispatch fails (transient API
-      error), the fallback PR stays gated until someone approves those runs
-      manually. (Push-triggered CI on release branches still works for
-      branches pushed with a real account token — e.g. agent-driven
-      standard-flow release branches.)
-5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`,
-   and creates the GitHub Release with notes generated from `git log` since
-   the last tag.
-
-A successful one-click run does NOT double-trigger `release.yml`: its check
-only matches release-branch merges / date-prefixed commits, never a plain
-`release v{VERSION}` commit. The standard branch/PR flow above remains the
-canonical path for anything non-trivial (updater changes, cross-repo bumps,
-or whenever a human wants the review gate).
-
-### CI publish mechanism (what release.yml does)
-
-- **Trigger**: push to `master` where the merge commit or branch name matches
-  `*_release-v*`.
-- **Prerelease handling**: if the version contains `-` (e.g. `0.1.17-beta.1`),
-  publishes with `--tag dev` instead of `--tag latest`.
-- **No publish step for the Agent**: the Agent never runs `npm publish`. The
-  only manual fallback (if CI is down) is a human running `npm publish`.
-
-### Cross-repo dependency: acp-kernel MUST ship first
-
-`acp-kernel` is pinned in **devDependencies** (exact version, no `^`) and
-**bundled inline** at build time, so `dist/index.js` is self-contained.
-
-⚠️ **When bumping the acp-kernel dependency version:**
-1. Release `acp-kernel` first (merge its release PR, wait for CI publish).
-2. **Verify it is live on npm:** `npm view acp-kernel version` returns the new version.
-3. THEN bump `acp-kernel` in this repo's `package.json` and release billion-context.
-
-Rationale: billion-context CI runs `npm ci`, which installs the exact
-`acp-kernel` version pinned in `package.json`. A release branch that bumps
-`acp-kernel` to a not-yet-published version fails CI at install time.
-
-### Auto-update testing
-
-To test that a running older version auto-updates to a newer registry version:
-
-```bash
-# 1. Install older version from registry
-npm install -g billion-context@0.1.16
-
-# 2. Merge the newer release PR (HUMAN merges) — CI publishes 0.1.17 to npm.
-
-# 3. Start the older version
-bili start --port 19195
-# Within ~10s (startup check) it detects 0.1.17 and installs it, logging:
-#   ✔ billion-context auto-updated 0.1.16 → 0.1.17. Restart bili to finish.
-```
-
-### ⚠ Releasing changes to the auto-update mechanism itself
-
-**The auto-update code (`src/update.ts`) is load-bearing for every future
-upgrade.** If a release ships a broken auto-update, users who install it become
-**permanently stuck** — they can never auto-update again (the broken thing is
-the updater itself), and many will never notice to manually reinstall. This is
-strictly worse than a normal bug: a normal bug affects one feature; a broken
-updater silently bricks the upgrade path for everyone who hits it.
-
-**Therefore: any change to `src/update.ts` (the download / extract / install /
-version-check logic) MUST be validated with a no-op release BEFORE shipping the
-change.** The sequence is:
-
-1. **Ship a no-op release first** (pure version bump, zero code changes) — this
-   proves the *existing* upgrade path is healthy end-to-end: the currently-
-   installed version auto-updates to the no-op release using the *old* code.
-   - Branch: `YYYY-MM-DD_release-v{VERSION}` (same naming convention).
-   - Commit: `release v{VERSION}` (version bump only).
-   - PR body MUST state it is a no-op and why (validation release).
-2. **Only after the no-op release is confirmed on npm** (`npm view
-   billion-context version` returns it) AND a real upgrade has been observed
-   succeeding (the log shows `auto-updated OLD → NEW`), ship the actual change
-   as a separate subsequent release.
-3. If the no-op release's upgrade **fails**, STOP. Do not ship the updater
-   change. Investigate the existing-path failure first — the existing code is
-   the only known-good upgrade path, and shipping a change on top of an
-   already-broken path compounds the problem.
-
-**Why the indirection?** Because if the change-to-the-updater is itself buggy,
-   anyone who upgrades to it is bricked. The no-op release isolates the test:
-   it exercises the upgrade path using code we already trust, so a success
-   confirms the *plumbing* (registry, tarball, file copy, restart) works,
-   independent of the new code. Only then do we trust the new code to run on
-   the next hop.
-
-**Concrete example (v0.1.22):** the Windows auto-update fix (replacing
-`execFile("tar"/"cp")` with the `tar` npm package + `fs.cp`) was staged in
-PR#44 but NOT shipped directly. A no-op v0.1.22 (PR#46, version bump only)
-was released first to confirm the running v0.1.21 could self-upgrade. Only
-after that succeeded was the Windows fix shipped in a follow-up release.
+- **Branch** `YYYY-MM-DD_release-v{VERSION}`; commit `release v{VERSION}` changing ONLY `version`. The Agent does steps 1–6 (sync master → branch → bump → **release-notes entry (#1870)** → pre-flight typecheck+test+build → commit/push/open PR); HUMAN merges step 7; CI publishes step 8.
+- **Release-notes entry (#1870):** every released version needs an entry in `release-notes/package.json` — standard flow adds it as its own commit in the SAME release PR; the one-click fast path requires it already merged to master (dispatch-time check; prereleases exempt). `release.yml` fails the publish without it. Full rules: [reference/release.md](reference/release.md) + `release-notes/README.md`.
+- **NEVER run `npm publish` manually** — CI does it (§4).
+- **Cross-repo: acp-kernel MUST ship first.** When bumping the acp-kernel pin: release acp-kernel, confirm it's live on npm (`npm view acp-kernel version`), THEN bump here — else CI's `npm ci` fails at install.
+- **Changing `src/update.ts` (the updater itself) requires a NO-OP validation release FIRST** — a pure version bump proves the *existing* upgrade path is healthy end-to-end before the change ships. A broken updater bricks every future upgrade. Full protocol + rationale: [reference/release.md](reference/release.md).
 
 ## 6. Contributing
 
-### Before Making Changes
+Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) understand the module dependency graph, (4) **consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned in BOTH plugin mode and proxy mode; correct-in-one-mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`.
 
-1. `npm run typecheck` — no type errors
-2. `npm test` — all tests pass
-3. Understand the module dependency graph
-4. **Consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned about in BOTH plugin mode (carrier = the agent's `compress` tool call; proxy suppresses injection) and proxy mode (carrier = the `acp_summary` message re-voiced as `user` by `systemToUser`; proxy executes `compress` server-side). A change correct in one mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`.
-
-### Commit Convention
-
-- `feat:` new feature
-- `fix:` bug fix
-- `refactor:` code restructuring
-- `test:` test changes
-- `docs:` documentation
-- `release:` version bump
+Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release:`.
 
 ## 7. Review & Auto-Merge Discipline
 
-> Distilled from a full-history review of AI auto-dev across billion-context /
-> billion-context-pi / acp-kernel (#801): 1543 issues+PRs, 3645 comments,
-> `devlog/`, and this file's own git history. Goal: ~90% of bugfixes mergeable
-> without rework, without drifting off direction. Full cited material:
-> `AUTO-MERGE-GUARDRAILS.md`.
+> Distilled from a full-history review of AI auto-dev across billion-context / billion-context-pi / acp-kernel (#801). Goal: ~90% of bugfixes mergeable without rework, without drifting off direction. Evidence appendix (baseline data, per-issue provenance, second-round analysis): [AUTO-MERGE-GUARDRAILS.md](AUTO-MERGE-GUARDRAILS.md) — the authoritative OPERATIVE rule text stays here in §7.
 
 ### 7.1 Before You Start
 
-- **Duplicate screening first.** Search open AND closed issues/PRs for the same
-  fix before implementing. If one exists, link it; do not start parallel work.
-- **One issue = one scope.** Split extra findings into separate issues/PRs.
-  Never bundle unrelated changes or mass whitespace/reformatting into a fix.
+- **Duplicate screening first.** Search open AND closed issues/PRs for the same fix before implementing; if one exists, link it — don't start parallel work.
+- **One issue = one scope.** Split extra findings into separate issues/PRs; never bundle unrelated changes or mass whitespace/reformatting.
 - **Open a PR, never just push a branch.** A bare branch is not a deliverable.
 
 ### 7.2 Review Discipline
 
-- **Rebase to CURRENT master before claiming mergeable.** Verify against the
-  live master, not the PR's original base. After rebase, re-run typecheck +
-  full test suite + build. A stale base is the single biggest cause of
-  second-round rework (#425 Aug-31 base, #467 43 commits behind, #517).
-- **Watch hot-file contention.** `src/server.ts`, the preflight paths,
-  `src/persist.ts`, and the `src/agent/*` extension types are touched by many
-  concurrent PRs. If another open PR rewrites the same file/region, expect a
-  semantic (not textual) conflict — coordinate/sequence, resolve by union of
-  intent, then prove it by running tests (#517↔#587, #571↔#558).
-- **One linear commit, clean diff.** No merge commits or rebases that explode
-  the diff and bury the real change; no incidental whitespace re-alignment.
-  Every line must relate to the PR's purpose (#571 "diff-爆炸", #467).
-- **Minor flaws found during review get fixed, not filed.** Per the owner
-  rule “小问题直接修” (see Issue Work §3): when your own review of a PR turns
-  up a small, non-semantic flaw (typo, misaligned indent, log wording), push
-  the one-line fix to the PR branch immediately instead of listing it as a
-  caveat — on ANY PR branch, external contributors included.
-- **Done = evidence, not "should work".** Double-review the code, then actually
-  run the changed behavior and observe it matches expectation. For fixes that
-  change context/wire behavior, prefer a real end-to-end A/B against the issue
-  repro over unit tests alone (#254).
-- **Tests must be deterministic.** No assertions that depend on environmental
-  luck (e.g. assuming a port range is free — Windows' ephemeral range
-  49152–65535 collides with fixed picks; request a port via `listen(0)`
-  instead, #360).
+- **Rebase to CURRENT master before claiming mergeable.** Verify against live master, not the PR's original base; after rebase re-run typecheck + full suite + build. Stale base is the #1 cause of second-round rework (#425 Aug-31 base, #467 43 commits behind, #517).
+- **Watch hot-file contention.** `src/server.ts`, the preflight paths, `src/persist.ts`, and the `src/agent/*` extension types are rewritten by many concurrent PRs — expect semantic (not textual) conflicts; coordinate/sequence, resolve by union of intent, then prove by running tests (#517↔#587, #571↔#558).
+- **One linear commit, clean diff.** No diff-exploding rebases, no incidental whitespace re-alignment; every line relates to the PR's purpose (#571 "diff-爆炸", #467).
+- **Minor flaws found during review get fixed, not filed.** Per the owner rule "小问题直接修" (§4 Issue & Problem Tracking): when your own review of a PR turns up a small, non-semantic flaw (typo, misaligned indent, log wording), push the one-line fix to the PR branch immediately instead of listing it as a caveat — on ANY PR branch, external contributors included.
+- **Done = evidence, not "should work".** Double-review, then RUN the changed behavior and observe it matches expectation; for context/wire fixes prefer a real e2e A/B against the issue repro over unit tests alone (#254).
+- **Tests must be deterministic.** No environmental luck (e.g. assuming a port range is free — Windows' ephemeral range 49152–65535 collides with fixed picks; request a port via `listen(0)` instead, #360).
 
 ### 7.3 Correctness Guardrails
 
-- **Root cause, not symptom (疏, not 堵 — first principle for every fix).**
-  A fix removes the mechanism that PRODUCES the defect; it never merely hides
-  the defect's visible trace at whatever layer is cheapest to intercept.
-  Before writing any fix, name the producer of the offending bytes/behavior
-  and fix it at the source or at the decision point — never by rewriting or
-  filtering payload in transit to make the symptom invisible. Litmus test:
-  "if the same root cause surfaced in a different shape tomorrow, would this
-  fix still hold?" If not, it is a mask, and a mask is a latent bug. Canonical
-  failure: #933 (model-echoed render tags leaking into a TUI) was "fixed" by
-  stripping tool-call arguments mid-stream; the mask itself became #1039's
-  silent data corruption once users legitimately wrote tag-shaped payloads
-  through write/edit/bash. When the true root cause is out of scope (another
-  repo, a product decision), fix the in-scope part, leave a documented
-  boundary note pointing at the real home of the fix, and do NOT compensate
-  in the wrong layer (#1039's echo-noise belongs on the injection side —
-  host renderTags policy — not on the wire). See also "Symptom ≠ mechanism"
-  below (attribution discipline) and the tool-args-verbatim invariant in the
-  Wire fidelity bullet.
-- **Never silently clobber or drop user config.** Any read-modify-write on user
-  config needs a parse-state guard; reject malformed input loudly (HTTP 400/409)
-  instead of merging into defaults or dropping fields. Whitelists must be
-  complete (#155: a missing key silently erased custom compress prompts).
-- **Sane defaults & fallbacks.** Fallback values must be reasonable (never a
-  too-small value that causes thrashing); a static/fallback source must always
-  lose to a fresher authoritative source when both are cheaply available
-  (#282: window fallback 200K/min 100K, not 64K; the bundled registry snapshot
-  must not outrank the live registry).
-- **Prefer native stable identifiers.** Use a client's native stable session id
-  when available (it survives credential/model/provider switches); report
-  clients that expose none. Do not build identity from derived hashes that
-  drift on switch (#280).
-- **Wire fidelity (host-side duty).** Never alter upstream protocol shape beyond
-  intended injection: preserve tool_call ids/ordering, SSE structure, and
-  upstream invariants (e.g. `compaction_trigger` must remain the last input
-  item, #283/#209). Reason in BOTH compression modes (§6).
-  - *Tool-call arguments are user intent (#1039).* Any payload a host will
-    EXECUTE or PERSIST — tool-call `arguments` in every wire shape (OpenAI
-    `tool_calls[].function.arguments`, Anthropic `input_json_delta.partial_json`
-    / `tool_use.input`, Responses `function_call_arguments.*`), fragment or
-    whole — is forwarded **byte-exact**. NEVER filter, strip, or "clean" it,
-    not even to remove model-echoed render tags: a shape-based filter cannot
-    distinguish an echo from a literal the user genuinely wants written (bash
-    command strings, write/edit file contents), so any such "fix" silently
-    corrupts executed/persisted data. Echoed tags surfacing in a host TUI is
-    cosmetic noise — the fix for that belongs on the injection side (host
-    renderTags policy, #933), never in the argument path. Tag-echo stripping
-    applies to model PROSE only (content/reasoning/thinking/summary text
-    fields); see the invariant block atop `src/loop/tag-echo-filter.ts`.
-  - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP
-    artifacts (the compression tags, block refs, `acp_summary` structure — see
-    Key Design Decision #2) and the **id-never-reused guarantee** belong to
-    **acp-kernel**, not this repo (see §2 "Kernel Contract"). This repo only
-    consumes them faithfully. Codifying the kernel-side spec is a separate
-    acp-kernel change — deferred; cross-repo work stays manual for now.
-- **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify
-  against upstream logs — repeated-compression logs may be an upstream rate-limit
-  retry illusion, not over-compression (#282).
-- **Wire-constraint ledger only grows (#1304).** Every upstream rejection or
-  validation constraint discovered in production or provider docs (e.g. #1299:
-  Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`)
-  becomes a PERMANENT entry in the wire-contract suite — the ledger
-  (`WIRE_RULES`, defined in `tests/wire-contract-fakes.ts`) plus the gates in
-  `tests/wire-contract.test.ts`, with provenance citing where the constraint
-  was learned — and enforcement in the matching validation-parity fake upstream
-  (`tests/wire-contract-fakes.ts`) — INSIDE THE FIXING PR. The ledger never
-  shrinks without owner sign-off. Golden schema snapshots
-  (`tests/golden/wire-contract/*.json`) change only via explicit regeneration
-  (`node --import tsx scripts/update-wire-contract-goldens.ts`) with the
-  justification stated in the PR. A pin bump or tool-surface change that trips
-  a gate is a stop-the-line signal, not something to loosen.
-- **Honest output.** Never emit misleading messages for degenerate states
-  (#155: export claimed "original conversation" for a 0-block session).
-- **Logs.** Mask secret values in all logs; separate trace/debug/info; keep
-  debug-on by default during bug-convergence phases (#247).
-- **Docs.** Keep zh/en in sync; place content where the actual reader will see
-  it; mirror env-var references into CONFIGURATION.md, not just one README
-  (#571).
+- **Root cause, not symptom (疏, not 堵 — first principle for every fix).** A fix removes the mechanism that PRODUCES the defect; it never merely hides the defect's visible trace at whatever layer is cheapest to intercept. Before writing any fix, name the producer of the offending bytes/behavior and fix it at the source or decision point — never by rewriting or filtering payload in transit to make the symptom invisible. Litmus test: "if the same root cause surfaced in a different shape tomorrow, would this fix still hold?" If not, it is a mask, and a mask is a latent bug. Canonical failure: #933 (model-echoed render tags leaking into a TUI) was "fixed" by stripping tool-call arguments mid-stream; the mask itself became #1039's silent data corruption once users legitimately wrote tag-shaped payloads through write/edit/bash. When the true root cause is out of scope (another repo, a product decision), fix the in-scope part, leave a documented boundary note pointing at the real home of the fix, and do NOT compensate in the wrong layer (#1039's echo-noise belongs on the injection side — host renderTags policy — not on the wire).
+- **Never silently clobber or drop user config.** Any read-modify-write on user config needs a parse-state guard; reject malformed input loudly (HTTP 400/409) instead of merging into defaults or dropping fields. Whitelists must be complete (#155: a missing key silently erased custom compress prompts).
+- **Sane defaults & fallbacks.** Fallback values must be reasonable (never a too-small value that thrashes); a static/fallback source must always lose to a fresher authoritative source when both are cheaply available (#282: window fallback 200K/min 100K, not 64K; the bundled registry snapshot must not outrank the live registry).
+- **Prefer native stable identifiers.** Use a client's native stable session id when available (survives credential/model/provider switches); report clients that expose none; never build identity from derived hashes that drift on switch (#280).
+- **Wire fidelity (host-side duty).** Never alter upstream protocol shape beyond intended injection: preserve tool_call ids/ordering, SSE structure, and upstream invariants (e.g. `compaction_trigger` must remain the last input item, #283/#209). Reason in BOTH compression modes (§6).
+  - *Tool-call arguments are user intent (#1039).* Any payload a host will EXECUTE or PERSIST — tool-call `arguments` in every wire shape (OpenAI `tool_calls[].function.arguments`, Anthropic `input_json_delta.partial_json` / `tool_use.input`, Responses `function_call_arguments.*`), fragment or whole — is forwarded **byte-exact**. NEVER filter, strip, or "clean" it, not even to remove model-echoed render tags: a shape-based filter cannot distinguish an echo from a literal the user genuinely wants written (bash command strings, write/edit file contents), so any such "fix" silently corrupts executed/persisted data. Echoed tags surfacing in a host TUI is cosmetic noise — the fix belongs on the injection side (host renderTags policy, #933), never in the argument path. Tag-echo stripping applies to model PROSE only (content/reasoning/thinking/summary text fields); see the invariant block atop `src/loop/tag-echo-filter.ts`.
+  - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP artifacts (the compression tags, block refs, `acp_summary` structure — KDD #2) and the **id-never-reused guarantee** belong to **acp-kernel**, not this repo (§2 Kernel Contract). This repo only consumes them faithfully. Codifying the kernel-side spec is a separate acp-kernel change — deferred; cross-repo work stays manual for now.
+- **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify against upstream logs — repeated-compression logs may be an upstream rate-limit retry illusion, not over-compression (#282).
+- **Wire-constraint ledger only grows (#1304).** Every upstream rejection or validation constraint discovered in production or provider docs (e.g. #1299: Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`) becomes a PERMANENT entry in the wire-contract suite — the ledger (`WIRE_RULES`, defined in `tests/wire-contract-fakes.ts`) plus the gates in `tests/wire-contract.test.ts` (with provenance citing where the constraint was learned) plus enforcement in the matching validation-parity fake upstream (`tests/wire-contract-fakes.ts`) — INSIDE THE FIXING PR. The ledger never shrinks without owner sign-off. Golden schema snapshots (`tests/golden/wire-contract/*.json`) change only via explicit regeneration (`node --import tsx scripts/update-wire-contract-goldens.ts`) with the justification stated in the PR. A pin bump or tool-surface change that trips a gate is a stop-the-line signal, not something to loosen.
+- **Honest output.** Never emit misleading messages for degenerate states (#155: export claimed "original conversation" for a 0-block session).
+- **Logs.** Mask secret values in all logs; separate trace/debug/info; keep debug-on by default during bug-convergence phases (#247).
+- **Docs.** Keep zh/en in sync; place content where the actual reader will see it; mirror env-var references into CONFIGURATION.md, not just one README (#571).
 
 ### 7.4 Auto-Merge Gate (this repo only)
 
@@ -818,37 +204,21 @@ A bugfix may **auto-merge** only if ALL hold:
 1. Single-module scoped fix; no architectural change.
 2. A regression test reproduces the original bug and now passes.
 3. Green **on the rebased head** (typecheck + full test suite + build).
-4. No change to: config schema, persistence format/version, wire protocol /
-   message shape, or cross-repo dependencies (acp-kernel).
+4. No change to: config schema, persistence format/version, wire protocol / message shape, or cross-repo dependencies (acp-kernel).
 5. Pure `fix:` — no new capability surface (not feat/refactor).
-6. Clean diff: no unrelated changes, no mass whitespace/reformat, no generated
-   or lock-file churn.
+6. Clean diff: no unrelated changes, no mass whitespace/reformat, no generated or lock-file churn.
 7. References its issue via `Fixes #N`.
-8. Does NOT touch load-bearing infra: `src/update.ts`, release workflow, CI
-   publish, the acp-kernel pin, message-ref/id logic, or security (MITM/CA/
-   credentials).
+8. Does NOT touch load-bearing infra: `src/update.ts`, release workflow, CI publish, the acp-kernel pin, message-ref/id logic, or security (MITM/CA/credentials).
 
-**Must stay human** (any hit): wire/message-shape changes (both modes affected),
-config schema or persistence version, cross-repo dependencies, `src/update.ts`
-(needs a no-op release first), identity/session-binding logic, feat/refactor/
-architecture, security-related, or any fallback/default-value change (a product
-decision).
+**Must stay human** (any hit): wire/message-shape changes (both modes affected), config schema or persistence version, cross-repo dependencies, `src/update.ts` (needs a no-op release first), identity/session-binding logic, feat/refactor/architecture, security-related, or any fallback/default-value change (a product decision).
 
-> **Scope note:** auto-merge applies to THIS repo only. Cross-repo changes
-> (acp-kernel bumps, anything spanning repos) remain manual/human for now.
+> **Scope note:** auto-merge applies to THIS repo only. Cross-repo changes (acp-kernel bumps, anything spanning repos) remain manual/human for now.
 
 ### 7.5 Reviewer Focus — the "重灾区" (second-round zones)
 
-Of 326 analyzed merged PRs, 26 (~7%) needed a second+ human review round. Two
-drivers dominate, and they are exactly where auto-merge is unsafe:
+Of 326 analyzed merged PRs, 26 (~7%) needed a second+ human review round. Two drivers dominate, and they are exactly where auto-merge is unsafe:
 
-1. **Stale-base / concurrent-file churn** — long-lived branches drift from
-   fast-moving master and collide with other PRs on hot files. Gate signals:
-   branch freshness, and whether a touched file is being rewritten by another
-   open PR.
-2. **Incomplete first pass** — the initial fix addresses the reported symptom
-   but misses an adjacent path/edge case, leaves promised work unfinished, or
-   needs its approach reconsidered. Gate signal: does the fix cover ALL paths of
-   the bug, not just the repro?
+1. **Stale-base / concurrent-file churn** — long-lived branches drift from fast-moving master and collide with other PRs on hot files. Gate signals: branch freshness, and whether a touched file is being rewritten by another open PR.
+2. **Incomplete first pass** — the initial fix addresses the reported symptom but misses an adjacent path/edge case, leaves promised work unfinished, or needs its approach reconsidered. Gate signal: does the fix cover ALL paths of the bug, not just the repro?
 
 These map directly onto §7.2–7.3; a reviewer walks those bullets in order.
