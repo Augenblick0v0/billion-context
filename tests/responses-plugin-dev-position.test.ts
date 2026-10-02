@@ -38,6 +38,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
@@ -165,7 +166,7 @@ async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
     return capturedRaw.map((raw) => {
         const parsed = JSON.parse(raw) as { input?: unknown };

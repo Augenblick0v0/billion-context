@@ -6,6 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import vm from "node:vm";
 import { apply, _resetRegisterForTest } from "../src/agent/dsh-native.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // The node:test runner sets NODE_TEST_CONTEXT itself (see tests/e2e/README.md);
 // set it defensively so a direct single-file run also stands down the spawn
@@ -79,7 +80,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -96,7 +97,7 @@ test("#1590: index-inject stays silent when no origin is known yet (spawn mode)"
             assert.deepEqual(table, []);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -146,7 +147,7 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
             assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787" });
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -163,7 +164,7 @@ test("#1809: /bili/origin answers null before binding", async () => {
             assert.deepEqual(JSON.parse(res.body), { origin: null });
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -204,7 +205,7 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
             assert.equal(disposed, 1);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 

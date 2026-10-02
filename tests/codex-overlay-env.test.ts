@@ -4,13 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { prepareCodexHome, renderCodexDotEnv } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const ORIGIN = "http://127.0.0.1:8787";
 const CA = "/home/user/.local/share/billion-context/ca/combined-ca.pem";
-
-function rmrf(dir: string): void {
-    fs.rmSync(dir, { recursive: true, force: true });
-}
 
 test("renderCodexDotEnv: socks5h proxies (upper + lower case) are replaced with the launch origin (#1802)", () => {
     const user = [
