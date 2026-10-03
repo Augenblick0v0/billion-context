@@ -48,6 +48,22 @@ export function safeJsonParse(s: string): unknown {
     }
 }
 
+/**
+ * #1954 safety signal. bili's Responses adapter replays `input` as the FULL
+ * conversation and strips `previous_response_id`, so it CANNOT materialize the
+ * history a native-chaining continuation references. When we strip a non-empty
+ * id, this returns an operator-facing warning: the request still succeeds with
+ * HTTP 200, so without it the context loss is silent. Keys off the id ALONE —
+ * not off `store` — because Responses stores responses by default, so an omitted
+ * `store` still leaves the referenced response resolvable upstream; judging on
+ * explicit `store:true` would miss the common case. Returns null when there is
+ * nothing to warn about (absent / empty / non-string id).
+ */
+export function strippedResponseIdWarning(prevId: unknown): string | null {
+    if (typeof prevId !== "string" || prevId.length === 0) return null;
+    return `responses previous_response_id=${prevId} stripped without rebuilding referenced history (#1954): bili replays input as full history, so a Responses native-chaining (delta) continuation loses prior turns upstream yet still returns 200. Send full input/output history, or set ACP_KEEP_RESPONSE_ID=1 to preserve the id.`;
+}
+
 /** True if a socket remote address is loopback. Covers the IPv4 127.0.0.0/8
  *  block and IPv6 ::1, including the IPv4-mapped ::ffff:127.x.x.x form Node
  *  reports for dual-stack sockets. Shared by the admin-endpoint gate
