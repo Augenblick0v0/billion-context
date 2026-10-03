@@ -30,6 +30,12 @@ function ms(fn: () => void): number {
     fn();
     return Number(process.hrtime.bigint() - t0) / 1e6;
 }
+/** Min-of-3 absorbs GC/JIT spikes so CI load cannot flake the pins. */
+function msMin3(fn: () => void): number {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) best = Math.min(best, ms(fn));
+    return best;
+}
 
 describe("reconcileFoldCoverage near-linear performance (#1930-2)", () => {
     const opts = { mode: "repair" as const, sessionId: "perf", log: () => {} };
@@ -40,10 +46,10 @@ describe("reconcileFoldCoverage near-linear performance (#1930-2)", () => {
         ms(() => reconcileFoldCoverage(coveredSession(warmup), warmup, opts));
 
         const small = makeHistory(1_000);
-        const t1k = ms(() => reconcileFoldCoverage(coveredSession(small), small, opts));
+        const t1k = msMin3(() => reconcileFoldCoverage(coveredSession(small), small, opts));
 
         const big = makeHistory(8_000);
-        const t8k = ms(() => reconcileFoldCoverage(coveredSession(big), big, opts));
+        const t8k = msMin3(() => reconcileFoldCoverage(coveredSession(big), big, opts));
 
         assert.ok(t1k > 0 && t8k > 0);
         // 8x the messages must not give ~64x the work: near-linear with CI-variance headroom.
@@ -54,10 +60,13 @@ describe("reconcileFoldCoverage near-linear performance (#1930-2)", () => {
 
     test("steady-state resend round is far cheaper than the cold round (anchor reuse)", () => {
         const big = makeHistory(8_000);
+        // Fresh session per cold run — reusing one would seed anchors on the
+        // first pass and turn runs 2-3 into warm rounds, invalidating the min.
+        const cold = msMin3(() => reconcileFoldCoverage(coveredSession(big), big, opts));
         const session = coveredSession(big);
-        const cold = ms(() => reconcileFoldCoverage(session, big, opts));
+        ms(() => reconcileFoldCoverage(session, big, opts));
         // Same ids resent: unchanged id => unchanged bytes => stored anchor still valid.
-        const warm = ms(() => reconcileFoldCoverage(session, big, opts));
+        const warm = msMin3(() => reconcileFoldCoverage(session, big, opts));
         assert.ok(warm < cold / 2, `warm ${warm.toFixed(1)}ms not far below cold ${cold.toFixed(1)}ms — anchor reuse path regressed`);
     });
 });
