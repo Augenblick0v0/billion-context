@@ -54,6 +54,13 @@ test("applyEstimateCalibration: scales only on the learned route, passes raw oth
     assert.equal(applyEstimateCalibration(10000, 0.5, undefined, "http://a"), 10000);
     assert.equal(applyEstimateCalibration(10000, 0.5, "http://a", undefined), 10000);
     assert.equal(applyEstimateCalibration(10000, 0.5, "http://a", "http://b"), 10000);
+    // Invalid factors (persisted garbage, null from JSON, 0, NaN, Infinity)
+    // degrade to no-correction — raw×0 would blind the estimate arm.
+    assert.equal(applyEstimateCalibration(10000, 0, "http://a", "http://a"), 10000);
+    assert.equal(applyEstimateCalibration(10000, null as unknown as number, "http://a", "http://a"), 10000);
+    assert.equal(applyEstimateCalibration(10000, Number.NaN, "http://a", "http://a"), 10000);
+    assert.equal(applyEstimateCalibration(10000, Number.POSITIVE_INFINITY, "http://a", "http://a"), 10000);
+    assert.equal(applyEstimateCalibration(10000, -0.5, "http://a", "http://a"), 10000);
 });
 
 // One settled pair (pending estimate + its usage report) on a route.
@@ -96,7 +103,10 @@ test("settleUsageReport: cross-route starts a fresh ring and clears the old fact
     assert.equal(st.lastInputTokensOrigin, "http://b");
 
     pair(s, 10000, "http://b", 21000);
-    assert.ok(Math.abs((st.calibratedEstimate ?? 0) - 2.05) < 1e-9, `expected 2.05, got ${st.calibratedEstimate}`);
+    // 2.0/2.1 are consistent under-estimate evidence (billing ABOVE the local
+    // estimate), but calibration is one-way: the mean clamps to 1 = raw
+    // estimate, legacy behavior — it may never fire earlier than the proxy.
+    assert.equal(st.calibratedEstimate, 1, "under-estimate route clamps to k̂=1 (no inflation)");
     assert.equal(st.calibratedEstimateOrigin, "http://b");
 });
 
@@ -130,16 +140,22 @@ test("settleUsageReport: implausible pairs never enter the ring", () => {
     assert.equal(st.calibrationRing?.values.length, 3, "ring capped at CALIBRATION_SAMPLE_WINDOW");
 });
 
-test("settleUsageReport: published factors clamp to [0.25, 4]", () => {
+test("settleUsageReport: published factors clamp to [0.25, 1] — one-way, deflate only", () => {
     const hi = makeSession();
     pair(hi, 10000, "http://e", 45000);
     pair(hi, 10000, "http://e", 50000);
-    assert.equal(hi.stats.calibratedEstimate, 4, "mean 4.75 clamps down to 4");
+    assert.equal(hi.stats.calibratedEstimate, 1, "mean 4.75 clamps down to 1: an under-estimating route keeps legacy behavior, calibration never inflates a reading");
 
     const lo = makeSession();
     pair(lo, 10000, "http://f", 2200);
     pair(lo, 10000, "http://f", 2400);
     assert.equal(lo.stats.calibratedEstimate, 0.25, "mean 0.23 clamps up to 0.25");
+
+    // The corrected reading can only drop BELOW the raw estimate, never rise:
+    // applying the clamped hi factor is a no-op (raw × 1), applying the lo
+    // one deflates — both bounded by the clamp range.
+    assert.equal(applyEstimateCalibration(10000, hi.stats.calibratedEstimate, "http://e", "http://e"), 10000);
+    assert.equal(applyEstimateCalibration(10000, lo.stats.calibratedEstimate, "http://f", "http://f"), 2500);
 });
 
 test("settleUsageReport: a report without a known upstream neither learns nor re-provenances", () => {

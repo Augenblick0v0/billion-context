@@ -78,7 +78,10 @@ export function normalizeUpstreamOrigin(u: string | undefined): string | undefin
  *  learned: both origins known and equal → scaled; either unknown or the
  *  routes differ → raw estimate unchanged (legacy behavior). */
 export function applyEstimateCalibration(raw: number, k: number | undefined, kOrigin: string | undefined, origin: string | undefined): number {
-    if (k === undefined || raw <= 0) return raw;
+    // Invalid factors (null/0/NaN/±Infinity — e.g. a corrupted persisted
+    // session.stats field) must degrade to no-correction, never zero or
+    // poison the reading: raw×0 would blind the estimate arm entirely.
+    if (k === undefined || !Number.isFinite(k) || k <= 0 || raw <= 0) return raw;
     const a = normalizeUpstreamOrigin(origin);
     const b = normalizeUpstreamOrigin(kOrigin);
     if (a === undefined || b === undefined || a !== b) return raw;

@@ -177,7 +177,11 @@ export type Session = {
         lastInputTokensOrigin?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
-          *  text estimate), clamped to [0.25, 4]. A sample is only admitted
+          *  text estimate), clamped to [0.25, 1] — one-way by design: the
+          *  correction can only deflate the estimate (never fire earlier
+          *  than the raw proxy); routes billing above the local estimate
+          *  publish k̂=1 (legacy behavior, overflow arm covers them). A
+          *  sample is only admitted
           *  when it falls in the plausibility band [0.2, 5] — outside it the
           *  report and the payload clearly don't correspond (placeholder
           *  billing, relay echo, mock upstreams) and must not teach anything.

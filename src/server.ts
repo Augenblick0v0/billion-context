@@ -5397,8 +5397,9 @@ async function preflightCompressIfNeeded(
     }
     // #1933 F1: scale the local text estimate by the per-route calibration
     // factor k̂ learned from this session's own usage reports (local estimate ÷
-    // what upstream actually billed, EMA, clamped 0.25–4; see settleUsageReport).
-    // Unknown/mismatched origin → raw estimate, i.e. today's behavior.
+    // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
+    // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
+    // i.e. today's behavior.
     const kFactor = session.stats.calibratedEstimate;
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);

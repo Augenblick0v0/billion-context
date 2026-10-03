@@ -633,7 +633,8 @@ export function recordCacheSample(
 // proxy whose ratio to real billing varies per upstream (observed 1.3–2.5× on
 // one relay vs ~1.0× on another in the same session), so k̂ is learned per
 // route and only applied on that route. Samples below MIN are noise (tiny
-// requests), clamps bound a single pathological sample from wrecking the EMA.
+// requests), clamps bound a single pathological sample from wrecking the EMA
+// and pin the correction to the deflate direction only (max 1, see below).
 const CALIBRATION_MIN_ESTIMATE = 2000;
 // Plausibility band for admitting a sample: outside it, the report and the
 // payload it bills demonstrably don't correspond (placeholder billing, relay
@@ -641,9 +642,16 @@ const CALIBRATION_MIN_ESTIMATE = 2000;
 const CALIBRATION_SAMPLE_MIN = 0.2;
 const CALIBRATION_SAMPLE_MAX = 5;
 // Final clamp on the published factor: bounds how far calibration can move
-// any decision away from the raw estimate.
+// any decision away from the raw estimate. One-way by design: the clamp max
+// is 1, so a learned factor can only DEFLATE the estimate (fire later than
+// the raw proxy would), never inflate it. Routes whose billing runs ABOVE
+// the local estimate (samples >1) publish k̂=1 — legacy raw behavior — and
+// stay covered by the overflow arm / learn-on-failure ladder instead. This
+// eliminates the class "calibration itself causes an earlier trigger": the
+// observed #1933 damage was over-triggering (37% window tax, fold churn),
+// while the opposite error already has a backstop. Discussion: PR #1940.
 const CALIBRATION_CLAMP_MIN = 0.25;
-const CALIBRATION_CLAMP_MAX = 4;
+const CALIBRATION_CLAMP_MAX = 1;
 // Evidence requirements: ≥2 recent same-route samples agreeing within ×2.
 // One lucky/degenerate pair must not flip every estimate on the route.
 const CALIBRATION_SAMPLE_WINDOW = 3;
