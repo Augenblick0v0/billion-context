@@ -691,13 +691,16 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // credential (or for schemes we cannot re-sign) the request is
         // REFUSED locally (403, actionable message): silent verbatim
         // forwarding would silently disable compression, and an un-armed
-        // tunnel 401s upstream anyway. BILI_RESIGN_PASSTHROUGH=1 opts in to
-        // the verbatim direct fallback (#1886 semantics); BILI_RESIGN=0
-        // un-deploys the whole branch (signed bodies fall through to the
-        // normal takeover path — pre-#1884 behavior).
+        // tunnel 401s upstream anyway. Passthrough/refusal are decided
+        // PER SCHEME — the lookup key is the request's own Authorization
+        // scheme, so opting one signature into verbatim forwarding never
+        // opens another (config `resign["<scheme>"].passthrough`, env
+        // BILI_RESIGN_PASSTHROUGH wins; BILI_RESIGN=0 un-deploys the whole
+        // branch — signed bodies fall through to the normal takeover path,
+        // pre-#1884 behavior).
         let resignExtra: Record<string, string> | undefined;
         const signedScheme = bodySignedSchemeOf(input, init);
-        if (signedScheme !== undefined && resignEnabled()) {
+        if (signedScheme !== undefined && resignEnabled(undefined, signedScheme)) {
             state.onSignedModelUrl?.(url, signedScheme);
             let cred: { ak: string; sk: string; token?: string } | undefined;
             if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
@@ -708,7 +711,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 }
             }
             if (cred === undefined) {
-                if (!resignPassthroughEnabled()) {
+                if (!resignPassthroughEnabled(undefined, signedScheme)) {
                     state.onDispatch?.(url, "refused");
                     const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
                     return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });

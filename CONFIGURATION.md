@@ -180,30 +180,37 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `resign`
 
-- **Type:** `object` (`{ enabled?, passthrough?, credentialRef? }`)
-- **Default:** `enabled: true`, `passthrough: false`; `credentialRef` *(unset — account-pool discovery)*
+- **Type:** `object` — scheme-keyed: `Record<scheme, { enabled?, passthrough?, credentialRef? }>` where each key is a lowercase signature scheme token as it appears on the wire's `Authorization` header (built-in: `"sdk-hmac-sha256"`)
+- **Default:** the built-in `"sdk-hmac-sha256"` key resolves out of the box — `enabled: true`, `passthrough: false`, `credentialRef` *(unset — account-pool discovery)*; any scheme the file does not mention keeps those defaults
 - **Status:** ACTIVE
-- **Description:** The config-file surface of the #1884 re-sign arm (CodeArts APIG `SDK-HMAC-SHA256` body-covering signatures). The arm itself is zero-config: on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box. This block is for the failure/override paths — env vars win over the file for every field:
-  - `enabled: boolean` — kill switch; `false` unloads the arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Env `BILI_RESIGN=0` wins.
-  - `passthrough: boolean` — opt-in verbatim forwarding for signed requests that cannot be re-signed (no credential, or an unsupported scheme like SigV4). The default is a **local 403 refusal** with an actionable message — no silent passthrough, because forwarding byte-untouched would silently disable compression for those requests (#1886 semantics are opt-in by design). Env `BILI_RESIGN_PASSTHROUGH=1` wins.
+- **Description:** The config-file surface of the #1884 re-sign arm (body-covering signatures; today Huawei CodeArts APIG's `SDK-HMAC-SHA256`). The arm itself is zero-config: on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box — the built-in key's defaults ARE that behavior, which is why keying by scheme does not make this a Huawei-shaped field. This block is for the failure/override paths — env vars win over the file for every field:
+  - `enabled: boolean` — kill switch for that scheme; `false` unloads the arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Env `BILI_RESIGN=0` wins.
+  - `passthrough: boolean` — opt-in verbatim forwarding for THAT scheme's requests when they cannot be re-signed (no credential, or a scheme bili cannot sign, like SigV4). The default is a **local 403 refusal** with an actionable message — no silent passthrough, because forwarding byte-untouched would silently disable compression for those requests (#1886 semantics are opt-in by design). Pinning the key pins the signature: opting `"aws4-hmac-sha256"` into passthrough never opens `"sdk-hmac-sha256"`, and vice versa. Env `BILI_RESIGN_PASSTHROUGH=1` wins.
   - `credentialRef: string` — pin the dsh credentials-service ref used for re-signing instead of account-pool discovery. Env `BILI_CODEARTS_REF` wins.
 
   The model-level knob is deliberately NOT a field here — see the three-level note below.
 
   ```jsonc
   {
-    "resign": { "passthrough": true }
+    "resign": {
+      "sdk-hmac-sha256": { "passthrough": true },
+      "aws4-hmac-sha256": { "passthrough": true }
+    }
   }
   ```
 
-- **Strict three levels (route-first):** the #1884 knobs follow the repo's standard cascade — env var > level 3 (`providers.<url>.models.<name>.benefit`) > level 2 (`providers.<url>.resign`) > level 1 (global `resign` block) > built-in default — resolved AFTER routing, the same family as [`imageBilling`](#imagebilling):
+- **Strict three levels (route-first):** the #1884 knobs follow the repo's standard cascade — env var > level 3 (`providers.<url>.models.<name>.benefit`) > level 2 (`providers.<url>.resign["<scheme>"]`) > level 1 (global `resign["<scheme>"]`) > built-in default — resolved AFTER routing, the same family as [`imageBilling`](#imagebilling):
 
   ```jsonc
   {
-    "resign": { "passthrough": false },
+    "resign": {
+      "sdk-hmac-sha256": { "passthrough": false }
+    },
     "providers": {
       "https://codearts.example.com": {
-        "resign": { "passthrough": true },
+        "resign": {
+          "sdk-hmac-sha256": { "passthrough": true }
+        },
         "models": {
           "glm-5.3-flash": { "benefit": true },
           "deepseek-v4.1":  { "benefit": false }
@@ -214,8 +221,8 @@ Top-level keys that control how the proxy listens and behaves globally.
   ```
 
   - `models.<name>.benefit: boolean` (level 3) — whether THIS model on THIS provider bills against the CodeArts free quota (its re-signed requests carry the signed `maas_type: benefit` header). `true`/`false` are explicit — `false` opts a default-set model out; unset falls through to the built-in fallback `glm-5.3-flash, deepseek-v4.1-flash` (the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK` mirror). Env `BILI_RESIGN_BENEFIT` (comma-separated) wins over the whole tree.
-  - `providers.<url>.resign` (level 2) — `{ enabled?, passthrough?, credentialRef? }`, per-field over the global block.
-  - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy.
+  - `providers.<url>.resign["<scheme>"]` (level 2) — `{ enabled?, passthrough?, credentialRef? }` under the same scheme key, per-field over the global block.
+  - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy. Scheme lookup itself is case-insensitive (wire tokens arrive as `SDK-HMAC-SHA256 Access=…`, keys are lowercase).
 
 ---
 
@@ -789,7 +796,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568). |
 | `BILI_STREAM_KEEPALIVE_MS` | Streaming-phase client hold (#1647): when an SSE response has written zero bytes to the client for this many milliseconds, bili emits one SSE comment line (`: bili-keepalive`, a spec-level no-op) so the client's undici `bodyTimeout` (default 300s; Node built-in fetch cannot override it per request) cannot kill long prefills whose upstream pings the rewriter/strip pipes swallow. Default `15000`; `0` disables. Sibling of `BILI_PREFLIGHT_HOLD_MS`, which covers compression-preflight silence — this covers upstream-caused silence during streaming. |
 | `BILI_RECLAIM_FETCH_PATCH` | Set to `0` to disable the native-mode fetch self-heal re-arm (#1158). By default the native fetch intercept installs `globalThis.fetch` as a guarded accessor, so a third-party patch that re-installs `globalThis.fetch` (e.g. dsh-http-proxy's settings refresh writing its frozen pre-bili `originalFetch`) is re-chained as the downstream and model traffic keeps routing through bili. With `0` the classic direct install stays: a third-party re-arm then wins and bili stops seeing model traffic for the session. **Egress note:** while the guard holds, claimed model traffic is dispatched by the bili proxy itself — it no longer rides the third-party chain's egress (e.g. a SOCKS5 proxy configured in dsh-http-proxy; bili's own upstream proxying supports HTTP proxies only). If you need the third-party egress back, set `0` and configure the egress at bili's level (`"proxy": "http://…"`). |
-| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A signed request that CANNOT be re-signed (no credential, or an unsupported scheme like SigV4) is refused locally with 403 and an actionable message — no silent passthrough: forwarding byte-untouched would silently disable compression. Opt in to verbatim no-compression forwarding with `BILI_RESIGN_PASSTHROUGH=1` (#1886 semantics). `enabled` / `passthrough` / `credentialRef` have config-file twins under the [`resign`](#resign) block (`providers.<url>.resign` is the level-2 override) — env vars win over the file. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — wins over the whole three-level tree; file-side twin is the level-3 `models.<name>.benefit` boolean, unset falls back to the built-in `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
+| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A signed request that CANNOT be re-signed (no credential, or an unsupported scheme like SigV4) is refused locally with 403 and an actionable message — no silent passthrough: forwarding byte-untouched would silently disable compression. Opt in to verbatim no-compression forwarding with `BILI_RESIGN_PASSTHROUGH=1` (#1886 semantics). `enabled` / `passthrough` / `credentialRef` have config-file twins under the [`resign`](#resign) block, keyed by signature scheme (`resign["sdk-hmac-sha256"]`; `providers.<url>.resign["<scheme>"]` is the level-2 override) — env vars win over the file. Scheme keys pin the passthrough opt-in: only the scheme whose key sets it tunnels. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — wins over the whole three-level tree; file-side twin is the level-3 `models.<name>.benefit` boolean, unset falls back to the built-in `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
 | `ACP_HOST` | Override the listen host. |

@@ -1025,15 +1025,17 @@ function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undefined): 
     return findRoute(opts.routes, upstreamUrl)?.imageTokenCap ?? opts.imageTokenCap ?? 0;
 }
 
-// #1884: per-provider re-sign policy — the matched route entry's `resign`
-// block (level 2) wins per-field over the global `resign` root, env over
-// both, the same cascade family as imageBillingFor. Resolved AFTER routing
-// so the provider (and its model filter) is known before the re-sign action
-// runs — the repo's route-first ordering, not action-first-then-filter.
-// Host-side consumers (native intercept, dsh lane) run pre-route and keep
-// the root cascade.
-function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResignSettings {
-    return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign);
+// #1884: per-provider, per-scheme re-sign policy — the matched route
+// entry's `resign["<scheme>"]` block (level 2) wins per-field over the
+// global `resign` root, env over both, the same cascade family as
+// imageBillingFor. Resolved AFTER routing so the provider (and its model
+// filter) is known before the re-sign action runs — the repo's route-first
+// ordering, not action-first-then-filter. `scheme` is the request's own
+// Authorization scheme, so passthrough/refusal is pinned to exactly the
+// signature on the wire. Host-side consumers (native intercept, dsh lane)
+// run pre-route and keep the root cascade.
+function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | undefined, scheme: string = APIG_RESIGN_SCHEME): ResignSettings {
+    return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign, scheme);
 }
 
 // #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
@@ -2961,19 +2963,19 @@ async function handle(
             // the guard consults the matched route entry's `resign` block, so
             // policy follows the provider/model scoping the rest of the system
             // uses (env > providers.<url>.resign > global resign root).
-            const guardResign = resignSettingsFor(opts, route?.rewrittenUrl ?? upstreamOrigin);
+            const guardResign = resignSettingsFor(opts, route?.rewrittenUrl ?? upstreamOrigin, guardScheme);
             if (
                 guardScheme !== undefined &&
                 !resignArmable &&
                 guardResign.enabled
             ) {
                 if (guardResign.passthrough) {
-                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign.passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
+                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign["${guardScheme}"].passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign.passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign["${guardScheme}"].passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });

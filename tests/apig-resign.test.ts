@@ -404,6 +404,31 @@ test("#1884 intercept: AWS4 (unsupported scheme) → refused by default; direct 
     });
 });
 
+test("#1884 intercept: passthrough is pinned per scheme — an aws4 file block opts in aws4 only", async () => {
+    await withConfigFile({ resign: { "aws4-hmac-sha256": { passthrough: true } } }, async () => {
+        // aws4-signed traffic tunnels verbatim under its own block (key = the wire scheme token, lowercased)
+        await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
+            const { sink } = await withIntercept(armedState(), async (fetch) =>
+                fetch("http://127.0.0.1:9199/v1/chat/completions", {
+                    method: "POST",
+                    headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
+                    body: "{}",
+                }));
+            assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "aws4 block opts aws4 into verbatim forwarding");
+            assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
+        });
+        // sdk-hmac-sha256 stays at the default refusal — the aws4 block never leaks across schemes
+        const cred = encodeApigCredential({ ak: "ak", sk: "sk", token: "" });
+        const { result } = await withIntercept(armedState({ resignCredentialFor: undefined }), async (fetch) =>
+            fetch("http://127.0.0.1:9199/v1/chat/completions", {
+                method: "POST",
+                headers: { authorization: `SDK-HMAC-SHA256 Access=${cred}`, "x-sdk-content-sha256": "aa" },
+                body: "{}",
+            }));
+        assert.equal(result.status, 403, "built-in scheme unaffected by the aws4-only block");
+    });
+});
+
 test("#1884 intercept: unsigned model traffic is unaffected", async () => {
     const dispatches: string[] = [];
     const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
@@ -450,7 +475,7 @@ function startVerifyingUpstream(sk: string): Promise<{ server: http.Server; port
     });
 }
 
-async function startResignProxy(upstreamPort: number, routeResign?: { resign?: { enabled?: boolean; passthrough?: boolean; credentialRef?: string } }): Promise<{ proxy: http.Server; port: number }> {
+async function startResignProxy(upstreamPort: number, routeResign?: { resign?: Record<string, { enabled?: boolean; passthrough?: boolean; credentialRef?: string }> }): Promise<{ proxy: http.Server; port: number }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -701,7 +726,7 @@ function withConfigFile<T>(config: unknown, fn: (file: string) => Promise<T> | T
 }
 
 test("#1884 config file: resign.passthrough / enabled are honored without any env var", async () => {
-    await withConfigFile({ resign: { enabled: true, passthrough: true } }, async () => {
+    await withConfigFile({ resign: { [APIG_RESIGN_SCHEME]: { enabled: true, passthrough: true } } }, async () => {
         await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined }, async () => {
             assert.equal(resignPassthroughEnabled(), true, "file passthrough wins over the default refusal");
             assert.equal(resignEnabled(), true);
@@ -710,7 +735,7 @@ test("#1884 config file: resign.passthrough / enabled are honored without any en
 });
 
 test("#1884 config file: resign.enabled=false unloads the arm (file-only kill switch)", async () => {
-    await withConfigFile({ resign: { enabled: false } }, async () => {
+    await withConfigFile({ resign: { [APIG_RESIGN_SCHEME]: { enabled: false } } }, async () => {
         await withEnv({ BILI_RESIGN: undefined }, async () => {
             assert.equal(resignEnabled(), false);
         });
@@ -718,7 +743,7 @@ test("#1884 config file: resign.enabled=false unloads the arm (file-only kill sw
 });
 
 test("#1884 precedence: env wins over the config file for every resign knob", async () => {
-    await withConfigFile({ resign: { enabled: true, passthrough: true } }, async () => {
+    await withConfigFile({ resign: { [APIG_RESIGN_SCHEME]: { enabled: true, passthrough: true } } }, async () => {
         await withEnv({ BILI_RESIGN: "0", BILI_RESIGN_PASSTHROUGH: "0", BILI_RESIGN_BENEFIT: "env-model" }, async () => {
             assert.equal(resignEnabled(), false, "BILI_RESIGN=0 beats file enabled:true");
             assert.equal(resignPassthroughEnabled(), false, "BILI_RESIGN_PASSTHROUGH=0 beats file passthrough:true");
@@ -728,7 +753,7 @@ test("#1884 precedence: env wins over the config file for every resign knob", as
 });
 
 test("e2e #1884: file-configured passthrough (no env var) → byte-untouched forwarding — the out-of-box surface", async () => {
-    await withConfigFile({ resign: { passthrough: true } }, async () => {
+    await withConfigFile({ resign: { [APIG_RESIGN_SCHEME]: { passthrough: true } } }, async () => {
         await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
             const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
             const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
@@ -757,25 +782,42 @@ test("unit #1884: provider-level resign block wins per-field over the global roo
     await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined, BILI_CODEARTS_REF: undefined }, async () => {
         const env = { ...process.env };
         // provider flips passthrough on while the root default stays refuse
-        assert.equal(resolveResignSettings(env, { passthrough: true }).passthrough, true);
+        assert.equal(resolveResignSettings(env, { [APIG_RESIGN_SCHEME]: { passthrough: true } }).passthrough, true);
         assert.equal(resolveResignSettings(env, {}).passthrough, false, "no provider field → root default (refuse)");
         // provider can un-deploy the action for its host only
-        assert.equal(resolveResignSettings(env, { enabled: false }).enabled, false);
+        assert.equal(resolveResignSettings(env, { [APIG_RESIGN_SCHEME]: { enabled: false } }).enabled, false);
         assert.equal(resolveResignSettings(env, {}).enabled, true, "no provider field → root default (armed)");
         // provider benefit list beats the root list; empty provider list falls through to root
-        await withConfigFile({ resign: { passthrough: true } }, async () => {
-            assert.equal(resolveResignSettings({ ...process.env }, { passthrough: false }).passthrough, false, "provider beats root file block per-field");
+        await withConfigFile({ resign: { [APIG_RESIGN_SCHEME]: { passthrough: true } } }, async () => {
+            assert.equal(resolveResignSettings({ ...process.env }, { [APIG_RESIGN_SCHEME]: { passthrough: false } }).passthrough, false, "provider beats root file block per-field");
             assert.equal(resolveResignSettings({ ...process.env }, {}).passthrough, true, "no provider field → root file block wins");
         });
         // env still outranks the provider entry
-        assert.equal(resolveResignSettings({ ...process.env, BILI_RESIGN_PASSTHROUGH: "1" }, { passthrough: false }).passthrough, true);
+        assert.equal(resolveResignSettings({ ...process.env, BILI_RESIGN_PASSTHROUGH: "1" }, { [APIG_RESIGN_SCHEME]: { passthrough: false } }).passthrough, true);
+    });
+});
+
+test("unit #1884: scheme-keyed blocks never leak across schemes; the built-in key is out-of-box", async () => {
+    await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined, BILI_CODEARTS_REF: undefined }, async () => {
+        const env = { ...process.env };
+        const provider = { [APIG_RESIGN_SCHEME]: { passthrough: false }, "aws4-hmac-sha256": { passthrough: true } };
+        assert.equal(resolveResignSettings(env, provider, "aws4-hmac-sha256").passthrough, true, "aws4 block honored for aws4");
+        assert.equal(resolveResignSettings(env, provider, APIG_RESIGN_SCHEME).passthrough, false, "built-in scheme unaffected");
+        // wire tokens arrive in mixed case ("SDK-HMAC-SHA256 Access=...") — keys match case-insensitively
+        assert.equal(resolveResignSettings(env, provider, "SDK-HMAC-SHA256").passthrough, false, "scheme lookup is case-insensitive");
+        // no file, no provider: the built-in key resolves with defaults (out-of-box)
+        await withConfigFile({ resign: { "aws4-hmac-sha256": { passthrough: true } } }, async () => {
+            assert.equal(resignPassthroughEnabled(undefined, "aws4-hmac-sha256"), true);
+            assert.equal(resignPassthroughEnabled(undefined, APIG_RESIGN_SCHEME), false, "built-in key untouched by an aws4-only file");
+            assert.equal(resignEnabled(undefined, APIG_RESIGN_SCHEME), true, "built-in key still armed out of the box");
+        });
     });
 });
 
 test("e2e #1884: provider-level resign.passthrough=true → byte-untouched forwarding for that host only (level 2)", async () => {
     await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
         const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
-        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { passthrough: true } });
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { [APIG_RESIGN_SCHEME]: { passthrough: true } } });
         try {
             const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
             const bodyStr = chatBody("deepseek-v4.1-flash", "provider-passthrough-1");
@@ -797,7 +839,7 @@ test("e2e #1884: provider-level resign.passthrough=true → byte-untouched forwa
 test("e2e #1884: provider-level resign.enabled=false → guard off for that host; signed traffic rides the normal path (pre-#1884)", async () => {
     await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
         const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
-        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { enabled: false } });
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { [APIG_RESIGN_SCHEME]: { enabled: false } } });
         try {
             const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
             const bodyStr = chatBody("deepseek-v4.1-flash", "provider-disabled-1");

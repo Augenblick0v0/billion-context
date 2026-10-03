@@ -180,30 +180,37 @@
 
 ### `resign`
 
-- **类型：** `object`（`{ enabled?, passthrough?, credentialRef? }`）
-- **默认值：** `enabled: true`、`passthrough: false`；`credentialRef` *（未设置 —— 账号池发现）*
+- **类型：** `object` —— 按签名方案分键：`Record<方案, { enabled?, passthrough?, credentialRef? }>`,键 = 电线上 `Authorization` 头里出现的签名方案 token(小写；内置:`"sdk-hmac-sha256"`)
+- **默认值：** 内置 `"sdk-hmac-sha256"` 键开箱即用 —— `enabled: true`、`passthrough: false`、`credentialRef` *（未设置 —— 账号池发现）*；文件没提到的方案一律保持这些默认
 - **状态：** ACTIVE
-- **说明：** #1884 重签臂的配置文件面（CodeArts APIG 的 `SDK-HMAC-SHA256` body 级签名）。重签臂本身零配置：在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
-  - `enabled: boolean` —— 总开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
-  - `passthrough: boolean` —— 对无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）的 opt-in 原样转发。默认是**本地 403 拒收**并给出可操作提示 —— 不静默直发，因为逐字节原样转发等于静默关掉那些请求的压缩（#1886 语义设计上就是 opt-in）。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先。
+- **说明：** #1884 重签臂的配置文件面（body 级签名；今天就是华为 CodeArts APIG 的 `SDK-HMAC-SHA256`）。重签臂本身零配置：在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用 —— 内置键的默认值**就是**这套行为，所以按方案分键并不把这个字段做成华为特殊设计。本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
+  - `enabled: boolean` —— 该方案的开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
+  - `passthrough: boolean` —— 对该方案的、无法重签的请求（拿不到凭据，或 SigV4 等签不了的方案）的 opt-in 原样转发。默认是**本地 403 拒收**并给出可操作提示 —— 不静默直发，因为逐字节原样转发等于静默关掉那些请求的压缩（#1886 语义设计上就是 opt-in）。**键定死签名**：给 `"aws4-hmac-sha256"` 开 passthrough 永远不会顺带放开 `"sdk-hmac-sha256"`，反之亦然。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先。
   - `credentialRef: string` —— 钉死重签用的 dsh credentials 服务 ref，而不是账号池发现。环境变量 `BILI_CODEARTS_REF` 优先。
 
   模型级开关刻意不在本块里 —— 见下面三级说明。
 
   ```jsonc
   {
-    "resign": { "passthrough": true }
+    "resign": {
+      "sdk-hmac-sha256": { "passthrough": true },
+      "aws4-hmac-sha256": { "passthrough": true }
+    }
   }
   ```
 
-- **严格三级（route-first）：** #1884 的开关遵循仓库标准联级 —— 环境变量 > 三级（`providers.<url>.models.<name>.benefit`）> 二级（`providers.<url>.resign`）> 一级（全局 `resign` 块）> 内置默认，解析发生在路由之后，与 [`imageBilling`](#imagebilling) 同一条联级：
+- **严格三级（route-first）：** #1884 的开关遵循仓库标准联级 —— 环境变量 > 三级（`providers.<url>.models.<name>.benefit`）> 二级（`providers.<url>.resign["<方案>"]`）> 一级（全局 `resign["<方案>"]`）> 内置默认，解析发生在路由之后，与 [`imageBilling`](#imagebilling) 同一条联级：
 
   ```jsonc
   {
-    "resign": { "passthrough": false },
+    "resign": {
+      "sdk-hmac-sha256": { "passthrough": false }
+    },
     "providers": {
       "https://codearts.example.com": {
-        "resign": { "passthrough": true },
+        "resign": {
+          "sdk-hmac-sha256": { "passthrough": true }
+        },
         "models": {
           "glm-5.3-flash": { "benefit": true },
           "deepseek-v4.1":  { "benefit": false }
@@ -214,8 +221,8 @@
   ```
 
   - `models.<name>.benefit: boolean`（三级）—— 这个模型在这个 provider 上是否走免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头）。`true`/`false` 都是显式的 —— `false` 可以把默认集里的模型踢出；未设置则落到内置回退集 `glm-5.3-flash, deepseek-v4.1-flash`（dsh codearts 插件 `CODEARTS_BENEFIT_FALLBACK` 的镜像）。环境变量 `BILI_RESIGN_BENEFIT`（逗号分隔）优先于整棵树。
-  - `providers.<url>.resign`（二级）—— `{ enabled?, passthrough?, credentialRef? }`，逐字段压过全局块。
-  - 宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块 —— 那是传输必要性判定（签名 body 只能隧道或拒收），不是策略。
+  - `providers.<url>.resign["<方案>"]`（二级）—— 同样的方案键下 `{ enabled?, passthrough?, credentialRef? }`，逐字段压过全局块。
+  - 宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块 —— 那是传输必要性判定（签名 body 只能隧道或拒收），不是策略。方案键匹配不区分大小写（电线 token 形如 `SDK-HMAC-SHA256 Access=…`，键一律小写）。
 
 ---
 
@@ -788,7 +795,7 @@
 | `BILI_PREFLIGHT_HOLD_MS` | 预压缩超过该宽限期（毫秒）后，代理提前提交响应并用保活字节挂住客户端（默认 `30000`；见 #568）。 |
 | `BILI_STREAM_KEEPALIVE_MS` | 流式阶段客户端保活（#1647）：SSE 响应连续该毫秒数没有向客户端写出任何字节时，bili 发一条 SSE 注释行（`: bili-keepalive`，协议层 no-op），防止客户端 undici `bodyTimeout`（默认 300s；Node 内置 fetch 无法按请求覆盖）在长 prefill 时断连——上游的 ping 注释会被重写器/剥离管道吞掉。默认 `15000`；`0` 关闭。与 `BILI_PREFLIGHT_HOLD_MS` 互补：后者覆盖压缩预检期的静默，本变量覆盖流式期上游导致的静默。 |
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。 |
-| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块（`providers.<url>.resign` 是二级覆盖）——环境变量优先于文件。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
+| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块——按签名方案分键（`resign["sdk-hmac-sha256"]`；`providers.<url>.resign["<方案>"]` 是二级覆盖）——环境变量优先于文件。方案键把 passthrough 钉死到具体签名：只有自己的键设了的方案才走隧道。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |
