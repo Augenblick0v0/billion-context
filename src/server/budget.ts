@@ -182,7 +182,13 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  which is preflight/self-heal territory, not output starvation). */
 export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
     const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
-    const cap = nativeWindow - inputEstimate - margin;
+    // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
+    // wire protocol. Since 0.1.181 inputEstimate can carry a fraction (image pixel-prior billing,
+    // #1843, adds ctx.imageTokens to the estimate), which made this cap fractional and strict
+    // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`. Floor
+    // at the decision point so the emitted budget is always an integer (floor <= exact headroom,
+    // so input+output <= window still holds).
+    const cap = Math.floor(nativeWindow - inputEstimate - margin);
     if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
     return cap;
 }
