@@ -148,6 +148,13 @@ async function withProxy(fn: (url: string, bodies: string[]) => Promise<void>): 
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

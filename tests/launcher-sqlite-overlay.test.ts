@@ -869,7 +869,8 @@ test("finalizeCodexHome: missing or untouched overlay is a silent no-op (#1965)"
 });
 
 test("finalizeCodexHome: a leftover lease directory never merges into the real home (#1965)", (t) => {
-    const root = mkRoot(t);
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const codexHome = path.join(root, "real");
     fs.mkdirSync(codexHome, { recursive: true });
     buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b", "", true);

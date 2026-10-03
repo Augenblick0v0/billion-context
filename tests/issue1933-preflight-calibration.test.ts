@@ -265,6 +265,14 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        promptCache: { routing: "auto" },
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions;
 }

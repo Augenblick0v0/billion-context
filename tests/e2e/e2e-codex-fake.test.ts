@@ -454,11 +454,11 @@ test("#1965: a clean bili exit writes the run's state back into the real home; n
 	if (sqliteMod) {
 		const db = new sqliteMod.DatabaseSync(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
 		try {
-			assert.equal(String(db.prepare("PRAGMA quick_check").get().quick_check), "ok", "written-back db must pass quick_check");
+			assert.equal(String(db.prepare("PRAGMA quick_check").get()!.quick_check), "ok", "written-back db must pass quick_check");
 			const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((r) => String(r.name));
 			const threadTable = tables.find((x) => /thread/i.test(x));
 			assert.ok(threadTable, `state_5.sqlite must carry a thread table, got ${JSON.stringify(tables)}`);
-			const rows = Number(db.prepare(`SELECT COUNT(*) AS c FROM ${threadTable}`).get().c);
+			const rows = Number(db.prepare(`SELECT COUNT(*) AS c FROM ${threadTable}`).get()!.c);
 			assert.ok(rows >= 1, "this run's thread record must be readable in the real home");
 		} finally {
 			db.close();

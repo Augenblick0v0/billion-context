@@ -575,14 +575,16 @@ test("#1961: virtual-model selection resolves compaction ownership from the phys
             ...extra,
         });
         const run = async (env: Record<string, string | undefined>, ctx: unknown, eventBranchEntries?: unknown): Promise<unknown> => {
-            return withEnv(env, async () => {
+            let result: unknown;
+            await withEnv(env, async () => {
                 const pi = makeFakePi();
                 createBiliPlugin("pi")(pi as never);
                 const handler = pi.events.get("session_before_compact")!;
                 const event: Record<string, unknown> = { reason: "threshold" };
                 if (eventBranchEntries !== undefined) event.branchEntries = eventBranchEntries;
-                return handler(event, ctx);
+                result = await handler(event, ctx);
             });
+            return result;
         };
         // Shaped like the REAL host surface: pi 0.99 ModelRegistry exposes
         // find(provider, modelId), not getModel — a stub inventing a
