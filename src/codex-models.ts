@@ -22,7 +22,12 @@ interface CodexModelsSnapshot {
 }
 
 const SNAPSHOT = snapshot as CodexModelsSnapshot;
-const TABLE: CodexModelEntry[] = SNAPSHOT.models;
+// #1953: the live table owns its own array AND its entries — aliased from
+// SNAPSHOT it would be mutated by _setCodexTableForTest, leaving reset with
+// nothing original to restore. Entries are all scalars today; a nested field
+// would need a deeper copy here and in the setter.
+const PRISTINE: CodexModelEntry[] = SNAPSHOT.models.map((m) => ({ ...m }));
+let TABLE: CodexModelEntry[] = PRISTINE.map((m) => ({ ...m }));
 
 /** codex's unknown-model fallback window (codex-rs
  *  models-manager/src/model_info.rs `model_info_from_slug`:
@@ -89,10 +94,9 @@ export function codexAlignedWindow(
 
 /** Test hook: replace the bundled table (mirrors registry._setForTest). */
 export function _setCodexTableForTest(models: CodexModelEntry[]): void {
-    TABLE.length = 0;
-    TABLE.push(...models);
+    TABLE = models.map((m) => ({ ...m }));
 }
 
 export function _resetCodexTableForTest(): void {
-    _setCodexTableForTest([...SNAPSHOT.models]);
+    TABLE = PRISTINE.map((m) => ({ ...m }));
 }
