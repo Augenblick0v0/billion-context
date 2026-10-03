@@ -47,6 +47,34 @@ generic opaque WebSocket passthrough, or change the user's OpenCode configuratio
   connection-local; ACP persistence remains unchanged. The ws implementation is
   a bundled build-time dependency, not an external runtime requirement.
 
+## Architecture: generic WebSocket bridge (#1467 phase-2 shell)
+
+The WebSocket interception is split into a protocol-independent shell and a
+per-protocol codec:
+
+- `src/ws-bridge.ts` (shell) owns admission (loopback source, `x-bili-plugin`
+  lane marker, `x-bili-plugin-conversation` session header, tunnel-destination
+  guard), the upgrade handshake, per-connection bookkeeping, and shutdown
+  teardown. It knows nothing about any wire protocol.
+- `src/responses-ws.ts` (codec) owns everything Responses-specific: frame
+  validation, the `previous_response_id` client history contract, the upstream
+  WebSocket transport with its continuation checkpoints, and the SSE response
+  sink. It is registered as `responsesCodec` in a codec table at the single
+  wiring site (`installWebSocketBridge(server, dispatch, log, [responsesCodec])`
+  in `src/server.ts`).
+
+A second wire protocol is a new codec file plus one table entry — no shell
+changes. The shell contract is `WsBridgeCodec` (name, plugin marker, URL claim,
+session factory) and `WsBridgeSession` (message/close/shutdown); sessions
+receive the labeled logger, the upgraded peer, the upgrade request, the claimed
+upstream URL, and the ACP pipeline entry (`dispatch`), and are expected to
+rebuild protocol-shaped envelopes in-process. `tests/ws-bridge.test.ts` drives
+the shell with a synthetic second codec to keep the codec table honest.
+
+Unknown protocols cannot be compressed (folding requires knowing where history
+lives in the wire format); they stay on the #1472 transparent passthrough lane
+and remain untouched by this bridge.
+
 ## Verification
 
 Use random loopback ports and fake Responses WebSocket upstreams, with no real

@@ -1,13 +1,11 @@
 import http from "node:http";
-import type { Duplex } from "node:stream";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
-import WebSocket, { WebSocketServer } from "ws";
+import WebSocket from "ws";
 import { MAX_REQUEST_BYTES, type FetchOptions } from "./fetch-util.js";
 import { withFetchTransport } from "./fetch-transport.js";
-import { checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
-import { isLoopbackAddress } from "./util.js";
 import { connectionNamedHeaders, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
 type JsonObject = Record<string, unknown>;
 type DiagnosticLog = (level: "debug" | "warn", message: string) => void;
@@ -365,108 +363,93 @@ class ResponsesWsResponse extends http.ServerResponse {
     }
 }
 
-export function installResponsesWebSocket(
-    server: http.Server,
-    dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
-    log: (level: string, message: string) => void,
-): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
-    const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
-    const transports = new Set<ResponsesWsUpstream>();
-    let connectionId = 0;
-    const close = server.close.bind(server);
-    server.close = callback => {
-        for (const transport of transports) transport.close("server-close");
-        for (const peer of wss.clients) peer.terminate();
-        return close(callback);
-    };
-    server.on("close", () => {
-        for (const transport of transports) transport.close("server-close");
-        for (const peer of wss.clients) peer.terminate();
-        wss.close();
-    });
-    return (source, socket, head) => {
-        const match = /^\/bili\/responses\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(source.url ?? "");
-        const conversation = source.headers["x-bili-plugin-conversation"];
-        if (!match || !isLoopbackAddress(source.socket.remoteAddress) || source.headers["x-bili-plugin"] !== "opencode" || typeof conversation !== "string" || conversation.trim().length === 0) return false;
-        const upstream = match[1];
-        void (async () => {
-            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv() });
-            if (!verdict.ok) {
-                socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-                return;
+
+// Responses protocol codec over the generic WebSocket bridge (ws-bridge.ts).
+// Protocol-specific pieces live here: frame validation, the client-side
+// history contract (previous_response_id expansion), the upstream WebSocket
+// transport with its continuation checkpoints, and the SSE response sink that
+// re-frames pipeline output for the client.
+
+class ResponsesWsSession implements WsBridgeSession {
+    private readonly transport: ResponsesWsUpstream;
+    private readonly history = new ResponsesWsHistory();
+    private active?: ResponsesWsResponse;
+    private busy = false;
+
+    constructor(private readonly context: WsBridgeContext) {
+        this.transport = new ResponsesWsUpstream(context.log);
+        context.log("info", "OpenCode Responses socket connected (ACP request pipeline)");
+    }
+
+    onMessage(data: Buffer, binary: boolean): void {
+        const peer = this.context.peer;
+        if (binary) { peer.close(1003, "Responses requires text frames"); return; }
+        if (this.busy) { this.context.log("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
+        let frame: unknown;
+        let body: JsonObject;
+        try {
+            frame = JSON.parse(data.toString());
+            if (!object(frame) || frame.type !== "response.create") throw new Error("Unsupported Responses client event");
+            if (frame.stream_id !== undefined || frame.stream !== undefined || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
+            body = { ...this.history.expand(frame), stream: true };
+            if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
+        } catch (error) {
+            const code = error instanceof Error && ["previous_response_not_found", "request_too_large"].includes(error.message) ? error.message : "invalid_request";
+            this.context.log("warn", `client rejected reason=${code}`);
+            peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
+            return;
+        }
+        this.busy = true;
+        const source = this.context.source;
+        const req = new http.IncomingMessage(source.socket);
+        req.complete = true;
+        req.method = "POST";
+        req.url = source.url;
+        const connectionHeaders = connectionNamedHeaders(source.headers.connection);
+        for (const [key, value] of Object.entries(source.headers)) {
+            if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") req.headers[key] = value;
+        }
+        req.headers["content-type"] = "application/json";
+        req.push(Buffer.from(JSON.stringify(body)));
+        req.push(null);
+        const res = new ResponsesWsResponse(req, peer);
+        res.on("error", () => {});
+        this.active = res;
+        void withFetchTransport((url, options) => this.transport.fetch(url, options), async () => {
+            try {
+                await this.context.dispatch(req, res);
+                if (res.response) {
+                    this.history.commit(body, res.response);
+                    if (res.restoredOutputItems > 0) this.context.log("debug", `checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
+                }
+            } catch {
+                this.context.log("warn", `exchange failed phase=dispatch terminal=${res.terminal}`);
+                if (!res.writableEnded) res.end();
+            } finally {
+                this.active = undefined;
+                this.busy = false;
             }
-            if (socket.destroyed) return;
-            wss.handleUpgrade(source, socket, head, peer => {
-                const label = `[responses-ws] [conn=${++connectionId}] [session=${JSON.stringify(conversation.slice(0, 128))}]`;
-                const trace: DiagnosticLog = (level, message) => log(level, `${label} ${message}`);
-                const transport = new ResponsesWsUpstream(trace);
-                transports.add(transport);
-                const history = new ResponsesWsHistory();
-                let active: ResponsesWsResponse | undefined;
-                let busy = false;
-                peer.on("error", () => {});
-                peer.on("close", code => {
-                    trace("debug", `client closed phase=${busy ? "active" : "idle"} close_code=${code}`);
-                    active?.destroy();
-                    transport.close("client-close");
-                    history.clear();
-                    trace("debug", "client checkpoint reset reason=client-close");
-                    transports.delete(transport);
-                });
-                peer.on("message", (data, binary) => {
-                    if (binary) { peer.close(1003, "Responses requires text frames"); return; }
-                    if (busy) { trace("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
-                    let frame: unknown;
-                    let body: JsonObject;
-                    try {
-                        frame = JSON.parse(data.toString());
-                        if (!object(frame) || frame.type !== "response.create") throw new Error("Unsupported Responses client event");
-                        if (frame.stream_id !== undefined || frame.stream !== undefined || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
-                        body = { ...history.expand(frame), stream: true };
-                        if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
-                    } catch (error) {
-                        const code = error instanceof Error && ["previous_response_not_found", "request_too_large"].includes(error.message) ? error.message : "invalid_request";
-                        trace("warn", `client rejected reason=${code}`);
-                        peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
-                        return;
-                    }
-                    busy = true;
-                    const req = new http.IncomingMessage(source.socket);
-                    req.complete = true;
-                    req.method = "POST";
-                    req.url = source.url;
-                    const connectionHeaders = connectionNamedHeaders(source.headers.connection);
-                    for (const [key, value] of Object.entries(source.headers)) {
-                        if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") req.headers[key] = value;
-                    }
-                    req.headers["content-type"] = "application/json";
-                    req.push(Buffer.from(JSON.stringify(body)));
-                    req.push(null);
-                    const res = new ResponsesWsResponse(req, peer);
-                    res.on("error", () => {});
-                    active = res;
-                    void withFetchTransport((url, options) => transport.fetch(url, options), async () => {
-                        try {
-                            await dispatch(req, res);
-                            if (res.response) {
-                                history.commit(body, res.response);
-                                if (res.restoredOutputItems > 0) trace("debug", `checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
-                            }
-                        } catch {
-                            trace("warn", `exchange failed phase=dispatch terminal=${res.terminal}`);
-                            if (!res.writableEnded) res.end();
-                        } finally {
-                            active = undefined;
-                            busy = false;
-                        }
-                    });
-                });
-                log("info", `${label} OpenCode Responses socket connected (ACP request pipeline)`);
-            });
-        })().catch(() => {
-            log("warn", "[responses-ws] upgrade failed");
-            if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
         });
-        return true;
-    };
+    }
+
+    onClose(code: number): void {
+        this.context.log("debug", `client closed phase=${this.busy ? "active" : "idle"} close_code=${code}`);
+        this.active?.destroy();
+        this.transport.close("client-close");
+        this.history.clear();
+        this.context.log("debug", "client checkpoint reset reason=client-close");
+    }
+
+    shutdown(reason: string): void {
+        this.transport.close(reason);
+        this.history.clear();
+        this.active?.destroy();
+    }
 }
+
+export const responsesCodec: WsBridgeCodec = {
+    name: "responses-ws",
+    pluginMarker: "opencode",
+    matchUpgrade: url => /^\/bili\/responses\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(url ?? "")?.[1],
+    createSession: context => new ResponsesWsSession(context),
+};

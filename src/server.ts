@@ -129,10 +129,10 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
-import { installResponsesWebSocket } from "./responses-ws.js";
+import { installWebSocketBridge } from "./ws-bridge.js";
+import { responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
+import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -466,7 +466,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     };
     const server = http.createServer(dispatch);
-    const responsesUpgrade = installResponsesWebSocket(server, dispatch, log);
+    // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
+    // phase-2 shell); the Responses codec is the first (and currently only)
+    // entry. Unclaimed upgrades still fall through to the 426 contract below.
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec]);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -474,7 +477,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
     // HTTP POST immediately.
     server.on("upgrade", (req, socket, head) => {
-        if (responsesUpgrade(req, socket, head)) return;
+        if (wsUpgrade(req, socket, head)) return;
         log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ? maskHostPortForLog(req.headers.host) : "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
