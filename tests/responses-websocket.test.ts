@@ -616,6 +616,29 @@ test("Responses WS faults: refused handshake then a new upstream reconnects with
     }
 });
 
+test("Responses WS: a first-turn all-bili tools frame is a main turn, not an #1897 side demotion", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        // turn() stamps tools: BILI_ACP_TOOLS_RESPONSES and no max_tokens, so the
+        // frame matches the #1897 omp leak shape exactly — but it arrives through
+        // the WS lane (x-bili-ws-lane stamped by the bridge), whose envelopes are
+        // the conversation mainline: the demotion must be vetoed, the kernel must
+        // engage, and nothing may be routed through the side passthrough (which
+        // cannot speak this lane's upstream transport).
+        const first = completed(await f.turn([user("#1897 veto: all-bili first frame stays a main turn")]));
+        assert.equal(first.status, "completed");
+        const previous = first.id as string;
+        const second = completed(await f.turn([user("still a main turn after the first usage report")], previous));
+        assert.equal(second.status, "completed");
+        const log = fs.readFileSync(f.logPath, "utf8");
+        assert.doesNotMatch(log, /leaked bili tools/);
+        assert.doesNotMatch(log, /side request \(/);
+        assert.match(log, /view=ws-expanded/);
+    } finally {
+        await f.close();
+    }
+});
+
 for (const terminalOutput of ["full", "empty", "omitted", "partial", "suffix"] as const) {
 test(`Responses WS: actual fold and successive tool results survive ${terminalOutput} terminal output`, { timeout: 30000 }, async () => {
     const f = await fixture();

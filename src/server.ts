@@ -2680,7 +2680,16 @@ async function handle(
         // run through the kernel. Veto on real history artifacts (detectAcpArtifacts
         // is history-scoped, never the top-level tools declarations), so a fresh
         // title-gen still demotes. Read-only; ordered BEFORE the mutating strip.
+        // #1467 WS lanes: envelopes rebuilt from a WebSocket upgrade carry the
+        // bridge's x-bili-ws-lane marker. The #1897 leak mechanism (an omp-style
+        // HTTP host registering bili's tools as extension tools) cannot produce
+        // them, the WS lane is that conversation's mainline, and a side
+        // passthrough cannot speak the lane's upstream transport — so the
+        // all-bili-tools demotion is vetoed for them (side requests on this lane
+        // are identified by the #1699 persona header instead).
+        const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
         const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
+            && !wsLaneEnvelope
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a

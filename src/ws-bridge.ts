@@ -89,6 +89,13 @@ export function installWebSocketBridge(
         })[0] : undefined;
         if (!claim) return false;
         const { codec, upstream } = claim;
+        // Stamp the codec name onto the upgrade request BEFORE the session is
+        // created: codecs rebuild in-process HTTP envelopes from `source`, so
+        // every envelope inherits this marker and the request pipeline can tell
+        // a WS-lane envelope from an omp-style HTTP request (#1897 demotion
+        // must not fire here — this lane IS the conversation mainline, and its
+        // side requests are identified by the #1699 persona header instead).
+        source.headers["x-bili-ws-lane"] = codec.name;
         void (async () => {
             const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv() });
             if (!verdict.ok) {
