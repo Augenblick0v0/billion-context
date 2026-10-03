@@ -105,14 +105,14 @@ interface V2CatalogModelEntry {
 
 export interface V2PluginContext {
     session?: {
-        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => void | Promise<V2Registration | undefined>;
+        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => V2Registration | void | Promise<V2Registration | undefined>;
         synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
-        transform?: (cb: (editor: V2ToolEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2ToolEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     command?: {
-        transform?: (cb: (editor: V2CommandEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2CommandEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     event?: { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<{ type?: unknown; data?: Record<string, unknown> }> | undefined };
     /** v2.0.x stable (probed @opencode/cli 2.0.18): ModelApi.list() →
