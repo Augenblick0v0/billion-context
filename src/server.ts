@@ -3535,6 +3535,11 @@ async function prepareAnthropic(
     // downstream consumer (injectSystem, Prepared.anthropicSystem → loop)
     // inherit the anchor, and the failure path below keeps forwarding it too.
     let sysNotes: string[] = [];
+    // [#1930-3] The client's own system captured BEFORE the anchor
+    // replacement below — fingerprinting the post-anchor value tracks bili's
+    // managed text and hides client-side drift (same rationale as the
+    // responses site; keeps all four wires on one semantic).
+    const clientSystem = parsed.system;
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -3616,7 +3621,7 @@ async function prepareAnthropic(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
-        noteSystemPromptFingerprint(session, parsed.system, { sessionId, log });
+        noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
