@@ -1904,8 +1904,14 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
                 }
             }
         }
+        // A SUCCESSFUL merge can introduce a db the real home did not hold
+        // when realEntries was snapshotted above (fresh home + db created by
+        // this launch's client) — the copy phase below must re-import it or
+        // the next launch's active home starts with no database (#1951).
+        const mergedBases = new Set<string>();
         for (const base of dbSets) {
-            if (!mergeSqliteSet(overlay, realHome, base)) {
+            if (mergeSqliteSet(overlay, realHome, base)) mergedBases.add(base);
+            else {
                 console.error(
                     `bili: could not merge the SQLite set ${base} / ${base}-wal / ${base}-shm into ${realHome} ` +
                         `(the real db is likely open/locked) — kept in the overlay, retry on the next launch.`,
@@ -1931,6 +1937,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
             if (!st.isFile()) continue;
             realDbBases.add(entry);
         }
+        // Merged-in bases are sqlite mains by construction (dbSets came from
+        // isSqliteMain) and a successful merge guarantees their main now sits
+        // in the real home — they join the copy inventory even though they were
+        // absent from the pre-merge realEntries snapshot (#1951).
+        for (const base of mergedBases) realDbBases.add(base);
         const realDbMembers = new Set<string>();
         for (const base of realDbBases) {
             for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
@@ -1938,7 +1949,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
-        for (const entry of realEntries) {
+        const copyPhaseEntries = [...realEntries];
+        for (const base of mergedBases) {
+            if (!realEntries.has(base)) copyPhaseEntries.push(base);
+        }
+        for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
