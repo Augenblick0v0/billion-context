@@ -16,8 +16,10 @@ type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
     // #1961: pi 0.99+ exposes the live model catalog on the extension ctx;
-    // optional because older hosts lack it.
-    modelRegistry?: { getModel?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
+    // optional because older hosts lack it. The real ModelRegistry surface is
+    // find(provider, modelId) — there is no getModel (verified against pi
+    // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
+    modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
     cwd?: string;
 };
 
@@ -100,7 +102,7 @@ function virtualModelProxyBase(ctx: Ctx, branchEntries: unknown): string | undef
     try {
         const last = latestPhysicalResponse(Array.isArray(branchEntries) ? branchEntries : ctx.sessionManager?.getBranch?.());
         if (last) {
-            const registryBase = ctx.modelRegistry?.getModel?.(last.provider, last.modelId)?.baseUrl;
+            const registryBase = ctx.modelRegistry?.find?.(last.provider, last.modelId)?.baseUrl;
             if (typeof registryBase === "string" && registryBase.length > 0) {
                 const base = detectProxyBase(registryBase);
                 if (base) return base;

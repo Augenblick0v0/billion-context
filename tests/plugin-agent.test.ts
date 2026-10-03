@@ -583,7 +583,11 @@ test("#1961: virtual-model selection resolves compaction ownership from the phys
                 return handler(event, ctx);
             });
         };
-        const wrappedRegistry = (origin: string) => ({ getModel: (provider: string, modelId: string) => (provider === "anthropic" && modelId === "claude-x" ? { baseUrl: `${origin}/bili/https://api.anthropic.com/v1` } : undefined) });
+        // Shaped like the REAL host surface: pi 0.99 ModelRegistry exposes
+        // find(provider, modelId), not getModel — a stub inventing a
+        // non-existent method once let this tier pass tests as dead code on
+        // the live host (#1943 lesson, restated for #1961).
+        const wrappedRegistry = (origin: string) => ({ find: (provider: string, modelId: string) => (provider === "anthropic" && modelId === "claude-x" ? { baseUrl: `${origin}/bili/https://api.anthropic.com/v1` } : undefined) });
         const noProxyEnv = { BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined };
 
         // (A) The reported repro: no env, the registry holds the physically
@@ -615,7 +619,7 @@ test("#1961: virtual-model selection resolves compaction ownership from the phys
         // (D) No evidence anywhere: raw upstream baseUrl, no manifest, no env →
         // the traffic genuinely bypassed the proxy → native compaction proceeds.
         assert.equal(
-            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: { getModel: () => ({ baseUrl: "https://api.anthropic.com/v1" }) } }), [assistantEntry("anthropic", "claude-x")]),
+            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: { find: () => ({ baseUrl: "https://api.anthropic.com/v1" }) } }), [assistantEntry("anthropic", "claude-x")]),
             undefined,
             "unwrapped upstream + no env → no proxy candidate",
         );
