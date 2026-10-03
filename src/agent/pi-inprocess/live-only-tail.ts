@@ -1,4 +1,5 @@
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
+import { safeSuffix } from "../../text-safe.js";
 
 type AgentMessage = SessionMessageEntry["message"];
 
@@ -31,7 +32,7 @@ function weakMessageSig(message: unknown): string {
   const customType = typeof m.customType === "string" ? m.customType : "";
   const toolCallId = typeof m.toolCallId === "string" ? m.toolCallId : "";
   const text = sigText(m.content);
-  return [role, customType, toolCallId, String(text.length), text.slice(0, 32), text.length > 32 ? text.slice(-32) : ""].join("\u0000");
+  return [role, customType, toolCallId, String(text.length), text.slice(0, 32), text.length > 32 ? safeSuffix(text, 32) : ""].join("\u0000");
 }
 
 // Map a persisted entry onto the shape its counterpart carries in the live array.

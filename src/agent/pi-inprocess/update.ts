@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { CONFIG_DIR_NAME } from "./config-dir.js";
 import { debug, logInfo, logWarn } from "./log.js";
+import { safeSuffix } from "../../text-safe.js";
 import { VERSION } from "../../version.js";
 
 // This entry ships INSIDE the billion-context package: its live update path is
@@ -326,7 +327,7 @@ export async function verifyInstall(
     "import(pathToFileURL(process.argv[1]).href).then(()=>{}," +
     "(e)=>{console.error(e&&e.stack||e);process.exit(1)})";
   const { code, stderr } = await runNodeImpl(["-e", SMOKE, entry], { timeout: 15_000 });
-  if (code !== 0) return { ok: false, reason: `entry-import-failed:${stderr.trim().slice(-500)}` };
+  if (code !== 0) return { ok: false, reason: `entry-import-failed:${safeSuffix(stderr.trim(), 500)}` };
   return { ok: true };
 }
 
@@ -368,7 +369,7 @@ export async function autoInstallLatest(latest: string, extDirOverride?: string)
         event: "auto-install-failed",
         latest,
         npmDir,
-        stderr: stderr.trim().slice(-2000),
+        stderr: safeSuffix(stderr.trim(), 2000),
       });
       if (PERMISSION_ERROR_RE.test(stderr)) {
         // The install prefix is not writable (e.g. root-owned global prefix).

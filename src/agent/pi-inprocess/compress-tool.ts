@@ -8,6 +8,7 @@ import type { AcpRuntime } from "./runtime.js";
 import { MAX_COMPRESS_ATTEMPTS, isPiHost, retryBreakerKey } from "./runtime.js";
 import { isDeclaredForkHost } from "./host.js";
 import { debug, logError, logInfo, logThrow, logWarn } from "./log.js";
+import { safePrefix, safeSuffix } from "../../text-safe.js";
 import { estimateTokens, collectCoveredMessageIds, collectImageTokens, modelSupportsImages, adjustedTokenCount } from "./tokens.js";
 import { applyToolPromptOverrides, type ToolPromptOverrides } from "./surface.js";
 import { resolveHostSession } from "./config.js";
@@ -323,8 +324,8 @@ export function blockSpanLabel(block: CompressionBlock, state: CompressionState)
 // head/tail excerpt + char length so the model can verify its summary was
 // stored intact without decompressing.
 export function summaryFingerprintLine(blockId: string, summary: string): string {
-  const head = summary.slice(0, 30).replace(/\r?\n/g, " ");
-  const tail = summary.slice(-100).replace(/\r?\n/g, " ");
+  const head = safePrefix(summary, 30).replace(/\r?\n/g, " ");
+  const tail = safeSuffix(summary, 100).replace(/\r?\n/g, " ");
   return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
 }
 
