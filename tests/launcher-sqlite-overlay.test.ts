@@ -621,3 +621,48 @@ test("relative legacy symlink to the real main is migrated too (#1919)", (t) => 
     assert.deepEqual(fs.readFileSync(path.join(overlay, "state_5.sqlite")), realMainBefore);
     assert.deepEqual(fs.readFileSync(path.join(real, "state_5.sqlite")), realMainBefore, "real main untouched");
 });
+
+test("second launch keeps the overlay-created database active in the new overlay (#1951)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, "config.toml"), 'model = "audit-model"\n');
+    // First launch: fresh real home, no database yet.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    // The client run inside that overlay creates its session database there
+    // (one sentinel row), then the launch ends.
+    buildDb(root, overlay, "state_5.sqlite", "1:first-session", "", true);
+    // Second launch: the set merges back into the real home AND the copy phase
+    // must re-import it into this launch's active home.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    assert.ok(fs.existsSync(path.join(real, "state_5.sqlite")), "db merged back into the real home");
+    const overlayDb = path.join(overlay, "state_5.sqlite");
+    assert.ok(fs.existsSync(overlayDb), "second launch's active CODEX_HOME keeps the database (#1951)");
+    const st = fs.lstatSync(overlayDb);
+    assert.ok(st.isFile(), "overlay db is a regular file");
+    assert.equal(st.nlink, 1, "overlay db stays a private copy, never a shared link");
+    assert.deepEqual(rowsOf(overlayDb), [1]);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite")), [1]);
+    for (const dir of [real, overlay]) {
+        for (const n of fs.readdirSync(dir)) {
+            assert.ok(!n.includes("bili-conflict"), `unexpected conflict file ${path.join(dir, n)}`);
+        }
+    }
+    const origin = JSON.parse(fs.readFileSync(path.join(overlay, SQLITE_ORIGIN_FILE), "utf8")) as Record<string, unknown>;
+    assert.ok(origin["state_5.sqlite"], "fresh copy carries the #1919 provenance snapshot");
+    // Third launch: the documented #1919 steady state — the unmodified overlay
+    // copy is silently dropped and re-copied, no divergence noise.
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("distinct") || e.includes("bili-conflict")), `unexpected divergence noise: ${errs.join(" | ")}`);
+    assert.ok(fs.existsSync(overlayDb), "steady state keeps the active overlay db");
+    assert.deepEqual(rowsOf(overlayDb), [1]);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite")), [1]);
+});
