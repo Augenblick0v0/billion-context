@@ -2601,10 +2601,10 @@ test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => 
         "  default: sglang-responses/qwen3.8-27b:high",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.equal(cfg.providers["sglang-responses"].baseUrl, "http://127.0.0.1:8199/v1");
-    assert.equal(cfg.providers["zhipuai"].baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
-    assert.equal(cfg.providers["ollama-chat"].baseUrl, "http://127.0.0.1:11435/v1");
-    assert.equal(Object.keys(cfg.providers).length, 3);
+    assert.equal(cfg.providers?.["sglang-responses"]?.baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers?.["zhipuai"]?.baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
+    assert.equal(cfg.providers?.["ollama-chat"]?.baseUrl, "http://127.0.0.1:11435/v1");
+    assert.equal(Object.keys(cfg.providers ?? {}).length, 3);
 });
 
 test("parseOmpYaml: no providers key → {}", () => {
@@ -2617,7 +2617,7 @@ test("readOmpConfig: reads models.yml from omp home", () => {
     try {
         fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: http://x:1/v1\n");
         const cfg = readOmpConfig(home);
-        assert.equal(cfg.providers.a.baseUrl, "http://x:1/v1");
+        assert.equal(cfg.providers?.a?.baseUrl, "http://x:1/v1");
     } finally {
         rmrf(home);
     }
@@ -2668,10 +2668,10 @@ test("readOpencodeConfig: reads provider baseURLs from opencode.json", () => {
             }),
         );
         const cfg = readOpencodeConfig(cfgFile);
-        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
-        assert.deepEqual(cfg.providers["remote"], { baseURL: "https://api.example.com/v1" });
-        assert.equal(cfg.providers["noUrl"], undefined);
-        assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers["local"], undefined);
+        assert.deepEqual(cfg.providers?.["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+        assert.deepEqual(cfg.providers?.["remote"], { baseURL: "https://api.example.com/v1" });
+        assert.equal(cfg.providers?.["noUrl"], undefined);
+        assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers?.["local"], undefined);
     } finally {
         rmrf(dir);
     }
@@ -2711,7 +2711,7 @@ test("readOpencodeConfig: parses JSONC (comments + trailing commas)", () => {
             ].join("\n"),
         );
         const cfg = readOpencodeConfig(cfgFile);
-        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+        assert.deepEqual(cfg.providers?.["local"], { baseURL: "http://127.0.0.1:18081/v1" });
     } finally {
         rmrf(dir);
     }
