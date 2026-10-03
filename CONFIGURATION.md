@@ -180,32 +180,42 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `resign`
 
-- **Type:** `object` (`{ enabled?, passthrough?, benefitModels?, credentialRef? }`)
-- **Default:** `enabled: true`, `passthrough: false`; `benefitModels` / `credentialRef` *(unset — static fallback / account-pool discovery)*
+- **Type:** `object` (`{ enabled?, passthrough?, credentialRef? }`)
+- **Default:** `enabled: true`, `passthrough: false`; `credentialRef` *(unset — account-pool discovery)*
 - **Status:** ACTIVE
 - **Description:** The config-file surface of the #1884 re-sign arm (CodeArts APIG `SDK-HMAC-SHA256` body-covering signatures). The arm itself is zero-config: on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box. This block is for the failure/override paths — env vars win over the file for every field:
   - `enabled: boolean` — kill switch; `false` unloads the arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Env `BILI_RESIGN=0` wins.
   - `passthrough: boolean` — opt-in verbatim forwarding for signed requests that cannot be re-signed (no credential, or an unsupported scheme like SigV4). The default is a **local 403 refusal** with an actionable message — no silent passthrough, because forwarding byte-untouched would silently disable compression for those requests (#1886 semantics are opt-in by design). Env `BILI_RESIGN_PASSTHROUGH=1` wins.
-  - `benefitModels: string[]` — free-quota models whose re-signed requests carry the signed `maas_type: benefit` header (default `glm-5.3-flash`, `deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`). Env `BILI_RESIGN_BENEFIT` (comma-separated) wins.
   - `credentialRef: string` — pin the dsh credentials-service ref used for re-signing instead of account-pool discovery. Env `BILI_CODEARTS_REF` wins.
+
+  The model-level knob is deliberately NOT a field here — see the three-level note below.
 
   ```jsonc
   {
-    "resign": { "passthrough": true, "benefitModels": ["glm-5.3-flash", "deepseek-v4.1-flash"] }
+    "resign": { "passthrough": true }
   }
   ```
 
-- **Per-provider override (level 2):** every field can also be set on a single provider entry — `providers.<url>.resign` takes the same `{ enabled?, passthrough?, benefitModels?, credentialRef? }` shape and wins per-field over the global block; env vars still win over both. Resolution happens after routing (route-first, the same cascade as [`imageBilling`](#imagebilling)), so the policy follows the provider and its model filter:
+- **Strict three levels (route-first):** the #1884 knobs follow the repo's standard cascade — env var > level 3 (`providers.<url>.models.<name>.benefit`) > level 2 (`providers.<url>.resign`) > level 1 (global `resign` block) > built-in default — resolved AFTER routing, the same family as [`imageBilling`](#imagebilling):
 
   ```jsonc
   {
+    "resign": { "passthrough": false },
     "providers": {
-      "https://codearts.example.com": { "resign": { "passthrough": true } }
+      "https://codearts.example.com": {
+        "resign": { "passthrough": true },
+        "models": {
+          "glm-5.3-flash": { "benefit": true },
+          "deepseek-v4.1":  { "benefit": false }
+        }
+      }
     }
   }
   ```
 
-  `benefitModels` on a provider entry is the model-level scope for that host — the list selects within the provider's own models. The host-side intercept (dsh native lane) runs before routing exists and always uses the global block.
+  - `models.<name>.benefit: boolean` (level 3) — whether THIS model on THIS provider bills against the CodeArts free quota (its re-signed requests carry the signed `maas_type: benefit` header). `true`/`false` are explicit — `false` opts a default-set model out; unset falls through to the built-in fallback `glm-5.3-flash, deepseek-v4.1-flash` (the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK` mirror). Env `BILI_RESIGN_BENEFIT` (comma-separated) wins over the whole tree.
+  - `providers.<url>.resign` (level 2) — `{ enabled?, passthrough?, credentialRef? }`, per-field over the global block.
+  - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy.
 
 ---
 
@@ -278,12 +288,12 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 
 ### `models`
 
-- **Type:** `Record<string, { context?: number; output?: number; compress?: CompressSettings }>`
+- **Type:** `Record<string, { context?: number; output?: number; compress?: CompressSettings; benefit?: boolean }>`
 - **Default:** *(none)*
 - **Status:** ACTIVE
 - **Description:** Maps a model name to its context-window declaration. The LLM `/models` endpoint does **not** return context windows (verified across OpenAI, Anthropic, zhipu, comfly), so the proxy cannot discover them at runtime. `context` is the model's context window in tokens; `output` is the max output size and serves as the output-headroom fallback when a request carries no output-budget field at all (see [`outputHeadroomMaxPct`](#outputheadroommaxpct)). It also floors the #546 output-budget restore: when a client's own `max_tokens` has starved to ≤ 200 on a tool-carrying main request, the proxy restores it to the session's last healthy budget, and that restore target is floored at the model's best-known output ceiling — client-reported runtime-info > launcher channel > this declared value > models.dev registry listing (#1665/#1840). When NO source knows the model's output ceiling, the proxy logs a one-time-per-model warning: the restore then rests solely on the client's last non-starved value, which may still truncate long sessions at max-tokens.
 
-  **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) this per-model `context` declaration; (3) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (4) the built-in context table. So this per-model `context` declaration **outranks the registry** — set it to the window your relay/private deployment actually serves, and it wins even when models.dev lists a different (usually larger) window for the model. `compress.modelContextLimit` remains the highest-priority source (always wins) when you want to pin the window across every route. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
+  **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) this per-model `context` declaration; (3) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (4) the built-in context table. So this per-model `context` declaration **outranks the registry** — set it to the window your relay/private deployment actually serves, and it wins even when models.dev lists a different (usually larger) window for the model. `compress.modelContextLimit` remains the highest-priority source (always wins) when you want to pin the window across every route. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)), and the #1884 re-sign arm's model-level knob: `benefit: true | false` — whether this model bills against the CodeArts free quota (its re-signed requests carry the signed `maas_type: benefit` header; env `BILI_RESIGN_BENEFIT` wins over the whole tree, unset falls back to the built-in `glm-5.3-flash, deepseek-v4.1-flash` set).
 
   The built-in context table (step 4) is static data shipped with each release and can go stale — e.g. DeepSeek's canonical request id `deepseek-flash` is not listed on models.dev under that name (its window is listed under `deepseek-v4-flash`), so only the table answered for it (#852). The log records which source won, once per model per process (`[window] ... fallback=true` means the value came from the built-in table). If the resolved window looks wrong, declare `models.<name>.context` as above — it outranks both the registry and the table — or pin `compress.modelContextLimit`; and remember the provider key must carry the traffic's scheme (`mitm://<host>` for MITM login-client traffic, `https://<host>` for `/bili/` traffic).
 
@@ -779,7 +789,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568). |
 | `BILI_STREAM_KEEPALIVE_MS` | Streaming-phase client hold (#1647): when an SSE response has written zero bytes to the client for this many milliseconds, bili emits one SSE comment line (`: bili-keepalive`, a spec-level no-op) so the client's undici `bodyTimeout` (default 300s; Node built-in fetch cannot override it per request) cannot kill long prefills whose upstream pings the rewriter/strip pipes swallow. Default `15000`; `0` disables. Sibling of `BILI_PREFLIGHT_HOLD_MS`, which covers compression-preflight silence — this covers upstream-caused silence during streaming. |
 | `BILI_RECLAIM_FETCH_PATCH` | Set to `0` to disable the native-mode fetch self-heal re-arm (#1158). By default the native fetch intercept installs `globalThis.fetch` as a guarded accessor, so a third-party patch that re-installs `globalThis.fetch` (e.g. dsh-http-proxy's settings refresh writing its frozen pre-bili `originalFetch`) is re-chained as the downstream and model traffic keeps routing through bili. With `0` the classic direct install stays: a third-party re-arm then wins and bili stops seeing model traffic for the session. **Egress note:** while the guard holds, claimed model traffic is dispatched by the bili proxy itself — it no longer rides the third-party chain's egress (e.g. a SOCKS5 proxy configured in dsh-http-proxy; bili's own upstream proxying supports HTTP proxies only). If you need the third-party egress back, set `0` and configure the egress at bili's level (`"proxy": "http://…"`). |
-| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A signed request that CANNOT be re-signed (no credential, or an unsupported scheme like SigV4) is refused locally with 403 and an actionable message — no silent passthrough: forwarding byte-untouched would silently disable compression. Opt in to verbatim no-compression forwarding with `BILI_RESIGN_PASSTHROUGH=1` (#1886 semantics). All knobs have config-file twins under the [`resign`](#resign) block — env vars win over the file. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — default `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
+| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A signed request that CANNOT be re-signed (no credential, or an unsupported scheme like SigV4) is refused locally with 403 and an actionable message — no silent passthrough: forwarding byte-untouched would silently disable compression. Opt in to verbatim no-compression forwarding with `BILI_RESIGN_PASSTHROUGH=1` (#1886 semantics). `enabled` / `passthrough` / `credentialRef` have config-file twins under the [`resign`](#resign) block (`providers.<url>.resign` is the level-2 override) — env vars win over the file. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — wins over the whole three-level tree; file-side twin is the level-3 `models.<name>.benefit` boolean, unset falls back to the built-in `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
 | `ACP_HOST` | Override the listen host. |

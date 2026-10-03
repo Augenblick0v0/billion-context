@@ -87,8 +87,8 @@ export type ProviderRoute = {
     imageTokenCap?: number;
     /** #1884 level-2 re-sign overrides for this provider: per-field deepest
      *  wins over the global `resign` block (env still wins over both). The
-     *  benefit model list is the model-level scope here — `models` entries
-     *  live under this same provider key, so the list selects within it. */
+     *  model-level knob lives one level deeper — `models.<name>.benefit` on
+     *  this same provider key (#1884 level 3). */
     resign?: ResignFileSettings;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
@@ -101,6 +101,13 @@ export type ModelEntry = {
     /** Per-model compression overrides (level 3 of 3, wins over provider
      *  and global). See CompressSettings. */
     compress?: CompressSettings;
+    /** #1884 level-3: this model bills against the CodeArts free quota —
+     *  re-signed requests for it carry the signed `maas_type: benefit`
+     *  header. `true` / `false` are explicit (false opts a default-set model
+     *  out); unset falls through to the built-in fallback set
+     *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
+     *  this like every other knob. */
+    benefit?: boolean;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -1213,8 +1220,10 @@ type FileConfig = {
      *  (pre-resign rewrite behavior; env BILI_RESIGN=0 wins). `passthrough:
      *  true` opts into verbatim forwarding for signed requests that cannot be
      *  re-signed (no credential) instead of the default local 403 refusal
-     *  (env BILI_RESIGN_PASSTHROUGH=1 wins). `benefitModels` overrides the
-     *  static free-quota model list (env BILI_RESIGN_BENEFIT wins).
+     *  (env BILI_RESIGN_PASSTHROUGH=1 wins). The model-level free-quota knob
+     *  is NOT here — it lives at level 3: `providers.<url>.models.<name>`.
+     *  `benefit: true|false` (env BILI_RESIGN_BENEFIT wins over the whole
+     *  tree).
      *  `credentialRef` pins the dsh credentials-service ref used for
      *  re-signing instead of account-pool discovery (env BILI_CODEARTS_REF
      *  wins). */
@@ -1368,19 +1377,18 @@ function loadConfigFile(): FileConfig {
 export interface ResignFileSettings {
     enabled?: boolean;
     passthrough?: boolean;
-    benefitModels?: string[];
     credentialRef?: string;
 }
 
 /** Resolved #1884 re-sign settings: env vars win over the config file, the
  *  file wins over the defaults (same precedence family as
- *  resolveClaudeNativePort / chainContentDetection). `benefitModels` and
- *  `credentialRef` stay undefined when neither env nor file sets them — the
- *  signer then uses its static fallback / account-pool discovery. */
+ *  resolveClaudeNativePort / chainContentDetection). `credentialRef` stays
+ *  undefined when neither env nor file sets it — the signer then falls back
+ *  to account-pool discovery. The free-quota model knob is resolved
+ *  separately at level 3 (ModelEntry.benefit). */
 export interface ResignSettings {
     enabled: boolean;
     passthrough: boolean;
-    benefitModels?: string[];
     credentialRef?: string;
 }
 
@@ -1398,13 +1406,8 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
         : provider.passthrough !== undefined
             ? provider.passthrough
             : file.passthrough === true;
-    const envBenefit = env.BILI_RESIGN_BENEFIT?.trim();
-    const providerBenefit = Array.isArray(provider.benefitModels) ? provider.benefitModels : [];
-    const rootBenefit = Array.isArray(file.benefitModels) ? file.benefitModels : [];
-    const benefitSource = envBenefit !== undefined && envBenefit !== "" ? envBenefit.split(",") : providerBenefit.length > 0 ? providerBenefit : rootBenefit;
-    const benefitModels = benefitSource.length > 0 ? benefitSource.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0) : undefined;
     const credentialRef = env.BILI_CODEARTS_REF?.trim() || provider.credentialRef || file.credentialRef || undefined;
-    return { enabled, passthrough, benefitModels, credentialRef };
+    return { enabled, passthrough, credentialRef };
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane

@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 
-import { resolveResignSettings, type ResignFileSettings } from "./config.js";
+import { resolveResignSettings, type ProviderRoute } from "./config.js";
 import { configFile } from "./paths.js";
 
 /**
@@ -52,27 +52,35 @@ export interface ApigCredential {
 }
 
 /** Benefit (free-quota) models require the signed `maas_type: benefit` header
- *  (InferHub.002002009.404 "model is not registered" otherwise). Static
- *  fallback mirrors the plugin's CODEARTS_BENEFIT_FALLBACK; override with
- *  BILI_RESIGN_BENEFIT (comma-separated model list). */
+ *  (InferHub.002002009.404 "model is not registered" otherwise). Strict
+ *  three-level resolution (#1884): env BILI_RESIGN_BENEFIT (comma-separated
+ *  model list) wins over the whole tree; otherwise the per-model entry
+ *  `providers.<url>.models.<name>.benefit` (true/false explicit, unset falls
+ *  through) decides, and unset everywhere falls back to this static mirror of
+ *  the plugin's CODEARTS_BENEFIT_FALLBACK. */
 const DEFAULT_BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash"];
 
-export function apigBenefitModels(provider?: ResignFileSettings): Set<string> {
-    const fromSettings = resolveResignSettings(process.env, provider).benefitModels;
-    if (fromSettings !== undefined && fromSettings.length > 0) {
-        return new Set(fromSettings);
+export function apigBenefitFor(model: string | undefined, route?: ProviderRoute): boolean {
+    if (model === undefined) return false;
+    const lower = model.toLowerCase();
+    const envBenefit = process.env.BILI_RESIGN_BENEFIT?.trim();
+    if (envBenefit !== undefined && envBenefit !== "") {
+        const set = new Set(envBenefit.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0));
+        return set.has(lower);
     }
-    return new Set(DEFAULT_BENEFIT_MODELS);
+    const entry = route?.models?.[model] ?? route?.models?.[lower];
+    if (entry?.benefit !== undefined) return entry.benefit;
+    return DEFAULT_BENEFIT_MODELS.includes(lower);
 }
 
-export function resignEnabled(provider?: ResignFileSettings): boolean {
-    return resolveResignSettings(process.env, provider).enabled;
+export function resignEnabled(route?: ProviderRoute): boolean {
+    return resolveResignSettings(process.env, route?.resign).enabled;
 }
 
 /** Opt-in verbatim forwarding for signed requests that cannot be re-signed
  *  (no silent passthrough by default — see the refusal rationale above). */
-export function resignPassthroughEnabled(provider?: ResignFileSettings): boolean {
-    return resolveResignSettings(process.env, provider).passthrough;
+export function resignPassthroughEnabled(route?: ProviderRoute): boolean {
+    return resolveResignSettings(process.env, route?.resign).passthrough;
 }
 
 export interface SignedRefusal {
@@ -239,12 +247,12 @@ export function resignApig(
     method: string,
     urlStr: string,
     body: string | Buffer,
-    provider?: ResignFileSettings,
+    route?: ProviderRoute,
     now?: Date,
 ): void {
     const bodyBuf = typeof body === "string" ? Buffer.from(body, "utf8") : body;
     const model = modelOfJsonBody(bodyBuf.toString("utf8"));
-    const benefit = model !== undefined && apigBenefitModels(provider).has(model.toLowerCase());
+    const benefit = apigBenefitFor(model, route);
     signApigHeaders(target, cred, method, urlStr, bodyBuf, {
         extraSignedHeaders: benefit ? { maas_type: "benefit" } : undefined,
         now,

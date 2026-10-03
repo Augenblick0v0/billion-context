@@ -180,32 +180,42 @@
 
 ### `resign`
 
-- **类型：** `object`（`{ enabled?, passthrough?, benefitModels?, credentialRef? }`）
-- **默认值：** `enabled: true`、`passthrough: false`；`benefitModels` / `credentialRef` *（未设置 —— 静态回退 / 账号池发现）*
+- **类型：** `object`（`{ enabled?, passthrough?, credentialRef? }`）
+- **默认值：** `enabled: true`、`passthrough: false`；`credentialRef` *（未设置 —— 账号池发现）*
 - **状态：** ACTIVE
 - **说明：** #1884 重签臂的配置文件面（CodeArts APIG 的 `SDK-HMAC-SHA256` body 级签名）。重签臂本身零配置：在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
   - `enabled: boolean` —— 总开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
   - `passthrough: boolean` —— 对无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）的 opt-in 原样转发。默认是**本地 403 拒收**并给出可操作提示 —— 不静默直发，因为逐字节原样转发等于静默关掉那些请求的压缩（#1886 语义设计上就是 opt-in）。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先。
-  - `benefitModels: string[]` —— 免费额度模型列表，这些模型的重签请求附带参与签名的 `maas_type: benefit` 头（默认 `glm-5.3-flash`、`deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）。环境变量 `BILI_RESIGN_BENEFIT`（逗号分隔）优先。
   - `credentialRef: string` —— 钉死重签用的 dsh credentials 服务 ref，而不是账号池发现。环境变量 `BILI_CODEARTS_REF` 优先。
+
+  模型级开关刻意不在本块里 —— 见下面三级说明。
 
   ```jsonc
   {
-    "resign": { "passthrough": true, "benefitModels": ["glm-5.3-flash", "deepseek-v4.1-flash"] }
+    "resign": { "passthrough": true }
   }
   ```
 
-- **按 provider 覆盖（二级）：**每个字段也可以只写在单个 provider 条目上 —— `providers.<url>.resign` 形状同为 `{ enabled?, passthrough?, benefitModels?, credentialRef? }`，逐字段优先于全局块；环境变量仍然优先于两者。解析发生在路由之后（route-first，与 [`imageBilling`](#imagebilling) 同一条联级），策略跟着 provider 及其模型过滤器走：
+- **严格三级（route-first）：** #1884 的开关遵循仓库标准联级 —— 环境变量 > 三级（`providers.<url>.models.<name>.benefit`）> 二级（`providers.<url>.resign`）> 一级（全局 `resign` 块）> 内置默认，解析发生在路由之后，与 [`imageBilling`](#imagebilling) 同一条联级：
 
   ```jsonc
   {
+    "resign": { "passthrough": false },
     "providers": {
-      "https://codearts.example.com": { "resign": { "passthrough": true } }
+      "https://codearts.example.com": {
+        "resign": { "passthrough": true },
+        "models": {
+          "glm-5.3-flash": { "benefit": true },
+          "deepseek-v4.1":  { "benefit": false }
+        }
+      }
     }
   }
   ```
 
-  provider 条目上的 `benefitModels` 就是该主机的模型级作用域 —— 列表只在该 provider 自己的模型里选。宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块。
+  - `models.<name>.benefit: boolean`（三级）—— 这个模型在这个 provider 上是否走免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头）。`true`/`false` 都是显式的 —— `false` 可以把默认集里的模型踢出；未设置则落到内置回退集 `glm-5.3-flash, deepseek-v4.1-flash`（dsh codearts 插件 `CODEARTS_BENEFIT_FALLBACK` 的镜像）。环境变量 `BILI_RESIGN_BENEFIT`（逗号分隔）优先于整棵树。
+  - `providers.<url>.resign`（二级）—— `{ enabled?, passthrough?, credentialRef? }`，逐字段压过全局块。
+  - 宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块 —— 那是传输必要性判定（签名 body 只能隧道或拒收），不是策略。
 
 ---
 
@@ -278,10 +288,10 @@
 
 ### `models`
 
-- **类型：** `Record<string, { context?: number; output?: number; compress?: CompressSettings }>`
+- **类型：** `Record<string, { context?: number; output?: number; compress?: CompressSettings; benefit?: boolean }>`
 - **默认值：** *（无）*
 - **状态：** ACTIVE
-- **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小，在请求完全不携带输出预算字段时作为 output headroom 预留的回退值（见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）。它同时是 #546 输出预算恢复的下限：当客户端自己的 `max_tokens` 在携带工具的 main 请求上萎缩到 ≤ 200 时，代理会把它恢复到该会话最近的健康预算，且恢复目标以模型已知的最大输出为下限 —— 客户端上报的 runtime-info > launcher 通道 > 此处声明值 > models.dev registry 条目（#1665/#1840）。若所有来源都不知道该模型的输出上限，代理会按模型打一条一次性警告：此时恢复只以客户端自己最后的非饥饿值为依据，长会话仍可能在 max-tokens 处被截断。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)）。
+- **说明：** 将模型名映射到其上下文窗口声明。LLM 的 `/models` 端点**不会**返回上下文窗口大小（已在 OpenAI、Anthropic、zhipu、comfly 上验证），因此代理无法在运行时发现它们 —— 你必须在此声明。`context` 是模型的上下文窗口（以 token 为单位）；`output` 是最大输出大小，在请求完全不携带输出预算字段时作为 output headroom 预留的回退值（见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）。它同时是 #546 输出预算恢复的下限：当客户端自己的 `max_tokens` 在携带工具的 main 请求上萎缩到 ≤ 200 时，代理会把它恢复到该会话最近的健康预算，且恢复目标以模型已知的最大输出为下限 —— 客户端上报的 runtime-info > launcher 通道 > 此处声明值 > models.dev registry 条目（#1665/#1840）。若所有来源都不知道该模型的输出上限，代理会按模型打一条一次性警告：此时恢复只以客户端自己最后的非饥饿值为依据，长会话仍可能在 max-tokens 处被截断。当模型未声明时，代理回退到内置上下文表或 models.dev 注册表。每个模型条目还可以携带按模型的 `compress` 块（见[压缩调优](#压缩调优)），以及 #1884 重签臂的模型级开关：`benefit: true | false` —— 这个模型是否走 CodeArts 免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头；环境变量 `BILI_RESIGN_BENEFIT` 优先于整棵树，未设置落到内置 `glm-5.3-flash, deepseek-v4.1-flash` 集）。
 
   内置上下文表是随每个版本发布的静态数据，可能过期 —— 例如 DeepSeek 的规范请求 id `deepseek-flash` 在 models.dev 上没有以该名列出（其窗口列在 `deepseek-v4-flash` 名下），因此只有兜底表能回答它（#852）。日志会为每个模型记录一次胜出来源（`[window] ... fallback=true` 表示值来自内置表）。若解析出的窗口不对，按上文声明 `models.<name>.context`（它优先于注册表和内置表），或固定 `compress.modelContextLimit`；注意 provider 键必须带流量的 scheme（MITM 登录态客户端流量用 `mitm://<host>`，`/bili/` 流量用 `https://<host>`）。
 
@@ -778,7 +788,7 @@
 | `BILI_PREFLIGHT_HOLD_MS` | 预压缩超过该宽限期（毫秒）后，代理提前提交响应并用保活字节挂住客户端（默认 `30000`；见 #568）。 |
 | `BILI_STREAM_KEEPALIVE_MS` | 流式阶段客户端保活（#1647）：SSE 响应连续该毫秒数没有向客户端写出任何字节时，bili 发一条 SSE 注释行（`: bili-keepalive`，协议层 no-op），防止客户端 undici `bodyTimeout`（默认 300s；Node 内置 fetch 无法按请求覆盖）在长 prefill 时断连——上游的 ping 注释会被重写器/剥离管道吞掉。默认 `15000`；`0` 关闭。与 `BILI_PREFLIGHT_HOLD_MS` 互补：后者覆盖压缩预检期的静默，本变量覆盖流式期上游导致的静默。 |
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。 |
-| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。全部开关都有配置文件孪生项，见 [`resign`](#resign) 块——环境变量优先于文件。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——默认 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
+| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块（`providers.<url>.resign` 是二级覆盖）——环境变量优先于文件。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |

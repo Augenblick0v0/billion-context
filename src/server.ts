@@ -5675,7 +5675,7 @@ async function forward(
     const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
         if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;
         try {
-            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr, fwdResign);
+            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
         } catch (err) {
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
         }

@@ -19,7 +19,7 @@ import {
     APIG_RESIGN_CREDENTIAL_HEADER,
     APIG_RESIGN_HEADER,
     APIG_RESIGN_SCHEME,
-    apigBenefitModels,
+    apigBenefitFor,
     decodeApigCredential,
     encodeApigCredential,
     inboundSignedScheme,
@@ -183,25 +183,36 @@ test("#1884 signer: stale signature headers are replaced, never duplicated", () 
     assert.equal(target["accept"], "application/json", "unrelated headers survive");
 });
 
-test("#1884 benefit: maas_type only for benefit models; env override honored", async () => {
-    assert.deepEqual([...apigBenefitModels()].sort(), ["deepseek-v4.1-flash", "glm-5.3-flash"]);
+test("#1884 benefit: maas_type only for benefit models; level-3 route entries and env override honored", async () => {
     const url = "http://127.0.0.1:9/v1/chat/completions";
     const benefitBody = JSON.stringify({ model: "GLM-5.3-FLASH", messages: [] });
     const plainBody = JSON.stringify({ model: "deepseek-v4-flash", messages: [] }); // near-miss, NOT benefit
 
     const a: Record<string, string> = {};
-    resignApig(a, CRED, "POST", url, benefitBody, NOW);
-    assert.equal(a["maas_type"], "benefit", "benefit model (case-insensitive) gets the signed maas_type");
+    resignApig(a, CRED, "POST", url, benefitBody, undefined, NOW);
+    assert.equal(a["maas_type"], "benefit", "fallback-set benefit model (case-insensitive) gets the signed maas_type");
     assert.equal(verifySdkHmac({ method: "POST", url, headers: a, body: Buffer.from(benefitBody), sk: CRED.sk }).ok, true, "maas_type joins the signature");
 
     const b: Record<string, string> = {};
-    resignApig(b, CRED, "POST", url, plainBody, NOW);
+    resignApig(b, CRED, "POST", url, plainBody, undefined, NOW);
     assert.equal(b["maas_type"], undefined, "non-benefit model signs without maas_type");
 
+    // level 3: the model entry on the provider route is the model-level scope
+    const declaredRoute = { models: { "custom-free-model": { benefit: true }, "glm-5.3-flash": { benefit: false } } } as never;
+    const c: Record<string, string> = {};
+    resignApig(c, CRED, "POST", url, JSON.stringify({ model: "custom-free-model", messages: [] }), declaredRoute, NOW);
+    assert.equal(c["maas_type"], "benefit", "models.<name>.benefit=true declares a benefit model outside the fallback set");
+    const d: Record<string, string> = {};
+    resignApig(d, CRED, "POST", url, benefitBody, declaredRoute, NOW);
+    assert.equal(d["maas_type"], undefined, "models.<name>.benefit=false explicitly opts a fallback-set model out");
+
     await withEnv({ BILI_RESIGN_BENEFIT: "custom-model" }, async () => {
-        const c: Record<string, string> = {};
-        resignApig(c, CRED, "POST", url, JSON.stringify({ model: "custom-model", messages: [] }), NOW);
-        assert.equal(c["maas_type"], "benefit", "env override replaces the default set");
+        const e: Record<string, string> = {};
+        resignApig(e, CRED, "POST", url, JSON.stringify({ model: "custom-model", messages: [] }), declaredRoute, NOW);
+        assert.equal(e["maas_type"], "benefit", "env override wins over the whole tree");
+        const f: Record<string, string> = {};
+        resignApig(f, CRED, "POST", url, benefitBody, declaredRoute, NOW);
+        assert.equal(f["maas_type"], undefined, "env override replaces the fallback set entirely");
     });
 });
 
@@ -439,7 +450,7 @@ function startVerifyingUpstream(sk: string): Promise<{ server: http.Server; port
     });
 }
 
-async function startResignProxy(upstreamPort: number, routeResign?: { resign?: { enabled?: boolean; passthrough?: boolean; benefitModels?: string[]; credentialRef?: string } }): Promise<{ proxy: http.Server; port: number }> {
+async function startResignProxy(upstreamPort: number, routeResign?: { resign?: { enabled?: boolean; passthrough?: boolean; credentialRef?: string } }): Promise<{ proxy: http.Server; port: number }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -689,12 +700,11 @@ function withConfigFile<T>(config: unknown, fn: (file: string) => Promise<T> | T
     });
 }
 
-test("#1884 config file: resign.passthrough / benefitModels / enabled are honored without any env var", async () => {
-    await withConfigFile({ resign: { enabled: true, passthrough: true, benefitModels: ["Custom-Free-Model"] } }, async () => {
+test("#1884 config file: resign.passthrough / enabled are honored without any env var", async () => {
+    await withConfigFile({ resign: { enabled: true, passthrough: true } }, async () => {
         await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined }, async () => {
             assert.equal(resignPassthroughEnabled(), true, "file passthrough wins over the default refusal");
             assert.equal(resignEnabled(), true);
-            assert.deepEqual(apigBenefitModels(), new Set(["custom-free-model"]), "file benefitModels wins over the static fallback");
         });
     });
 });
@@ -708,11 +718,11 @@ test("#1884 config file: resign.enabled=false unloads the arm (file-only kill sw
 });
 
 test("#1884 precedence: env wins over the config file for every resign knob", async () => {
-    await withConfigFile({ resign: { enabled: true, passthrough: true, benefitModels: ["file-model"] } }, async () => {
+    await withConfigFile({ resign: { enabled: true, passthrough: true } }, async () => {
         await withEnv({ BILI_RESIGN: "0", BILI_RESIGN_PASSTHROUGH: "0", BILI_RESIGN_BENEFIT: "env-model" }, async () => {
             assert.equal(resignEnabled(), false, "BILI_RESIGN=0 beats file enabled:true");
             assert.equal(resignPassthroughEnabled(), false, "BILI_RESIGN_PASSTHROUGH=0 beats file passthrough:true");
-            assert.deepEqual(apigBenefitModels(), new Set(["env-model"]), "BILI_RESIGN_BENEFIT beats file benefitModels");
+            assert.equal(apigBenefitFor("ENV-MODEL"), true, "BILI_RESIGN_BENEFIT beats the whole tree");
         });
     });
 });
@@ -753,9 +763,9 @@ test("unit #1884: provider-level resign block wins per-field over the global roo
         assert.equal(resolveResignSettings(env, { enabled: false }).enabled, false);
         assert.equal(resolveResignSettings(env, {}).enabled, true, "no provider field → root default (armed)");
         // provider benefit list beats the root list; empty provider list falls through to root
-        await withConfigFile({ resign: { benefitModels: ["root-model"] } }, async () => {
-            assert.deepEqual(resolveResignSettings({ ...process.env }, { benefitModels: ["Provider-Model"] }).benefitModels, ["provider-model"]);
-            assert.deepEqual(resolveResignSettings({ ...process.env }, {}).benefitModels, ["root-model"]);
+        await withConfigFile({ resign: { passthrough: true } }, async () => {
+            assert.equal(resolveResignSettings({ ...process.env }, { passthrough: false }).passthrough, false, "provider beats root file block per-field");
+            assert.equal(resolveResignSettings({ ...process.env }, {}).passthrough, true, "no provider field → root file block wins");
         });
         // env still outranks the provider entry
         assert.equal(resolveResignSettings({ ...process.env, BILI_RESIGN_PASSTHROUGH: "1" }, { passthrough: false }).passthrough, true);
