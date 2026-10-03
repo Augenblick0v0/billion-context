@@ -467,17 +467,36 @@ export interface LiveOriginResolverDeps {
  *  fallback for attach mode — #1130/#1135); this resolver only decides WHEN
  *  to fire it and whether the result is actually alive. */
 export function createLiveOriginResolver(state: NativeInterceptState, deps: LiveOriginResolverDeps = {}): () => Promise<string | undefined> {
-    const probe = withProbeTtl(deps.probe ?? probeHealth, deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS);
+    // #1957: a health verdict describes a PROCESS GENERATION, not a URL. A
+    // respawn puts a new process behind the same origin (lane port memory,
+    // #1723), so every verdict obtained before that boundary is void — a
+    // stale negative hit would send the first post-recovery request(s)
+    // direct (uncompressed) until the TTL lapses. At each respawn the TTL
+    // cache is rebuilt (kills cached verdicts) and `generation` advances
+    // (kills in-flight verdicts, which must not clear a healthy
+    // replacement that already landed).
+    const healthProbe = deps.probe ?? probeHealth;
+    const probeTtlMs = deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS;
+    let probe = withProbeTtl(healthProbe, probeTtlMs);
+    let generation = 0;
     const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
     let lastRespawn = 0;
     return async (): Promise<string | undefined> => {
         let ownedThenLost = false;
-        if (state.origin !== undefined) {
-            if (await probe(state.origin)) return state.origin;
-            // Proxy died mid-session. Clearing origin first makes concurrent
-            // callers share the same state.ready (dedup).
-            ownedThenLost = true;
-            state.origin = undefined;
+        const held = state.origin;
+        const gen = generation;
+        if (held !== undefined) {
+            const ok = await probe(held);
+            // Act on the verdict only if the world didn't move while it was
+            // in flight: a concurrent caller's respawn (generation bump) or
+            // any origin change underneath us voids it — re-resolve instead.
+            if (gen === generation && state.origin === held) {
+                if (ok) return held;
+                // Proxy died mid-session. Clearing origin first makes concurrent
+                // callers share the same state.ready (dedup).
+                ownedThenLost = true;
+                state.origin = undefined;
+            }
         }
         // Retry bootstrap whenever no live origin is held — either just lost
         // it or the load-time bootstrap failed (the hook cannot observe send
@@ -485,6 +504,8 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
         // one per interval instead of one per request.
         if (state.respawn !== undefined && (ownedThenLost || Date.now() - lastRespawn >= respawnCooldownMs)) {
             lastRespawn = Date.now();
+            generation += 1;
+            probe = withProbeTtl(healthProbe, probeTtlMs);
             state.ready = state.respawn();
         }
         const o = await readyOrigin(state);
