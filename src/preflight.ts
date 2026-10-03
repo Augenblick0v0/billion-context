@@ -706,15 +706,29 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
-const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"]);
+// In-loop retry set — parity with the main model-request path's fail-fast
+// kinds (#1263/#1453 isFailFastUpstreamKind): a summary call must not die
+// faster than the request it protects. TLS trust failures stay OUT on purpose:
+// a bad CA does not self-heal within the backoff window (the main path agrees).
+const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED"]);
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
-    ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "ENOTFOUND", "UND_ERR_ABORTED", "UND_ERR_CONNECT_TIMEOUT",
+    ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+// Certificate-TRUST codes: the failure is "this CA chain is not trusted here"
+// (corporate interception / MITM), not "the upstream is broken" — the
+// client-facing error must say so and name the remedy (#1987).
+const TLS_TRUST_HINT_CODES = new Set([
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
 ]);
 
 class SummaryTransportError extends Error {
     readonly retryable: boolean;
+    readonly aborted: boolean;
+    readonly code?: string;
     constructor(stage: "request" | "response body", error: unknown, attempts: number) {
         let code: string | undefined;
         let aborted = false;
@@ -729,6 +743,8 @@ class SummaryTransportError extends Error {
         super(`summary ${stage} failed (${name}${code ? `, code=${code}` : ""}; ${attempts} attempt${attempts === 1 ? "" : "s"})`);
         this.name = "SummaryTransportError";
         this.retryable = !aborted && code !== undefined && TRANSIENT_SUMMARY_CODES.has(code);
+        this.aborted = aborted;
+        this.code = code;
     }
 }
 
@@ -1170,7 +1186,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         failure = ABORTED_FAILURE;
                         deps.log("warn", `[preflight] summarization aborted: client disconnected`);
                     } else if (err instanceof SummaryTransportError) {
-                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}`, ...(err.retryable ? { retryable: true } : {}) };
+                        // #1987: a transport-class death carries NO upstream verdict about the
+                        // content — the call simply did not complete — so it stays retryable for
+                        // the client regardless of which code surfaced (a cert problem is not more
+                        // terminal than a gzip corruption). Only an abort (client gone / idle budget)
+                        // is not worth retrying; keep that case's field omitted as before.
+                        const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
+                            ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
+                            : "";
+                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                         deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                     } else {
                         failure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
@@ -1259,19 +1283,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
         } else {
             failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}${skipNote}` };
-        }
-    }
-    if (result.compressedRanges > 0) {
-        // #857: never persist the IMAGE FLOOR into the usage baseline — images
-        // are billed by the upstream and every fit/clamp gate adds their
-        // estimate separately, so the baseline must stay usage-semantics
-        // (text + overhead only). A bytes-mode floor (b64/4) overestimates
-        // pixel-billing upstreams ~100× and would poison the upward window
-        // self-heal and close the #496 escape hatch permanently.
-        const textBaseline = result.payloadEstimate - imageReserve;
-        if (textBaseline > deps.session.stats.lastInputTokens) {
-            deps.session.stats.lastInputTokens = textBaseline;
-            deps.session.stats.lastInputTokensSource = "estimate";
         }
     }
     result.rangesRemaining = rangesRemaining;
