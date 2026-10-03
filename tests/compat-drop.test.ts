@@ -153,6 +153,11 @@ async function startProxy(upstream: http.Server, { configJson }: StartOpts): Pro
         passthrough: false,
         chainContentDetection: false,
         passthroughSource: null,
+        streamErrorShape: "protocol",
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

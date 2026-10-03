@@ -144,7 +144,14 @@ test("/bili/ integration preserves query, subscription, account and thread heade
         debug: false,
         passthrough: true,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const bili = await startServer(opts);
     if (!bili.listening) await once(bili, "listening");
@@ -236,7 +243,7 @@ test("default (unset mode) is direct, not env auto-detect (#346)", () => {
         });
         assert.equal(opts.proxy, "");
         assert.equal(opts.proxySource, "direct");
-        assert.equal(opts.proxyFallback.explicitDirect, true);
+        assert.equal(opts.proxyFallback!.explicitDirect, true);
         const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
         assert.deepEqual(decision, { source: "direct" });
     } finally {
@@ -255,7 +262,7 @@ test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
             HTTPS_PROXY: "http://fallback.example:8080",
         });
         assert.equal(opts.proxySource, "auto");
-        assert.equal(opts.proxyFallback.explicitDirect, false);
+        assert.equal(opts.proxyFallback!.explicitDirect, false);
         const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
         assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" });
     } finally {
@@ -282,9 +289,9 @@ test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
             clientSocket.pipe(socket);
             socket.pipe(clientSocket);
         });
-        tunnels.add(clientSocket);
+        tunnels.add(clientSocket as net.Socket);
         tunnels.add(socket);
-        clientSocket.once("close", () => tunnels.delete(clientSocket));
+        clientSocket.once("close", () => tunnels.delete(clientSocket as net.Socket));
         socket.once("close", () => tunnels.delete(socket));
     });
     await listen(proxy);

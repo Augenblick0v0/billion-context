@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 
 // #1637: bili's Anthropic lane never emitted cache_control breakpoints, so
 // Anthropic-style upstreams (explicit caching) never cached anything bili
@@ -74,6 +75,13 @@ async function startRig(): Promise<Rig> {
         kernelConfig: defaultConfig(100_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         log: false,
         sessionHeader: "x-acp-session",
         debug: false,

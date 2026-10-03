@@ -10,9 +10,9 @@ import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest, forwardTool, ar
 export const name = "bili-acp";
 export const inject = ["commands"];
 
-type CommandOutcome = { kind: "success" | "error"; text: string };
+export type CommandOutcome = { kind: "success" | "error"; text: string };
 
-type CommandsService = {
+export type CommandsService = {
     register: (command: { name: string; description: string; handler: () => Promise<CommandOutcome> }) => unknown;
 };
 

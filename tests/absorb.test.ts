@@ -232,7 +232,7 @@ test("handlePluginManifest: absorb advertised on all three wires only when enabl
     assert.ok(!d.tools.openai.some((t) => t.function?.name === "absorb"));
     assert.ok(!d.tools.responses.some((t) => t.name === "absorb"));
 
-    handlePluginManifest(res, { ...defaultConfig(200_000), absorb: { enabled: true } });
+    handlePluginManifest(res, { ...defaultConfig(200_000), absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true } });
     d = data();
     assert.ok(d.toolNames.includes("absorb"));
     const anthro = d.tools.anthropic.find((t) => t.name === "absorb");

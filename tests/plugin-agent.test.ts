@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import http from "node:http";
 import net from "node:net";
+import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -194,7 +195,7 @@ function makeFakePi(): FakePi {
         commands,
         providers,
         get registerCalls() { return registerCallCount; },
-        on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
+        on: (event, handler) => events.set(event, handler as (event: unknown, ctx: unknown) => unknown),
         registerTool: (tool) => {
             registerCallCount++;
             const i = tools.findIndex((t) => t.name === tool.name);
@@ -908,12 +909,12 @@ test("before_provider_headers stays silent when the manifest fetch keeps failing
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        await pi.events.get("session_start")!({}, fakeCtx(origin));
+        await pi.events.get("session_start")!({}, fakeCtx(origin as unknown as FakeProxy));
         await flush();
         await flush();
         assert.equal(pi.tools.length, 0);
         const headers: Record<string, string> = {};
-        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin as unknown as FakeProxy));
         assert.deepEqual(headers, {});
     } finally {
         server.close();
@@ -2290,7 +2291,7 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
         const out = await handler(pi, payload) as Record<string, unknown>;
         assert.equal(out.prompt_cache_key, sid, "chat payload stamped with the omp session id");
         assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
-        assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
+        assert.equal((payload as Record<string, unknown>).prompt_cache_key, undefined, "original payload not mutated");
     }
     // real-world chat-completions payload carries max_tokens (omp's openai-compat
     // providers use maxTokensField:"max_tokens") → stamped (#268)

@@ -392,6 +392,9 @@ async function startRig(fakeUrl: string, model: string, compressOverrides: Recor
         passthroughSource: null,
         autoRestartOnUpdate: false,
         updateTag: "latest",
+        streamErrorShape: "protocol",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

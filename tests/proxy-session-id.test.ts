@@ -44,8 +44,14 @@ test("preferPromptCacheKeyIdentity: stronger signals win over prompt_cache_key",
 });
 
 test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps fingerprint", () => {
-    for (const body of [{ input: [] }, { input: [], prompt_cache_key: "   " }, { input: [], prompt_cache_key: 42 }]) {
-        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+    type RespBody = Parameters<typeof conversationIdentityResponses>[0];
+    const pckBodies: { input: RespBody["input"]; prompt_cache_key?: string | number }[] = [
+        { input: [] },
+        { input: [], prompt_cache_key: "   " },
+        { input: [], prompt_cache_key: 42 },
+    ];
+    for (const body of pckBodies) {
+        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body as RespBody, undefined), body);
         assert.equal(id!.source, "content-fingerprint");
         assert.equal(id!.clientProvided, false);
     }

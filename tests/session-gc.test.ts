@@ -539,6 +539,9 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             passthroughSource: null,
             autoRestartOnUpdate: false,
             updateTag: "latest",
+            streamErrorShape: "protocol",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
             mitm: { enabled: false, domains: [] },
         };
         const proxy = await startServer(opts);

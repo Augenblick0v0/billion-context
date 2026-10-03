@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import test from "node:test";
 import { appendSystemText } from "../src/util.ts";
+import type { AnthropicTextBlock } from "acp-kernel/wire";
 
 // #1876: outbound Anthropic system reconstruction must APPEND bili's added
 // text instead of merging client blocks into one (kernel buildSystem's old
@@ -9,7 +10,7 @@ import { appendSystemText } from "../src/util.ts";
 // byte-identical.
 
 test("array original: client blocks ride out byte-exact, added text becomes ONE trailing unmarked text block", () => {
-    const original = [
+    const original: AnthropicTextBlock[] = [
         { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
         { type: "text", text: "YOU_ARE_CLAUDE_CODE", cache_control: { type: "ephemeral" } },
         { type: "text", text: "REPO_CONVENTIONS" },
@@ -24,7 +25,7 @@ test("array original: client blocks ride out byte-exact, added text becomes ONE 
 });
 
 test("array original: input not mutated, returned array is fresh", () => {
-    const original = [{ type: "text", text: "A" }];
+    const original: AnthropicTextBlock[] = [{ type: "text", text: "A" }];
     const out = appendSystemText("P", original);
     assert.notEqual(out, original, "new array reference");
     assert.equal((out as typeof original).length, 2);
@@ -34,13 +35,13 @@ test("array original: input not mutated, returned array is fresh", () => {
 test("array original with image block: image survives byte-exact (old merge destroyed it into 'undefined' text)", () => {
     const img = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAA=" } };
     const original = [{ type: "text", text: "A" }, img];
-    const out = appendSystemText("P", original) as Array<typeof original[number]>;
+    const out = appendSystemText("P", original as unknown as AnthropicTextBlock[]) as Array<typeof original[number]>;
     assert.deepEqual(out[1], img, "image block preserved verbatim");
     assert.deepEqual(out[2], { type: "text", text: "P" });
 });
 
 test("empty added on array original: shallow copy, no extra block", () => {
-    const original = [{ type: "text", text: "A" }];
+    const original: AnthropicTextBlock[] = [{ type: "text", text: "A" }];
     const out = appendSystemText("", original);
     assert.ok(Array.isArray(out));
     assert.deepEqual(out, original, "same content, no appended block");

@@ -157,7 +157,7 @@ function makeFakeCtx() {
 
     return {
         ctx,
-        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown }) => {
+        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown; headers?: Record<string, string> }) => {
             const store: Record<string, string> = {};
             await modelRequestCb!({
                 sessionID: opts.sessionID,

@@ -21,14 +21,14 @@ import { rmrf } from "./tmp-rm.ts";
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
 
-import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { defaultConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
+import { startServer } from "../src/server.ts";
+import { findCcrPluginDivergences, loadOptions, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
-import { findCcrPluginDivergences, loadOptions } from "../src/config.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const MODEL = "test-model";
@@ -59,7 +59,7 @@ test("handlePluginManifest: acp_retrieve NOT advertised by default (CCR off)", (
 });
 
 test("handlePluginManifest: acp_retrieve advertised on anthropic+openai only when CCR enabled", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
     assert.ok(m.toolNames.includes("acp_retrieve"), "enabled CCR advertises acp_retrieve");
     assert.ok(namesOnWire(m.tools.anthropic).includes("acp_retrieve"), "anthropic wire carries acp_retrieve");
     assert.ok(namesOnWire(m.tools.openai).includes("acp_retrieve"), "openai wire carries acp_retrieve");
@@ -69,7 +69,7 @@ test("handlePluginManifest: acp_retrieve advertised on anthropic+openai only whe
 });
 
 test("handlePluginManifest: custom ccr.toolName is honored", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true, toolName: "fetch_full" } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true, toolName: "fetch_full" } });
     assert.ok(m.toolNames.includes("fetch_full"), "custom retrieve tool name advertised");
     assert.ok(namesOnWire(m.tools.anthropic).includes("fetch_full"));
 });
@@ -128,7 +128,7 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -160,10 +160,17 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxyPort: proxy.address().port as number, upstreamPort, forwards, proxy, upstream };
+    return { proxyPort: (proxy.address() as { port: number }).port, upstreamPort, forwards, proxy, upstream };
 }
 
 // The SessionStore is file-global (closeRig only closes sockets), so every

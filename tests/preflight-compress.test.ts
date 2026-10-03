@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig, defaultCountTokens } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -93,7 +94,7 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -117,9 +118,16 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const headers = { "content-type": "application/json", "x-acp-session": "preflight-sess" };
@@ -205,7 +213,7 @@ test("e2e: no preflight when the context fits the (small) model window", async (
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -229,9 +237,16 @@ test("e2e: no preflight when the context fits the (small) model window", async (
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const headers = { "content-type": "application/json", "x-acp-session": "preflight-fits-sess" };
@@ -288,7 +303,7 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -312,9 +327,16 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         // No prior request: the session is brand new (lastInputTokens = 0),
@@ -425,7 +447,7 @@ test("e2e: CJK stable session switch → preflight compresses (CJK-aware token a
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -449,9 +471,16 @@ test("e2e: CJK stable session switch → preflight compresses (CJK-aware token a
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     // 12 alternating messages, each ~2495 CJK chars (≈1 token/char) → ~30k
     // accurate tokens but only ~7.5k by the chars/4 estimator.

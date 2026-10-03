@@ -25,7 +25,7 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
 });
 
 function fakeFetch(sink: string[]) {
-    return (async (input: RequestInfo | URL, _init?: RequestInit) => {
+    return (async (input: string | URL | Request, _init?: RequestInit) => {
         sink.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
         return new Response("{}", { status: 200 });
     }) as typeof fetch;
@@ -38,7 +38,7 @@ interface RecordedCall {
 }
 
 function fakeFetchRecordingHeaders(sink: RecordedCall[]) {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    return (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
         const headers: Record<string, string> = {};
@@ -272,7 +272,7 @@ test("install: TypeError triggers one respawn + retry", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
     let failNext = true;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (failNext) {
@@ -334,7 +334,7 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
     let failNext = true;
     let respawns = 0;
     let giveUps = 0;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (failNext) {
@@ -424,7 +424,7 @@ test("install: headersFor stamps an already-routed /bili/ request without rewrit
     const saved = globalThis.fetch;
     _resetForTest();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const headers: Record<string, string> = {};
         if (init?.headers instanceof Headers) {
@@ -460,7 +460,7 @@ test("install: attach mode rewrites to the attach origin and stamps (#809 + #941
     const saved = globalThis.fetch;
     _resetForTest();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const headers: Record<string, string> = {};
         const h = init?.headers;
@@ -519,7 +519,7 @@ test("install: spawn mode stamps headers on the rewritten request (#941)", async
     const saved = globalThis.fetch;
     _resetForTest();
     let headerDump = "";
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         headerDump = h.get("x-bili-plugin") ?? "";
         return new Response("{}", { status: 200 });
@@ -562,7 +562,7 @@ test("#1117 takeoverGate: unattributed /bili/-routed URL is marked x-bili-passth
     _resetForTest();
     let passthrough = "";
     let pluginHeader = "";
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         passthrough = h.get("x-bili-passthrough") ?? "";
         pluginHeader = h.get("x-bili-plugin") ?? "";
@@ -591,7 +591,7 @@ test("#1117 takeoverGate: attributed /bili/-routed URL keeps plugin headers (no 
     _resetForTest();
     let passthrough = "";
     let pluginHeader = "";
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         passthrough = h.get("x-bili-passthrough") ?? "";
         pluginHeader = h.get("x-bili-plugin") ?? "";
@@ -638,7 +638,7 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
@@ -686,7 +686,7 @@ test("install: routed /bili/ request with no respawn degrades to a direct send (
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
@@ -723,7 +723,7 @@ test("install: routed /bili/ request whose recovery also fails degrades to direc
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");

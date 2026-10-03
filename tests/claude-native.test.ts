@@ -809,7 +809,7 @@ test("repinClaudeManagedBaseUrl: follows a drifted origin, preserves the relay, 
             "utf8",
         );
         const notes = repinClaudeManagedBaseUrl("http://127.0.0.1:18788");
-        const after = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string>; hooks?: unknown };
+        const after = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string>; hooks?: { SessionStart?: unknown } };
         // The relay survives the repin; only the origin moves.
         assert.equal(after.env?.ANTHROPIC_BASE_URL, "http://127.0.0.1:18788/bili/https://relay.example");
         assert.ok(Array.isArray(after.hooks?.SessionStart), "the hook is upserted alongside");

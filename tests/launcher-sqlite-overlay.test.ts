@@ -12,6 +12,7 @@ const crequire = createRequire(import.meta.url);
 interface SqliteStmt {
     run(...params: unknown[]): unknown;
     all(...params: unknown[]): Record<string, unknown>[];
+    get(...params: unknown[]): Record<string, unknown> | undefined;
 }
 interface SqliteDb {
     exec(sql: string): void;
@@ -76,7 +77,7 @@ function quickCheckOk(p: string): boolean {
     assert.ok(sqliteCtor, "node:sqlite unavailable");
     const db = new sqliteCtor(p);
     try {
-        return String(db.prepare("PRAGMA quick_check").get().quick_check) === "ok";
+        return String(db.prepare("PRAGMA quick_check").get()!.quick_check) === "ok";
     } finally {
         db.close();
     }

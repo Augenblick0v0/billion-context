@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import type { ProxyOptions } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #1322: /__bili/health must expose the session-lifecycle watchdog state so
@@ -61,7 +62,7 @@ test("health exposes an armed watchdog with its owner set (#1322)", async () => 
     ]);
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const opts = {
+    const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1:1",
@@ -78,7 +79,14 @@ test("health exposes an armed watchdog with its owner set (#1322)", async () => 
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");

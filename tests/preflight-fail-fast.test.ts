@@ -9,8 +9,8 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
 import { defaultConfig, type Config } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
-import { type CompressSettings } from "../src/config.ts";
+import { startServer } from "../src/server.ts";
+import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -104,7 +104,14 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
@@ -116,11 +123,11 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         // Fresh session: a ~13k-token history against a 10k window — the
@@ -173,14 +180,14 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, {
         "claude-big": { context: 400_000 },
         "claude-small": { context: 20_000 },
     });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const headers = { "content-type": "application/json", "x-acp-session": "preflight-fits-429-sess" };
@@ -219,7 +226,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     // #330: a lone large user message is now foldable (the soft recent zone is
     // relaxed under overflow), so the truly-incompressible case is a large
@@ -228,7 +235,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
     // — even after the soft zone is relaxed.
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const filler = "FILLER_".repeat(7000);
@@ -266,11 +273,11 @@ test("e2e #330: over-window payload whose only foldable content is in the protec
     const upstream = makeUpstreamOk(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         // Three messages against a 10k window: a small opener plus two large
@@ -315,11 +322,11 @@ test("e2e #470: system + tools overhead counts in the preflight trigger — text
     const upstream = makeUpstreamOk(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         // The message text alone (~8.5k) fits the 10k window, but the wire
@@ -362,7 +369,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     // Same incompressible-payload shape as the #301 exhausted test, but the
     // 4k window is an OPERATOR override of the model's declared 10k — the
@@ -370,7 +377,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
     // "raise the model context window" (which sends operators to the upstream).
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] }, { modelContextLimit: 4_000 });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const filler = "FILLER_".repeat(7000);
@@ -402,7 +409,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         // carry the shrink note (effective === full window).
         const proxyPlain = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
         await once(proxyPlain, "listening");
-        const plainPort = proxyPlain.address().port;
+        const plainPort = (proxyPlain.address() as { port: number }).port;
         const r2 = await fetch(`http://127.0.0.1:${plainPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-plain-sess" },
@@ -442,7 +449,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     // Model declares a 10k window (registry table), NO operator override. The
     // OpenAI-chat endpoint reserves output headroom: max_tokens 4000 shrinks the
@@ -450,7 +457,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
     // tool result overflows 6000 → fail-fast.
     const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, { protectedTools: ["bash"] });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const filler = "FILLER_".repeat(7000);

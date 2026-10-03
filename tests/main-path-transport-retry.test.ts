@@ -10,7 +10,8 @@ process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
 
 import { defaultConfig } from "acp-kernel";
 import { _liveUpstreamTimersForTest, _resetFetchUtilForTest, fetchWithTransportRetry, type ReplayRetryInfo } from "../src/fetch-util.ts";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -67,7 +68,7 @@ test("#1688 unit: connect-refused is replayed and the recovered response is retu
     await new Promise((r) => setTimeout(r, 10));
     srv.listen(port, "127.0.0.1");
     await once(srv, "listening");
-    let result: Awaited<ReturnType<typeof fetchWithTransportRetry>>;
+    let result: Awaited<ReturnType<typeof fetchWithTransportRetry>> | undefined;
     try {
         result = await pending;
         assert.equal(result.response.status, 200);
@@ -281,10 +282,17 @@ async function startProxy(upstreamPort: number): Promise<{ proxy: http.Server; p
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxy, port: proxy.address().port };
+    return { proxy, port: (proxy.address() as { port: number }).port };
 }
 
 function chatBody(): string {
@@ -305,7 +313,7 @@ test("#1688 e2e: a pre-response reset mid-round is replayed transparently — th
     const relay = makeRelay({ destroyStreamingAt: [1] });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort);
 
     try {
@@ -331,7 +339,7 @@ test("#1688 e2e: persistent transport failure exhausts the budget, then surfaces
     const relay = makeRelay({ destroyStreamingAt: [1, 2, 3, 4, 5] });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort);
 
     try {
@@ -358,7 +366,7 @@ test("#1688 e2e: an upstream 4xx verdict passes through verbatim without any rep
     const relay = makeRelay({ failFirstStreamingWith: 400 });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort);
 
     try {

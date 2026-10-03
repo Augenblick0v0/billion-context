@@ -3,7 +3,7 @@ import test from "node:test";
 import { installNativeFetchIntercept, type NativeInterceptState } from "../src/agent/native-intercept.js";
 
 function fakeFetch(sink: string[]) {
-    return (async (input: RequestInfo | URL, _init?: RequestInit) => {
+    return (async (input: string | URL | Request, _init?: RequestInit) => {
         sink.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
         return new Response("{}", { status: 200 });
     }) as typeof fetch;
@@ -46,10 +46,10 @@ test("#1158 self-heal: third-party reset to a frozen bare fetch re-chains and ke
 test("#1158 self-heal: third-party wrapper becomes the downstream (dsh-http-proxy apply shape)", async () => {
     const downstreamSeen: string[] = [];
     const { sink } = await withHeal(async ({ rearm, fetch }) => {
-        const wrapper = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const wrapper = (async (input: string | URL | Request, init?: RequestInit) => {
             downstreamSeen.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
             return fakeFetch([])(input, init);
-        }) as typeof fetch;
+        }) as typeof globalThis.fetch;
         rearm(wrapper);
         const res = await fetch()("http://127.0.0.1:8199/v1/messages");
         assert.equal(res.status, 200);
@@ -73,7 +73,7 @@ test("#1158 self-heal: guarded property is transparent when nobody fights it", a
 
 test("#1158 self-heal: non-function and self writes are ignored by the guard", async () => {
     const { sink } = await withHeal(async ({ rearm, fetch }) => {
-        rearm(undefined as unknown as typeof fetch);
+        rearm(undefined as unknown as typeof globalThis.fetch);
         const mine = fetch();
         rearm(mine);
         const res = await mine("http://127.0.0.1:8199/v1/messages");
@@ -95,7 +95,7 @@ function foreignScope() {
     return {
         open: (): void => {
             baseFetch = globalThis.fetch;
-            scopedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => baseFetch!(input, init)) as typeof fetch;
+            scopedFetch = (async (input: string | URL | Request, init?: RequestInit) => baseFetch!(input, init)) as typeof fetch;
             globalThis.fetch = scopedFetch;
         },
         close: (): void => {
@@ -203,7 +203,7 @@ test("#1410: _resetForTest leaves a third-party redefined descriptor alone", asy
 test("#1410: every observed fetch torn down → loud failure, no silent corruption", async () => {
     const saved = globalThis.fetch;
     let inner: typeof fetch | undefined = fakeFetch([]);
-    const doomed = (async (input: RequestInfo | URL, init?: RequestInit) => inner!(input, init)) as typeof fetch;
+    const doomed = (async (input: string | URL | Request, init?: RequestInit) => inner!(input, init)) as typeof fetch;
     const { _resetForTest } = await import("../src/agent/native-intercept.js");
     _resetForTest({ anchor: doomed });
     globalThis.fetch = doomed;
@@ -275,7 +275,7 @@ test("#1662: thousands of foreign re-wraps of the current top cannot grow reques
         // O(1) per request regardless of history length.
         for (let i = 0; i < 16000; i++) {
             const base = globalThis.fetch;
-            const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => base(input, init)) as typeof fetch;
+            const wrapped = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
             globalThis.fetch = wrapped;
         }
         const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
@@ -329,7 +329,7 @@ test("#1662: a steady-state foreign wrapper wrapping bili's chain stays in the c
         const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
         assert.equal(installNativeFetchIntercept(state), true);
         const base = globalThis.fetch;
-        const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const wrapped = (async (input: string | URL | Request, init?: RequestInit) => {
             seenByWrapper.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
             return base(input, init);
         }) as typeof fetch;
