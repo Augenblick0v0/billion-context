@@ -135,15 +135,27 @@ describe("planReconciliation (#1921)", () => {
         assert.equal(plan.unmatched.length, 0);
     });
 
-    test("length guard rejects same-hash different-scale collisions", () => {
-        // normalized identities differ (different words) so this must not match —
-        // the guard exists for hash-slice collisions; simulate via equal norm but absurd length delta
-        const long = "x".repeat(10_000);
+    test("length guard rejects same-norm different-scale candidates", () => {
+        // Same normalized identity as the anchor ("x" — non-newline whitespace
+        // collapses and trims away), but raw length drifts far beyond
+        // max(256, b>>2): the guard in the norm-pairing path must reject before
+        // the ordinal pairing can claim it (#1930: this is the only defense
+        // against a same-norm/different-scale false match).
         const anchorsL = { big: { n: normalizedIdentity(msg("big", "user", "x")), r: "user", b: 1 } };
-        const incoming = [msg("big-new", "user", long)];
+        const incoming = [msg("big-new", "user", "x" + " ".repeat(10_000))];
         const plan = planReconciliation(["big"], anchorsL, incoming, new Set(["big"]));
-        // same normalized identity ("x" prefix vs 10k "x")? normalize keeps full text -> different norm strings -> unmatched
         assert.equal(plan.claims.size, 0);
+        assert.deepEqual(plan.unmatched, ["big"]);
+    });
+
+    test("length guard accepts same-norm candidates within tolerance", () => {
+        // Control side of the branch: identical norm, raw delta 200 <= max(256, b>>2)
+        // -> the guard passes and k-th-to-k-th pairing claims the churn.
+        const anchorsL = { big: { n: normalizedIdentity(msg("big", "user", "hello world")), r: "user", b: 11 } };
+        const incoming = [msg("big-new", "user", "hello world" + " ".repeat(200))];
+        const plan = planReconciliation(["big"], anchorsL, incoming, new Set(["big"]));
+        assert.equal(plan.claims.get("big"), "big-new");
+        assert.equal(plan.byNorm, 1);
     });
 
     test("covered-present ids inside the churn region are not claimable twice", () => {
