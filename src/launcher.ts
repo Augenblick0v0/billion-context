@@ -1927,8 +1927,8 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         // moves a freshly-created, overlay-only database INTO the real home, so the
         // pre-merge `realEntries` snapshot misses it and the copy phase below would
         // never bring it back into the active overlay — the next launch would start
-        // without the previous run's sessions. A set that failed to merge stays in
-        // the overlay and is still picked up via the `present` check below.
+        // without the previous run's sessions. A set that failed to merge was never
+        // moved, so it stays in the overlay untouched and the client starts from it.
         const liveRealEntries = new Set<string>();
         try {
             for (const entry of fs.readdirSync(realHome)) liveRealEntries.add(entry);
