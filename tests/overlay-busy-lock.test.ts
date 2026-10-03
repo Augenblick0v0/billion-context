@@ -203,7 +203,7 @@ test("six racing processes: exactly one wins the lease (#1952)", { timeout: 60_0
     const overlay = path.join(tmp, "race-overlay");
     fs.mkdirSync(overlay, { recursive: true });
     const launcherUrl = new URL("../src/launcher.ts", import.meta.url).href;
-    const script = path.join(tmp, "race-child.ts");
+    const script = path.join(tmp, "race-child.mjs");
     fs.writeFileSync(
         script,
         [
