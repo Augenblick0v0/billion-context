@@ -340,8 +340,8 @@ back into the real home only on the NEXT `bili` launch — sync is startup-time
 only, with no merge-back on process exit. So a plain `codex` started right after
 `bili codex` exits may not yet see that run's sessions; they surface on the next
 `bili` launch. A safe exit-time merge (reconciling an open/crashed SQLite set
-against a possibly-concurrent real client) is a distinct mechanism, tracked
-separately (#1951).
+against a possibly-concurrent real client) is a distinct, higher-risk
+mechanism — deliberately out of scope of the startup-only contract.
 
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
