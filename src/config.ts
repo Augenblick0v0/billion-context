@@ -85,6 +85,12 @@ export type ProviderRoute = {
      *  `imageTokenCap`; env BILI_IMAGE_TOKEN_CAP wins over both. Positive
      *  integer; undefined/unset = no cap. */
     imageTokenCap?: number;
+    /** #1884 level-2 scheme-keyed re-sign overrides for this provider:
+     *  key = lowercase signature scheme (e.g. "sdk-hmac-sha256"), per-field
+     *  deepest wins over the global `resign` block (env still wins over
+     *  both). The model-level knob lives one level deeper —
+     *  `models.<name>.benefit` on this same provider key (#1884 level 3). */
+    resign?: ResignSchemeMap;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -96,6 +102,13 @@ export type ModelEntry = {
     /** Per-model compression overrides (level 3 of 3, wins over provider
      *  and global). See CompressSettings. */
     compress?: CompressSettings;
+    /** #1884 level-3: this model bills against the CodeArts free quota —
+     *  re-signed requests for it carry the signed `maas_type: benefit`
+     *  header. `true` / `false` are explicit (false opts a default-set model
+     *  out); unset falls through to the built-in fallback set
+     *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
+     *  this like every other knob. */
+    benefit?: boolean;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -1203,6 +1216,21 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
+     *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
+     *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
+     *  behavior; env BILI_RESIGN=0 wins). `passthrough: true` opts into
+     *  verbatim forwarding for requests signed with THAT scheme that cannot
+     *  be re-signed (no credential) instead of the default local 403
+     *  refusal (env BILI_RESIGN_PASSTHROUGH=1 wins) — scoping passthrough
+     *  by scheme pins exactly which signature may tunnel. The model-level
+     *  free-quota knob is NOT here — it lives at level 3:
+     *  `providers.<url>.models.<name>.benefit: true|false` (env
+     *  BILI_RESIGN_BENEFIT wins over the whole tree).
+     *  `credentialRef` pins the dsh credentials-service ref used for
+     *  re-signing instead of account-pool discovery (env BILI_CODEARTS_REF
+     *  wins). */
+    resign?: ResignSchemeMap;
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;
@@ -1303,7 +1331,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
-    "compat", "imageBilling", "claude", "native",
+    "compat", "imageBilling", "claude", "native", "resign",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1346,6 +1374,61 @@ function loadConfigFile(): FileConfig {
         return parsed as FileConfig;
     }
     return {};
+}
+
+/** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
+export interface ResignFileSettings {
+    enabled?: boolean;
+    passthrough?: boolean;
+    credentialRef?: string;
+}
+
+/** The scheme bili can re-sign out of the box: Huawei CodeArts APIG's
+ *  SDK-HMAC-SHA256. The `resign` block is keyed by signature scheme name
+ *  (lowercase, as it appears on the wire's Authorization header) so the
+ *  field stays generic — adding a second re-signable scheme later adds a
+ *  key, not a redesign (#1884). */
+export const RESIGN_BUILTIN_SCHEME = "sdk-hmac-sha256";
+
+/** Scheme-keyed re-sign policy: key = lowercase Authorization scheme
+ *  (e.g. "sdk-hmac-sha256"). The built-in key resolves out of the box
+ *  (defaults below); other body-covering schemes can be scoped their own
+ *  `passthrough` opt-in without opening the built-in one. */
+export type ResignSchemeMap = Record<string, ResignFileSettings>;
+
+/** Resolved #1884 re-sign settings: env vars win over the config file, the
+ *  file wins over the defaults (same precedence family as
+ *  resolveClaudeNativePort / chainContentDetection). `credentialRef` stays
+ *  undefined when neither env nor file sets it — the signer then falls back
+ *  to account-pool discovery. The free-quota model knob is resolved
+ *  separately at level 3 (ModelEntry.benefit). */
+export interface ResignSettings {
+    enabled: boolean;
+    passthrough: boolean;
+    credentialRef?: string;
+}
+
+/** Per-field precedence: env var > provider-level block (`providers.<url>.resign`,
+ *  level 2) > global file block > default. Provider resolution happens AFTER
+ *  routing — the provider and its model filter are known before the re-sign
+ *  action runs (the repo's route-first ordering; #1884). Host-side callers
+ *  (native intercept, dsh lane) pass no provider — they run before any route
+ *  exists and take the root cascade. `scheme` scopes the lookup to one
+ *  signature: the built-in key resolves with defaults when the file says
+ *  nothing about it (out-of-box), and a scheme the file only mentions under
+ *  a different key never leaks into another key's policy. */
+export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, provider: ResignSchemeMap = {}, scheme: string = RESIGN_BUILTIN_SCHEME): ResignSettings {
+    const key = scheme.trim().toLowerCase();
+    const file = loadConfigFile().resign?.[key] ?? {};
+    const providerBlock = provider?.[key] ?? {};
+    const enabled = env.BILI_RESIGN !== undefined ? env.BILI_RESIGN !== "0" : providerBlock.enabled !== undefined ? providerBlock.enabled : file.enabled !== false;
+    const passthrough = env.BILI_RESIGN_PASSTHROUGH !== undefined
+        ? env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true"
+        : providerBlock.passthrough !== undefined
+            ? providerBlock.passthrough
+            : file.passthrough === true;
+    const credentialRef = env.BILI_CODEARTS_REF?.trim() || providerBlock.credentialRef || file.credentialRef || undefined;
+    return { enabled, passthrough, credentialRef };
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane

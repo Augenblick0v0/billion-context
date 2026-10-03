@@ -177,6 +177,10 @@ export interface RequestOptions {
      *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
      *  compat the initial forward() applied. Returns the body to serialize. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #1884: re-sign every re-sent body before it hits the wire (armed
+     *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
+     *  the body, so a signature computed for an earlier round is stale. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 export type ParsedStreamEvent =
@@ -337,6 +341,7 @@ export async function* runCompressLoop(
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
         const wireBodyStr = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body);
+        requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         noteForwardedBody(ctx.session, wireBodyStr);
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
