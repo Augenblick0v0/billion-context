@@ -178,6 +178,23 @@
 - **状态：** ACTIVE
 - **说明：** 预检尺寸门、输出钳制与图片压缩统计所用单图 token 估算的统一天花板（#488/#496/#1843）。叠加在任何计费模式之上 —— 适用于路由真实编码器计费远低于像素先验的场景。优先级：`BILI_IMAGE_TOKEN_CAP` 环境变量（实时读取，无需重启）> 按 provider 的 `providers.<url>.imageTokenCap` > 本全局项。非数字或非正值按宽松解析丢弃（与 `imageBilling` 一致）。
 
+### `resign`
+
+- **类型：** `object`（`{ enabled?, passthrough?, benefitModels?, credentialRef? }`）
+- **默认值：** `enabled: true`、`passthrough: false`；`benefitModels` / `credentialRef` *（未设置 —— 静态回退 / 账号池发现）*
+- **状态：** ACTIVE
+- **说明：** #1884 重签臂的配置文件面（CodeArts APIG 的 `SDK-HMAC-SHA256` body 级签名）。重签臂本身零配置：在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
+  - `enabled: boolean` —— 总开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
+  - `passthrough: boolean` —— 对无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）的 opt-in 原样转发。默认是**本地 403 拒收**并给出可操作提示 —— 不静默直发，因为逐字节原样转发等于静默关掉那些请求的压缩（#1886 语义设计上就是 opt-in）。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先。
+  - `benefitModels: string[]` —— 免费额度模型列表，这些模型的重签请求附带参与签名的 `maas_type: benefit` 头（默认 `glm-5.3-flash`、`deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）。环境变量 `BILI_RESIGN_BENEFIT`（逗号分隔）优先。
+  - `credentialRef: string` —— 钉死重签用的 dsh credentials 服务 ref，而不是账号池发现。环境变量 `BILI_CODEARTS_REF` 优先。
+
+  ```jsonc
+  {
+    "resign": { "passthrough": true, "benefitModels": ["glm-5.3-flash", "deepseek-v4.1-flash"] }
+  }
+  ```
+
 ---
 
 ## Providers
@@ -749,7 +766,7 @@
 | `BILI_PREFLIGHT_HOLD_MS` | 预压缩超过该宽限期（毫秒）后，代理提前提交响应并用保活字节挂住客户端（默认 `30000`；见 #568）。 |
 | `BILI_STREAM_KEEPALIVE_MS` | 流式阶段客户端保活（#1647）：SSE 响应连续该毫秒数没有向客户端写出任何字节时，bili 发一条 SSE 注释行（`: bili-keepalive`，协议层 no-op），防止客户端 undici `bodyTimeout`（默认 300s；Node 内置 fetch 无法按请求覆盖）在长 prefill 时断连——上游的 ping 注释会被重写器/剥离管道吞掉。默认 `15000`；`0` 关闭。与 `BILI_PREFLIGHT_HOLD_MS` 互补：后者覆盖压缩预检期的静默，本变量覆盖流式期上游导致的静默。 |
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。 |
-| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——默认 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
+| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。全部开关都有配置文件孪生项，见 [`resign`](#resign) 块——环境变量优先于文件。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——默认 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |

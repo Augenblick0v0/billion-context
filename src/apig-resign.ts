@@ -1,5 +1,8 @@
 import { createHash, createHmac } from "node:crypto";
 
+import { resolveResignSettings } from "./config.js";
+import { configFile } from "./paths.js";
+
 /**
  * #1884 (CodeArts APIG): requests signed with SDK-HMAC-SHA256 carry a
  * signature over the exact request bytes. bili's pipeline rewrites bodies
@@ -55,22 +58,21 @@ export interface ApigCredential {
 const DEFAULT_BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash"];
 
 export function apigBenefitModels(): Set<string> {
-    const raw = process.env.BILI_RESIGN_BENEFIT;
-    if (raw !== undefined && raw.trim() !== "") {
-        return new Set(raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0));
+    const fromSettings = resolveResignSettings().benefitModels;
+    if (fromSettings !== undefined && fromSettings.length > 0) {
+        return new Set(fromSettings);
     }
     return new Set(DEFAULT_BENEFIT_MODELS);
 }
 
 export function resignEnabled(): boolean {
-    return process.env.BILI_RESIGN !== "0";
+    return resolveResignSettings().enabled;
 }
 
 /** Opt-in verbatim forwarding for signed requests that cannot be re-signed
  *  (no silent passthrough by default — see the refusal rationale above). */
 export function resignPassthroughEnabled(): boolean {
-    const v = process.env.BILI_RESIGN_PASSTHROUGH;
-    return v === "1" || v === "true";
+    return resolveResignSettings().passthrough;
 }
 
 export interface SignedRefusal {
@@ -83,7 +85,7 @@ export interface SignedRefusal {
  *  Protocol-native shapes (anthropic/openai wire) so real clients surface the
  *  message instead of choking on it. */
 export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"): SignedRefusal {
-    const message = `bili refused to forward this ${scheme}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available. Fix one of: provide a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service, or BILI_CODEARTS_REF), set BILI_RESIGN_PASSTHROUGH=1 to forward signed requests byte-untouched without compression, or set BILI_RESIGN=0 to restore pre-resign handling.`;
+    const message = `bili refused to forward this ${scheme}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available. Fix one of: provide a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service), set "resign": {"passthrough": true} in the config file (${configFile()}; or env BILI_RESIGN_PASSTHROUGH=1) to forward signed requests byte-untouched without compression, or set "resign": {"enabled": false} / BILI_RESIGN=0 to restore pre-resign handling.`;
     if (protocol === "anthropic") {
         return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
     }

@@ -3,8 +3,17 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createHash, createHmac } from "node:crypto";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
+
+// Hermetic config: point the config file at a per-process path that does not
+// exist (config absent → {}), so the default-path tests below never read the
+// developer machine's real billion-context.json. Per-test file configs use
+// withConfigFile() below, which overrides this via BILI_CONFIG_FILE.
+process.env.BILI_CONFIG_FILE = path.join(tmpdir(), `apig-resign-absent-${process.pid}.json`);
 
 import {
     APIG_RESIGN_CREDENTIAL_HEADER,
@@ -17,6 +26,7 @@ import {
     modelOfJsonBody,
     resignApig,
     resignEnabled,
+    resignPassthroughEnabled,
     signApigHeaders,
     type ApigCredential,
 } from "../src/apig-resign.ts";
@@ -659,4 +669,73 @@ test("#1884 review: non-streaming Responses JSON loop re-signs rebuilt rounds be
     } finally {
         globalThis.fetch = previousFetch;
     }
+});
+// --- config-file surface (m-resign block): env wins over the file, the file
+// wins over the defaults. BILI_CONFIG_FILE redirects configFile() so each
+// test writes its own config; that env var itself must be cleared/overridden
+// per-test to avoid leaking the developer machine's real config.
+
+function withConfigFile<T>(config: unknown, fn: (file: string) => Promise<T> | T): Promise<T> {
+    const dir = mkdtempSync(path.join(tmpdir(), "apig-resign-cfg-"));
+    const file = path.join(dir, "billion-context.json");
+    writeFileSync(file, JSON.stringify(config), "utf8");
+    return withEnv({ BILI_CONFIG_FILE: file }, async () => {
+        try {
+            return await fn(file);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+}
+
+test("#1884 config file: resign.passthrough / benefitModels / enabled are honored without any env var", async () => {
+    await withConfigFile({ resign: { enabled: true, passthrough: true, benefitModels: ["Custom-Free-Model"] } }, async () => {
+        await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined }, async () => {
+            assert.equal(resignPassthroughEnabled(), true, "file passthrough wins over the default refusal");
+            assert.equal(resignEnabled(), true);
+            assert.deepEqual(apigBenefitModels(), new Set(["custom-free-model"]), "file benefitModels wins over the static fallback");
+        });
+    });
+});
+
+test("#1884 config file: resign.enabled=false unloads the arm (file-only kill switch)", async () => {
+    await withConfigFile({ resign: { enabled: false } }, async () => {
+        await withEnv({ BILI_RESIGN: undefined }, async () => {
+            assert.equal(resignEnabled(), false);
+        });
+    });
+});
+
+test("#1884 precedence: env wins over the config file for every resign knob", async () => {
+    await withConfigFile({ resign: { enabled: true, passthrough: true, benefitModels: ["file-model"] } }, async () => {
+        await withEnv({ BILI_RESIGN: "0", BILI_RESIGN_PASSTHROUGH: "0", BILI_RESIGN_BENEFIT: "env-model" }, async () => {
+            assert.equal(resignEnabled(), false, "BILI_RESIGN=0 beats file enabled:true");
+            assert.equal(resignPassthroughEnabled(), false, "BILI_RESIGN_PASSTHROUGH=0 beats file passthrough:true");
+            assert.deepEqual(apigBenefitModels(), new Set(["env-model"]), "BILI_RESIGN_BENEFIT beats file benefitModels");
+        });
+    });
+});
+
+test("e2e #1884: file-configured passthrough (no env var) → byte-untouched forwarding — the out-of-box surface", async () => {
+    await withConfigFile({ resign: { passthrough: true } }, async () => {
+        await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
+            const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+            const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+            try {
+                const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+                const bodyStr = chatBody("deepseek-v4.1-flash", "file-passthrough-1");
+                const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+                signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+                const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+                assert.equal(r.status, 200, `file passthrough keeps the original signature valid: ${await r.text()}`);
+                assert.equal(calls.length, 1);
+                assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte");
+            } finally {
+                proxy.close();
+                (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+                upstream.close();
+                upstream.closeAllConnections?.();
+            }
+        });
+    });
 });

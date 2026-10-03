@@ -1203,6 +1203,17 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Re-sign block (#1884): applies to body-covering signatures (APIG
+     *  SDK-HMAC-SHA256 today). `enabled: false` unloads the arm entirely
+     *  (pre-resign rewrite behavior; env BILI_RESIGN=0 wins). `passthrough:
+     *  true` opts into verbatim forwarding for signed requests that cannot be
+     *  re-signed (no credential) instead of the default local 403 refusal
+     *  (env BILI_RESIGN_PASSTHROUGH=1 wins). `benefitModels` overrides the
+     *  static free-quota model list (env BILI_RESIGN_BENEFIT wins).
+     *  `credentialRef` pins the dsh credentials-service ref used for
+     *  re-signing instead of account-pool discovery (env BILI_CODEARTS_REF
+     *  wins). */
+    resign?: ResignFileSettings;
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;
@@ -1303,7 +1314,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
-    "compat", "imageBilling", "claude", "native",
+    "compat", "imageBilling", "claude", "native", "resign",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1346,6 +1357,42 @@ function loadConfigFile(): FileConfig {
         return parsed as FileConfig;
     }
     return {};
+}
+
+/** File shape of the `resign` block (see FileConfig.resign). */
+export interface ResignFileSettings {
+    enabled?: boolean;
+    passthrough?: boolean;
+    benefitModels?: string[];
+    credentialRef?: string;
+}
+
+/** Resolved #1884 re-sign settings: env vars win over the config file, the
+ *  file wins over the defaults (same precedence family as
+ *  resolveClaudeNativePort / chainContentDetection). `benefitModels` and
+ *  `credentialRef` stay undefined when neither env nor file sets them — the
+ *  signer then uses its static fallback / account-pool discovery. */
+export interface ResignSettings {
+    enabled: boolean;
+    passthrough: boolean;
+    benefitModels?: string[];
+    credentialRef?: string;
+}
+
+export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env): ResignSettings {
+    const file = loadConfigFile().resign ?? {};
+    const enabled = env.BILI_RESIGN !== undefined ? env.BILI_RESIGN !== "0" : file.enabled !== false;
+    const passthrough = env.BILI_RESIGN_PASSTHROUGH !== undefined
+        ? env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true"
+        : file.passthrough === true;
+    const envBenefit = env.BILI_RESIGN_BENEFIT?.trim();
+    const benefitModels = envBenefit !== undefined && envBenefit !== ""
+        ? envBenefit.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0)
+        : Array.isArray(file.benefitModels) && file.benefitModels.length > 0
+            ? file.benefitModels.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0)
+            : undefined;
+    const credentialRef = env.BILI_CODEARTS_REF?.trim() || file.credentialRef || undefined;
+    return { enabled, passthrough, benefitModels, credentialRef };
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane

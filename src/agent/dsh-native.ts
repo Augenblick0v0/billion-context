@@ -38,6 +38,7 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -819,7 +820,9 @@ export function apply(ctx: PluginContext): void {
     // ak/sk/token to the proxy, which re-signs every egress body it produces
     // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
     // a credential expires the upstream 401 is visible and the plugin's next
-    // successful refresh re-arms through this same resolver.
+    // successful refresh re-arms through this same resolver. The pinned ref
+    // comes from resolveResignSettings(): env BILI_CODEARTS_REF wins over the
+    // config file's "resign": {"credentialRef": …}.
     let credentialsService: { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined;
     if (typeof ctx.inject === "function") {
         try {
@@ -836,7 +839,7 @@ export function apply(ctx: PluginContext): void {
         if (svc !== undefined && typeof svc === "object") credentialsService = svc as typeof credentialsService;
     }
     const codeartsRefCandidates = (): { ref: string; nickname?: string }[] => {
-        const pinned = process.env.BILI_CODEARTS_REF;
+        const pinned = resolveResignSettings().credentialRef;
         if (pinned !== undefined && pinned.trim() !== "") return [{ ref: pinned.trim() }];
         try {
             const home = process.env.DSH_HOME ?? path.join(homedir(), ".dsh");
