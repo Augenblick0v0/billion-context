@@ -43,7 +43,7 @@ const fakeCodec: WsBridgeCodec = {
     createSession: context => new RecordingSession(context),
 };
 
-async function harness(codecs: readonly WsBridgeCodec[], options: Parameters<typeof installWebSocketBridge>[4]) {
+async function harness(codecs: readonly WsBridgeCodec[], options: Parameters<typeof installWebSocketBridge>[4] = {}) {
     const server = http.createServer((_req, res) => res.writeHead(404).end());
     const logs: string[] = [];
     const handler = installWebSocketBridge(server, (_req, res) => Promise.resolve(res.writeHead(200).end()), (level, message) => logs.push(`${level} ${message}`), codecs, options);
@@ -163,6 +163,6 @@ test("ws bridge: server close shuts every session down and terminates peers", as
         assert.deepEqual(session.shutdowns, ["server-close"]);
         assert.equal(socket.readyState, WebSocket.CLOSED);
     } finally {
-        await new Promise(resolve => upstream.close(() => resolve()));
+        await new Promise<void>(resolve => upstream.close(() => resolve()));
     }
 });
