@@ -13,8 +13,13 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
 type Ctx = {
-    sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown } | undefined;
-    model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; [key: string]: unknown } | undefined;
+    sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
+    model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
+    // #1961: pi 0.99+ exposes the live model catalog on the extension ctx;
+    // optional because older hosts lack it. The real ModelRegistry surface is
+    // find(provider, modelId) — there is no getModel (verified against pi
+    // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
+    modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
     cwd?: string;
 };
 
@@ -64,7 +69,58 @@ function agentName(override: string | undefined): string {
     return process.env.BILLION_CONTEXT_PLUGIN_AGENT === "omp" ? "omp" : "pi";
 }
 
-function proxyBaseForCtx(ctx: Ctx | undefined): string | undefined {
+// pi 0.99+ virtual models (`pi.registerVirtualModel`, e.g. router/auto): the
+// selection names a ROUTER, not a destination — its baseUrl is "" and it never
+// reaches a provider, so detectProxyBase(ctx.model.baseUrl) has nothing to read
+// (#1961). The conversation's real traffic went to the PHYSICAL models that
+// answered; resolve the proxy from that evidence instead: the latest non-failed
+// assistant response's registry entry (launcher httpRewrites and manually
+// /bili/-wrapped models.json both land there), then the launcher's
+// BILI_PROVIDER_REWRITES manifest entry for its provider, then the plain env
+// fallback. Every candidate passes through detectProxyBase so the
+// BILLION_CONTEXT_PLUGIN kill switch and URL validation apply uniformly, and
+// any shape mismatch degrades to today's behavior. Downstream carriage gates
+// (#1382/#1392) still decide ownership — this only fixes WHICH proxy is asked.
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+function latestPhysicalResponse(branchEntries: unknown): { provider: string; modelId: string } | undefined {
+    if (!Array.isArray(branchEntries)) return undefined;
+    for (let i = branchEntries.length - 1; i >= 0; i--) {
+        const entry = branchEntries[i] as { type?: unknown; message?: { role?: unknown; stopReason?: unknown; provider?: unknown; model?: unknown } } | null | undefined;
+        const msg = entry?.message;
+        // Mirrors pi's own findLatestResponse: skip failed/aborted routing attempts.
+        if (entry?.type !== "message" || msg?.role !== "assistant") continue;
+        if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
+        const provider = typeof msg.provider === "string" ? msg.provider : "";
+        const modelId = typeof msg.model === "string" ? msg.model : "";
+        if (provider.length > 0 && modelId.length > 0) return { provider, modelId };
+    }
+    return undefined;
+}
+
+function virtualModelProxyBase(ctx: Ctx, branchEntries: unknown): string | undefined {
+    try {
+        const last = latestPhysicalResponse(Array.isArray(branchEntries) ? branchEntries : ctx.sessionManager?.getBranch?.());
+        if (last) {
+            const registryBase = ctx.modelRegistry?.find?.(last.provider, last.modelId)?.baseUrl;
+            if (typeof registryBase === "string" && registryBase.length > 0) {
+                const base = detectProxyBase(registryBase);
+                if (base) return base;
+            }
+            const rewrite = parseProviderRewrites(process.env)?.[last.provider];
+            if (rewrite) {
+                const base = detectProxyBase(rewrite);
+                if (base) return base;
+            }
+        }
+        return detectProxyBase(undefined);
+    } catch {
+        return detectProxyBase(undefined);
+    }
+}
+
+function proxyBaseForCtx(ctx: Ctx | undefined, branchEntries?: unknown): string | undefined {
+    if (ctx !== undefined && ctx.model?.api === VIRTUAL_MODEL_API) return virtualModelProxyBase(ctx, branchEntries);
     return detectProxyBase(ctx?.model?.baseUrl);
 }
 
@@ -434,8 +490,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // cancel overflows the session. The handlers are async on purpose —
         // pi's runner awaits session_before_compact handlers (verified in
         // pi-coding-agent dist) before consulting .cancel/.compaction.
-        const ownsCompaction = async (ctx: Ctx | undefined): Promise<boolean> => {
-            const proxyBase = proxyBaseForCtx(ctx);
+        const ownsCompaction = async (ctx: Ctx | undefined, branchEntries?: unknown): Promise<boolean> => {
+            const proxyBase = proxyBaseForCtx(ctx, branchEntries);
             if (proxyBase === undefined) return false;
             const baseUrl = ctx?.model?.baseUrl;
             if (typeof baseUrl === "string" && baseUrl.length > 0 && !/^https?:\/\//i.test(baseUrl)) {
@@ -460,9 +516,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         if (agent === "pi" || agent === "omp") {
             if (agent === "pi") {
                 pi.on("session_before_compact", async (event, ctx) => {
-                    const reason = (event as unknown as { reason?: unknown }).reason;
-                    if (reason !== "threshold" && reason !== "overflow") return undefined;
-                    if (!(await ownsCompaction(ctx))) return undefined;
+                    const ev = event as unknown as { reason?: unknown; branchEntries?: unknown };
+                    if (ev.reason !== "threshold" && ev.reason !== "overflow") return undefined;
+                    if (!(await ownsCompaction(ctx, ev.branchEntries))) return undefined;
                     return { cancel: true };
                 });
             } else {
