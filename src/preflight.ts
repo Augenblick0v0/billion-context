@@ -13,6 +13,7 @@ import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
+import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
@@ -762,7 +763,12 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
             const retryable = failure instanceof UpstreamHttpError
                 ? isTransientUpstreamError(failure.status, failure.body)
                 : failure.retryable;
-            if (!retryable || attempt >= maxAttempts) throw failure;
+            if (!retryable || attempt >= maxAttempts) {
+                if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
+                    dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
+                }
+                throw failure;
+            }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
         } finally {
             clearTimer?.();
@@ -1182,15 +1188,39 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
+                        // #1993: the rejection body is the only evidence for WHY the
+                        // upstream said no — log it the way the main paths already do
+                        // and carry a bounded snippet into the client-visible detail.
+                        const transient = isTransientUpstreamError(err.status, err.body);
+                        const bodySnippet = safePrefix(err.body.trim(), 200);
                         failure = {
                             kind: "upstream",
                             status: err.status,
-                            retryable: isTransientUpstreamError(err.status, err.body),
+                            retryable: transient,
                             detail: err.status === 429
                                 ? `the summarization call was rate-limited by the upstream (HTTP 429)`
-                                : `the summarization call was rejected by the upstream (HTTP ${err.status})`,
+                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
                         };
-                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)`);
+                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                        // #1993: a hard (non-transient) size-plausible rejection gets the
+                        // same halving recovery as an unusable HTTP-200 summary — the
+                        // whole request was refused, so it is at least as likely to be
+                        // size-driven as an empty 200. Transient 4xx (risk-control
+                        // markers) keep the replay-retry semantics; other 4xx (auth /
+                        // routing) fail fast instead of burning the call budget;
+                        // unsplittable spans fall through to the give-up below. The
+                        // cascade is bounded by the per-invocation summary budget
+                        // (summaryBudget, #1933) via the while-top budgetHit check.
+                        const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                        if ((err.status === 400 || err.status === 413) && !transient
+                            && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
+                            lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
+                            deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
+                            const mid = Math.floor((cs + ce) / 2);
+                            spans.push([mid + 1, ce]);
+                            spans.push([cs, mid]);
+                            continue;
+                        }
                     } else if (deps.signal?.aborted) {
                         failure = ABORTED_FAILURE;
                         deps.log("warn", `[preflight] summarization aborted: client disconnected`);
@@ -1234,6 +1264,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
+                // #1993: a fold succeeded after an earlier rejection in this walk — the
+                // payload shrank, so the stale failure no longer describes the end
+                // state; clear it so a later exhaustion reports its own reason (and a
+                // fitting result reports none at all).
+                failure = undefined;
                 // The summary itself re-enters the payload; net its cost against
                 // both the folded size and the session's input baseline. Without a
                 // baseline currentTokens is char-based, so net the folded span's
