@@ -304,6 +304,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let usageYielded = false;
             const indexMap = new Map<number, number>();
             const thinkingIndexes = new Set<number>();
+            // #1960: a redacted_thinking block arrives whole in content_block_start
+            // (no deltas) — capture its opaque payload so the rebuilt tail replays it
+            // byte-exact in position.
+            const redactedPayloads = new Map<number, string>();
             // #206: strip model-imitated render tags from PROSE deltas before
             // they reach the client (and before the loop accumulates them for
             // re-request rounds). Flush at the owning block's stop so held-back
@@ -405,6 +409,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         if (block.type === "thinking" || block.type === "redacted_thinking") {
                             thinkingIndexes.add(upstreamIndex);
                             sawThinking = true;
+                            if (block.type === "redacted_thinking" && typeof block.data === "string") {
+                                redactedPayloads.set(upstreamIndex, block.data);
+                            }
                         }
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
@@ -469,6 +476,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
+                        // #1960: a redacted block has no captured reasoning — replay its
+                        // opaque payload instead of sealing an empty segment.
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         removeOpenBlock(ci);
                         if (lastThinkingIndex !== null) {
@@ -479,7 +488,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             lastThinkingIndex = null;
                         }
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: false } as ParsedStreamEvent;
-                        yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
+                        const redactedData = redactedPayloads.get(upstreamIndex);
+                        if (redactedData !== undefined) {
+                            redactedPayloads.delete(upstreamIndex);
+                            yield { kind: "redacted_thinking", data: redactedData } as ParsedStreamEvent;
+                        } else {
+                            yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
+                        }
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         removeOpenBlock(ci);
