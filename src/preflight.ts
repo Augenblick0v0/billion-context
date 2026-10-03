@@ -1209,8 +1209,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // markers) keep the replay-retry semantics; other 4xx (auth /
                         // routing) fail fast instead of burning the call budget;
                         // unsplittable spans fall through to the give-up below. The
-                        // cascade is bounded by MAX_SUMMARY_CALLS_PER_PREFLIGHT via the
-                        // while-top budgetHit check.
+                        // cascade is bounded by the per-invocation summary budget
+                        // (summaryBudget, #1933) via the while-top budgetHit check.
                         const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                         if ((err.status === 400 || err.status === 413) && !transient
                             && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
