@@ -13,5 +13,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 test("default system prompt is byte-identical to the recorded fixture", async () => {
   const fixture = await import("node:fs/promises").then((fs) => fs.readFile(path.join(here, "pi-inprocess-fixtures/pi-system-prompt-default.txt"), "utf8"));
-  assert.equal(buildAcpSystemPrompt(defaultPrompts), fixture);
+  // Windows checkouts materialize text fixtures as CRLF (core.autocrlf); the
+  // in-memory template is LF — normalize before the byte comparison.
+  assert.equal(buildAcpSystemPrompt(defaultPrompts), fixture.replace(/\r\n/g, "\n"));
 });
