@@ -14,25 +14,25 @@
       {
         "version": "0.1.181",
         "date": "2026-10-03",
-        "tier": "recommended",
+        "tier": "routine",
         "summary": "Window & preflight accuracy wave: dsh context windows resolve again after every resolveModelInfo call failed on a detached receiver (#1943); preflight no longer fires at 59–63% real usage — local estimates are now calibrated against provider-reported usage (#1940, #1933); pi virtual-model selections no longer double-compress (#1962); re-signed SDK-HMAC-SHA256 egress on armed tunnels (#1884)."
       },
       {
         "version": "0.1.180",
         "date": "2026-10-02",
-        "tier": "recommended",
+        "tier": "routine",
         "summary": "OpenCode WebSocket traffic is intercepted again — compression and usage stats no longer silently no-op on OpenCode ≥ 2.0.20 (#1844)."
       },
       {
         "version": "0.1.179",
         "date": "2026-10-01",
-        "tier": "recommended",
+        "tier": "routine",
         "summary": "Compression is now inherited across agent restart / resume / new-branch forks (#1834): folded summaries survive instead of silently re-expanding on the wire (claude-code and openai-chat wires; codex/gemini in #1853 follow-up)."
       },
       {
         "version": "0.1.178",
         "date": "2026-10-01",
-        "tier": "recommended",
+        "tier": "routine",
         "summary": "dsh installs self-heal: profile bundles now converge to the global version automatically (#1803/#1804) — fixes the one-time 'invalid plugin' boot crash after a new bili publish."
       },
       {
@@ -44,7 +44,7 @@
       {
         "version": "0.1.176",
         "date": "2026-10-01",
-        "tier": "recommended",
+        "tier": "routine",
         "summary": "Stability wave: zero-injection session identity keeps the prefix cache hot across fork/resume (#1692/#1611); launcher port hardening (#1756); ACP tag-echo strip no longer eats prose (#1722); responses degenerate-output guard and transport replay retry."
       }
     ]

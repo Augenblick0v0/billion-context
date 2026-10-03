@@ -43,9 +43,12 @@ The Agent does steps 1–6, the human does step 7 (merge).
      "summary": "what changes FOR THE USER, one line, issue/PR refs"
    }
    ```
-   - `tier`: `routine` (default) or `recommended` (worth restarting soon —
-     correctness/cache/self-heal fixes; marketing is NEVER recommended).
-     Critical defects go to `advisories/`, never here.
+   - `tier`: `routine` (default) | `recommended` (restart-soon record —
+     correctness/cache/self-heal fixes; NOT user-visible, marketing is NEVER
+     recommended) | `critical` (a serious defect users must act on — the only
+     tier that ever surfaces to users, #1977; use sparingly, when the fix
+     matters more than the silence). Force-upgradeable defects go to
+     `advisories/`, never here.
    - The summary is model-written, ≤400 chars, newest-first order, cap 20
      entries. NEVER hand-edit the companion package's own `"version"` field —
      CI bumps it on publish.

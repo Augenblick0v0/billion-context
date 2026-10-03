@@ -1,13 +1,18 @@
 /**
- * Tiered release-notes visibility (#1870).
+ * Tiered release-notes visibility (#1870, display policy #1977).
  *
  * The npm companion package `billion-context-release-notes` (published by CI
  * from this repo's release-notes/ directory, exactly like the advisories
  * companion) carries one model-written summary per release with a tier label:
- *   - routine      — default; worth having, no urgency
- *   - recommended  — worth restarting soon (correctness/cache fixes)
- * Critical defects stay in the ADVISORY doc (#1481) — it is the only
- * authoritative source for force-upgrades; this doc never claims critical.
+ *   - routine      — default; worth having, no urgency. Never user-visible.
+ *   - recommended  — worth restarting soon; RECORD-ONLY since #1977 — a
+ *                    release log, not a nag. Never user-visible.
+ *   - critical     — fixes a serious defect users must act on (correctness /
+ *                    data / billing class) yet below the advisory bar. The
+ *                    ONLY tier that surfaces (#1977: silent by default).
+ * Force-upgradeable critical defects stay in the ADVISORY doc (#1481) — it
+ * remains the only authoritative source for forced updates; entries here
+ * never trigger the safety chain, they only make the update visible.
  *
  * Why a watcher at all: the self-updater is a silent courier — it downloads a
  * new version and writes one log line ("Restart to finish") that native-lane
@@ -34,7 +39,7 @@ const SUPPORTED_SCHEMA = 1;
 /** Producer-side cap (release-notes/README): the doc keeps ~20 entries. */
 export const MAX_RELEASE_NOTES_ENTRIES = 20;
 
-export type ReleaseTier = "routine" | "recommended";
+export type ReleaseTier = "routine" | "recommended" | "critical";
 
 export type ReleaseNoteEntry = {
     /** Exact released version this entry describes. */
@@ -108,7 +113,7 @@ export function parseReleaseNotesDoc(raw: unknown): { entries: ReleaseNoteEntry[
         if (typeof item !== "object" || item === null) continue;
         const e = item as Record<string, unknown>;
         const version = typeof e.version === "string" ? e.version.trim() : "";
-        const tier = e.tier === "recommended" || e.tier === "routine" ? e.tier : undefined;
+        const tier = e.tier === "recommended" || e.tier === "routine" || e.tier === "critical" ? e.tier : undefined;
         const summary = typeof e.summary === "string" ? e.summary.trim() : "";
         if (!semver.valid(version) || tier === undefined || !summary) continue;
         entries.push({
@@ -159,15 +164,18 @@ export type UpdateVisibility = {
     pendingRestart: boolean;
     /** Notes for everything between running and the newest known release. */
     span: ReleaseNoteEntry[];
-    /** A recommended-tier entry sits in the span — worth updating soon even
-     *  without a pending restart (e.g. auto-update disabled). */
-    recommended: boolean;
+    /** A critical-tier entry sits in the span — the only thing that surfaces
+     *  (#1977): a serious-defect release tells the user even without a
+     *  pending restart (e.g. auto-update disabled), and a pending restart is
+     *  only announced when the pending span contains one. */
+    critical: boolean;
 };
 
 /** Derived, synchronous view for the visibility surfaces (#1870): reads the
- *  watcher's cached state — no network, no fs. Clean installs (no span, no
- *  pending restart) yield visible=false and every surface stays
- *  byte-identical to the pre-#1870 output. */
+ *  watcher's cached state — no network, no fs. Clean installs, routine-only
+ *  spans and recommended-only spans all yield visible=false (#1977: silent
+ *  by default) and every surface stays byte-identical to the pre-#1870
+ *  output. */
 export function getUpdateVisibility(runningVersion: string): UpdateVisibility & { visible: boolean } {
     const diskVersion = state.diskVersion;
     const pendingRestart =
@@ -175,29 +183,31 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
         semver.valid(diskVersion) === diskVersion &&
         semver.gt(diskVersion, runningVersion);
     const span = spanNotes(state.entries, runningVersion);
-    const recommended = span.some((e) => e.tier === "recommended");
+    const critical = span.some((e) => e.tier === "critical");
     return {
         runningVersion,
         ...(diskVersion !== undefined ? { diskVersion } : {}),
         pendingRestart,
         span,
-        recommended,
-        visible: pendingRestart || recommended,
+        critical,
+        visible: critical,
     };
 }
 
 /** Shared wording for the /acp panel line — one line, stripper-safe slot is
  *  the caller's job. Kept compact: the panel is small, and acp_status carries
- *  the full span. */
+ *  the full span. Only ever rendered for critical spans (#1977); the final
+ *  fallback branch exists for totality (invisible states never reach the
+ *  surfaces, but the function must stay total for future callers). */
 export function describeUpdateReady(v: UpdateVisibility): string {
     const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
-    const topRec = v.span.find((e) => e.tier === "recommended");
+    const topCritical = v.span.find((e) => e.tier === "critical");
     if (v.pendingRestart && latest !== undefined) {
-        const notable = topRec ? ` Notable since ${v.runningVersion}: ${topRec.summary}` : "";
-        return `Update ready: ${latest} — restart to finish.${notable}`;
+        const notable = topCritical ? ` Critical fix since ${v.runningVersion}: ${topCritical.summary}` : "";
+        return `Critical update ready: ${latest} — restart to finish.${notable}`;
     }
-    if (topRec && latest !== undefined) {
-        return `Update available: ${latest} (recommended) — ${topRec.summary} (npm install -g billion-context@${latest})`;
+    if (topCritical && latest !== undefined) {
+        return `Critical update available: ${latest} — ${topCritical.summary} (npm install -g billion-context@${latest})`;
     }
     return `Update available: ${latest ?? "newer version"} — npm install -g billion-context@${latest ?? "latest"}`;
 }
