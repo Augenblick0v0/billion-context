@@ -3,7 +3,7 @@ import { injectResponsesDeveloperMessage, type ResponseInputItem, type Responses
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
-import { hashId } from "../util.js";
+import { hashId, strippedResponseIdWarning } from "../util.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
@@ -311,7 +311,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
             const rebuilt: Record<string, unknown> = { ...requestBody, input: finalInput };
-            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+            // #1954: same as the HTTP path — warn when we strip a non-empty
+            // chain ref, since a delta continuation then loses its history silently.
+            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+                const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
+                if (chainWarn) loggerLog("warn", `[acp-responses] ${chainWarn}`);
+                delete rebuilt.previous_response_id;
+            }
             delete rebuilt.instructions;
             return rebuilt;
         },

@@ -116,7 +116,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -4613,7 +4613,14 @@ async function prepareResponses(
     // was already lifted into the developer message at input[1]; forwarding it
     // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+    // #1954: stripping is only lossless when input already holds the full
+    // conversation. Warn when we strip a non-empty id so a native-chaining
+    // (delta) continuation that loses its history is visible, not silent 200s.
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+        const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
+        if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
+        delete rebuilt.previous_response_id;
+    }
     delete rebuilt.instructions;
     // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
     // directive; keep prompt_cache_key. Sent by hermes' codex transport and
