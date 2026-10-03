@@ -2599,6 +2599,104 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
     return `${out.join("\n")}\n`;
 }
 
+/** #1965: exit-time merge-back for the persistent codex overlay — the safe
+ *  counterpart to refreshOverlayHome's startup fold. Call it after the client
+ *  (and its db-holding processes) has exited, while this launch's pid marker
+ *  still names us as the overlay's holder, so no other bili run is mid-write
+ *  on the same overlay.
+ *
+ *  What moves back into the real home:
+ *   - SQLite sets (main + WAL/SHM/journal) merge as ONE generation via
+ *     mergeSqliteSet: winner by main-db mtime only, the loser stale-checked
+ *     against the copy-time origin snapshot (#1919) and either dropped
+ *     silently or preserved as .bili-conflict (#1917). Any rename failure
+ *     (real db open/locked — e.g. a concurrent native codex on Windows) rolls
+ *     the set back and it stays in the overlay for the next launch's startup
+ *     merge;
+ *   - private regular files/dirs created under the overlay root during the
+ *     run merge back under the same mtime-adjudicated, conflict-preserving
+ *     rules as the startup path (mergeOverlayEntry);
+ *   - entries SHARED with the real home (symlink/junction/write-through
+ *     hardlink) are skipped — their writes already landed in the real home;
+ *   - this launch's generated files (.env, MCP config.toml), bili's own
+ *     metadata (.bili-sqlite-origin.json, .bili-launch.pid) and their drafts
+ *     never leave the overlay.
+ *
+ *  Guarantee boundary: normal client exit only (a killed/crashed launcher
+ *  skips finally; its data stays recoverable in the overlay and is folded by
+ *  the next launch's refreshOverlayHome). A concurrent NATIVE codex writing
+ *  the real home during finalize is handled per set: Windows' open-file lock
+ *  makes the rename fail → rollback + retry-next-launch; on POSIX the rename
+ *  succeeds under open handles and the #1917 divergence contract applies
+ *  (both generations survive, loser as .bili-conflict).
+ *
+ *  Returns true when nothing remains pending in the overlay. */
+export function finalizeCodexHome(realHome: string, overlay: string, generatedFiles?: readonly string[]): boolean {
+    const generatedSet = new Set<string>(generatedFiles ?? []);
+    const isExcluded = (name: string): boolean =>
+        name === SQLITE_ORIGIN_FILE ||
+        name === `${SQLITE_ORIGIN_FILE}.tmp` ||
+        name === path.basename(overlayLockPath(overlay)) ||
+        name === path.basename(overlayLeaseDir(overlay)) || // release-failure residue must never merge into the real home
+        generatedSet.has(name) ||
+        [...generatedSet].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
+    let overlayEntries: string[];
+    try {
+        overlayEntries = fs.readdirSync(overlay);
+    } catch {
+        return true;
+    }
+    const entrySet = new Set(overlayEntries);
+    const dbBases: string[] = [];
+    for (const entry of overlayEntries) {
+        if (isExcluded(entry) || !isSqliteMain(entry, entrySet)) continue;
+        let st: fs.Stats;
+        try {
+            st = fs.lstatSync(path.join(overlay, entry));
+        } catch {
+            continue;
+        }
+        if (!st.isFile() && !st.isSymbolicLink()) continue;
+        dbBases.push(entry);
+    }
+    const skipMembers = new Set<string>();
+    for (const base of dbBases) {
+        for (const m of sqliteSetMembers(base)) skipMembers.add(m);
+    }
+    let ok = true;
+    for (const entry of overlayEntries) {
+        if (isExcluded(entry) || skipMembers.has(entry)) continue;
+        const p = path.join(overlay, entry);
+        let st: fs.Stats;
+        try {
+            st = fs.lstatSync(p);
+        } catch {
+            continue;
+        }
+        if (st.isSymbolicLink()) continue;
+        if (!st.isDirectory() && !st.isFile()) continue;
+        if (st.isFile() && isWriteThroughHardlink(p, path.join(realHome, entry), st)) continue;
+        if (mergeOverlayEntry(p, path.join(realHome, entry), generatedSet)) {
+            try {
+                fs.rmSync(p, { recursive: true, force: true });
+            } catch {}
+        } else {
+            ok = false;
+            console.error(`bili: could not merge ${p} into ${realHome} at exit — kept in the overlay, resolve manually.`);
+        }
+    }
+    for (const base of dbBases) {
+        if (!mergeSqliteSet(overlay, realHome, base)) {
+            ok = false;
+            console.error(
+                `bili: could not merge the SQLite set ${base} / ${base}-wal / ${base}-shm into ${realHome} at exit ` +
+                    `(the real db is likely open/locked) — kept in the overlay, retry on the next launch.`,
+            );
+        }
+    }
+    return ok;
+}
+
 /** #681/#1802: persistent <CODEX_HOME>-bili overlay. Carries (a) the bili MCP
  *  server in a merged config.toml when a per-spawn conversationId is given
  *  (inline `-c` args cannot survive cmd.exe on Windows), and (b) whenever the
@@ -2611,13 +2709,16 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  the two homes lets two paths grow independent WALs over one inode and lose
  *  committed writes (#1917). Generated files are rewritten each launch and
  *  never linked back nor merged into the real home.
- *  The overlay's .env is refresh-protected on EVERY launch, so a stale
- *  generated copy can never merge back into the real home even when a later
- *  launch does not manage it (#1802 review).
-  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
-  *  be built (caller degrades: wire-injected compression still works, native
-  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
-  *  write when another live launch owns the overlay (#1952) — callers abort. */
+ *  The overlay's .env and config.toml are refresh-protected on EVERY launch,
+ *  so a stale generated copy can never merge back into the real home even
+ *  when a later launch does not generate it (#1802 review; config.toml
+ *  symmetric to .env, #1965). On normal exit the run's data is written back
+ *  into the real home by finalizeCodexHome (#1965); generated files stay
+ *  overlay-local throughout.
+ *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
+ *  be built (caller degrades: wire-injected compression still works, native
+ *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
+ *  write when another live launch owns the overlay (#1952) — callers abort. */
 export function prepareCodexHome(opts: {
     codexHome: string;
     origin: string;
@@ -2641,12 +2742,12 @@ export function prepareCodexHome(opts: {
             }
         }
     }
-    // ".env" is ALWAYS refresh-protected, even on launches that do not
-    // generate it: a previous routed launch may have left an owned copy in the
-    // overlay, and letting refresh treat that as user data would merge it back
-    // into the real home (#1802 review).
-    const generatedFiles: string[] = [".env"];
-    if (conversationId !== undefined) generatedFiles.push("config.toml");
+    // ".env" and "config.toml" are ALWAYS refresh-protected, even on launches
+    // that do not generate them: a previous routed/MCP launch may have left an
+    // owned copy in the overlay, and letting refresh treat it as user data
+    // would merge it back into the real home (#1802 review; config.toml
+    // symmetric to .env, #1965).
+    const generatedFiles: string[] = [".env", "config.toml"];
     const overlay = `${codexHome}-bili`;
     if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
     if (manageDotEnv) {
@@ -2691,6 +2792,31 @@ export function prepareCodexHome(opts: {
             txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
         } catch {}
         writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    } else {
+        // Non-MCP launch: config.toml must end up SHARED with the real home
+        // (or absent) — drop any owned residue from a previous MCP launch and
+        // re-link from the real one (mirror of the .env handling above).
+        const cfgPath = path.join(overlay, "config.toml");
+        const realCfgPath = path.join(codexHome, "config.toml");
+        let needsLink = false;
+        try {
+            const st = fs.lstatSync(cfgPath);
+            const shared = st.isSymbolicLink()
+                ? fs.readlinkSync(cfgPath) === realCfgPath
+                : isWriteThroughHardlink(cfgPath, realCfgPath, st);
+            if (!shared) {
+                fs.unlinkSync(cfgPath);
+                needsLink = true;
+            }
+        } catch {
+            needsLink = true;
+        }
+        if (needsLink) {
+            try {
+                fs.lstatSync(realCfgPath);
+                linkOverlayEntry(codexHome, overlay, "config.toml");
+            } catch {}
+        }
     }
     return overlay;
 }
@@ -4129,6 +4255,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let opencodeTmpFile: string | undefined;
     let dshOverlayHome: string | undefined;
     let gooseOverlay: GooseOverlay | undefined;
+    let codexOverlay: { realHome: string; overlay: string; generated: readonly string[] } | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -4531,10 +4658,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // $CODEX_HOME/.env (load_dotenv overrides spawn env after start);
         // direct-URL launches only need it to carry the MCP server block.
         if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
+            const codexRealHome = resolveCodexHome(process.env);
             let inj: ReturnType<typeof prepareCodexMcpInjection>;
             try {
                 inj = prepareCodexMcpInjection({
-                    codexHome: resolveCodexHome(process.env),
+                    codexHome: codexRealHome,
                     origin,
                     caPath: codexCaPath,
                     conversationId: codexConversationId,
@@ -4548,6 +4676,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
+            // #1965: remember the exact home pair this launch used so a clean
+            // exit can write the run's data back into the REAL home. Only set
+            // when the overlay actually became CODEX_HOME — a failed prepare
+            // degrades to running directly on the real home, where nothing
+            // needs writing back.
+            const activeOverlay = inj.envPatch.CODEX_HOME;
+            if (activeOverlay !== undefined) {
+                const generated: string[] = [".env"];
+                if (codexConversationId !== undefined) generated.push("config.toml");
+                codexOverlay = { realHome: codexRealHome, overlay: activeOverlay, generated };
+            }
         }
     } else if (base === "codebuddy") {
         env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
@@ -4624,6 +4763,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (gooseOverlay) {
             try {
                 finalizeGooseHome(gooseOverlay);
+            } catch {}
+        }
+        if (codexOverlay) {
+            try {
+                finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated);
             } catch {}
         }
         if (opencodeTmpFile) {
