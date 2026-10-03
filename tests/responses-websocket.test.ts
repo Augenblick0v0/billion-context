@@ -455,6 +455,27 @@ test("Responses WS: tool argument fragments and completed arguments are byte-exa
     } finally { await f.close(); }
 });
 
+/** Windows-runners flake guard: the bili log file is written by the server
+ *  process while the test advances, so a snapshot taken right after a turn can
+ *  miss lines that are logically already emitted. Poll until every positive
+ *  pattern has landed (bounded), then vet the settled snapshot against the
+ *  negative pattern — the CI legs showed 1-2 random WS fault tests failing per
+ *  run purely on this read race (#1968). */
+async function readLogUntil(logPath: string, patterns: readonly RegExp[], notMatch?: RegExp, timeoutMs = 10000): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let log = "";
+    for (;;) {
+        log = fs.readFileSync(logPath, "utf8");
+        if (patterns.every(pattern => pattern.test(log))) break;
+        if (Date.now() > deadline) {
+            assert.ok(false, `timed out waiting for log patterns ${patterns.map(String).join(" ; ")}\n--- log tail ---\n${log.split("\n").slice(-40).join("\n")}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    if (notMatch) assert.doesNotMatch(log, notMatch);
+    return log;
+}
+
 test("Responses WS: unknown continuation returns an explicit retry-full error", async () => {
     const f = await fixture();
     try {
@@ -485,13 +506,12 @@ test(`Responses WS faults: ${terminalMode} after a delivered tool never commits 
         assert.ok(!f.rows[2].full.some(item => item.call_id === call.call_id));
         assert.ok(!JSON.stringify(f.rows[2].full).includes("private-request-payload"));
         assert.equal(f.httpRequests, 0);
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.match(log, /\[responses-ws\] \[conn=\d+\] \[session="ses_ws_/);
-        if (terminalMode === "disconnect") {
-            assert.match(log, /upstream failed phase=stream event=close close_code=1011/);
-            assert.match(log, /checkpoint reset reason=upstream-disconnect/);
-        } else assert.ok(log.includes(`checkpoint reset reason=response.${terminalMode}`));
-        assert.doesNotMatch(log, /private-tool-payload|private-request-payload|private-upstream-close-reason|fake-credential/);
+        const log = await readLogUntil(
+            f.logPath,
+            [/\[responses-ws\] \[conn=\d+\] \[session="ses_ws_/, terminalMode === "disconnect" ? /upstream failed phase=stream event=close close_code=1011/ : new RegExp(`checkpoint reset reason=response\.${terminalMode}`)],
+            /private-tool-payload|private-request-payload|private-upstream-close-reason|fake-credential/,
+        );
+        if (terminalMode === "disconnect") assert.match(log, /checkpoint reset reason=upstream-disconnect/);
     } finally { await f.close(); }
 });
 }
@@ -527,11 +547,11 @@ test("Responses WS faults: cancel after tool delivery and immediately resume wit
         assert.equal(f.connectionCount(), 2);
         await until(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(f.httpRequests, 0);
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.match(log, /client closed phase=active close_code=1000/);
-        assert.match(log, /client checkpoint reset reason=client-close/);
-        assert.match(log, /client rejected reason=previous_response_not_found/);
-        assert.doesNotMatch(log, /private-tool-payload|private-client-close-reason|private-rotated-credential/);
+        const log = await readLogUntil(
+            f.logPath,
+            [/client closed phase=active close_code=1000/, /client checkpoint reset reason=client-close/, /client rejected reason=previous_response_not_found/],
+            /private-tool-payload|private-client-close-reason|private-rotated-credential/,
+        );
     } finally { await f.close(); }
 });
 
@@ -558,7 +578,7 @@ test("Responses WS faults: an overlapping create is rejected without corrupting 
         assert.equal(f.rows[1].request.previous_response_id, response.id);
         assert.equal(f.rows[1].full.filter(item => item.call_id === call.call_id).length, 2);
         assert.ok(!JSON.stringify(f.rows[1].full).includes("must not reach upstream"));
-        assert.match(fs.readFileSync(f.logPath, "utf8"), /client rejected reason=response-in-progress/);
+        await readLogUntil(f.logPath, [/client rejected reason=response-in-progress/]);
     } finally { await f.close(); }
 });
 
@@ -581,9 +601,9 @@ test(`Responses WS faults: repeated ${code} stops after one transport recovery`,
         assert.equal(f.rows.length, 4);
         assert.equal(f.rows[3].request.previous_response_id, undefined);
         assert.ok(!JSON.stringify(f.rows[3].full).includes("bounded retry"));
-        const log = fs.readFileSync(f.logPath, "utf8").split("\n").filter(line => line.includes("[responses-ws]")).join("\n");
+        const log = (await readLogUntil(f.logPath, [/upstream rejected phase=await-first-event status=400/]))
+            .split("\n").filter(line => line.includes("[responses-ws]")).join("\n");
         assert.equal((log.match(/upstream retry reason=/g) ?? []).length, 1);
-        assert.match(log, /upstream rejected phase=await-first-event status=400/);
         assert.doesNotMatch(log, /private-error-message|fake-credential/);
         assert.equal(f.httpRequests, 0);
     } finally { await f.close(); }
@@ -630,10 +650,7 @@ test("Responses WS: a first-turn all-bili tools frame is a main turn, not an #18
         const previous = first.id as string;
         const second = completed(await f.turn([user("still a main turn after the first usage report")], previous));
         assert.equal(second.status, "completed");
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.doesNotMatch(log, /leaked bili tools/);
-        assert.doesNotMatch(log, /side request \(/);
-        assert.match(log, /view=ws-expanded/);
+        await readLogUntil(f.logPath, [/view=ws-expanded/], /leaked bili tools|side request \(/);
     } finally {
         await f.close();
     }
@@ -735,11 +752,11 @@ test(`Responses WS: actual fold and successive tool results survive ${terminalOu
                 assert.ok(!JSON.stringify(next.full).includes("OLD-BULKY-SENTINEL"));
                 assert.ok(JSON.stringify(next.full).includes("SUMMARY-WS-FOLD"));
             }
-            const log = fs.readFileSync(f.logPath, "utf8");
-            assert.match(log, /upstream retry reason=continuation-rejected action=resend-full/);
-            assert.match(log, /upstream checkpoint reset reason=reconnect/);
-            assert.match(log, /upstream retry reason=connection-limit action=reconnect-full/);
-            assert.doesNotMatch(log, /fake-credential|private-idle-close-reason/);
+            const log = await readLogUntil(
+                f.logPath,
+                [/upstream retry reason=continuation-rejected action=resend-full/, /upstream checkpoint reset reason=reconnect/, /upstream retry reason=connection-limit action=reconnect-full/],
+                /fake-credential|private-idle-close-reason/,
+            );
         }
         assert.equal(f.httpRequests, 0);
     } finally { await f.close(); }
