@@ -333,6 +333,17 @@ alive. Session binding is headless: the launcher passes
 session otherwise; per-call `conversation_id` overrides work as everywhere
 (#760).
 
+**Responses native chaining (a caveat).** bili compresses by replaying the full
+`input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a
+delta-only continuation would lose its earlier turns upstream while still
+returning 200. Today this is a non-issue for codex — observed builds send
+`store:false` and never set `previous_response_id` (an observation, not a proof;
+the E2E does not cover that shape). If you point a native-chaining Responses
+client through bili, either resend the full input/output history or set
+`ACP_KEEP_RESPONSE_ID=1`; when bili strips a non-empty `previous_response_id` it
+now logs a `warn` (#1954). Full chaining support is tracked as #1973. See the
+[official migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
 Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of
