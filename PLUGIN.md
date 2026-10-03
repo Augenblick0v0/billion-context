@@ -46,7 +46,10 @@ Fetch once at plugin startup.
     "instructionsMutable": "x-bili-plugin-instructions-mutable"
   },
   "toolEndpoint": "/__bili/plugin/tool",
-  "statusEndpoint": "/__bili/plugin/status"
+  "statusEndpoint": "/__bili/plugin/status",
+  "capabilities": {
+    "fork": { "protocolVersion": 1, "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
+  }
 }
 ```
 
@@ -91,7 +94,8 @@ Return `result` verbatim as the native tool result content.
 Notes:
 
 - Execution happens **under the session lock**, against the same view the model was shown on the last request (refs match what the model sees).
-- `compress` mutates state; `decompress` / `search_context` / `acp_status` are read-only.
+- Optional `expectedRevision` is the opaque `parentRevision` from a snapshot. It requires an explicit `conversationId` and is checked under the same session lock immediately before execution. A stale revision returns `409 PARENT_REVISION_CONFLICT` without executing the tool. This also avoids witness routing to another conversation. Existing callers omitting it retain their routing and execution behavior.
+- `compress` mutates state. Inline `decompress` marks a block restored for re-folding; range restores queue content for the next request. Successful restores also update the estimated context footprint. `search_context` / `acp_status` are read-only.
 - Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure. A **known but disabled** opt-in tool (`absorb` / `acp_rule`) is not an error: it answers `200` with `ok: true` and a `result` explaining that the feature is off on this proxy (#1192).
 
 ### 4. `GET /__bili/plugin/status?conversationId=<id>`
@@ -106,6 +110,11 @@ Context-level visibility for plugin UIs (status bars / slash commands):
   "pluginAgent": "pi",
   "contextLimit": 200000,
   "contextTokens": 138211,
+  "contextTokensSource": "usage",
+  "contextTokensAt": 1755300000000,
+  "contextGeneration": "opaque-generation",
+  "sessionRevision": "opaque-revision",
+  "model": "claude-sonnet-4",
   "inputTokens": 251000,
   "outputTokens": 40021,
   "cachedTokens": 180000,
@@ -115,7 +124,11 @@ Context-level visibility for plugin UIs (status bars / slash commands):
 }
 ```
 
-`contextTokens` is the last reported context size (input + cache-read) — the same value the nudge decision reads. Errors: `400` missing `conversationId`, `404` unknown conversation.
+`contextTokens` is the effective current input footprint, not accumulated billing. `contextTokensSource` is `usage` only for a real positive upstream input measurement with no outstanding fold credit, `estimate` for a local projection, or `unavailable` with `contextTokens: null`. Manual `compress` subtracts only its new credit from the previous observation, once; successful `decompress` adds the returned content (or file pointer) and any newly queued range content. Both publish an independent `estimate` observation without replacing the last-usage calibration baseline or changing cumulative `inputTokens` / `cachedTokens`. Never add those billing fields to infer effective context.
+
+Forwarding a new model request replaces the previous observation with an estimate until a real positive usage report arrives. That report restores `usage`; zero/missing usage cannot revive an older measured generation. A real report netted against outstanding fold credit remains an estimate of the effective view, not a measurement of that view. Forks start with independent estimates, not inherited parent usage.
+
+`contextTokensAt` is the observation time in Unix milliseconds (not the status read time), independently of the last usage timestamp. `contextGeneration` is an opaque change detector covering a unique observation id, context, revision, model and limit: successive observations remain distinct even at the same timestamp with identical token counts; repeated status reads do not create observations. Unavailable context has null tokens, timestamp and generation. Legacy persisted sessions without an independently attributed observation are unavailable until another request establishes one. `sessionId` and nullable `sessionRevision` identify the resolved session and its fork state. Pre-first-request/chain-only responses explicitly report unavailable context. Persisted sessions are loaded by the requested id before considering an explicitly requested `fallback=latest`. Errors: `400` missing `conversationId`, `404` unknown conversation.
 
 ### 5. `POST /__bili/plugin/compact`
 
@@ -140,6 +153,46 @@ The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. 
 5. The next model request carries the tool call + result in history; the proxy's `processTurn` hides the consumed call and folds the compressed range out of the wire body. The summary lives in block state, retrievable via `search_context` / `decompress` — the same as wire mode.
 
 No special handling is needed for decompression: `decompress` results come back through the same endpoint.
+
+### 8. Public snapshot and fork (protocol 1)
+
+Discover `capabilities.fork` from the manifest; do not infer support from the package version. No new configuration is required. These endpoints use the same admin gate and request-body limit as the tool API.
+
+`GET /__bili/plugin/snapshot?conversationId=<stable-parent-id>` returns:
+
+```json
+{
+  "ok": true, "protocolVersion": 1, "status": "exact",
+  "conversationId": "parent", "sessionId": "parent",
+  "parentRevision": "<opaque SHA-256 revision>",
+  "orderHash": "<SHA-256 of the full orderedMessages JSON>",
+  "orderedMessages": [{ "rawId": "h_example", "ref": "m00001", "identityHash": "<opaque SHA-256 identity>" }],
+  "messages": [{ "rawId": "h_example", "ref": "m00001", "role": "user", "text": "original text", "contentType": "text" }]
+}
+```
+
+`messages` is in exactly the same order as `orderedMessages`, describes the raw `pluginSnapshot` rather than a folded view, and includes optional `text`, `toolName`, and `toolCallId`. Compare original text and role to establish the longest matching prefix; tool identities/content type must match too. Copy the corresponding ordered identities verbatim; `identityHash` and revisions are opaque and clients do not need a content-hash algorithm. Multimodal/opaque content that cannot be verified by this text projection returns `409`, `status: unavailable`, `code: SNAPSHOT_UNAVAILABLE`, not a guessed text match. Missing raw snapshots or inconsistent raw/ref/CCR mappings likewise fail closed.
+
+`POST /__bili/plugin/fork` body:
+
+```json
+{
+  "protocolVersion": 1,
+  "parentConversationId": "parent", "childConversationId": "new-child",
+  "parentRevision": "<snapshot.parentRevision>",
+  "branchPoint": { "messageCount": 1, "orderHash": "<prefix order hash>" },
+  "orderedMessages": [{ "rawId": "h_example", "ref": "m00001", "identityHash": "<snapshot identity>" }],
+  "idempotencyKey": "stable-operation-id"
+}
+```
+
+The branch is an ordered prefix, including an empty prefix. Compute its existing order hash as lowercase SHA-256 of UTF-8 `JSON.stringify(orderedMessages)` with each identity object's keys in order `rawId`, `ref`, `identityHash`; for a full prefix reuse snapshot `orderHash`. Do not hash descriptors or folded text. Extra child messages, including a final model reply that has not left the proxy yet, may be appended on the child's first model request after copying the matched prefix.
+
+New success is `201`; exact payload replay is `200` with `replayed: true`, even after restart or later parent changes. Both return `status`, `parentRevision`, `childRevision`, `sessionId`, `branchPoint`, `inheritedBlocks`, and `expandedBlocks`. Reusing the child id with another parent, key or payload returns `409 CHILD_CONFLICT`. Invalid shapes/version/identifiers return `400 INVALID_REQUEST`; absent parent returns `404 PARENT_NOT_FOUND`; stale parent returns `409 PARENT_REVISION_CONFLICT`; altered order/raw/ref/identity returns `409 BRANCH_POINT_CONFLICT`. Missing nested originals return `409 PARENT_STATE_INCOMPLETE` with `status: unavailable`. Publication/persistence failure returns `503 FORK_FAILED` with `status: unavailable` and exposes no child; the same request may be retried.
+
+Boundary handling is `exact` when complete blocks fit inside the prefix, `expanded` when a block crosses it (crossing summaries are omitted, affected nested descendants are expanded, matched originals are retained), and `unavailable` when safe reconstruction is impossible. Blocks, nested caches, raw messages, issued ref namespace, token snapshots, rules and prefix CCR payloads are independent copies. The child never reads its parent's later state as a fallback. Registration and first-request resume heuristics do not replace its copied state. With existing persistence enabled, raw snapshots, receipts, nested originals and the child's CCR payloads survive restart; with persistence disabled, durability is not promised. Atomic child publication/idempotency covers concurrent requests to one proxy process; concurrent writers sharing one state directory across processes are not supported by this protocol.
+
+中文集成要点：协议仍为 1；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
 
 ## Security
 

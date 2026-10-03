@@ -1,10 +1,13 @@
-import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { createHash } from "node:crypto";
+import { getStore } from "./persist.js";
+import { cloneStoreForRefs } from "./store.js";
+import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -21,11 +24,12 @@ import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { settleUsageReport } from "./cache-ledger.js";
+import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
+import { incomingCoreMessages } from "./fork-adoption.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
 // via tsx and bundled via tsup). Shown in the /acp panel header, aligned with
@@ -301,7 +305,7 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision): void {
+export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
     // so both the ≤200 heuristic and size-based guards are proxies that a new
@@ -329,6 +333,19 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     );
     for (const id of staleSessionIds) remembered.delete(id);
     remembered.set(sessionId, { processed, original, nudge });
+    const session = peekSession(sessionId);
+    if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
+        session.pluginSnapshot = structuredClone(original);
+        if (rawWire !== undefined) {
+            try {
+                const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
+                session.metadata.publicSnapshotTextComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+            } catch {
+                session.metadata.publicSnapshotTextComparable = false;
+            }
+        }
+        markDirty(session);
+    }
 }
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
@@ -636,6 +653,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
+        capabilities: { fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
     }));
 }
 
@@ -680,6 +698,239 @@ export function resolveConversation(conversationId: string): { session: Session 
         entry = conversations.get(conversationId);
     }
     return { session, entry };
+}
+
+type ForkIdentity = { rawId: string; ref: string; identityHash: string };
+
+// Only inspect message content, not arbitrary tool arguments containing a `type` key.
+function comparableHistory(value: unknown): boolean {
+    if (value === null || typeof value === "string") return true;
+    if (Array.isArray(value)) return value.every(comparableHistory);
+    if (!value || typeof value !== "object") return false;
+    const part = value as Record<string, unknown>;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type === "tool_use" || part.type === "function_call") return true;
+    if (part.content !== undefined) return comparableHistory(part.content);
+    if (part.output !== undefined) return comparableHistory(part.output);
+    if (part.parts !== undefined) return comparableHistory(part.parts);
+    return typeof part.text === "string" || Array.isArray(part.tool_calls);
+}
+type ForkRequest = {
+    protocolVersion: 1;
+    parentConversationId: string;
+    childConversationId: string;
+    parentRevision: string;
+    branchPoint: { messageCount: number; orderHash: string };
+    orderedMessages: ForkIdentity[];
+    idempotencyKey: string;
+};
+
+function stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    if (value !== null && typeof value === "object") {
+        const obj = value as Record<string, unknown>;
+        return `{${Object.keys(obj).filter((k) => obj[k] !== undefined).sort().map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+}
+
+function forkHash(value: unknown): string {
+    return createHash("sha256").update(stableJson(value), "utf8").digest("hex");
+}
+
+function forkOrderHash(messages: ForkIdentity[]): string {
+    return createHash("sha256").update(JSON.stringify(messages), "utf8").digest("hex");
+}
+
+function forkToolIsError(message: CoreMessage): boolean {
+    return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
+}
+
+function forkMessageIdentityHash(message: CoreMessage): string {
+    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
+}
+
+/** Read under the session lock; compare ordered semantics, never just an id set. */
+export function publicForkInputMatches(session: Session, protocol: WireProtocol, parsed: unknown): boolean {
+    const prefix = session.pluginSnapshot;
+    if (session.metadata.publicForkReceipt === undefined || !prefix) return false;
+    try {
+        const incoming = incomingCoreMessages(protocol, parsed);
+        return incoming !== null && incoming.length >= prefix.length && prefix.every((message, index) => {
+            const candidate = incoming[index]!;
+            const ref = session.state.messageRefs.byRaw[message.id];
+            return ref !== undefined && session.state.messageRefs.byRef[ref] === message.id
+                && candidate.id === message.id && forkMessageIdentityHash(candidate) === forkMessageIdentityHash(message);
+        });
+    } catch {
+        return false;
+    }
+}
+
+function forkSnapshot(session: Session) {
+    const messages = session.pluginSnapshot;
+    if (!messages) throw new Error("raw snapshot unavailable; send a fresh plugin model request");
+    if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
+    const store = contentStoreOf(session);
+    const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
+    if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
+    const orderedMessages = messages.map((m): ForkIdentity => {
+        const ref = session.state.messageRefs.byRaw[m.id];
+        if (!ref || session.state.messageRefs.byRef[ref] !== m.id) throw new Error("raw/ref mapping inconsistent");
+        const entry = store.byRef[ref];
+        if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (m.text && parseStoredPlaceholder(m.text)?.ref === ref && !entry)) throw new Error("CCR original unavailable or alias inconsistent");
+        return { rawId: m.id, ref, identityHash: forkMessageIdentityHash(m) };
+    });
+    const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
+    const parentRevision = forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
+    return { protocolVersion: 1, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+}
+
+function resolveForkConversation(id: string): Session | undefined {
+    if (peekSession(id)) return peekSession(id);
+    if (getStore().loadSync(id)) return getSession(id);
+    const { session, entry } = resolveConversation(id);
+    if (session) return session;
+    const persistedId = entry?.sessionId ?? id;
+    if (!getStore().loadSync(persistedId)) return undefined;
+    return getSession(persistedId);
+}
+
+function forkReply(res: ServerResponse, status: number, body: unknown): void {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+}
+
+export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
+    if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
+    const session = resolveForkConversation(conversationId);
+    if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
+    acquireInFlight(session);
+    try {
+        await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
+    } catch (err) {
+        forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
+    } finally {
+        releaseInFlight(session);
+    }
+}
+
+function parseForkRequest(payload: string): ForkRequest {
+    const value: unknown = JSON.parse(payload);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected fork object");
+    const b = value as Record<string, unknown>;
+    const identifier = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 256 && v.trim() === v && !/[\x00-\x1f\x7f]/.test(v);
+    const hash = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
+    if (b.protocolVersion !== 1) throw new Error("unsupported fork protocolVersion (expected 1)");
+    if (!identifier(b.parentConversationId) || !identifier(b.childConversationId) || !identifier(b.idempotencyKey) || !hash(b.parentRevision)) throw new Error("invalid fork identity/revision");
+    if (b.parentConversationId === b.childConversationId) throw new Error("parent and child must differ");
+    const point = b.branchPoint as Record<string, unknown> | null;
+    if (!point || !Number.isSafeInteger(point.messageCount) || (point.messageCount as number) < 0 || !hash(point.orderHash) || !Array.isArray(b.orderedMessages) || b.orderedMessages.length !== point.messageCount) throw new Error("invalid branchPoint/orderedMessages");
+    const orderedMessages = b.orderedMessages.map((v: unknown): ForkIdentity => {
+        if (!v || typeof v !== "object") throw new Error("invalid ordered identity");
+        const item = v as Record<string, unknown>;
+        if (!identifier(item.rawId) || typeof item.ref !== "string" || !/^m\d{5,}$/.test(item.ref) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
+        return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
+    });
+    return { protocolVersion: 1, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+}
+
+export async function handlePluginFork(payload: string, res: ServerResponse): Promise<void> {
+    let request: ForkRequest;
+    try { request = parseForkRequest(payload); }
+    catch (err) { return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: String(err) }); }
+    const requestHash = forkHash(request);
+    const replay = (): boolean => {
+        const existing = resolveForkConversation(request.childConversationId);
+        if (!existing) return false;
+        const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
+        if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
+        else forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
+        return true;
+    };
+    if (replay()) return;
+    if (conversations.has(request.childConversationId) || registeredIds.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId)) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+    const parent = resolveForkConversation(request.parentConversationId);
+    if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
+    acquireInFlight(parent);
+    try {
+        await withSessionLock(parent, () => {
+            if (replay()) return;
+            if (conversations.has(request.childConversationId) || registeredIds.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId)) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+            let snapshot: ReturnType<typeof forkSnapshot>;
+            try { snapshot = forkSnapshot(parent); }
+            catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
+            if (snapshot.parentRevision !== request.parentRevision) return forkReply(res, 409, { ok: false, code: "PARENT_REVISION_CONFLICT", error: "parent revision changed" });
+            const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
+            if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
+            const rawIds = new Set(prefix.map((m) => m.rawId));
+            const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
+            const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
+            const blocks = parent.state.blocks.filter((b) => b.effectiveMessageIds.length > 0 && b.effectiveMessageIds.every((id) => rawIds.has(id)));
+            const blockIds = new Set(blocks.map((b) => b.blockId));
+            const expandedChildren = new Set(crossing.flatMap((b) => b.directBlockIds));
+            for (const b of [...blocks, ...crossing]) {
+                const content = parent.blockContents.get(b.blockId);
+                if (!content || !content.full || typeof content.full.text !== "string" || !content.full.text || b.directBlockIds.some((id) => !parent.state.blocks.some((childBlock) => childBlock.blockId === id))) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block/original content unavailable" });
+            }
+            for (const b of blocks) {
+                if (b.directBlockIds.some((id) => !blockIds.has(id))) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "nested block outside matched prefix" });
+                child.state.blocks.push({ ...structuredClone(b), ...(expandedChildren.has(b.blockId) ? { active: false, expanded: true } : {}) });
+                child.blockContents.set(b.blockId, structuredClone(parent.blockContents.get(b.blockId)!));
+            }
+            // Keep the issued ref namespace reserved, including dead refs, to prevent reuse.
+            child.state.messageRefs = structuredClone(parent.state.messageRefs);
+            for (const { rawId, ref } of prefix) {
+                child.state.messageRefs.byRaw[rawId] = ref;
+                child.state.messageRefs.byRef[ref] = rawId;
+                if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
+            }
+            child.state.nextBlockId = parent.state.nextBlockId;
+            child.state.nextRunId = parent.state.nextRunId;
+            child.state.lastPassIds = prefix.map((m) => m.rawId);
+            child.state.rules = structuredClone(parent.state.rules);
+            child.state.nextRuleId = parent.state.nextRuleId;
+            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
+            child.state.stats.compressionCount = blocks.length;
+            if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
+            child.pluginSnapshot = structuredClone(parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount));
+            const forkView = prune(child.pluginSnapshot, child.state);
+            // Hiding the original pair is safe only if its summary survives the fork.
+            child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
+                rawIds.has(a.callMessageId) && rawIds.has(a.resultMessageId) && (
+                    (a.absorbCallId !== undefined && forkView.some((m) => m.contentType === "tool-call" && m.toolCallId === a.absorbCallId)) ||
+                    child.state.blocks.some((b) => b.active && !b.expanded && a.summary.length > 0 && b.summary.includes(a.summary))
+                )) ?? []);
+            child.lastMessages = structuredClone(child.pluginSnapshot);
+            child.lastMessagesFolded = false;
+            const parentStore = contentStoreOf(parent);
+            for (const { ref, rawId } of prefix) {
+                const entry = parentStore.byRef[ref];
+                if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
+            }
+            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.map((m) => m.ref))) ?? undefined;
+            child.metadata.publicSnapshotTextComparable = true;
+            child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
+            for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveCcr", "effectiveContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
+            child.metadata.parentConversationId = request.parentConversationId;
+            child.metadata.parentRevision = request.parentRevision;
+            child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
+            child.stats.contextTokensSource = "estimate";
+            child.metadata.contextTokensAt = Date.now();
+            recordContextObservation(child, child.stats.contextTokens, "estimate");
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 1, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            child.metadata.publicForkReceipt = { requestHash, response };
+            publishForkSession(child);
+            recordPluginSession(request.childConversationId, child.id);
+            remembered.set(child.id, { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) });
+            forkReply(res, 201, response);
+        });
+    } catch (err) {
+        forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) });
+    } finally {
+        releaseInFlight(parent);
+    }
 }
 
 /** #1192: model-facing explanation for an opt-in tool the host registered but
@@ -749,8 +1000,8 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
 }
 
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
-    const { session: resolvedSession, entry } = resolveConversation(conversationId);
-    let session = resolvedSession;
+    let session = resolveForkConversation(conversationId);
+    const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
     if (!session && fallbackLatest) {
@@ -778,7 +1029,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const verdict = chainVerdictFor(conversationId);
         if (verdict !== undefined) {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict) }));
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict), sessionId: null, sessionRevision: null, model: null, contextLimit: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
         // Runtime-info protocol (#955): no session exists yet, but the client
@@ -789,7 +1040,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const pre = pluginRuntimeTable.get(conversationId) ?? pluginRuntimeByConversation.get(conversationId);
         if (pre !== undefined) {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null }));
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
         res.writeHead(404, { "content-type": "application/json" });
@@ -798,6 +1049,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     }
     if (entry) entry.lastSeen = Date.now();
     const limit = session.metadata.effectiveContextLimit;
+    const observation = currentContextObservation(session);
+    const contextTokensSource = observation?.source ?? "unavailable";
+    const contextTokens = observation?.tokens ?? null;
+    let sessionRevision: string | null = null;
+    try { sessionRevision = forkSnapshot(session).parentRevision; } catch {}
     const mem = remembered.get(session.id);
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     // #387: the remembered nudge is a prepare-time snapshot. A compress tool
@@ -809,7 +1065,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     // serving the stale snapshot.
     let nudge: NudgeDecision | undefined;
     try {
-        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
+        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
         if (messages.length > 0) {
             // #833: base kernelConfig carries no file/provider/model compress
             // settings — render from the session's last resolved Config so the
@@ -887,6 +1143,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     res.end(JSON.stringify({
         ok: true,
         conversationId: resolvedConversationId,
+        sessionId: session.id,
+        sessionRevision,
         fallback: viaFallback || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
@@ -896,7 +1154,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             ?? pluginRuntimeInfoForConversation(conversationIdForSession(session.id), typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
             ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
-        contextTokens: session.stats.lastInputTokens,
+        contextTokens,
+        contextTokensSource,
+        contextTokensAt: observation?.at ?? null,
+        contextGeneration: observation ? forkHash({ sessionId: session.id, sessionRevision, generation: observation.generation, contextTokens, contextTokensSource, limit, model: session.metadata.lastModel }) : null,
+        compressCreditTokens: session.stats.compressCreditTokens ?? 0,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
         cachedTokens: session.stats.cachedTokens,
@@ -913,9 +1175,10 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown };
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected tool object");
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
@@ -923,29 +1186,31 @@ export async function handlePluginTool(
     }
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
+    if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });
+    if (parsed.expectedRevision !== undefined && !conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision requires conversationId" });
+    // Explicit ids never yield to another session's outbound witness.
     // #1685 zero-injection routing ladder for id-less tool POSTs:
     //   1. outbound witness — this proxy streamed the very tool_use being
     //      answered; a unique hit names the session (the free-text summary is
-    //      a unique anchor). Wins over a body id when they disagree.
-    //   2. body conversationId — extensions (pi/opencode/dsh) and legacy
-    //      per-call values still carry it; unchanged behavior.
-    //   3. single-active arbitration — one fresh conversation on the proxy.
-    //   4. anything else is a loud 400 (never a silent guess).
+    //      a unique anchor).
+    //   2. single-active arbitration — one fresh conversation on the proxy.
+    //   3. anything else is a loud 400 (never a silent guess).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
     let routedBy: "witness" | "body" | "arb" = "body";
-    if (witnessIds.size === 1) {
+    if (conversationId) {
+        session = resolveForkConversation(conversationId);
+        entry = conversations.get(conversationId);
+        if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+    } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];
         session = peekSession(wit);
         if (session) {
             const cid = conversationIdForSession(session.id);
             entry = cid ? conversations.get(cid) : undefined;
             routedBy = "witness";
-            if (conversationId && conversationId !== cid && conversationId !== session.id) {
-                deps.log("info", `[plugin] tool "${tool}" routed by outbound witness to session ${session.id}${cid ? ` (conversation ${cid})` : ""}; body conversationId "${conversationId}" differs and was ignored (#1685)`);
-            }
         }
     } else if (witnessIds.size > 1 && !conversationId) {
         res.writeHead(400, { "content-type": "application/json" });
@@ -976,7 +1241,8 @@ export async function handlePluginTool(
         }
     }
     if (!session) {
-        ({ session, entry } = resolveConversation(conversationId));
+        session = resolveForkConversation(conversationId);
+        entry = conversations.get(conversationId);
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.
@@ -1043,16 +1309,31 @@ export async function handlePluginTool(
     delete args.conversation_id;
     const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
-    let result: string;
+    let result: string | undefined;
     try {
         result = await withSessionLock(session, async () => {
+            if (parsed.expectedRevision !== undefined) {
+                try {
+                    if (forkSnapshot(session).parentRevision !== parsed.expectedRevision) {
+                        forkReply(res, 409, { ok: false, code: "PARENT_REVISION_CONFLICT", error: "session revision changed" });
+                        return undefined;
+                    }
+                } catch (err) {
+                    forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
+                    return undefined;
+                }
+            }
             // Read the remembered snapshot UNDER the session lock: the model
             // request rewrites remembered atomically under this same lock
             // (rememberPluginMessages), so a racing tool call sees a consistent
             // state instead of a stale/empty window.
             const mem = remembered.get(session.id);
-            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
-            return executeProxyTool(tool, args, {
+            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+            const before = currentContextObservation(session);
+            const creditBefore = session.stats.compressCreditTokens ?? 0;
+            const compressBefore = session.lastCompress;
+            const pendingBefore = new Set(session.pendingRetrievals.map((p) => p.ref));
+            const toolResult = executeProxyTool(tool, args, {
                 core: deps.core,
                 // #833: run proxy tools under the session's last resolved Config
                 // (same values the wire path used), not the base kernelConfig.
@@ -1061,6 +1342,16 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId);
+            const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
+            const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
+            // The string tool protocol has distinct success headers for whole/derived and range restores.
+            const restored = tool === "decompress" && (/^\[Block [^\n]+ content /.test(toolResult) || /^\[decompress [^\n]+: restored \d+ item\(s\)/.test(toolResult));
+            if (before && (creditDelta !== 0 || session.lastCompress !== compressBefore || restored)) {
+                // Credit was already applied to lastInputTokens by the tool; do not net it twice.
+                const restoredTokens = restored ? countMessageTokens({ text: toolResult }) + restoredInjections.reduce((sum, p) => sum + countMessageTokens(p.injection), 0) : 0;
+                recordContextObservation(session, Math.max(0, before.tokens - creditDelta) + restoredTokens, "estimate");
+            }
+            return toolResult;
         });
     } catch (err) {
         releaseInFlight(session);
@@ -1070,6 +1361,7 @@ export async function handlePluginTool(
         return;
     }
     releaseInFlight(session);
+    if (result === undefined) return;
     // #760b: evidence-based plugin-mode flip. A successful MCP tool execution proves
     // this session's host owns the bili compression tools, so bind it to plugin mode
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire

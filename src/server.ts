@@ -111,8 +111,9 @@ import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
+import { publicForkInputMatches } from "./plugin.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -1483,6 +1484,18 @@ async function handle(
         // requires. Do not "simplify" this back to `config`.
         return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress));
     }
+    if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
+        return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/fork") {
+        try {
+            return await handlePluginFork((await readBody(req)).toString("utf8"), res);
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, code: "INVALID_REQUEST", error: String(err) }));
+            return;
+        }
+    }
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
         const params = new URLSearchParams(query);
@@ -2349,6 +2362,22 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        let publicForkPrefix = false;
+        if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
+            acquireInFlight(session);
+            try {
+                const accepted = await withSessionLock(session, () => {
+                    publicForkPrefix = publicForkInputMatches(session, protocol, parsed);
+                    if (publicForkPrefix || session.stats.requests > 0) return true;
+                    res.writeHead(409, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, code: "FORK_PREFIX_CONFLICT", error: "first child request does not match its inherited ordered prefix" }));
+                    return false;
+                });
+                if (!accepted) return;
+            } finally {
+                releaseInFlight(session);
+            }
+        }
         // Audit stamp (#730 forensics): the effective pack for the most recent
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.
@@ -2518,7 +2547,7 @@ async function handle(
         // parent chain at read time (src/decompress-shared.ts, depth cap 8).
         // Late binding is harmless (the link copies nothing at link time), so
         // the gate is idempotence, not first-request.
-        if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined) {
+        if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
             try {
                 const parentSession = resolveConversation(derivedParent)?.session;
                 if (parentSession) {
@@ -2557,7 +2586,7 @@ async function handle(
         // assigns refs. A resolved explicit plugin-reported lineage above wins
         // (gate on derivedFromSessionId); this content match is the fallback
         // signal for clients that report no lineage.
-        if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && opts.resumeInheritance !== false) {
+        if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
             const resume = prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
             if (resume) {
                 const resumeParent = peekSession(resume.sessionId) ?? getStore().loadSync(resume.sessionId, { protocol, upstreamOrigin }) ?? undefined;
@@ -2688,8 +2717,9 @@ async function handle(
         // all-bili-tools demotion is vetoed for them (side requests on this lane
         // are identified by the #1699 persona header instead).
         const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
+        // A verified public-fork prefix also proves this is main history.
         const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
-            && !wsLaneEnvelope
+            && !wsLaneEnvelope && !publicForkPrefix
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
@@ -2743,7 +2773,7 @@ async function handle(
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
         const requestAgent = pluginRequestAgentHeader(req.headers);
-        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || isSideRequest(parsed, requestAgent))) {
+        if (!countTokens && !responsesCompact && protocol !== null && !publicForkPrefix && (demotedSide || isSideRequest(parsed, requestAgent))) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -3200,7 +3230,7 @@ async function handle(
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
                 }
             }
         } finally {
@@ -3797,6 +3827,7 @@ async function prepareAnthropic(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
+        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4042,6 +4073,7 @@ async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
+        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4308,6 +4340,7 @@ async function prepareGoogle(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
+        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4615,6 +4648,7 @@ async function prepareResponses(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
+        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;

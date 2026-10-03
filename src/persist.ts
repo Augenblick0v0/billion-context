@@ -154,6 +154,8 @@ interface PersistedSession {
      *  absent on records written before #401, whose `messages` held the raw
      *  history and must still be pruned at export time. */
     messagesFolded?: boolean;
+    pluginSnapshot?: CoreMessage[];
+    forkContentStore?: MessageContentStore;
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
@@ -170,6 +172,10 @@ function mergeState(parsed: CompressionState): CompressionState {
         nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
         nextRunId: parsed.nextRunId ?? fresh.nextRunId,
         tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
+        lastPassIds: parsed.lastPassIds ?? fresh.lastPassIds,
+        hiddenOrphanRefs: parsed.hiddenOrphanRefs ?? fresh.hiddenOrphanRefs,
+        terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
+        nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
         // Without this, a restart re-exposes absorbed tool outputs: state
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
@@ -677,10 +683,15 @@ function buildRecord(session: Session): PersistedSession {
         stats: { ...session.stats },
         messages: snapshot,
         messagesFolded: snapshot ? true : undefined,
+        pluginSnapshot: session.pluginSnapshot,
+        forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
-        metadata: { ...session.metadata, biliVersion: VERSION },
+        metadata: { ...session.metadata, ...(session.pluginSnapshot && session.contentStore ? { publicSnapshotStoredRefs: session.pluginSnapshot.flatMap((m) => {
+            const ref = session.state.messageRefs.byRaw[m.id];
+            return ref && session.contentStore!.byRef[ref] ? [ref] : [];
+        }) } : {}), biliVersion: VERSION },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,
@@ -777,6 +788,8 @@ function buildSession(parsed: PersistedSession): Session {
         blockContents,
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
+        pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
+        contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,
         pendingRetrievals: [],
