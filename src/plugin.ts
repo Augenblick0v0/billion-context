@@ -336,6 +336,14 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     const session = peekSession(sessionId);
     if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
         session.pluginSnapshot = structuredClone(original);
+        const previousRefs = session.metadata.publicSnapshotStoredRefs;
+        session.metadata.publicSnapshotStoredRefs = [...new Set([
+            ...(Array.isArray(previousRefs) ? previousRefs : []),
+            ...original.flatMap((m) => {
+                const ref = session.state.messageRefs.byRaw[m.id];
+                return ref && session.contentStore?.byRef[ref] ? [ref] : [];
+            }),
+        ])];
         if (rawWire !== undefined) {
             try {
                 const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
@@ -710,6 +718,7 @@ function comparableHistory(value: unknown): boolean {
     const part = value as Record<string, unknown>;
     if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
+    if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return comparableHistory(part.content);
     if (part.output !== undefined) return comparableHistory(part.output);
     if (part.parts !== undefined) return comparableHistory(part.parts);
@@ -774,11 +783,15 @@ function forkSnapshot(session: Session) {
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
+    const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
+    if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
+    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         if (!ref || session.state.messageRefs.byRef[ref] !== m.id) throw new Error("raw/ref mapping inconsistent");
         const entry = store.byRef[ref];
-        if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (m.text && parseStoredPlaceholder(m.text)?.ref === ref && !entry)) throw new Error("CCR original unavailable or alias inconsistent");
+        const placeholder = m.text ? parseStoredPlaceholder(m.text) : null;
+        if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
         return { rawId: m.id, ref, identityHash: forkMessageIdentityHash(m) };
     });
     const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
@@ -917,7 +930,6 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.metadata.parentRevision = request.parentRevision;
             child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
             child.stats.contextTokensSource = "estimate";
-            child.metadata.contextTokensAt = Date.now();
             recordContextObservation(child, child.stats.contextTokens, "estimate");
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 1, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
@@ -1164,6 +1176,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         cachedTokens: session.stats.cachedTokens,
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
+        compressibleRanges: nudge?.compressibleRanges ?? null,
         panel,
         webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,

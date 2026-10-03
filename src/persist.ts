@@ -11,6 +11,7 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
+import { currentContextObservation } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -675,12 +676,24 @@ export class SessionStore {
 
 function buildRecord(session: Session): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
+    const observation = currentContextObservation(session);
+    if (session.pluginSnapshot && session.contentStore) {
+        const previous = session.metadata.publicSnapshotStoredRefs;
+        session.metadata.publicSnapshotStoredRefs = [...new Set([
+            ...(Array.isArray(previous) ? previous : []),
+            ...session.pluginSnapshot.flatMap((m) => {
+                const ref = session.state.messageRefs.byRaw[m.id];
+                return ref && session.contentStore!.byRef[ref] ? [ref] : [];
+            }),
+        ])];
+    }
     return {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         id: session.id,
         meta: { ...session.meta },
-        stats: { ...session.stats },
+        // Credits are one-shot and are not restored; persist the effective view instead.
+        stats: { ...session.stats, ...(observation ? { contextTokens: observation.tokens, contextTokensSource: observation.source } : {}) },
         messages: snapshot,
         messagesFolded: snapshot ? true : undefined,
         pluginSnapshot: session.pluginSnapshot,
@@ -688,10 +701,7 @@ function buildRecord(session: Session): PersistedSession {
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
-        metadata: { ...session.metadata, ...(session.pluginSnapshot && session.contentStore ? { publicSnapshotStoredRefs: session.pluginSnapshot.flatMap((m) => {
-            const ref = session.state.messageRefs.byRaw[m.id];
-            return ref && session.contentStore!.byRef[ref] ? [ref] : [];
-        }) } : {}), biliVersion: VERSION },
+        metadata: { ...session.metadata, biliVersion: VERSION },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,

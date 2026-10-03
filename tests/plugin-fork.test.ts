@@ -3,11 +3,11 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { applyAbsorb, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
+import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -15,6 +15,7 @@ import { _resetPluginStateForTest, rememberPluginMessages, resolveConversation }
 import { _resetSessionsForTest, getSession } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
+import { contentStoreOf } from "../src/store.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -51,6 +52,7 @@ interface StatusResponse {
     compressCreditTokens: number;
     inputTokens: number;
     contextLimit: number | null;
+    compressibleRanges: { startRef: string; endRef: string; count: number }[] | null;
 }
 
 type PluginResponse<Path extends string> = Path extends "/__bili/plugin/manifest"
@@ -267,6 +269,12 @@ test("HTTP compressed originals are isolated across parent and siblings and stra
         assert.equal(straddler.status, 201);
         assert.equal(straddler.body.status, "expanded");
         assert.deepEqual(straddler.body.inheritedBlocks, []);
+        await sendModel(h, "straddler", [...h.messages.slice(0, 1), { role: "assistant", content: "expanded child first continuation" }]);
+        const expandedOutbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert.match(expandedOutbound, /first original/);
+        assert(!expandedOutbound.includes("second original"), expandedOutbound);
+        assert(!expandedOutbound.includes("tail original"), expandedOutbound);
+        assert(!expandedOutbound.includes(summary), expandedOutbound);
         const original = await h.request("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
         assert.match(original.body.result, /first original/);
         assert.match(original.body.result, /second original/);
@@ -357,6 +365,95 @@ test("HTTP persistence failure leaves no child and retry can succeed", async () 
     } finally { _setStoreForTest(h.store); await h.close(); }
 });
 
+test("HTTP CCR deleted index fails closed in memory after persistence", async () => {
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
+        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "retained CCR original", kind: "original", tokens: 10, head: "retained" });
+        parent.contentStoreDirty = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        delete parent.contentStore.byRef.m00001;
+        const before = JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, store: parent.contentStore });
+        const unavailable = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(unavailable.status, 409);
+        assert.equal(unavailable.body.code, "SNAPSHOT_UNAVAILABLE");
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
+        assert.equal(fork.status, 409);
+        assert.equal(fork.body.status, "unavailable");
+        assert.equal(resolveConversation("child").session, undefined);
+        assert.equal(h.store.loadSync("child"), null);
+        assert.equal(JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, store: parent.contentStore }), before);
+    } finally { await h.close(); }
+});
+
+test("HTTP CCR shared payload deletion fails closed before persistence", async () => {
+    const h = await harness();
+    try {
+        const parent = resolveConversation("parent").session!;
+        let store = createContentStore();
+        for (const [i, message] of parent.pluginSnapshot!.slice(0, 2).entries()) {
+            store = storeOriginal(store, { ref: `m0000${i + 1}`, rawId: message.id, text: "shared payload", kind: "original", tokens: 10, head: "shared" });
+        }
+        parent.contentStore = store;
+        rememberPluginMessages(parent.id, parent.pluginSnapshot!, parent.pluginSnapshot!);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        delete store.byRef.m00001;
+        const before = JSON.stringify(parent);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 409);
+        assert.equal(resolveConversation("child").session, undefined);
+        assert.equal(JSON.stringify(parent), before);
+    } finally { await h.close(); }
+});
+
+for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
+    test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
+        const h = await harness(true);
+        try {
+            const parent = resolveConversation("parent").session!;
+            let store = createContentStore();
+            for (const [i, message] of parent.pluginSnapshot!.slice(0, 2).entries()) {
+                store = storeOriginal(store, { ref: `m0000${i + 1}`, rawId: message.id, text: "shared payload", kind: "original", tokens: 10, head: "shared" });
+            }
+            parent.contentStore = store;
+            parent.contentStoreDirty = true;
+            assert(h.store.flushSync(parent));
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const namespace = join(h.dir, "sessions", parent.meta.protocol!);
+            const filename = readdirSync(namespace).find((name) => name.endsWith(".content-store.json"));
+            assert(filename);
+            const path = join(namespace, filename);
+            const disk = JSON.parse(readFileSync(path, "utf8")) as typeof store;
+            const payloadHash = disk.byRef.m00001!.hash;
+            switch (corruption) {
+                case "missing-ref": delete disk.byRef.m00001; break;
+                case "missing-payload": delete disk.byHash[payloadHash]; break;
+                case "orphan-payload": disk.byHash[createHash("sha256").update("orphan").digest("hex")] = "orphan"; break;
+                case "wrong-raw-alias": disk.byRef.m00001!.rawId = parent.pluginSnapshot![1].id; break;
+                case "changed-payload": disk.byHash[payloadHash] = "corrupted original"; break;
+            }
+            writeFileSync(path, JSON.stringify(disk));
+            h.store.cancelAll();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            const restored = getSession("parent");
+            contentStoreOf(restored);
+            const parentState = () => JSON.stringify({ state: restored.state, messages: restored.pluginSnapshot, metadata: restored.metadata, store: restored.contentStore });
+            const before = parentState();
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+            const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
+            assert.equal(fork.status, 409);
+            assert.equal(fork.body.status, "unavailable");
+            assert.equal(resolveConversation("child").session, undefined);
+            assert.equal(h.store.loadSync("child"), null);
+            assert.equal(parentState(), before);
+            assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
+        } finally { await h.close(); }
+    });
+}
+
 test("HTTP fork revision and originals survive a new proxy process", async () => {
     const h = await harness(true);
     let child: ReturnType<typeof spawn> | undefined;
@@ -427,7 +524,17 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
         assert(typeof before.body.contextTokensAt === "number");
         assert(before.body.contextTokensAt > 0);
         assert.equal(typeof before.body.contextGeneration, "string");
+        assert(Array.isArray(before.body.compressibleRanges));
+        assert(before.body.compressibleRanges.length > 0);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        for (const range of before.body.compressibleRanges) {
+            assert(snapshot.orderedMessages.some(message => message.ref === range.startRef));
+            assert(snapshot.orderedMessages.some(message => message.ref === range.endRef));
+            assert(Number.isInteger(range.count) && range.count > 0);
+        }
+        assert.equal(before.body.sessionRevision, snapshot.parentRevision);
         const again = await h.request("/__bili/plugin/status?conversationId=parent");
+        assert.deepEqual(again.body.compressibleRanges, before.body.compressibleRanges);
         assert.equal(again.body.contextTokensAt, before.body.contextTokensAt);
         assert.equal(again.body.contextGeneration, before.body.contextGeneration);
         const compressed = await h.request("/__bili/plugin/tool", { conversationId: "parent", tool: "compress", args: { content: [{ startId: "m00001", endId: "m00002", summary: "The prefix preserves the first user request and the second assistant response, with all original content retained for decompression." }] } });
@@ -442,6 +549,35 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
         assert.notEqual(after.body.contextGeneration, before.body.contextGeneration);
         assert.equal(after.body.inputTokens, 10000);
         assert.equal(after.body.contextLimit, 400000);
+    } finally { await h.close(); }
+});
+
+test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", async () => {
+    const h = await harness(true);
+    try {
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot, "child", 3))).status, 201);
+        assert.equal(resolveConversation("child").session!.metadata.contextTokensAt, undefined);
+        await compress(h, "child");
+        const before = (await h.request("/__bili/plugin/status?conversationId=child")).body;
+        assert.equal(before.contextTokensSource, "estimate");
+        assert(before.compressCreditTokens > 0);
+        assert(h.store.flushSync(resolveConversation("child").session!));
+        _resetPluginStateForTest();
+        _resetSessionsForTest();
+        const after = (await h.request("/__bili/plugin/status?conversationId=child")).body;
+        assert.equal(after.contextTokens, before.contextTokens);
+        assert.equal(after.contextTokensAt, before.contextTokensAt);
+        assert.equal(after.contextGeneration, before.contextGeneration);
+        assert.equal(after.sessionRevision, before.sessionRevision);
+        assert.equal(after.compressCreditTokens, 0);
+        const restored = resolveConversation("child").session!;
+        assert.equal(restored.stats.contextTokens, before.contextTokens);
+        assert.equal(restored.stats.contextTokensSource, "estimate");
+        assert(h.store.flushSync(restored));
+        _resetPluginStateForTest();
+        _resetSessionsForTest();
+        assert.equal((await h.request("/__bili/plugin/status?conversationId=child")).body.contextTokens, before.contextTokens);
     } finally { await h.close(); }
 });
 
@@ -498,6 +634,55 @@ test("HTTP multimodal snapshots are explicitly unavailable, not text-only matche
         assert.equal(resolveConversation("child").session, undefined);
     } finally { await h.close(); }
 });
+
+test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", async () => {
+    const h = await harness(true);
+    try {
+        const baseline = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const placeholder = buildStoredPlaceholder({ ref: "m00077", kind: "original", tokens: 100, head: "missing original", retrieveToolName: "acp_retrieve" });
+        await sendModel(h, "foreign-placeholder", [{ role: "user", content: placeholder }, { role: "assistant", content: "retained tail" }]);
+        const parent = resolveConversation("foreign-placeholder").session!;
+        assert.equal(parent.state.messageRefs.byRaw[parent.pluginSnapshot![0].id], "m00001");
+        assert.deepEqual(contentStoreOf(parent).byRef, {});
+        const state = () => JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, metadata: parent.metadata, store: parent.contentStore });
+        const before = state();
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=foreign-placeholder");
+        assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(baseline), parentConversationId: "foreign-placeholder" });
+        assert.equal(fork.status, 409, JSON.stringify(fork.body));
+        assert.equal(fork.body.status, "unavailable");
+        assert.equal(resolveConversation("child").session, undefined);
+        assert.equal(h.store.loadSync("child"), null);
+        assert.equal(state(), before);
+    } finally { await h.close(); }
+});
+
+for (const content of [null, "audio transcript"] as const) {
+    test(`HTTP OpenAI assistant audio with ${content === null ? "null" : "text"} content is unavailable`, async () => {
+        const h = await harness(true);
+        try {
+            const baseline = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const messages = [{ role: "user", content: "review the audio" }, { role: "assistant", content, audio: { id: "audio_fixture" } }, { role: "user", content: "continue" }];
+            const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "audio-parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+            assert.equal(response.status, 200, await response.text());
+            const parent = resolveConversation("audio-parent").session!;
+            contentStoreOf(parent);
+            const state = () => JSON.stringify({ state: parent.state, messages: parent.pluginSnapshot, metadata: parent.metadata, store: parent.contentStore });
+            const before = state();
+            const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=audio-parent");
+            assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));
+            assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+            assert.equal(parent.metadata.publicSnapshotTextComparable, false);
+            const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(baseline), parentConversationId: "audio-parent" });
+            assert.equal(fork.status, 409, JSON.stringify(fork.body));
+            assert.equal(fork.body.status, "unavailable");
+            assert.equal(resolveConversation("child").session, undefined);
+            assert.equal(h.store.loadSync("child"), null);
+            assert.equal(state(), before);
+        } finally { await h.close(); }
+    });
+}
 
 test("HTTP fork before absorb summary preserves the original pair on the first child request", async () => {
     const h = await harness();
@@ -620,6 +805,14 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot, "nested-sibling", 5))).status, 201);
         for (const id of ["nested", "nested-sibling"]) {
             await sendModel(h, id, [...history.slice(0, 5), { role: "assistant", content: `${id} first continuation` }]);
+            const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+            assert(outbound.includes(summary), outbound);
+            assert(outbound.includes(`${id} first continuation`), outbound);
+            // Kernel prune preserves the first user anchor even when its block is folded.
+            assert.match(outbound, /first original/);
+            assert(!outbound.includes("second original"), outbound);
+            assert(!outbound.includes("third response"), outbound);
+            assert(!outbound.includes("retained recent tail"), outbound);
             const continued = (await h.request(`/__bili/plugin/snapshot?conversationId=${id}`)).body;
             assert.deepEqual(continued.orderedMessages.slice(0, 5), snapshot.orderedMessages.slice(0, 5));
             assert.equal(resolveConversation(id).session!.state.blocks[1].summary, summary);
@@ -627,6 +820,15 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         }
         assert.notEqual(resolveConversation("nested").session!.pluginSnapshot![5].text, resolveConversation("nested-sibling").session!.pluginSnapshot![5].text);
         assert.notEqual(resolveConversation("nested").session!.blockContents.get("b2"), resolveConversation("nested-sibling").session!.blockContents.get("b2"));
+        await sendModel(h, "nested-prefix", [...history.slice(0, 2), { role: "user", content: "expanded nested first continuation" }]);
+        const prefixOutbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert.match(prefixOutbound, /first original/);
+        assert.match(prefixOutbound, /second original/);
+        assert(!prefixOutbound.includes("third response"), prefixOutbound);
+        assert(!prefixOutbound.includes("retained recent tail"), prefixOutbound);
+        assert(!prefixOutbound.includes(summary), prefixOutbound);
+        assert.notEqual(parent.state.blocks[1].expanded, true);
+        assert.notEqual(resolveConversation("nested-sibling").session!.state.blocks[1].expanded, true);
         const original = await h.request("/__bili/plugin/tool", { conversationId: "nested", tool: "decompress", args: { blockId: "b2", full: true } });
         const file = original.body.result.match(/written to: (.+)\n/)?.[1];
         const text = file ? readFileSync(file, "utf8") : original.body.result;

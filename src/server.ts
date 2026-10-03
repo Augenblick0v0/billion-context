@@ -3827,7 +3827,6 @@ async function prepareAnthropic(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4073,7 +4072,6 @@ async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4340,7 +4338,6 @@ async function prepareGoogle(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -4648,7 +4645,6 @@ async function prepareResponses(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        session.metadata.contextTokensAt = Date.now();
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
@@ -5524,6 +5520,21 @@ function outboundPayloadBreakdown(
     return { textEstimate, overheadEstimate, imageTokens, payloadEstimate: textEstimate + overheadEstimate + imageTokens, armEstimate };
 }
 
+function outboundContextEstimate(prepared: Prepared, wireBody: string, opts: ProxyOptions, upstream: string): number {
+    let msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+    try {
+        const parsed = JSON.parse(wireBody);
+        switch (prepared.protocol) {
+            case "anthropic": msgs = anthropicToCore(parsed as AnthropicRequestBody).msgs; break;
+            case "openai": msgs = openaiToCore(parsed as OpenAIRequestBody).msgs; break;
+            case "responses": msgs = responsesToCore(parsed as ResponsesRequestBody).msgs; break;
+            case "google": msgs = googleToCore(parsed as GoogleRequestBody).msgs; break;
+        }
+    } catch { /* Preserve the prepared projection if the wire codec cannot project a provider extension. */ }
+    return estimateCoreMessagesUpper(msgs) + estimateWireOverhead(prepared.protocol, wireBody)
+        + imageReserveFor(prepared.session, prepared.protocol, wireBody, opts, upstream);
+}
+
 async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -6238,7 +6249,13 @@ async function forward(
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
     if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
-        noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
+        const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+        // Publish this send, not a historical usage baseline with a fresh timestamp.
+        const estimate = outboundContextEstimate(prepared, sentBody, opts, upstreamUrl);
+        prepared.session.stats.localInputEstimate = estimate;
+        prepared.session.stats.contextTokens = estimate;
+        prepared.session.stats.contextTokensSource = "estimate";
+        noteForwardedBody(prepared.session, sentBody);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {

@@ -215,14 +215,15 @@ export interface ContextObservation {
 /** Public context provenance is separate from billing and nudge baselines. */
 export function recordContextObservation(session: Session, tokens: number, source: ContextObservation["source"]): void {
     if (!Number.isFinite(tokens) || tokens < 0) {
-        delete session.metadata.publicContextObservation;
+        delete session.metadata?.publicContextObservation;
         return;
     }
+    session.metadata ??= {};
     session.metadata.publicContextObservation = { sessionId: session.id, tokens, source, at: Date.now(), generation: randomUUID() } satisfies ContextObservation;
 }
 
 export function currentContextObservation(session: Session): ContextObservation | undefined {
-    const raw = session.metadata.publicContextObservation;
+    const raw = session.metadata?.publicContextObservation;
     if (!raw || typeof raw !== "object") return undefined;
     const o = raw as Record<string, unknown>;
     if (o.sessionId !== session.id || typeof o.tokens !== "number" || !Number.isFinite(o.tokens) || o.tokens < 0 ||
@@ -245,7 +246,7 @@ export function noteForwardedBody(session: Session, body: string): void {
     seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
-    else delete session.metadata.publicContextObservation;
+    else delete session.metadata?.publicContextObservation;
 }
 
 // #1843 L1: learned per-route image cost. The prior (pixel tile model or bytes)
