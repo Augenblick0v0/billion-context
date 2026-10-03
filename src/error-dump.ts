@@ -55,3 +55,34 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
         return null;
     }
 }
+
+// #1993: persist a rejected PREFLIGHT SUMMARY exchange — both sides of it, the
+// request bytes bili sent and the response bytes the upstream answered — when
+// BILI_DUMP_4XX=1. The summary call is built independently of the forwarded
+// wire body, so dumpRejectedBody's two main-path call sites never see it;
+// without this, "summarization failed: HTTP 400" could not be explained
+// byte-for-byte after the fact. Separate `summary-err-` prefix so a main-path
+// and a summary dump landing in the same millisecond cannot clobber each
+// other. Sides are embedded as strings so the envelope stays valid JSON even
+// when a side is not itself JSON.
+export function dumpSummaryRejection(status: number, sessionId: string, request: string, response: string): string | null {
+    if (process.env.BILI_DUMP_4XX !== "1") return null;
+    if (!request && !response) return null;
+    try {
+        const cap = Math.max(1024, Number(process.env.BILI_DUMP_4XX_MAX_BYTES) || DEFAULT_MAX_BYTES);
+        const side = (raw: string): string => {
+            const bounded = raw.length > cap ? `${raw.slice(0, cap)}\n[truncated: ${raw.length - cap} more character(s)]` : raw;
+            try { return JSON.stringify(JSON.parse(bounded)); } catch { return bounded; }
+        };
+        const dir = dumpsDir();
+        fs.mkdirSync(dir, { recursive: true });
+        const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const out = path.join(dir, `summary-err-${Date.now()}-${sid}-${status}.json`);
+        fs.writeFileSync(out, JSON.stringify({ status, request: side(request), response: side(response) }, null, 2));
+        loggerLog("info", `[dump] upstream ${status} rejected summary exchange written to ${out}`);
+        return out;
+    } catch (err) {
+        warnDumpFailure(err);
+        return null;
+    }
+}
