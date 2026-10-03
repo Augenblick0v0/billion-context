@@ -140,8 +140,8 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const upstreamOrigin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
     const sid = `ses_ws_${randomUUID()}`;
-    const openPeer = async (authorization = "Bearer fake-credential") => {
-        const client = new WebSocket(`${proxyOrigin.replace(/^http/, "ws")}/bili/responses/${upstreamOrigin}/v1/responses`, { headers: { authorization, "x-bili-plugin": "opencode", "x-bili-plugin-conversation": sid, "x-bili-plugin-model": "gpt-5.2", "x-bili-plugin-context-window": "200000" } });
+    const openPeer = async (authorization = "Bearer fake-credential", extraHeaders: Record<string, string> = {}) => {
+        const client = new WebSocket(`${proxyOrigin.replace(/^http/, "ws")}/bili/responses/${upstreamOrigin}/v1/responses`, { headers: { authorization, "x-bili-plugin": "opencode", "x-bili-plugin-conversation": sid, "x-bili-plugin-model": "gpt-5.2", "x-bili-plugin-context-window": "200000", ...extraHeaders } });
         await once(client, "open");
         return client;
     };
@@ -634,6 +634,26 @@ test("Responses WS: a first-turn all-bili tools frame is a main turn, not an #18
         assert.doesNotMatch(log, /leaked bili tools/);
         assert.doesNotMatch(log, /side request \(/);
         assert.match(log, /view=ws-expanded/);
+    } finally {
+        await f.close();
+    }
+});
+
+test("Responses WS: a title-persona side request rides the lane transport instead of 502ing", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        // The upgrade carries the #1699 persona header, so every frame on this
+        // connection is a #388 side request (passthrough + tag strip only). Its
+        // outbound body reaches the transport as a Buffer — the side passthrough
+        // forwards the inbound buffer verbatim — and must still ride the lane's
+        // WebSocket upstream instead of failing with 502.
+        const titlePeer = await f.openPeer(undefined, { "x-bili-plugin-agent": "title" });
+        const events = await f.turn([user("title over the WS lane")], undefined, {}, titlePeer);
+        const done = events.find(e => e.type === "response.completed");
+        assert.ok(done, JSON.stringify(events));
+        const log = fs.readFileSync(f.logPath, "utf8");
+        assert.match(log, /side request \(agent=title\)/);
+        assert.doesNotMatch(log, /Unsupported request in Responses WebSocket transport/);
     } finally {
         await f.close();
     }

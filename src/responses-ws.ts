@@ -111,6 +111,17 @@ export class ResponsesWsHistory {
     }
 }
 
+// The pipeline emits JSON bodies as strings (prepare* re-serialization) or
+// Buffers (#388 side passthrough forwards the inbound buffer verbatim) —
+// normalize both here; a string-only contract 502s every side request.
+function bodyToText(body: RequestInit["body"]): string | undefined {
+    if (typeof body === "string") return body;
+    if (Buffer.isBuffer(body)) return body.toString("utf8");
+    if (body instanceof ArrayBuffer) return Buffer.from(body).toString("utf8");
+    if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8");
+    return undefined;
+}
+
 export class ResponsesWsUpstream {
     private socket?: InstanceType<typeof UpstreamWebSocket>;
     private key?: string;
@@ -169,8 +180,9 @@ export class ResponsesWsUpstream {
     }
 
     async fetch(url: string, options: FetchOptions, rotateRetry = true): Promise<Response> {
-        if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || typeof options.body !== "string") throw new Error("Unsupported request in Responses WebSocket transport");
-        const parsed: unknown = JSON.parse(options.body);
+        const bodyText = bodyToText(options.body);
+        if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || bodyText === undefined) throw new Error("Unsupported request in Responses WebSocket transport");
+        const parsed: unknown = JSON.parse(bodyText);
         if (!object(parsed) || !Array.isArray(parsed.input)) throw new Error("Invalid Responses WebSocket request");
         const { stream, stream_options: _streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
         const socket = await this.connect(url, options);
