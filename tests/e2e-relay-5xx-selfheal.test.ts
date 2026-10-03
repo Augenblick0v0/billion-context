@@ -10,7 +10,8 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, type Session } from "../src/session.ts";
@@ -166,18 +167,25 @@ async function startProxy(upstreamPort: number, saves?: string[]): Promise<{ pro
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxy, port: proxy.address().port };
+    return { proxy, port: (proxy.address() as { port: number }).port };
 }
 
 test("e2e #604: relay 5xx on near-window payload → arm → next retry truncates + recovers", async () => {
     const relay = makeRelay({ failFirstStreamingWith: 500 });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const saves: string[] = [];
     const { proxy, port } = await startProxy(upstreamPort, saves);
 
@@ -249,7 +257,7 @@ test("e2e #604: network-level failure arms the emergency shrink too", async () =
     const relay = makeRelay({ destroyFirst: true });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort);
 
     try {
@@ -304,7 +312,7 @@ test("e2e #604: 4xx (auth) must NOT arm — no distortion of the usage signal", 
     const relay = makeRelay({ failFirstStreamingWith: 401 });
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     const { proxy, port } = await startProxy(upstreamPort);
 
     try {

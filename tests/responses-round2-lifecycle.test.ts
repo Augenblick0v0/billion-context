@@ -118,7 +118,7 @@ test("responses wire round-2: lifecycle references stay valid and remapped ids f
     );
 
     const round2Item = events.find(
-        (e) => e.event === "response.output_item.added" && typeof e.data.item?.id === "string" && String(e.data.item.id).startsWith("msg-proxy-2-"),
+        (e) => e.event === "response.output_item.added" && typeof (e.data.item as Record<string, unknown>)?.id === "string" && String((e.data.item as Record<string, unknown>).id).startsWith("msg-proxy-2-"),
     );
     assert.ok(round2Item, "round-2 message item forwarded with remapped id (native streaming, not buffered)");
     const round2Id = String((round2Item.data.item as Record<string, unknown>).id);
@@ -197,7 +197,7 @@ test("responses wire round-2: custom_tool_call input delta/done frames are forwa
     assert.equal(inputDone[0].data.input, fullInput, "input done carries the full input");
     const ctcDone = events.filter((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.type === "custom_tool_call");
     assert.equal(ctcDone.length, 1, "custom_tool_call item done frame forwarded");
-    assert.equal(ctcDone[0].data.item.input, fullInput, "done item carries the full input");
+    assert.equal((ctcDone[0].data.item as Record<string, unknown>).input, fullInput, "done item carries the full input");
 });
 
 test("sanitizeResponsesInputIds rewrites over-long ids deterministically and heals poisoned rollouts (#242)", () => {

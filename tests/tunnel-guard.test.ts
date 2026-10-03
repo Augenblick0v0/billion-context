@@ -253,6 +253,7 @@ test("integration: tunnel cannot reach the proxy's own management plane (#409 Po
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -316,6 +317,7 @@ test("integration: metadata destination never contacted (403 before any socket);
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -365,6 +367,7 @@ test("integration: unresolvable /bili/ destination answers 502 transport-class, 
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

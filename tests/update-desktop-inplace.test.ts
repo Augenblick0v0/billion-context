@@ -122,7 +122,8 @@ function stubRegistryFetch(tgz: Buffer, tarballUrl: string, version: string, int
     }) as unknown as typeof fetch;
 }
 
-type CaptureLog = (level: "info" | "warn", msg: string) => void;
+// level stays string: must satisfy src/logger.ts Logger (refreshDshDesktopCopy) yet remain assignable to refreshDshProfileBundles' narrower ("info" | "warn") param.
+type CaptureLog = (level: string, msg: string) => void;
 
 function captureLog(): { lines: string[]; log: CaptureLog } {
     const lines: string[] = [];

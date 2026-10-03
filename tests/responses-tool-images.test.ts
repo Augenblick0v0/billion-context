@@ -8,7 +8,8 @@ import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWi
 import { imageTokensInParsedBody } from "../src/image-tokens.ts";
 import { imagePlaceholders } from "../src/image-note.ts";
 import { createResponsesAdapter } from "../src/loop/adapter-responses.ts";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -138,7 +139,9 @@ async function testProxy(window: number, run: (url: string, forwarded: RequestBo
         modelContextLimit: window, kernelConfig: defaultConfig(window),
         compress: { injectTool: true, injectNudge: true }, imageBilling: "pixels",
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
-        log: false, debug: false, passthrough: false, autoUpdate: false,
+        log: false, debug: false, passthrough: false, passthroughSource: null, autoUpdate: false,
+        autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
+        compat: { roles: {} }, streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");

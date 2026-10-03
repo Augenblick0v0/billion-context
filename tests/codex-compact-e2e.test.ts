@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
@@ -132,7 +133,7 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     if (opts.mode === undefined) delete process.env.BILI_CODEX_COMPACT;
     else process.env.BILI_CODEX_COMPACT = opts.mode;
@@ -153,11 +154,18 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const base = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1`;
     const h: Harness = { proxy, upstream, bodies, url: `${base}/responses`, compactUrl: `${base}/responses/compact` };
     try {

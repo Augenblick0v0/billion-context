@@ -241,9 +241,9 @@ function anthropicTextSse(res: http.ServerResponse, id: string, text: string): v
     res.end();
 }
 
-function listen(server: http.Server | ReturnType<typeof startServer> extends Promise<infer R> ? Awaited<R> : never): Promise<void> {
-    if ((server as { listening?: boolean }).listening) return Promise.resolve();
-    return once(server as http.Server, "listening").then(() => undefined);
+function listen(server: http.Server): Promise<void> {
+    if (server.listening) return Promise.resolve();
+    return once(server, "listening").then(() => undefined);
 }
 
 function close(server: http.Server): Promise<void> {
@@ -303,13 +303,20 @@ async function startPlanProxy(captured: string[], planAware: boolean): Promise<{
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true }, search: planAware ? { planAware: true } : undefined },
+        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true }, search: planAware ? { planAware: true } : undefined },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

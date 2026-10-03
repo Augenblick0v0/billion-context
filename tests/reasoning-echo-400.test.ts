@@ -72,8 +72,15 @@ async function startHarness(captured: Captured[], onUpstreamRequest: (bodyText: 
         log: true,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         chainContentDetection: false,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -155,7 +162,7 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
             const files = fs.readdirSync(dumpDir).filter((f) => f.startsWith("err-"));
             assert.equal(files.length, 1, `expected exactly one 4xx dump, got: ${files.join(", ")}`);
             assert.match(files[0]!, /^err-\d+-re400-1-400\.json$/);
-            const dumped = JSON.parse(fs.readFileSync(path.join(dumpDir, files[0]!), "utf8")) as { model: string; messages: Array<{ role?: string; content?: unknown }> };
+            const dumped = JSON.parse(fs.readFileSync(path.join(dumpDir, files[0]!), "utf8")) as { model: string; messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }> };
             assert.equal(dumped.model, "gpt-test");
             // #1881: injectTool=false sessions still carry the ACP-TAGS prohibition —
             // the client's 6 messages + the injected head system.

@@ -7,12 +7,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { ProxyOptions, parseCompressSettings } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { rootCaPath } from "../src/ca.ts";
-import { parseCompressSettings } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function close(server: http.Server): Promise<void> {
@@ -51,7 +50,14 @@ test("Web UI exposes upstream controls without inline handlers", async () => {
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -123,7 +129,14 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -242,7 +255,14 @@ test("#154: PUT /__bili/config with compress hot-applies the global compress blo
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -324,7 +344,14 @@ test("compress round-trip preserves injectTool/injectNudge injection toggles", a
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -381,7 +408,14 @@ test("PUT /__bili/config refuses to overwrite a config file that does not parse"
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

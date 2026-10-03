@@ -22,7 +22,7 @@ const ORIGIN = "http://127.0.0.1:8787";
 const EMPTY_ROUTES = { httpsDomains: [] as string[], httpRewrites: [] as { key: string; realUpstream: string }[], httpsRewrites: [] as { key: string; realUpstream: string }[], httpEnvRoutes: [] as { key: string; realUpstream: string }[] };
 
 test("launch client registry includes gemini/iflow/qwen (#1047)", () => {
-    for (const c of ["gemini", "iflow", "qwen"]) {
+    for (const c of ["gemini", "iflow", "qwen"] as const) {
         assert.equal(isLaunchClient(c), true);
         assert.equal(baseClientName(c), c);
         assert.ok(LAUNCH_CLIENTS.includes(c as (typeof LAUNCH_CLIENTS)[number]));

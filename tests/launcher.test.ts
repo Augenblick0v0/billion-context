@@ -433,7 +433,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
             clientArgsSeen.push([...args]);
             // runClient resolves on "exit" — fire it on next tick.
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -542,7 +542,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (cmd === fakePi) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -613,7 +613,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         if (cmd === process.env.BILI_CLIENT_BIN) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -695,7 +695,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
         if (cmd === fakeHermes) {
             childEnv = options.env;
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -813,7 +813,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         if (cmd === fakeOmp) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -997,7 +997,7 @@ test("runLaunch: client exit spares the shared proxy when other watchers remain 
     const spawnImpl: SpawnFn = (cmd, _args, options) => {
         if (cmd === fakeBin) {
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -1089,9 +1089,9 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     );
     assert.equal(handle.child?.pid, 42421);
     assert.ok(spawnedArgs !== null);
-    assert.ok(spawnedArgs.includes("start"));
-    assert.ok(spawnedArgs.includes("--host"));
-    const portIdx = spawnedArgs.indexOf("--port");
+    assert.ok((spawnedArgs as string[]).includes("start"));
+    assert.ok((spawnedArgs as string[]).includes("--host"));
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.ok(portIdx >= 0, "spawn args include --port");
     assert.equal(spawnedArgs[portIdx + 1], String(handle.port));
     assert.ok(healthProbes >= 2, "fallback polls health until the child answers");
@@ -1485,7 +1485,7 @@ test("ensureProxyRunning: a lane'd launch with port 0 binds the zone preference 
     );
     assert.deepEqual(preferred, ["zcode"], "the lane's zone preference resolves the spawn port");
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.equal(spawnedArgs[portIdx + 1], "18787", "zone base is the spawn port, not an OS ephemeral");
     assert.equal(handle.port, 18787);
     assert.deepEqual(settled, [["zcode", 18787]], "the settled port is recorded sticky for later launches");
@@ -1512,7 +1512,7 @@ test("ensureProxyRunning: an unlane'd launch keeps the OS ephemeral default — 
         },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     const childPort = Number(spawnedArgs[portIdx + 1]);
     assert.ok(Number.isInteger(childPort) && childPort > 0, `ephemeral port assigned, got ${childPort}`);
     assert.equal(handle.port, childPort);
@@ -2153,7 +2153,7 @@ test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned e
         { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.ok(portIdx >= 0, "spawn args include --port");
     const childPort = Number(spawnedArgs[portIdx + 1]);
     assert.ok(Number.isInteger(childPort) && childPort >= 1024 && childPort <= 65535, `ephemeral port assigned, got ${childPort}`);
@@ -2172,7 +2172,7 @@ test("ensureProxyRunning: explicit port is honored verbatim (no ephemeral reassi
         { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.equal(spawnedArgs[portIdx + 1], "8787");
     assert.equal(handle.port, 8787);
 });
@@ -2252,7 +2252,7 @@ test("stopProxy: POSIX kills the owned child, win32 defers to the parent-gone wa
             return true;
         },
     };
-    stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, reused: false, child });
+    stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, child });
     if (process.platform === "win32") {
         assert.equal(killed, false, "win32 child.kill is TerminateProcess (no flush) — shutdown belongs to BILI_PARENT_PID watcher");
     } else {
@@ -2912,8 +2912,8 @@ test("prepareOpencodeHttpRewrite: re-anchors relative local plugin specs against
         ]);
         // original file untouched and the caller's merged root stays pristine
         assert.equal(fs.readFileSync(path.join(cfgDir, "opencode.json"), "utf8"), original);
-        assert.equal((root.plugin as unknown[])[0], "./ntfy.js");
-        assert.equal(((root.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
+        assert.equal((root!.plugin as unknown[])[0], "./ntfy.js");
+        assert.equal(((root!.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
         rmrf(path.dirname(tmpFile));
     } finally {
         rmrf(dir);
@@ -3530,7 +3530,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
             if (options?.env) envSeen.push(options.env);
             argsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -3640,7 +3640,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
         if (cmd === fakeDsh) {
             if (options?.env) envSeen.push(options.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -3911,7 +3911,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
     const spawnImpl: SpawnFn = (cmd, args, opts) => {
         if (cmd === fakeOmp) {
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4138,7 +4138,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         if (cmd === fakeCodex) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4223,7 +4223,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         if (cmd === fakeClaude) {
             clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4548,7 +4548,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
         if (cmd === fakeCodebuddy) {
             clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4783,7 +4783,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         if (cmd === fakeQoder) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5190,7 +5190,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         if (cmd === fakeTrae) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5280,7 +5280,7 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
         if (cmd === fakeBin) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5403,7 +5403,7 @@ async function runAiderLaunch(
         if (cmd === fakeAider) {
             clientEnv = env;
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5640,7 +5640,7 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         if (cmd === fakeKimi) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5865,7 +5865,7 @@ test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA
         if (cmd === fakeMcode) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -6078,7 +6078,7 @@ test("runLaunch goose: custom provider rides the regenerated GOOSE_PATH_ROOT ove
             clientEnvs.push(env);
             fs.writeFileSync(path.join(String(env!.GOOSE_PATH_ROOT), "config", "config.toml"), 'active_provider = "mine"\nsome_new_key = 1\n');
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);

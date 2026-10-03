@@ -12,7 +12,8 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_PREFLIGHT_HOLD_MS = "300";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -106,6 +107,7 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
 }
 
@@ -141,11 +143,11 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         // Fresh session, ~13k-token history vs 10k window → preflight fires
@@ -202,11 +204,11 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await timedPost(
@@ -254,11 +256,11 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "gpt-resp": { context: 10_000 } }, 10_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const input = bigConversation().map((m) => ({ type: "message", role: m.role, content: m.content }));
@@ -312,11 +314,11 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, 400_000);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await timedPost(

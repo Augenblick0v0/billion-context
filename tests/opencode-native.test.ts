@@ -213,13 +213,13 @@ test("setup(route): header stamping applies to the REPLACED request, tools regis
         session: {
             hook: (name, cb) => {
                 hooks.push({ name, cb });
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
         tool: {
             transform: (add) => {
                 add({ add: (t) => tools.push(t.name) });
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
     };
@@ -248,7 +248,7 @@ test("setup(route): kill switch keeps the hook fully inert", async () => {
         session: {
             hook: (_name, cb) => {
                 hooks.push(cb);
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
     };

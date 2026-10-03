@@ -121,7 +121,14 @@ async function withProxy(upstreamHandler: (req: http.IncomingMessage, res: http.
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -202,7 +209,7 @@ test("e2e #1102: opencode AGENTS.md edit (instructions drift) keeps ONE session 
         assert.ok(bodies[2].includes("DRIFT-SUMMARY-SETUP"), "the folded summary renders in place of the compressed range");
         assert.ok(bodies[2].includes(userEditsAgentsMd), "the new turn is forwarded");
 
-        const stats = await (await fetch(statsUrl)).json();
+        const stats = (await (await fetch(statsUrl)).json()) as { sessions: Array<{ id: string }> };
         assert.equal(stats.sessions.length, 1, "same logical conversation stays in ONE compression namespace despite instructions drift");
         assert.equal(stats.sessions[0].id, AFFINITY, "no |sub:<fp> fork");
     });
@@ -233,7 +240,7 @@ test("e2e #1106: plugin conversation without the mutable flag stays ONE session 
         await req2.text();
 
         assert.equal(bodies.length, 2);
-        const stats = await (await fetch(statsUrl)).json();
+        const stats = (await (await fetch(statsUrl)).json()) as { sessions: Array<{ id: string }> };
         assert.equal(stats.sessions.length, 1, "plugin lane keys verbatim; the mutable flag is no longer required");
         assert.equal(stats.sessions[0].id, CONVERSATION);
     });
@@ -264,7 +271,7 @@ test("e2e #1106: generic relay client (x-session-id) keeps ONE session across in
         await req2.text();
 
         assert.equal(bodies.length, 2);
-        const stats = await (await fetch(statsUrl)).json();
+        const stats = (await (await fetch(statsUrl)).json()) as { sessions: Array<{ id: string }> };
         assert.equal(stats.sessions.length, 1, "generic id + instructions drift = same conversation evolving, no fork");
         assert.equal(stats.sessions[0].id, GENERIC_ID);
     });
@@ -298,7 +305,7 @@ test("e2e #150: codex root thread reusing a task id across personas still splits
         assert.equal(req2.status, 200);
         await req2.text();
 
-        const stats = await (await fetch(statsUrl)).json();
+        const stats = (await (await fetch(statsUrl)).json()) as { sessions: Array<{ id: string }> };
         assert.equal(stats.sessions.length, 2, "codex id-sharing personas stay split (#150 allowlist entry)");
         const ids = stats.sessions.map((s: { id: string }) => s.id).sort();
         assert.equal(ids[0], TASK_ID);

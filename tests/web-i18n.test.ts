@@ -102,7 +102,7 @@ function parseHtml(html: string): Node[] {
                 target.push({ tag: name, attrs: {}, children: [{ text: body }] });
                 continue;
             }
-            const el: El = { tag: name, attrs: parseAttrs(raw.slice(nameMatch[1].length)), children: [] };
+            const el: El = { tag: name, attrs: parseAttrs(raw.slice(nameMatch![1].length)), children: [] };
             target.push(el);
             parseInto(el.children, name);
         }

@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 process.env.BILI_PERSIST = "0";
 
-import { createCore, defaultConfig, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, type Config, type CoreMessage } from "acp-kernel";
+import { createCore, defaultConfig, DEFAULT_CCR_CONFIG, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, type Config, type CoreMessage } from "acp-kernel";
 import { applyCompressSettings } from "../src/compress-settings.ts";
 import { storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
@@ -112,13 +112,13 @@ test("#1712: proxy mode without CCR keeps the enable-CCR error", () => {
 
 type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; parameters?: Record<string, unknown> } };
 
-function propsOf(arr: unknown[], name: string): Record<string, unknown> | undefined {
+function propsOf(arr: unknown[], name: string): Record<string, { type?: string } | undefined> | undefined {
     const e = arr.find((t) => {
         const o = t as FlatTool;
         return o.name === name || o.function?.name === name;
     }) as FlatTool | undefined;
     if (!e) return undefined;
-    const schema = (e.input_schema ?? e.parameters ?? e.function?.parameters) as { properties?: Record<string, unknown> } | undefined;
+    const schema = (e.input_schema ?? e.parameters ?? e.function?.parameters) as { properties?: Record<string, { type?: string } | undefined> } | undefined;
     return schema?.properties;
 }
 
@@ -174,7 +174,7 @@ test("#1712: manifest (CCR off by default) never advertises decompress range arg
 });
 
 test("#1712: manifest with base CCR on advertises range args on anthropic/openai only — responses never arms CCR in plugin mode (#1271)", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
     for (const wire of ["anthropic", "openai"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.equal(props?.startId?.type, "string", `${wire}: startId advertised with base CCR on`);

@@ -92,11 +92,12 @@ test("#1733 repro: pruning messages between two configuration_updates yields one
     const pruned = projection.msgs.filter((m) => !dropCoreIds.has(m.id));
     const rebuilt = patchResponsesInputWithToolImages(projection, pruned);
     assert.notEqual(typeof rebuilt, "string");
-    assert.deepEqual(adjacentConfigUpdateIndices(rebuilt), []);
-    const updates = rebuilt.filter((it) => it.type === "configuration_update");
+    const items = rebuilt as ResponseInputItem[];
+    assert.deepEqual(adjacentConfigUpdateIndices(items), []);
+    const updates = items.filter((it) => it.type === "configuration_update");
     assert.equal(updates.length, 1);
     assert.deepEqual(updates[0], { type: "configuration_update", reasoning: { effort: "high" } });
-    assert.deepEqual(validateResponsesBody({ input: rebuilt }), []);
+    assert.deepEqual(validateResponsesBody({ input: items }), []);
 });
 
 // Faithful pipeline: real kernel applyCompression + prune, then the proxy's
@@ -139,8 +140,9 @@ test("#1733 end-to-end: kernel applyCompression + prune + patch yields protocol-
     const visible = prune(projection.msgs, fold.state).filter((m) => !isRenderedSummaryMessage(m));
     const rebuilt = patchResponsesInputWithToolImages(projection, visible);
     assert.notEqual(typeof rebuilt, "string");
-    assert.deepEqual(adjacentConfigUpdateIndices(rebuilt), []);
-    const updates = rebuilt.filter((it) => it.type === "configuration_update");
+    const items = rebuilt as ResponseInputItem[];
+    assert.deepEqual(adjacentConfigUpdateIndices(items), []);
+    const updates = items.filter((it) => it.type === "configuration_update");
     assert.equal(updates.length, 1);
     assert.deepEqual(updates[0], { type: "configuration_update", reasoning: { effort: "high" } });
 });

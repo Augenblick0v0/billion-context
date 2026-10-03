@@ -28,7 +28,8 @@ process.env.NODE_ENV = "test";
 //      never conflated with billing-grade "usage".
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest, type Session } from "../src/session.ts";
@@ -150,7 +151,7 @@ async function startHarness(sessionId: string, script: VerdictRule[]) {
     const relay = makeRelay(script);
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -166,11 +167,12 @@ async function startHarness(sessionId: string, script: VerdictRule[]) {
         log: true,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const url = `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+    const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
     const headers = { "content-type": "application/json", "x-acp-session": sessionId };
     const post = (messages: Msg[]) => fetch(url, {
         method: "POST",
@@ -287,7 +289,7 @@ test("#1839 G3: overflow arming is tagged 'overflow-arm', never billing-grade 'u
         await r2.text();
         const s = h.session();
         assert.equal(s.stats.lastInputTokensSource, "overflow-arm", "armed value must carry its own provenance, not 'usage'");
-        assert.ok(s.stats.overflowArmTokens > 0, "side-request guard armed (#1110)");
+        assert.ok(s.stats.overflowArmTokens! > 0, "side-request guard armed (#1110)");
         assert.ok(s.stats.lastInputTokens > 0 && s.stats.lastInputTokens <= WINDOW, "arm bounded by the declared window");
         const armVal = s.stats.lastInputTokens;
         assert.ok(h.logs.some((l) => l.includes("armed emergency shrink at ~")), "arm warning logged");

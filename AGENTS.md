@@ -78,7 +78,7 @@ The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a se
 
 ```bash
 npm run build          # tsup bundle (inlines acp-kernel)
-npm run typecheck      # tsc --noEmit --project tsconfig.build.json
+npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
 npm test               # node --import tsx --test tests/*.test.ts
 ```
 

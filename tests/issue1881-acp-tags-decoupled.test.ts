@@ -105,6 +105,12 @@ async function startProxy(upstream: http.Server, injectTool: boolean): Promise<H
         passthrough: false,
         chainContentDetection: false,
         passthroughSource: null,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

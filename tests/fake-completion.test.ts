@@ -9,7 +9,8 @@ process.env.NODE_ENV = "test";
 process.env.BILI_FAKE_COMPLETION_RETRIES = "2";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { applyCompatRoles } from "../src/compat-roles.ts";
@@ -163,7 +164,7 @@ function startHarness(scripts: string[][], extra?: Partial<ProxyOptions>): Promi
     upstream.listen(0, "127.0.0.1");
     return (async () => {
         await once(upstream, "listening");
-        const upstreamPort = upstream.address().port;
+        const upstreamPort = (upstream.address() as { port: number }).port;
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
         const proxy = await startServer({
@@ -184,7 +185,7 @@ function startHarness(scripts: string[][], extra?: Partial<ProxyOptions>): Promi
         ...extra,
     } as ProxyOptions);
         await once(proxy, "listening");
-        const proxyPort = proxy.address().port;
+        const proxyPort = (proxy.address() as { port: number }).port;
         return {
             proxyPort,
             upstreamPort,
@@ -207,7 +208,7 @@ async function callAnthropic(h: Harness, session: string, messages: Array<{ role
     });
     assert.equal(resp.status, 200);
     let raw = "";
-    for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+    for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
     return raw;
 }
 
@@ -244,7 +245,7 @@ async function callResponses(h: Harness, session: string, input: unknown[]): Pro
     });
     assert.equal(resp.status, 200);
     let raw = "";
-    for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+    for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
     return raw;
 }
 
@@ -357,7 +358,7 @@ test("e2e #1900: role learned mid-request (400 → hop) — hinted retry carries
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -374,10 +375,17 @@ test("e2e #1900: role learned mid-request (400 → hop) — hinted retry carries
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
             method: "POST",
@@ -389,7 +397,7 @@ test("e2e #1900: role learned mid-request (400 → hop) — hinted retry carries
         });
         assert.equal(resp.status, 200);
         let raw = "";
-        for await (const chunk of resp.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of resp.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(captured.length, 3, `expected main + role-hop + hinted retry, got ${captured.length}`);
         assert.ok(captured[0]!.includes('"role":"developer"'), "main attempt sends the client's original role");
         assert.ok(!captured[1]!.includes('"role":"developer"'), "role hop rewrote developer→system before re-sending");

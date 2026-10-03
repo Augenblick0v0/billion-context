@@ -5,7 +5,7 @@ import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
 import { responsesToCore, coreToResponses } from "acp-kernel/wire";
 import type { AnthropicBlock, AnthropicRequestBody } from "acp-kernel/wire";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
-import type { ResponsesRequestBody } from "acp-kernel/wire";
+import type { ResponseInputItem, ResponsesRequestBody } from "acp-kernel/wire";
 
 const IMG_DATA = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 const DATA_URL = `data:image/png;base64,${IMG_DATA}`;

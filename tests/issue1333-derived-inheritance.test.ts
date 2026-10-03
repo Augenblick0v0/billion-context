@@ -367,6 +367,9 @@ function proxyOpts(relayPort: number): ProxyOptions {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        streamErrorShape: "protocol",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
 }
@@ -429,7 +432,7 @@ async function runDerivedInheritanceE2E(shape: "anonymous" | "stamped"): Promise
         // conversation) — it records the parent link, it does NOT copy state
         // (the kernel's syncBlocks would deactivate copied blocks anyway).
         // The stamped shape mirrors what the real pi extension sends.
-        const childHeaders = shape === "stamped"
+        const childHeaders: Record<string, string> = shape === "stamped"
             ? { "x-bili-plugin": "pi", "x-bili-plugin-conversation": childConv }
             : {};
         const childReply = await chat(url, [{ role: "user", content: `run ${run} child first turn (${shape}): ${FILLER.repeat(12)}` }], childConv, childHeaders);

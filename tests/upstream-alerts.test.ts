@@ -39,7 +39,7 @@ async function freePort(): Promise<number> {
 }
 
 function netError(code: string, message = code): Error & { code?: string } {
-    const e = new Error(message);
+    const e: Error & { code?: string } = new Error(message);
     e.code = code;
     return e;
 }
@@ -182,6 +182,13 @@ async function startProxyFor(upstreamPort: number, registerRoute: boolean): Prom
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

@@ -82,6 +82,7 @@ async function startHarnessLoop(handler: (bodyText: string, res: http.ServerResp
         log: true,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

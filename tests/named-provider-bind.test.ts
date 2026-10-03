@@ -63,7 +63,7 @@ test("bind alias applies compress/models/proxy onto the bound URL lane", (t) => 
     const routes = loadRoutes();
     assert.deepEqual(Object.keys(routes), ["https://api.anthropic.com"]);
     const lane = routes["https://api.anthropic.com"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.75);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.75);
     assert.equal(lane.models?.["claude-sonnet-4"]?.context, 200000);
     assert.equal(lane.models?.["claude-sonnet-4"]?.output, 8192);
     assert.equal(lane.proxy, "http://127.0.0.1:9999");
@@ -101,11 +101,11 @@ test("explicit URL key beats alias fields, per field; gaps are filled", (t) => {
     const routes = loadRoutes();
     assert.deepEqual(Object.keys(routes), ["https://api.anthropic.com"]);
     const lane = routes["https://api.anthropic.com"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.5);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.5);
     assert.equal(lane.compress?.emergencyThresholdPercent, 0.9);
     assert.equal(lane.compress?.outputHeadroomMaxPct, 0.3);
     assert.equal(lane.models?.m1?.context, 1000);
-    assert.equal(lane.models?.m1?.compress?.maxContextLimitPct, 0.6);
+    assert.equal((lane.models?.m1?.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.6);
     assert.equal(lane.models?.m1?.compress?.nudgeGrowthTokens, 50000);
     assert.equal(lane.models?.m2?.context, 3000);
     assert.equal(lane.proxy, "http://127.0.0.1:1111");
@@ -191,7 +191,7 @@ test("external ACP_PROVIDERS outranks inline config at every level", (t) => {
         extAlias: { bind: "https://e.example", compress: { maxContextLimitPct: 0.2, outputHeadroomMaxPct: 0.2, nudgeGrowthTokens: 888 } },
     }), "utf8");
     const lane = loadRoutes({ ACP_PROVIDERS: extPath })["https://e.example"];
-    assert.equal(lane.compress?.maxContextLimitPct, 0.1);
+    assert.equal((lane.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.1);
     assert.equal(lane.compress?.outputHeadroomMaxPct, 0.2);
     assert.equal(lane.compress?.nudgeGrowthTokens, 888);
 });
@@ -205,7 +205,7 @@ test("compactionOptIn is still consumed alongside bind", (t) => {
     const ids = resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "envopt" });
     for (const id of ["claude-bridge", "optin-only", "envopt"]) assert.ok(ids.includes(id));
     const routes = loadRoutes();
-    assert.equal(routes["https://api.anthropic.com"]?.compress?.maxContextLimitPct, 0.75);
+    assert.equal((routes["https://api.anthropic.com"]?.compress as unknown as { maxContextLimitPct?: number } | undefined)?.maxContextLimitPct, 0.75);
     assert.ok(!("claude-bridge" in routes));
     assert.ok("optin-only" in routes);
 });

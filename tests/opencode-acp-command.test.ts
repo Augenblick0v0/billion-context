@@ -68,7 +68,7 @@ test("/acp-cache forwards acp_cache and renders the wrapped report via session.p
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "ses_x" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "ses_x" }), HANDLED);
         assert.deepEqual(proxy.calls, [{ conversationId: "ses_x", tool: "acp_cache", args: {} }]);
         assert.equal(prompts.length, 1);
         assert.equal(prompts[0].sid, "ses_x");
@@ -90,7 +90,7 @@ test("/acp-cache full flag maps to detail=full (word boundary only) (#1146)", as
         const proxy = await startToolProxy("R");
         try {
             const hooks = createAcpCommandHooks(() => proxy.origin, {});
-            await assert.rejects(hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "s", arguments: args }), HANDLED);
+            await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "s", arguments: args }), HANDLED);
             assert.deepEqual(proxy.calls[0]?.args, expected, `arguments=${JSON.stringify(args)}`);
         } finally {
             await proxy.close();
@@ -101,7 +101,7 @@ test("/acp-cache full flag maps to detail=full (word boundary only) (#1146)", as
 test("/acp-cache with no proxy base renders a diagnostic and still handles (#1146)", async () => {
     const prompts: Rendered[] = [];
     const hooks = createAcpCommandHooks(() => undefined, makeCtx(prompts));
-    await assert.rejects(hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "s" }), HANDLED);
+    await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "s" }), HANDLED);
     assert.equal(prompts.length, 1);
     assert.match(prompts[0].text, /no bili proxy detected/);
 });
@@ -111,7 +111,7 @@ test("/acp-cache renders proxy-side failures unwrapped (#1146)", async () => {
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "s" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "s" }), HANDLED);
         assert.equal(prompts.length, 1);
         assert.match(prompts[0].text, /cache report failed/);
         assert.match(prompts[0].text, /boom/);
@@ -126,7 +126,7 @@ test("/acp-cache on an unknown conversation renders the friendly no-session noti
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp-cache", sessionID: "s" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "s" }), HANDLED);
         assert.equal(prompts.length, 1);
         assert.match(prompts[0].text, /no ACP session yet/);
     } finally {

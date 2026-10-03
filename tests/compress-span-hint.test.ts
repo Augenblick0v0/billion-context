@@ -11,11 +11,11 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
-const MESSAGES: CoreMessage[] = Array.from({ length: 80 }, (_, i) => ({
+const MESSAGES = Array.from({ length: 80 }, (_, i) => ({
     id: `raw${i}`,
     role: (i % 2 ? "assistant" : "user") as "assistant" | "user",
     text: "lorem ipsum dolor sit amet conseq ".repeat(8) + i,
-}));
+})) as unknown as CoreMessage[];
 
 function makeCtx(): Ctx {
     const logs: string[] = [];
@@ -26,7 +26,7 @@ function makeCtx(): Ctx {
         session: {
             id: "span-hint-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -34,6 +34,7 @@ function makeCtx(): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,

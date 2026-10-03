@@ -59,6 +59,13 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         passthrough: false,
         chainContentDetection: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -122,7 +129,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         // (#1207 / #1399 are both opt-in), so acp_retrieve and acp_rule join
         // the injected tool set.
         assert.deepEqual(
-            forwarded.tools.map((t: { name: string }) => t.name),
+            forwarded.tools.map((t: unknown) => (t as { name: string }).name),
             ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_rule", "acp_retrieve"],
         );
 

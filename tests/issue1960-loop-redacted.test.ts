@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CoreMessage } from "acp-kernel";
+import type { CoreMessage, Prompts } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { anthropicToCore } from "acp-kernel/wire";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -40,13 +41,14 @@ function makeSession(): Session {
     return {
         id: "issue1960-loop-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
         blockContents: new Map(),
         inFlight: 0,
+        pendingRetrievals: [],
         persisted: false,
     };
 }
@@ -88,7 +90,7 @@ function inbound(): Record<string, unknown> {
 function prepare(body: Record<string, unknown>, session: Session) {
     const core = createCore();
     const config = defaultConfig(200000);
-    const { msgs } = anthropicToCore(body) as { msgs: CoreMessage[] };
+    const { msgs } = anthropicToCore(body as AnthropicRequestBody) as { msgs: CoreMessage[] };
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
     session.state = turn.state;
     return { core, config, processed: turn.messages, original: msgs };
@@ -191,7 +193,7 @@ async function runLoop(round1: (args: string) => string, respond: (n: number) =>
                 return [...t.messages, ...records];
             },
         };
-        for await (const c of runCompressLoop(new Response(round1(compressArgs), { status: 200 }).body!, ctx, body, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config))) {
+        for await (const c of runCompressLoop(new Response(round1(compressArgs), { status: 200 }).body!, ctx, body, { url: "http://mock", headers: {} }, adapter, buildCompressSystemPrompt(config as unknown as Prompts))) {
             out += c.toString("utf8");
         }
     } finally {

@@ -22,7 +22,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: { protocol: "openai", upstreamOrigin: "http://up:1", title: "tail test" },
-        stats: { requests: 3, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 5, cacheSamples: 0, lastInputTokens: 10, contextTokens: 1000 },
+        stats: { requests: 3, tokensSaved: 0, inputTokens: 10, cachedTokens: 0, outputTokens: 5, cacheSamples: 0, lastInputTokens: 10, contextTokens: 1000, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         createdAt: Date.now() - 1000,
         lastSeen: Date.now(),
@@ -30,6 +30,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -38,7 +39,7 @@ function withBlock(s: Session): void {
         blockId: "b0", runId: "r0", tier: 1, topic: "old work",
         summary: "SUMMARY-MARKER: covered early messages about the old work.",
         directMessageIds: ["m1", "m2"], effectiveMessageIds: ["m1", "m2"], directBlockIds: [],
-        compressedTokens: 500, createdAt: Date.now(), survivedCount: 2, generation: 1, active: true,
+        compressedTokens: 500, createdAt: Date.now(), survivedCount: 2, generation: "young", active: true,
     });
     cacheBlockContent(s, "b0", {
         one: null,

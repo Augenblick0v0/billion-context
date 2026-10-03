@@ -63,7 +63,8 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -346,7 +347,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/messages",
         buildBody: (items) => ({
             model: "claude-test", max_tokens: 1024, stream: true, system: SYS,
-            messages: items.flatMap((it) => "pair" in it
+            messages: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "assistant", content: [{ type: "tool_use", id: it.pair.id, name: "compress", input: it.pair.args }] },
                     { role: "user", content: [{ type: "tool_result", tool_use_id: it.pair.id, content: it.pair.result }] },
@@ -367,7 +368,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/chat/completions",
         buildBody: (items) => ({
             model: "gpt-test", stream: true,
-            messages: items.flatMap((it) => "pair" in it
+            messages: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "assistant", content: null, tool_calls: [{ id: it.pair.id, type: "function", function: { name: "compress", arguments: JSON.stringify(it.pair.args) } }] },
                     { role: "tool", tool_call_id: it.pair.id, content: it.pair.result },
@@ -385,7 +386,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         path: "/v1/responses",
         buildBody: (items) => ({
             model: "gpt-test", stream: true,
-            input: items.flatMap((it) => "pair" in it
+            input: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { type: "function_call", name: "compress", call_id: it.pair.id, arguments: JSON.stringify(it.pair.args) },
                     { type: "function_call_output", call_id: it.pair.id, output: it.pair.result },
@@ -406,7 +407,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
         model: "gemini-test",
         path: "/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
         buildBody: (items) => ({
-            contents: items.flatMap((it) => "pair" in it
+            contents: items.flatMap((it): Record<string, unknown>[] => "pair" in it
                 ? [
                     { role: "model", parts: [{ functionCall: { name: "compress", args: it.pair.args } }] },
                     { role: "user", parts: [{ functionResponse: { name: "compress", response: { result: it.pair.result } } }] },
@@ -459,6 +460,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
         sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -527,8 +529,12 @@ const MAIN_STEPS: Step[] = [
 
 function countOcc(raw: string, needle: string): number { return raw.split(needle).length - 1; }
 
+// node:test (v22) silently ignores an options object passed AFTER the fn argument, but its
+// overloads reject that call shape — bind a precise alias so the existing calls typecheck unchanged.
+const testCompat = test as (name: string, fn: () => void | Promise<void>, opts?: { timeout?: number }) => Promise<void>;
+
 for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
-    test(`cache-friendly plugin matrix: ${wire}`, async () => {
+    testCompat(`cache-friendly plugin matrix: ${wire}`, async () => {
         const cans = await driveWire(wire, MAIN_STEPS);
         assert.equal(cans.length, 8, "expected 8 outbound bodies");
         const L = (i: number) => `cfp/${wire} t${i + 1}`;
@@ -568,7 +574,7 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
     }, { timeout: 120_000 });
 }
 
-test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", async () => {
+testCompat("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", async () => {
     const FOLD_WIDE: FoldSpec = { startId: "m00001", endId: "m00004", topic: "CFP-TOPIC-WIDE", summary: "Cache-friendly plugin fold summary covering m00001..m00004 wide" };
     const FOLD_E: FoldSpec = { startId: "m00005", endId: "m00007", topic: "CFP-TOPIC-E", summary: "Cache-friendly plugin fold summary covering m00005..m00007 gamma" };
     const steps: Step[] = [
@@ -639,7 +645,7 @@ test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", 
 // stripped (P2b); the moment the pair vanishes the anchor MUST re-carry the
 // summary (zero-carrier fail-safe) and the body must stay append-stable on
 // later turns (no flapping).
-test(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries (#1567 hardening)`, async () => {
+testCompat(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries (#1567 hardening)`, async () => {
     const steps: Step[] = [
         { send: [T(1), A(1), T(2), A(2)] },
         { send: [T(3), A(3)] },
@@ -683,7 +689,7 @@ test(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → 
 // consumed compress pairs beyond the newest KEEP_LAST_ORPHANED=2, so the
 // oldest pair leaves the wire while its block is still active — the strip
 // guard must see it gone and KEEP that anchor (kernel-side fail-safe).
-test(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest pair → oldest anchor kept (#1567 hardening)`, async () => {
+testCompat(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest pair → oldest anchor kept (#1567 hardening)`, async () => {
     const SUM_P1 = "Prune-safe fold one summary covering m00001..m00002";
     const SUM_P2 = "Prune-safe fold two summary covering m00003..m00004";
     const SUM_P3 = "Prune-safe fold three summary covering m00005..m00006";
