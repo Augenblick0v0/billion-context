@@ -108,7 +108,7 @@ import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, instructionsFingerprintApplies, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -1988,6 +1988,28 @@ async function handle(
                   clientProvided: !!convHeader,
               }
             : undefined;
+        // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
+        // conversation id on every model request of a session, INCLUDING the
+        // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
+        // freshly-flattened user blob, fired before every tool call under the
+        // Auto permission tier). Keying dsh traffic by id + system hash splits
+        // those review requests onto their own `|sub:<fp>` session so they
+        // stop overwriting the main session's usage baseline (#1916) and
+        // evicting its remembered snapshots (#1307), while successive review
+        // calls still share ONE forked session. Allowlisted by plugin agent
+        // (evidence-per-client discipline, see dshPersonaFingerprintApplies)
+        // because for everyone else system drift mid-id means "same
+        // conversation, evolved" and forking would reset compression for no
+        // defending bug (#1106). The kernel's anchor semantics keep the FIRST
+        // system seen under the id on the raw key — the main turn claims it,
+        // reviews fork; an empty system is non-anchoring (verbatim key), so
+        // system-less auxiliary calls keep riding the main session.
+        const dshPersona = dshPersonaFingerprintApplies(req.headers);
+        const personaSystemText = protocol === "openai"
+            ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
+            : protocol === "anthropic"
+              ? systemTextsForSplit.join("\n\n")
+              : "";
         const conversation = protocol === "google"
             ? (googleIdentity?.value ?? googleSignal)
             : protocol === "anthropic"
@@ -2000,9 +2022,13 @@ async function handle(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : anthropicIdentity?.value ?? anthropicSignal)
+                  : dshPersona
+                    ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
+                    : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? openaiIdentity?.value ?? openaiSignal
+              ? (dshPersona
+                    ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
+                    : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain
                 // directly — do NOT route it through subagentNamespace (the
@@ -2036,6 +2062,17 @@ async function handle(
                            (parsed as ResponsesRequestBody).instructions,
                        )
                      : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
+        // #1916/#1307: true when the dsh persona fingerprint actually split
+        // this request onto a suffixed session key (kernel anchor mismatch).
+        // Used by the recordPluginSession branch below so the fork records
+        // under its split id instead of stealing the raw conversation key
+        // from the main session (same single-valued-map discipline as #970).
+        const rawPersonaIdentity = protocol === "openai"
+            ? (openaiIdentity?.value ?? openaiSignal)
+            : protocol === "anthropic"
+              ? (anthropicIdentity?.value ?? anthropicSignal)
+              : undefined;
+        const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2299,8 +2336,11 @@ async function handle(
             // /acp lookups and MCP tool routing (last writer wins). The raw
             // key keeps pointing at the MAIN session; the subagent session
             // stays reachable via its verbatim split id and its canonical
-            // pfa-* (printed in wire notes).
-            recordPluginSession(claudeSub !== undefined ? conversation : (pluginConversation ?? conversation), session.id);
+            // pfa-* (printed in wire notes). personaForked (#1916/#1307:
+            // dsh review persona split onto a `|sub:<fp>` session) gets the
+            // same discipline — the fork records under its suffixed id and
+            // the raw key stays owned by the main session.
+            recordPluginSession((claudeSub !== undefined || personaForked) ? conversation : (pluginConversation ?? conversation), session.id);
         }
         // #1206: first request of this session — identify the client and scan
         // its plugin registry for a co-resident THIRD-PARTY compression plugin
