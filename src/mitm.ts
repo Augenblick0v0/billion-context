@@ -278,8 +278,10 @@ function doMitm(
     }
     // Mark the socket so resolveUpstream() can recover the real origin. handle()
     // sees the decrypted request as a plain POST /api/anthropic/v1/messages —
-    // with this marker it routes to https://<host> instead of the default.
-    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}`;
+    // with this marker it routes to https://<host>[:port] instead of the default.
+    // The port must be preserved: dropping it silently misroutes every
+    // non-443 CONNECT to :443 (connect-refused for local gateways).
+    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}${port === 443 ? "" : `:${port}`}`;
     (tlsSocket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] = clientSocket;
     // A TLS handshake error (client rejects our cert, abrupt disconnect,
     // reset) emits "error" on the TLSSocket. Without a listener Node treats
