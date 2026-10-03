@@ -544,6 +544,20 @@ test("bare head at chunk boundary: closed form stripped, live prose released (#1
     assert.equal(v2, "x ");
 });
 
+// #1881's bare-open-swallow flush path releases its tail at EOF; without the
+// same bare-run rule there, \x3cname>prose \x3cac at EOF would leak the
+// trailing echo while whole text drops it (streaming ≢ stripAcpTags).
+test("bare-open-swallow flush applies the same bare-run rule as whole text (#1755/#1881)", () => {
+    for (const full of [`${LT}acp>see ${LT}ac`, `${LT}acp>x${LT}/acp>tail ${LT}/ac`]) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
 // Owner review of PR #1759: a head whose next char merely breaks the letter
 // run is NOT proof of death — user-defined kebab elements (\x3cai-video\x3e)
 // start that way. Only the CLOSED 2-letter form is stripped mid-text.

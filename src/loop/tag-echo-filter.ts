@@ -745,7 +745,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                         drop(tc[0]);
                         result = rest.slice(0, tc.index);
                     } else {
-                        result = rest;
+                        // #1755: same bare-run rule as the non-swallow path —
+                        // without it, \x3cname>prose \x3cac at EOF would leak
+                        // the trailing echo while whole text drops it.
+                        const tb = TRUNC_BARE.exec(rest);
+                        if (tb) {
+                            drop(tb[0]);
+                            result = rest.slice(0, tb.index);
+                        } else {
+                            result = rest;
+                        }
                     }
                 }
             } else {
