@@ -46,7 +46,7 @@ const fakeCodec: WsBridgeCodec = {
 async function harness(codecs: readonly WsBridgeCodec[], options: Parameters<typeof installWebSocketBridge>[4] = {}) {
     const server = http.createServer((_req, res) => res.writeHead(404).end());
     const logs: string[] = [];
-    const handler = installWebSocketBridge(server, (_req, res) => { res.writeHead(200).end(); return Promise.resolve(); }, (level, message) => logs.push(`${level} ${message}`), codecs, options);
+    const handler = installWebSocketBridge(server, async (_req, res) => { res.writeHead(200).end(); }, (level, message) => logs.push(`${level} ${message}`), codecs, options);
     server.on("upgrade", (req, socket, head) => { if (!handler(req, socket, head)) socket.destroy(); });
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     return { server, handler, logs, port: (server.address() as AddressInfo).port };
