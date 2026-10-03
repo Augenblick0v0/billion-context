@@ -124,7 +124,9 @@ export function installWebSocketBridge(
     let connectionId = 0;
     const now = options.now ?? Date.now;
     const scanMs = options.scanMs ?? 60_000;
-    const idleWarnMs = options.idleWarnMs ?? Number(process.env.BILI_WS_IDLE_WARN_SECONDS ?? 1800) * 1000;
+    const idleWarnSeconds = Number(process.env.BILI_WS_IDLE_WARN_SECONDS ?? 1800);
+    // Non-numeric or negative env values fall back to the 30-minute default instead of silently disabling the scan (sibling-knob convention, e.g. BILI_MODEL_INFO_RETRY_MS).
+    const idleWarnMs = options.idleWarnMs ?? (Number.isFinite(idleWarnSeconds) && idleWarnSeconds >= 0 ? idleWarnSeconds : 1800) * 1000;
     // #1926: idle client peers pin one live upstream connection plus both
     // checkpoints each, with no reclamation until the client closes. Until
     // idle-close (a)/(b) is verified against the retry-full contract, surface
