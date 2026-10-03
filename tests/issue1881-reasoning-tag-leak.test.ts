@@ -6,6 +6,12 @@
 //   D. google all-proxy call chunks still delivering their sibling prose
 //   E. openai dropped proxy-only frames still delivering their sibling prose
 //   F. google finish-stub chunks never duplicating already-settled prose
+// #1960 REVERSAL: the two SIGNED channels (anthropic thinking, google thought)
+// are no longer filtered — thought text is signature-verified byte-for-byte
+// on replay, so stripping desynchronizes text from signature and bricks the
+// session. Their pins below now assert VERBATIM passthrough; the unsigned
+// channels (openai reasoning_content, responses reasoning summaries) keep
+// the #1881 strip.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter, createGoogleAdapter } from "../src/loop/index.ts";
@@ -83,19 +89,20 @@ test("#1881 openai: a tool-frame replay carries cleaned reasoning bytes, argumen
     assert.ok(out.includes(JSON.stringify(args)), `arguments stay byte-exact (#1039): ${out}`);
 });
 
-test("#1881 anthropic: thinking_delta echo is stripped, thinking prose survives", async () => {
+test("#1960 anthropic: signed thinking_delta echo rides VERBATIM (filtering bricks the session)", async () => {
     const adapter = createAnthropicAdapter({ model: "test" });
     const events = await collect(
         adapter,
         sseEv("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 1 } } }) +
             sseEv("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }) +
             sseEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: `${TAG}plan first` } }) +
+            sseEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-1" } }) +
             sseEv("content_block_stop", { type: "content_block_stop", index: 0 }) +
             sseEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }) +
             sseEv("message_stop", { type: "message_stop" }),
     );
     const out = clientBytes(events);
-    assert.ok(!out.includes("\x3cacp"), `no render tag may reach the client, got: ${out}`);
+    assert.ok(out.includes("\x3cacp"), `thinking is a SIGNED payload — the tag must ride verbatim or the signature breaks (#1960), got: ${out}`);
     assert.ok(out.includes("plan first"), `thinking prose survives: ${out}`);
 });
 
@@ -111,7 +118,7 @@ test("#1881 responses: reasoning_summary_text.delta echo is stripped, prose surv
     assert.ok(out.includes("think more"), `reasoning prose survives: ${out}`);
 });
 
-test("#1881 google: thought-part echo is stripped, thought prose survives once", async () => {
+test("#1960 google: signed thought-part echo rides VERBATIM once (filtering bricks the session)", async () => {
     const adapter = createGoogleAdapter({ model: "gemini-3-pro-preview" }, undefined, "bili_absorb", "gemini-3-pro-preview");
     const events = await collect(
         adapter,
@@ -119,7 +126,7 @@ test("#1881 google: thought-part echo is stripped, thought prose survives once",
             sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } }),
     );
     const out = clientBytes(events);
-    assert.ok(!out.includes("\x3cacp"), `no render tag may reach the client, got: ${out}`);
+    assert.ok(out.includes("\x3cacp"), `thought text carries thoughtSignature — the tag must ride verbatim (#1960), got: ${out}`);
     assert.equal((out.match(/plan/g) ?? []).length, 1, `thought prose arrives once, got: ${out}`);
 });
 

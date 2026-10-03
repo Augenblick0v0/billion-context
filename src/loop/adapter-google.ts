@@ -286,9 +286,14 @@ export function createGoogleAdapter(
             const rawCallChunks: { json: string; parsed: Record<string, unknown>; callIndexes: number[] }[] = [];
             // #206/#717: strip model-imitated render tags and forged ACP
             // confirmation markers from prose parts; filters may hold back a
-            // short tail, flushed on finish (and at stream end). #1881: thought
-            // parts get their own instance — interleaved text/thought deltas on
-            // one shared state would misattribute held tails between fields.
+            // short tail, flushed on finish (and at stream end).
+            // #1960: there is deliberately NO filter instance for thought parts —
+            // thought text is signed (thoughtSignature is verified byte-for-byte
+            // on replay, the same fatality class as Anthropic thinking), so any
+            // filtering of the forwarded or accumulated bytes desynchronizes
+            // text from signature and bricks the session. Thought echoes are
+            // forwarded verbatim; cosmetic leaks inside a thought pane are
+            // accepted (#1960 verdict).
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
@@ -303,15 +308,10 @@ export function createGoogleAdapter(
                 }),
             );
             const tagFilter = makeFilter();
-            const thoughtFilter = makeFilter();
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     yield { kind: "text", delta: tail, raw: buildChunk([{ text: tail }]) } as ParsedStreamEvent;
-                }
-                const ttail = thoughtFilter.flush();
-                if (ttail.length > 0) {
-                    yield { kind: "reasoning", delta: ttail, raw: buildChunk([{ text: ttail, thought: true }]) } as ParsedStreamEvent;
                 }
             };
             let callIndex = 0;
@@ -500,28 +500,17 @@ export function createGoogleAdapter(
                     if (typeof part.text !== "string" || part.text.length === 0) continue;
                     if (part.thought === true) {
                         sawReasoning = true;
-                        const clean = thoughtFilter.push(part.text);
-                        if (clean.length === 0) continue;
+                        // #1960: thought parts replay VERBATIM — never filtered
+                        // (thoughtSignature is verified byte-for-byte; see the
+                        // makeFilter note above).
                         emitted = true;
                         let raw: Buffer | undefined;
-                        if (clean === part.text) {
-                            // A chunk that also carries functionCall parts is replayed
-                            // whole at settle, so its text must not be forwarded twice.
-                            if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
-                        } else {
-                            editedParts = (editedParts ?? [...parts]).map((p, j) => (j === i ? { ...p, text: clean } : p));
-                            if (!hasCallPart) {
-                                raw = sseFrame(cloneChunk(parsed, {
-                                    parts: parts
-                                        .map((p, j) => (j === i ? { ...p, text: clean } : p))
-                                        .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
-                                    dropFinishReason: true,
-                                }));
-                            }
-                        }
+                        // A chunk that also carries functionCall parts is replayed
+                        // whole at settle, so its text must not be forwarded twice.
+                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                         yield {
                             kind: "reasoning",
-                            delta: clean,
+                            delta: part.text,
                             ...(raw ? { raw } : {}),
                             ...(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0
                                 ? { signature: part.thoughtSignature }
