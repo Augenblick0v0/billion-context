@@ -333,6 +333,16 @@ alive. Session binding is headless: the launcher passes
 session otherwise; per-call `conversation_id` overrides work as everywhere
 (#760).
 
+Sessions persist through a persistent `<CODEX_HOME>-bili` overlay: `bili codex`
+points codex's `$CODEX_HOME` at it, so anything codex writes during the run
+(including its SQLite session store) lands in the overlay. The overlay folds
+back into the real home only on the NEXT `bili` launch — sync is startup-time
+only, with no merge-back on process exit. So a plain `codex` started right after
+`bili codex` exits may not yet see that run's sessions; they surface on the next
+`bili` launch. A safe exit-time merge (reconciling an open/crashed SQLite set
+against a possibly-concurrent real client) is a distinct mechanism, tracked
+separately (#1951).
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
 Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of

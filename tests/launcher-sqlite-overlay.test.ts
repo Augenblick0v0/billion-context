@@ -430,6 +430,52 @@ test("sequential relaunch merges back silently: no warning, no conflict files (#
     }
 });
 
+test("fresh home: an overlay-created db is copied back on relaunch (#1951)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    // Fresh home: config only, no db yet — unlike every other relaunch test, which
+    // pre-seeds the db in the real home (the gap this regression slipped through).
+    fs.writeFileSync(path.join(real, "config.toml"), "[x]\n");
+
+    // Launch 1: cold start copies only config; codex has not created its db yet.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    assert.ok(!fs.existsSync(path.join(overlay, "state_5.sqlite")), "fresh home starts without a db");
+
+    // Simulated bili session: create a brand-new db in the ACTIVE overlay home with
+    // one session sentinel, then close cleanly.
+    const ov = path.join(overlay, "state_5.sqlite");
+    const db = new sqliteCtor(ov);
+    db.exec("CREATE TABLE threads(id TEXT PRIMARY KEY)");
+    db.prepare("INSERT INTO threads VALUES(?)").run("first-session");
+    db.close();
+
+    // Launch 2: the new db must reach BOTH homes — merged into real AND copied back
+    // into this launch's active CODEX_HOME (the regression left the overlay empty).
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("could not merge")), `merge must succeed: ${JSON.stringify(errs)}`);
+
+    const re = path.join(real, "state_5.sqlite");
+    assert.ok(fs.existsSync(re), "merged db lands in the real home");
+    assert.ok(fs.existsSync(ov), "second launch retains the db in its active CODEX_HOME");
+    assert.equal(fs.lstatSync(ov).nlink, 1, "active db is a private copy, not a shared link");
+    const check = new sqliteCtor(ov);
+    try {
+        const rows = check.prepare("SELECT id FROM threads ORDER BY id").all().map((r) => String(r.id));
+        assert.deepEqual(rows, ["first-session"], "the previous run's session sentinel survives in the active db");
+    } finally {
+        check.close();
+    }
+});
+
 test("true divergence with the REAL side as loser still warns and preserves (#1919)", (t) => {
     if (!sqliteCtor) {
         t.skip("node:sqlite unavailable on this Node");

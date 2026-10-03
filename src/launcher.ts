@@ -1806,6 +1806,17 @@ export function mergeSqliteSet(overlay: string, realHome: string, base: string):
     }
 }
 
+/** Startup-time overlay sync (#681/#381/#1917/#1951) — runs ONLY when a launch
+ *  prepares its home overlay (see callers: dsh + codex); it does NOT run at
+ *  process exit. Each call folds overlay-owned entries back into the real home,
+ *  then re-copies/links the real home's entries into the now-active overlay. The
+ *  synchronization contract is therefore one-directional per LAUNCH BOUNDARY:
+ *  data created during a bili run lives in the overlay until the NEXT bili launch
+ *  folds it into the real home. A plain/direct client started immediately after
+ *  a launcher run exits may not yet see sessions created during that run; they
+ *  appear on the next bili launch. A safe exit-time merge (reconciling an
+ *  open/crashed SQLite set against a possibly-concurrent real client) is a
+ *  distinct, higher-risk mechanism — deliberately NOT implemented here. */
 export function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
@@ -1912,6 +1923,16 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
                 );
             }
         }
+        // Re-inventory the real home AFTER the merge above (#1951): mergeSqliteSet
+        // moves a freshly-created, overlay-only database INTO the real home, so the
+        // pre-merge `realEntries` snapshot misses it and the copy phase below would
+        // never bring it back into the active overlay — the next launch would start
+        // without the previous run's sessions. A set that failed to merge stays in
+        // the overlay and is still picked up via the `present` check below.
+        const liveRealEntries = new Set<string>();
+        try {
+            for (const entry of fs.readdirSync(realHome)) liveRealEntries.add(entry);
+        } catch {}
         // Real-home SQLite sets are COPIED into the overlay, never file-linked
         // (#1917, see copySqliteSet). Their sidecars travel with the base: an
         // individually linked/copied sidecar would share state across the two
@@ -1920,8 +1941,8 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         // the ordinary link path below, not routed into copySqliteSet where it
         // would fail and land in linkFailures.
         const realDbBases = new Set<string>();
-        for (const entry of realEntries) {
-            if (generatedFiles.has(entry) || !isSqliteMain(entry, realEntries)) continue;
+        for (const entry of liveRealEntries) {
+            if (generatedFiles.has(entry) || !isSqliteMain(entry, liveRealEntries)) continue;
             let st: fs.Stats;
             try {
                 st = fs.lstatSync(path.join(realHome, entry));
@@ -1938,7 +1959,7 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
-        for (const entry of realEntries) {
+        for (const entry of liveRealEntries) {
             if (generatedFiles.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
