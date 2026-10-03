@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 
-import { resolveResignSettings } from "./config.js";
+import { resolveResignSettings, type ResignFileSettings } from "./config.js";
 import { configFile } from "./paths.js";
 
 /**
@@ -57,22 +57,22 @@ export interface ApigCredential {
  *  BILI_RESIGN_BENEFIT (comma-separated model list). */
 const DEFAULT_BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash"];
 
-export function apigBenefitModels(): Set<string> {
-    const fromSettings = resolveResignSettings().benefitModels;
+export function apigBenefitModels(provider?: ResignFileSettings): Set<string> {
+    const fromSettings = resolveResignSettings(process.env, provider).benefitModels;
     if (fromSettings !== undefined && fromSettings.length > 0) {
         return new Set(fromSettings);
     }
     return new Set(DEFAULT_BENEFIT_MODELS);
 }
 
-export function resignEnabled(): boolean {
-    return resolveResignSettings().enabled;
+export function resignEnabled(provider?: ResignFileSettings): boolean {
+    return resolveResignSettings(process.env, provider).enabled;
 }
 
 /** Opt-in verbatim forwarding for signed requests that cannot be re-signed
  *  (no silent passthrough by default — see the refusal rationale above). */
-export function resignPassthroughEnabled(): boolean {
-    return resolveResignSettings().passthrough;
+export function resignPassthroughEnabled(provider?: ResignFileSettings): boolean {
+    return resolveResignSettings(process.env, provider).passthrough;
 }
 
 export interface SignedRefusal {
@@ -239,11 +239,12 @@ export function resignApig(
     method: string,
     urlStr: string,
     body: string | Buffer,
+    provider?: ResignFileSettings,
     now?: Date,
 ): void {
     const bodyBuf = typeof body === "string" ? Buffer.from(body, "utf8") : body;
     const model = modelOfJsonBody(bodyBuf.toString("utf8"));
-    const benefit = model !== undefined && apigBenefitModels().has(model.toLowerCase());
+    const benefit = model !== undefined && apigBenefitModels(provider).has(model.toLowerCase());
     signApigHeaders(target, cred, method, urlStr, bodyBuf, {
         extraSignedHeaders: benefit ? { maas_type: "benefit" } : undefined,
         now,

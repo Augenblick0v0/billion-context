@@ -30,6 +30,7 @@ import {
     signApigHeaders,
     type ApigCredential,
 } from "../src/apig-resign.ts";
+import { resolveResignSettings } from "../src/config.ts";
 import { bodySignedSchemeOf, installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -438,14 +439,14 @@ function startVerifyingUpstream(sk: string): Promise<{ server: http.Server; port
     });
 }
 
-async function startResignProxy(upstreamPort: number): Promise<{ proxy: http.Server; port: number }> {
+async function startResignProxy(upstreamPort: number, routeResign?: { resign?: { enabled?: boolean; passthrough?: boolean; benefitModels?: string[]; credentialRef?: string } }): Promise<{ proxy: http.Server; port: number }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4.1-flash": { context: 200_000 }, "glm-5.3-flash": { context: 200_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4.1-flash": { context: 200_000 }, "glm-5.3-flash": { context: 200_000 } }, ...routeResign } },
         modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
         compress: { injectTool: true, injectNudge: true },
@@ -737,5 +738,73 @@ test("e2e #1884: file-configured passthrough (no env var) → byte-untouched for
                 upstream.closeAllConnections?.();
             }
         });
+    });
+});
+
+// ── level-2 cascade: providers.<url>.resign (route-first ordering, #1884) ──
+
+test("unit #1884: provider-level resign block wins per-field over the global root", async () => {
+    await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined, BILI_RESIGN_BENEFIT: undefined, BILI_CODEARTS_REF: undefined }, async () => {
+        const env = { ...process.env };
+        // provider flips passthrough on while the root default stays refuse
+        assert.equal(resolveResignSettings(env, { passthrough: true }).passthrough, true);
+        assert.equal(resolveResignSettings(env, {}).passthrough, false, "no provider field → root default (refuse)");
+        // provider can un-deploy the action for its host only
+        assert.equal(resolveResignSettings(env, { enabled: false }).enabled, false);
+        assert.equal(resolveResignSettings(env, {}).enabled, true, "no provider field → root default (armed)");
+        // provider benefit list beats the root list; empty provider list falls through to root
+        await withConfigFile({ resign: { benefitModels: ["root-model"] } }, async () => {
+            assert.deepEqual(resolveResignSettings({ ...process.env }, { benefitModels: ["Provider-Model"] }).benefitModels, ["provider-model"]);
+            assert.deepEqual(resolveResignSettings({ ...process.env }, {}).benefitModels, ["root-model"]);
+        });
+        // env still outranks the provider entry
+        assert.equal(resolveResignSettings({ ...process.env, BILI_RESIGN_PASSTHROUGH: "1" }, { passthrough: false }).passthrough, true);
+    });
+});
+
+test("e2e #1884: provider-level resign.passthrough=true → byte-untouched forwarding for that host only (level 2)", async () => {
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
+        const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { passthrough: true } });
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "provider-passthrough-1");
+            const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+            signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+            const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+            assert.equal(r.status, 200, `per-provider passthrough keeps the original signature valid: ${await r.text()}`);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
+});
+
+test("e2e #1884: provider-level resign.enabled=false → guard off for that host; signed traffic rides the normal path (pre-#1884)", async () => {
+    await withEnv({ BILI_RESIGN: undefined, BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
+        const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { enabled: false } });
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "provider-disabled-1");
+            const clientHeaders: Record<string, string> = { "content-type": "application/json", "x-sdk-date": "20261002T120000Z" };
+            signApigHeaders(clientHeaders, { ak: "CLIENT", sk: CRED.sk }, "POST", `http://127.0.0.1:${upstreamPort}/v1/chat/completions`, Buffer.from(bodyStr, "utf8"), { now: new Date("2026-10-02T12:00:00.000Z") });
+            const r = await fetch(url, { method: "POST", headers: clientHeaders, body: bodyStr });
+            // NOT locally refused (403) and NOT byte-untouched (200): the request
+            // entered the rewrite pipeline and the verifying upstream rejected the
+            // mutated body with its own 401 — the documented pre-#1884 behavior.
+            assert.equal(r.status, 401, `rewritten body fails the original signature upstream: ${await r.text()}`);
+            assert.notEqual(r.headers.get("x-bili-resign"), "unavailable", "local guard stayed out of it");
+            assert.equal(calls.length, 1, "the request DID reach upstream");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
     });
 });

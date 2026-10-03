@@ -195,6 +195,18 @@
   }
   ```
 
+- **按 provider 覆盖（二级）：**每个字段也可以只写在单个 provider 条目上 —— `providers.<url>.resign` 形状同为 `{ enabled?, passthrough?, benefitModels?, credentialRef? }`，逐字段优先于全局块；环境变量仍然优先于两者。解析发生在路由之后（route-first，与 [`imageBilling`](#imagebilling) 同一条联级），策略跟着 provider 及其模型过滤器走：
+
+  ```jsonc
+  {
+    "providers": {
+      "https://codearts.example.com": { "resign": { "passthrough": true } }
+    }
+  }
+  ```
+
+  provider 条目上的 `benefitModels` 就是该主机的模型级作用域 —— 列表只在该 provider 自己的模型里选。宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块。
+
 ---
 
 ## Providers

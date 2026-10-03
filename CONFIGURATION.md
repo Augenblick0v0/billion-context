@@ -195,6 +195,18 @@ Top-level keys that control how the proxy listens and behaves globally.
   }
   ```
 
+- **Per-provider override (level 2):** every field can also be set on a single provider entry — `providers.<url>.resign` takes the same `{ enabled?, passthrough?, benefitModels?, credentialRef? }` shape and wins per-field over the global block; env vars still win over both. Resolution happens after routing (route-first, the same cascade as [`imageBilling`](#imagebilling)), so the policy follows the provider and its model filter:
+
+  ```jsonc
+  {
+    "providers": {
+      "https://codearts.example.com": { "resign": { "passthrough": true } }
+    }
+  }
+  ```
+
+  `benefitModels` on a provider entry is the model-level scope for that host — the list selects within the provider's own models. The host-side intercept (dsh native lane) runs before routing exists and always uses the global block.
+
 ---
 
 ## Providers

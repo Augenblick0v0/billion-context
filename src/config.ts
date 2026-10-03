@@ -85,6 +85,11 @@ export type ProviderRoute = {
      *  `imageTokenCap`; env BILI_IMAGE_TOKEN_CAP wins over both. Positive
      *  integer; undefined/unset = no cap. */
     imageTokenCap?: number;
+    /** #1884 level-2 re-sign overrides for this provider: per-field deepest
+     *  wins over the global `resign` block (env still wins over both). The
+     *  benefit model list is the model-level scope here — `models` entries
+     *  live under this same provider key, so the list selects within it. */
+    resign?: ResignFileSettings;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -1379,19 +1384,26 @@ export interface ResignSettings {
     credentialRef?: string;
 }
 
-export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env): ResignSettings {
+/** Per-field precedence: env var > provider-level block (`providers.<url>.resign`,
+ *  level 2) > global file block > default. Provider resolution happens AFTER
+ *  routing — the provider and its model filter are known before the re-sign
+ *  action runs (the repo's route-first ordering; #1884). Host-side callers
+ *  (native intercept, dsh lane) pass no provider — they run before any route
+ *  exists and take the root cascade. */
+export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, provider: ResignFileSettings = {}): ResignSettings {
     const file = loadConfigFile().resign ?? {};
-    const enabled = env.BILI_RESIGN !== undefined ? env.BILI_RESIGN !== "0" : file.enabled !== false;
+    const enabled = env.BILI_RESIGN !== undefined ? env.BILI_RESIGN !== "0" : provider.enabled !== undefined ? provider.enabled : file.enabled !== false;
     const passthrough = env.BILI_RESIGN_PASSTHROUGH !== undefined
         ? env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true"
-        : file.passthrough === true;
+        : provider.passthrough !== undefined
+            ? provider.passthrough
+            : file.passthrough === true;
     const envBenefit = env.BILI_RESIGN_BENEFIT?.trim();
-    const benefitModels = envBenefit !== undefined && envBenefit !== ""
-        ? envBenefit.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0)
-        : Array.isArray(file.benefitModels) && file.benefitModels.length > 0
-            ? file.benefitModels.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0)
-            : undefined;
-    const credentialRef = env.BILI_CODEARTS_REF?.trim() || file.credentialRef || undefined;
+    const providerBenefit = Array.isArray(provider.benefitModels) ? provider.benefitModels : [];
+    const rootBenefit = Array.isArray(file.benefitModels) ? file.benefitModels : [];
+    const benefitSource = envBenefit !== undefined && envBenefit !== "" ? envBenefit.split(",") : providerBenefit.length > 0 ? providerBenefit : rootBenefit;
+    const benefitModels = benefitSource.length > 0 ? benefitSource.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0) : undefined;
+    const credentialRef = env.BILI_CODEARTS_REF?.trim() || provider.credentialRef || file.credentialRef || undefined;
     return { enabled, passthrough, benefitModels, credentialRef };
 }
 

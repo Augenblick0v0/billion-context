@@ -8,10 +8,10 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
-import type { CompressSettings, ProxyOptions } from "./config.js";
+import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
@@ -79,7 +79,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, resignEnabled, resignPassthroughEnabled, signedRefusal } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -1023,6 +1023,17 @@ function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): R
 // 0 = no cap.
 function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undefined): number {
     return findRoute(opts.routes, upstreamUrl)?.imageTokenCap ?? opts.imageTokenCap ?? 0;
+}
+
+// #1884: per-provider re-sign policy — the matched route entry's `resign`
+// block (level 2) wins per-field over the global `resign` root, env over
+// both, the same cascade family as imageBillingFor. Resolved AFTER routing
+// so the provider (and its model filter) is known before the re-sign action
+// runs — the repo's route-first ordering, not action-first-then-filter.
+// Host-side consumers (native intercept, dsh lane) run pre-route and keep
+// the root cascade.
+function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | undefined): ResignSettings {
+    return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign);
 }
 
 // #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
@@ -2946,18 +2957,23 @@ async function handle(
             // request instead of entering the rewrite pipeline with a stale
             // signature that is guaranteed to 401 upstream (APIG.0301).
             const resignArmable = resignMarker === APIG_RESIGN_SCHEME && decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) !== undefined;
+            // Route-first (#1884): the provider is resolved before the action —
+            // the guard consults the matched route entry's `resign` block, so
+            // policy follows the provider/model scoping the rest of the system
+            // uses (env > providers.<url>.resign > global resign root).
+            const guardResign = resignSettingsFor(opts, route?.rewrittenUrl ?? upstreamOrigin);
             if (
                 guardScheme !== undefined &&
                 !resignArmable &&
-                resignEnabled()
+                guardResign.enabled
             ) {
-                if (resignPassthroughEnabled()) {
-                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884, BILI_RESIGN_PASSTHROUGH)`);
+                if (guardResign.passthrough) {
+                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign.passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set BILI_RESIGN_PASSTHROUGH=1 for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign.passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
@@ -5648,8 +5664,9 @@ async function forward(
     // just before it hits the wire, so the rewritten body and the signature
     // always agree. A failed re-sign logs and sends the previous signature:
     // the upstream's 401 stays visible instead of a synthetic bili error.
+    const fwdResign = resignSettingsFor(opts, upstreamUrl);
     const resignCtx =
-        resignEnabled() && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
+        fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
             ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
             : undefined;
     if (resignCtx !== undefined) {
@@ -5658,7 +5675,7 @@ async function forward(
     const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
         if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;
         try {
-            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr);
+            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr, fwdResign);
         } catch (err) {
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
         }
