@@ -63,7 +63,10 @@ test("ws bridge: second codec claims its own path+marker and exchanges frames", 
         const session = [...RecordingSession.live][0]!;
         socket.close(1000);
         await new Promise(resolve => socket.on("close", resolve));
-        await new Promise(resolve => setImmediate(resolve));
+        const deadline = Date.now() + 5000;
+        while (!session.events.includes("close:1000") && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
         assert.deepEqual(session.events, ["message:text:hello", "close:1000"]);
         assert.ok(logs.some(line => line.includes("[fake-ws] [conn=1] [session=\"ses_fake_1\"] fake socket connected")));
     } finally {
