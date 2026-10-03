@@ -213,7 +213,12 @@ function refreshModelInfo(origin: string | undefined): void {
         if (modelInfo.cached.contextWindow !== undefined) return;
         if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
     }
-    const resolve = svc.llm?.resolveModelInfo;
+    // The host registers llm as a service object, so resolveModelInfo needs its
+    // receiver; called detached below, this threw
+    // "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
+    // for every provider and model, and the failure-shaped cache (#1812) then
+    // left the process without x-bili-plugin-context-window.
+    const resolve = svc.llm?.resolveModelInfo?.bind(svc.llm);
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;
