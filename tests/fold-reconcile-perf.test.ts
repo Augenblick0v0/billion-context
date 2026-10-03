@@ -46,14 +46,29 @@ describe("reconcileFoldCoverage near-linear performance (#1930-2)", () => {
         ms(() => reconcileFoldCoverage(coveredSession(warmup), warmup, opts));
 
         const small = makeHistory(1_000);
-        const t1k = msMin3(() => reconcileFoldCoverage(coveredSession(small), small, opts));
-
         const big = makeHistory(8_000);
-        const t8k = msMin3(() => reconcileFoldCoverage(coveredSession(big), big, opts));
 
-        assert.ok(t1k > 0 && t8k > 0);
-        // 8x the messages must not give ~64x the work: near-linear with CI-variance headroom.
-        assert.ok(t8k / t1k < 12, `8K/1K cold-round ratio ${t8k / t1k} is super-linear (t1k=${t1k.toFixed(1)}ms t8k=${t8k.toFixed(1)}ms)`);
+        // Paired rounds: measure 1K and 8K back-to-back in the same runner
+        // state and keep the BEST ratio. Min-of-ratios, not ratio-of-mins —
+        // the old form (independent min-of-3 timings) biased the denominator
+        // down and flaked CI when the 1K baseline ran unusually fast
+        // (observed 12.6x vs the old <12 cap on windows-latest/24).
+        let ratio = Infinity;
+        let t1k = Infinity; // min 1K timing (reporting + absolute nets)
+        let t8k = Infinity; // min 8K timing
+        for (let i = 0; i < 3; i++) {
+            const a = ms(() => reconcileFoldCoverage(coveredSession(small), small, opts));
+            const b = ms(() => reconcileFoldCoverage(coveredSession(big), big, opts));
+            t1k = Math.min(t1k, a);
+            t8k = Math.min(t8k, b);
+            ratio = Math.min(ratio, b / a);
+        }
+
+        assert.ok(t1k > 0 && t8k > 0 && ratio > 0 && Number.isFinite(ratio));
+        // 8x the messages must not give ~64x the work: near-linear with
+        // CI-variance headroom. Linear is 8; the cap at 20 still sits >3x
+        // below the ~64x quadratic signal, so a real regression trips loudly.
+        assert.ok(ratio < 20, `8K/1K cold-round ratio ${ratio.toFixed(2)} is super-linear (t1k=${t1k.toFixed(1)}ms t8k=${t8k.toFixed(1)}ms)`);
         // Absolute sanity net (current implementation is well under a second).
         assert.ok(t8k < 10_000, `8K cold round took ${t8k.toFixed(1)}ms`);
     });
