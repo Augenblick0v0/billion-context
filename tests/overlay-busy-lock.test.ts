@@ -219,9 +219,17 @@ test("six racing processes: exactly one wins the lease (#1952)", { timeout: 60_0
     );
     const K = 6;
     const results: string[] = [];
+    const stderrs: string[] = [];
     const children: ChildProcess[] = [];
     for (let i = 0; i < K; i++) {
-        children.push(spawn(process.execPath, ["--import", "tsx", script, overlay], { stdio: ["ignore", "pipe", "pipe"] }));
+        // Point every temp var at our own fixture so the child's tooling (tsx's
+        // transform cache) never depends on the host's /tmp state or perms.
+        children.push(
+            spawn(process.execPath, ["--import", "tsx", script, overlay], {
+                stdio: ["ignore", "pipe", "pipe"],
+                env: { ...process.env, TMPDIR: tmp, TEMP: tmp, TMP: tmp },
+            }),
+        );
     }
     try {
         await new Promise<void>((resolve, reject) => {
@@ -232,7 +240,7 @@ test("six racing processes: exactly one wins the lease (#1952)", { timeout: 60_0
                 if (err) reject(err);
                 else resolve();
             };
-            for (const c of children) {
+            children.forEach((c, i) => {
                 let buf = "";
                 c.stdout?.on("data", (d: Buffer) => {
                     buf += d.toString();
@@ -248,18 +256,27 @@ test("six racing processes: exactly one wins the lease (#1952)", { timeout: 60_0
                         }
                     }
                 });
+                c.stderr?.on("data", (d: Buffer) => {
+                    stderrs[i] = (stderrs[i] ?? "") + d.toString();
+                });
                 c.on("error", (err: Error) => finish(err));
                 c.on("close", (code) => {
-                    if (!settled && code !== 0) finish(new Error(`race child exited ${code}`));
+                    if (!settled && code !== 0) {
+                        finish(new Error(`race child ${i} exited ${code}: ${(stderrs[i] ?? "").trim().slice(0, 400) || "(no stderr)"}`));
+                    }
                 });
-            }
+            });
         });
     } finally {
         for (const c of children) {
             try { c.kill("SIGTERM"); } catch {}
         }
     }
-    assert.equal(results.filter((r) => r === "WIN").length, 1);
+    assert.equal(
+        results.filter((r) => r === "WIN").length,
+        1,
+        `expected exactly one WIN, got results=${JSON.stringify(results)} stderr=${JSON.stringify(stderrs.map((s) => s.trim()).filter(Boolean))}`,
+    );
     assert.equal(results.filter((r) => r === "BUSY").length, K - 1);
     cleanup(tmp);
 });
