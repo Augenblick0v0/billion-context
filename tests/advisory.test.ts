@@ -69,7 +69,7 @@ function pkgJson(version: string): string {
     return JSON.stringify({ name: "billion-context", version, type: "module", main: "dist/index.js", bin: { bili: "./dist/index.js" } });
 }
 
-function advisoryDoc(entries: AdvisoryEntry[]): Record<string, unknown> {
+function advisoryDoc(entries: unknown[]): Record<string, unknown> {
     return { name: "billion-context-advisories", version: "0.0.2", billionContextAdvisories: { schema: 1, updated: "2026-09-27", advisories: entries } };
 }
 

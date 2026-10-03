@@ -3,9 +3,11 @@
 // file), so disk runs new while the process runs old. These tests pin the
 // three behaviors that make the fix safe and useful:
 //   1. parsing/validation of the remote doc (bad entries skipped, bad doc = error),
-//   2. the user-side span + visibility derivation (restart-pending beats
-//      everything; recommended surfaces even without pending restart; clean
-//      installs see NOTHING — byte-identical to pre-#1870 output),
+//   2. the user-side span + visibility derivation (#1977: silent by
+//      default — routine/recommended NEVER surface; only a critical-tier
+//      entry does, and a pending restart is announced only when the pending
+//      span carries one; clean installs see NOTHING — byte-identical to
+//      pre-#1870 output),
 //   3. the two surfaces: acp_status section + /acp panel line before the
 //      footer (stripper-safe), with remote-doc text escaped for replace().
 import { test } from "node:test";
@@ -37,13 +39,13 @@ const NEXT = semver.inc(RUNNING, "patch") ?? "0.0.2";
 const NEXT2 = semver.inc(NEXT, "patch") ?? "0.0.3";
 const SURFACE_ENTRIES: ReleaseNoteEntry[] = [
     { version: NEXT2, tier: "routine", summary: "docs and log polish" },
-    { version: NEXT, date: "2026-10-02", tier: "recommended", summary: "OpenCode WebSocket traffic intercepted again (#1844)" },
+    { version: NEXT, date: "2026-10-02", tier: "critical", summary: "OpenCode WebSocket traffic intercepted again (#1844)" },
     { version: RUNNING, tier: "recommended", summary: "compression survives restart/resume forks (#1834)" },
 ];
 
 const ENTRIES: ReleaseNoteEntry[] = [
     { version: "0.1.181", tier: "routine", summary: "docs and log polish" },
-    { version: "0.1.180", date: "2026-10-02", tier: "recommended", summary: "OpenCode WebSocket traffic intercepted again (#1844)" },
+    { version: "0.1.180", date: "2026-10-02", tier: "critical", summary: "OpenCode WebSocket traffic intercepted again (#1844)" },
     { version: "0.1.179", tier: "recommended", summary: "compression survives restart/resume forks (#1834)" },
 ];
 
@@ -57,14 +59,16 @@ test("#1870 parseReleaseNotesDoc: valid doc parses; malformed entries skip; brok
                 { version: "0.1.180", tier: "urgent", summary: "bad tier skipped" },
                 { version: "0.1.179", tier: "routine", summary: "   " },
                 { version: "0.1.178", tier: "recommended", date: "2026-10-01", summary: "ok with date" },
+                { version: "0.1.177", tier: "critical", date: "2026-10-01", summary: "ok critical accepted (#1977)" },
             ],
         },
     };
     const parsed = parseReleaseNotesDoc(doc);
     assert.equal(parsed.error, undefined);
-    assert.equal(parsed.entries.length, 2);
+    assert.equal(parsed.entries.length, 3);
     assert.equal(parsed.entries[0].version, "0.1.181");
     assert.equal(parsed.entries[1].date, "2026-10-01");
+    assert.equal(parsed.entries[2].tier, "critical", "critical tier accepted (#1977)");
 
     assert.equal(parseReleaseNotesDoc(null).error, "document is not a JSON object");
     assert.equal(parseReleaseNotesDoc({}).error, "missing billionContextReleaseNotes object");
@@ -86,7 +90,7 @@ test("#1870 spanNotes: strictly-newer entries, ascending (user-side diff), inval
     assert.deepEqual(spanNotes(ENTRIES, "garbage"), [], "invalid running version → empty (no crash)");
 });
 
-test("#1870 getUpdateVisibility: pending restart beats everything; recommended-only still visible; clean = invisible", () => {
+test("#1977 getUpdateVisibility: silent by default — only critical surfaces; pending restart alone is silent", () => {
     _resetReleaseNotesWatcherForTest();
     try {
         // Clean install: no disk info, no span → invisible (byte-identical surfaces).
@@ -95,19 +99,35 @@ test("#1870 getUpdateVisibility: pending restart beats everything; recommended-o
         assert.equal(clean.pendingRestart, false);
         assert.deepEqual(clean.span, []);
 
-        // Recommended release exists beyond running version (auto-update off).
+        // #1977 core: routine/recommended-only span (span from 0.1.180 =
+        // [0.1.181 routine]) → invisible even though an update exists.
         _setReleaseNotesStateForTest({ entries: ENTRIES });
-        const recOnly = getUpdateVisibility("0.1.179");
+        const recOnly = getUpdateVisibility("0.1.180");
         assert.equal(recOnly.pendingRestart, false);
-        assert.equal(recOnly.recommended, true);
-        assert.equal(recOnly.visible, true, "recommended alone must surface (updater may be off)");
-        assert.deepEqual(recOnly.span.map((e) => e.version), ["0.1.180", "0.1.181"]);
+        assert.equal(recOnly.critical, false);
+        assert.equal(recOnly.visible, false, "#1977: recommended/routine alone must NOT surface");
+        assert.deepEqual(recOnly.span.map((e) => e.version), ["0.1.181"]);
 
-        // Disk newer than running → restart-pending, the actionable case.
+        // Critical entry in the span (auto-update off) → the one case that
+        // surfaces without a restart pending.
+        const crit = getUpdateVisibility("0.1.179");
+        assert.equal(crit.pendingRestart, false);
+        assert.equal(crit.critical, true);
+        assert.equal(crit.visible, true, "critical alone must surface (updater may be off)");
+        assert.deepEqual(crit.span.map((e) => e.version), ["0.1.180", "0.1.181"]);
+
+        // Disk newer than running + critical in the pending span → the
+        // actionable announcement.
         _setReleaseNotesStateForTest({ entries: ENTRIES, diskVersion: "0.1.181" });
         const pending = getUpdateVisibility("0.1.179");
         assert.equal(pending.pendingRestart, true);
         assert.equal(pending.visible, true);
+
+        // #1977: disk newer but the pending span is routine/recommended-only
+        // → restart happens naturally, nothing surfaces.
+        const pendingQuiet = getUpdateVisibility("0.1.180");
+        assert.equal(pendingQuiet.pendingRestart, true);
+        assert.equal(pendingQuiet.visible, false, "pending restart with no critical entry stays silent");
 
         // Disk older or equal (edge: rollback / same) → not pending.
         assert.equal(getUpdateVisibility("0.1.181").pendingRestart, false);
@@ -123,28 +143,28 @@ test("#1870 getUpdateVisibility: pending restart beats everything; recommended-o
     }
 });
 
-test("#1870 describeUpdateReady: actionable wording + byte-stability", () => {
+test("#1977 describeUpdateReady: critical wording + byte-stability", () => {
     _resetReleaseNotesWatcherForTest();
     try {
         _setReleaseNotesStateForTest({ entries: ENTRIES, diskVersion: "0.1.181" });
         const pending = getUpdateVisibility("0.1.179");
         const line = describeUpdateReady(pending);
-        assert.ok(line.startsWith("Update ready: 0.1.181 — restart to finish."), `pending-restart wording (got: ${line})`);
-        assert.ok(line.includes("#1844"), "top recommended summary carried");
+        assert.ok(line.startsWith("Critical update ready: 0.1.181 — restart to finish."), `pending-restart wording (got: ${line})`);
+        assert.ok(line.includes("#1844"), "top critical summary carried");
         assert.equal(line, describeUpdateReady(getUpdateVisibility("0.1.179")), "byte-stable for identical state");
 
         _setReleaseNotesStateForTest({ entries: ENTRIES }); // no disk info
         const rec = describeUpdateReady(getUpdateVisibility("0.1.179"));
-        assert.ok(rec.startsWith("Update available: 0.1.181 (recommended) —"), `recommended wording (got: ${rec})`);
+        assert.ok(rec.startsWith("Critical update available: 0.1.181 —"), `critical wording (got: ${rec})`);
         assert.ok(rec.includes("npm install -g billion-context@0.1.181"), "manual command when restart cannot finish it");
 
-        // Span with NO recommended entry + no pending restart = invisible; the
+        // Span with NO critical entry + no pending restart = invisible; the
         // routine-only branch exists for panel completeness only.
         const routineOnly = getUpdateVisibility("0.1.178"); // span = 179(rec),… — pick a base where span is routine-only
         const routineEntries: ReleaseNoteEntry[] = [{ version: "0.2.0", tier: "routine", summary: "polish" }];
         _setReleaseNotesStateForTest({ entries: routineEntries });
         const ro = getUpdateVisibility("0.1.179");
-        assert.equal(ro.recommended, false);
+        assert.equal(ro.critical, false);
         assert.equal(ro.visible, false);
         assert.ok(describeUpdateReady(ro).includes("0.2.0"), "fallback line still names the version");
         assert.ok(routineOnly !== undefined);
@@ -168,7 +188,7 @@ function makeCtx(messages: CoreMessage[]): { core: ReturnType<typeof createCore>
         session: {
             id: "update-notes-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 15000, compressCreditTokens: 0, contextTokens: 0 , retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -176,6 +196,7 @@ function makeCtx(messages: CoreMessage[]): { core: ReturnType<typeof createCore>
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -199,7 +220,7 @@ function mockRes(): { res: http.ServerResponse; status: number; body: string } {
     return out;
 }
 
-test("#1870 acp_status: UPDATE READY section lists the span; clean state stays byte-absent", async () => {
+test("#1977 acp_status: CRITICAL UPDATE READY section lists the span; clean + non-critical states stay byte-absent", async () => {
     _resetReleaseNotesWatcherForTest();
     const { handleAcpStatus } = await import("../src/acp-status.ts");
     try {
@@ -207,18 +228,24 @@ test("#1870 acp_status: UPDATE READY section lists the span; clean state stays b
         const clean = handleAcpStatus({}, ctx);
         assert.ok(!clean.includes("UPDATE READY") && !clean.includes("UPDATE AVAILABLE"), "no section on a clean install");
 
+        // #1977: a newer disk version with a routine/recommended-only span
+        // must NOT surface either — silence is the default.
+        _setReleaseNotesStateForTest({ entries: [SURFACE_ENTRIES[0]], diskVersion: NEXT2 });
+        const quiet = handleAcpStatus({}, ctx);
+        assert.ok(!quiet.includes("UPDATE READY") && !quiet.includes("UPDATE AVAILABLE"), "#1977: pending restart without a critical entry stays silent");
+
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const out = handleAcpStatus({}, ctx);
-        assert.ok(out.includes(`UPDATE READY (instance-level): ${NEXT2} downloaded — restart this agent's proxy to finish`), "actionable headline names the disk version");
+        assert.ok(out.includes(`CRITICAL UPDATE READY (instance-level): ${NEXT2} downloaded — restart this agent's proxy to finish`), "actionable headline names the disk version");
         assert.ok(out.includes(`(running ${VERSION})`), "names the running version for contrast");
-        assert.ok(out.includes(`· ${NEXT} [recommended] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
+        assert.ok(out.includes(`· ${NEXT} [critical] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
         assert.ok(out.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
         assert.ok(out.includes("GET /__bili/status → update"), "points at the live-state field");
 
         // No disk info (auto-update off): AVAILABLE wording + manual command.
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
         const avail = handleAcpStatus({}, ctx);
-        assert.ok(avail.includes("UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
+        assert.ok(avail.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
         assert.ok(avail.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
         assert.ok(!avail.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
     } finally {
@@ -226,7 +253,7 @@ test("#1870 acp_status: UPDATE READY section lists the span; clean state stays b
     }
 });
 
-test("#1870 /acp panel: one update line BEFORE the footer, stripper-safe, byte-exact when clean; $ survives", async () => {
+test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-safe, byte-exact when clean; $ survives", async () => {
     _resetReleaseNotesWatcherForTest();
     const { _resetSessionsForTest } = await import("../src/session.ts");
     const { handlePluginStatus } = await import("../src/plugin.ts");
@@ -241,16 +268,16 @@ test("#1870 /acp panel: one update line BEFORE the footer, stripper-safe, byte-e
         handlePluginStatus("never-seen", r0.res, deps, true);
         assert.equal(r0.status, 200);
         const p0 = JSON.parse(r0.body).panel as string;
-        assert.ok(!p0.includes("Update ready") && !p0.includes("Update available"), "no update line when clean");
+        assert.ok(!p0.includes("Update ready") && !p0.includes("Update available") && !p0.includes("Critical update"), "no update line when clean");
         assert.ok(p0.includes(PANEL_BOX_FOOTER), "footer present when clean");
 
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const r1 = mockRes();
         handlePluginStatus("never-seen", r1.res, deps, true);
         const p1 = JSON.parse(r1.body).panel as string;
-        assert.ok(p1.includes(`Update ready: ${NEXT2} — restart to finish.`), "panel line present");
+        assert.ok(p1.includes(`Critical update ready: ${NEXT2} — restart to finish.`), "panel line present");
         assert.ok(p1.includes(PANEL_BOX_FOOTER), "footer still present with the update line");
-        assert.ok(p1.indexOf("Update ready") < p1.indexOf(PANEL_BOX_FOOTER), "update line sits BEFORE the footer (stripper anchor)");
+        assert.ok(p1.indexOf("Critical update ready") < p1.indexOf(PANEL_BOX_FOOTER), "update line sits BEFORE the footer (stripper anchor)");
         const footerEsc = PANEL_BOX_FOOTER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         assert.equal((p1.match(new RegExp(footerEsc, "g")) ?? []).length, 1, "footer appears exactly once");
 
@@ -258,7 +285,7 @@ test("#1870 /acp panel: one update line BEFORE the footer, stripper-safe, byte-e
         // byte-exact (same escape the advisory line relies on).
         const dollarSummary = "saves $5 and echoes $& `$'` verbatim";
         _setReleaseNotesStateForTest({
-            entries: [{ version: NEXT, tier: "recommended", summary: dollarSummary }],
+            entries: [{ version: NEXT, tier: "critical", summary: dollarSummary }],
             diskVersion: NEXT,
         });
         const r2 = mockRes();

@@ -105,7 +105,7 @@ QQ群:
 
 | 客户端 | 用这个 |
 |---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 |
 | **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](CLIENTS.zh-CN.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
@@ -294,6 +294,10 @@ bili --no-auto-update        # 本次启动禁用自动更新
 ### 日志文件
 
 所有日志**默认同时写入文件**:`~/.local/state/billion-context/bili.log`(XDG state 目录),同时仍打印到 stderr。覆盖用配置的 `"logFile"` 或 `ACP_LOG_FILE`(`off` 关闭文件)。超过 10 MB 自动轮转(`bili.log.old`)。每个请求的缓存命中统计以 `[acp-usage] round N input=X cached=Y (cache hit Z%)` 打印,可直接从日志衡量前缀缓存健康度。
+
+### 连接生命周期调优（#1982）
+
+客户端侧连接在最终响应结束后优雅关闭:代理主动发起关闭(`Connection: close`)时,最多等待 `BILI_POST_RESPONSE_LINGER_MS`(默认 `5000`)毫秒的对端关闭信号才释放套接字,池化客户端因此看到的是干净的 EOF,而非字节竞态可能产生的 RST。相关旋钮:`BILI_KEEP_ALIVE_TIMEOUT_MS`(空闲回收预算,默认 `5000`)与 `BILI_CLIENT_ERROR_BACKSTOP_MS`(错误排空路径终局兜底,默认 `30000`)——完整语义见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
 ### 自动更新
 

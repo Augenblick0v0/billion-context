@@ -104,13 +104,15 @@ function makeFakeCtx() {
     const addedCommands: FakeAddedCommand[] = [];
     const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
+    let wsHandshakeCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
     const ctx = {
         session: {
             hook: async (name: string, cb: (e: Record<string, unknown>) => void | Promise<void>) => {
-                assert.equal(name, "http.request");
-                modelRequestCb = cb;
+                if (name === "http.request") modelRequestCb = cb;
+                else if (name === "experimental.ws.handshake") wsHandshakeCb = cb;
+                else assert.fail(`unexpected hook ${name}`);
                 return { dispose: () => { disposed.push(1); } };
             },
             synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
@@ -157,7 +159,7 @@ function makeFakeCtx() {
 
     return {
         ctx,
-        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown }) => {
+        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown; headers?: Record<string, string> }) => {
             const store: Record<string, string> = {};
             await modelRequestCb!({
                 sessionID: opts.sessionID,
@@ -170,6 +172,10 @@ function makeFakeCtx() {
             return { headers: store };
         },
         pushEvent: (evt: { type?: unknown; data?: Record<string, unknown> }) => { eventQueue.push(evt); wake?.(); },
+        fireWsHandshake: async (event: Record<string, unknown>) => {
+            await wsHandshakeCb!(event);
+            return event;
+        },
         get addedTools() { return addedTools; },
         get addedCommands() { return addedCommands; },
         get syntheticCalls() { return syntheticCalls; },

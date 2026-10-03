@@ -598,7 +598,7 @@ export async function main(): Promise<void> {
             // affected range (rollback-form advisories cover latest too).
             advisoryBlocksVersion,
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,
@@ -619,7 +619,7 @@ export async function main(): Promise<void> {
             advisoryUrl: opts.advisoryUrl,
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,
@@ -631,10 +631,10 @@ export async function main(): Promise<void> {
             }),
         });
     }
-    // #1870: tiered release-notes visibility — fetch + cache only (never
-    // installs, never restarts). Runs independently of autoUpdate for the
-    // same reason as the advisory watcher: installs with auto-update off
-    // still deserve to learn a recommended update exists.
+    // #1870 release-notes visibility (#1977 silent by default) — fetch +
+    // cache only (never installs, never restarts). Runs independently of
+    // autoUpdate for the same reason as the advisory watcher: installs with
+    // auto-update off still deserve to learn when a critical-tier fix exists.
     if (opts.releaseNotesCheck) {
         startReleaseNotesWatcher({
             packageName: PACKAGE_NAME,

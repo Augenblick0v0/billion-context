@@ -333,6 +333,17 @@ alive. Session binding is headless: the launcher passes
 session otherwise; per-call `conversation_id` overrides work as everywhere
 (#760).
 
+**Responses native chaining (a caveat).** bili compresses by replaying the full
+`input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a
+delta-only continuation would lose its earlier turns upstream while still
+returning 200. Today this is a non-issue for codex — observed builds send
+`store:false` and never set `previous_response_id` (an observation, not a proof;
+the E2E does not cover that shape). If you point a native-chaining Responses
+client through bili, either resend the full input/output history or set
+`ACP_KEEP_RESPONSE_ID=1`; when bili strips a non-empty `previous_response_id` it
+now logs a `warn` (#1954). Full chaining support is tracked as #1973. See the
+[official migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
 Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of
@@ -466,6 +477,26 @@ launcher. Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made
 healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
+
+### OpenAI Responses WebSockets (V2)
+
+The V2 plugin also intercepts OpenAI `experimental.ws.handshake` requests.
+Both legs use WebSocket: OpenCode → bili → the Responses upstream. This
+includes API-key OpenAI and ChatGPT Pro/Plus browser/headless OAuth; the login
+method does not select the transport. No OpenCode configuration rewrite or
+new bili setting is required. The socket must originate locally and carry
+the cooperative plugin identity; generic or unclaimed upgrades retain 426.
+
+ACP processing, native tools and usage accounting stay active. Client deltas
+are expanded before compression. Upstream deltas are used only when the
+processed history exactly extends the previous response; a fold starts a new
+chain with full compressed input on the same socket. Ref tagging or other
+history edits can also require full input, so connection reuse does not imply
+every turn is incremental. Older hosts without the experimental hook must
+use OpenCode's existing `providers.openai.settings.transport: "http"` setting.
+Realtime, multiplexed concurrent responses, and remote WS clients are outside
+this integration's scope. Verification: real OpenCode V2.0.20 with a local
+Responses WS upstream, not live OpenAI/ChatGPT credentials.
 
 ### Pure proxy (no plugin)
 

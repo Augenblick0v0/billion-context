@@ -89,13 +89,21 @@ function proxyOptions(upstreamPort: number): ProxyOptions {
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
         }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
-    } as ProxyOptions;
+    };
 }
 
 test("e2e preflight: a payload that needs more folds than one round allows is still brought under the window", async () => {

@@ -103,7 +103,7 @@ Pick by your client:
 
 | Client | Use |
 |---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili pi` (launcher) or `bili plugin install pi` (native); standalone [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) remains usable |
 | **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x — full guide: [OpenCode](CLIENTS.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane) — details: [CLIENTS.md](CLIENTS.md) |
@@ -374,6 +374,10 @@ By default the proxy binds `127.0.0.1` and only accepts loopback connections. To
 ### Log file
 
 All logs tee to `~/.local/state/billion-context/bili.log` by default (XDG state dir) and still print to stderr. Override with `"logFile"` in config or `ACP_LOG_FILE` (`off` disables the file). Auto-rotates at 10 MB (`bili.log.old`). Per-request cache-hit stats log as `[acp-usage] round N input=X cached=Y (cache hit Z%)` so you can measure prefix-cache health directly from the log.
+
+### Connection lifecycle tuning (#1982)
+
+Client-facing connections close gracefully after the final response: when the proxy initiates the close (`Connection: close`), it waits up to `BILI_POST_RESPONSE_LINGER_MS` (default `5000`) for the client's close signal before releasing the socket, so pooled clients see a clean EOF instead of a possible RST from racing bytes. Related knobs: `BILI_KEEP_ALIVE_TIMEOUT_MS` (idle-reap budget, default `5000`) and `BILI_CLIENT_ERROR_BACKSTOP_MS` (terminal backstop for the error-drain path, default `30000`) — full semantics in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
 
 ### Self-update
 

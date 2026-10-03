@@ -630,13 +630,13 @@ export type ProxyOptions = {
      *  plain-object key paths of client-fixed fields to strip before forward
      *  for strict-schema gateways that 400 on unknown fields; per-provider
      *  lists union onto it additively. Empty = byte-for-byte transparent. */
-    compat: { roles: Record<string, string>; dropFields?: string[] };
+    compat?: { roles: Record<string, string>; dropFields?: string[] };
     /** #1455: how upstream stream failures are presented to the client on the
      *  anthropic/openai wire — "protocol" (default) = protocol-native error
      *  frames; "completion" = legacy synthesized-completion shape for hosts
      *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
      *  wins over the file's compat.streamErrorShape. */
-    streamErrorShape: "protocol" | "completion";
+    streamErrorShape?: "protocol" | "completion";
     /** Global-level image billing mode (#767); per-provider route entries
      *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto
      *  (= pixels for every host since #1843). */
@@ -653,20 +653,20 @@ export type ProxyOptions = {
     /** Where `passthrough` came from: "env" (ACP_PASSTHROUGH or --passthrough
      *  flag), "file" (config `passthrough: true`), or null (default off).
      *  Drives the #405 boot warning and the web panel's source display. */
-    passthroughSource: "env" | "file" | null;
+    passthroughSource?: "env" | "file" | null;
     autoUpdate: boolean;
     /** Opt-in self-restart when a newer version is already installed on disk
      *  (#811): re-exec at zero in-flight requests. Default OFF. */
-    autoRestartOnUpdate: boolean;
+    autoRestartOnUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
-    updateTag: string;
+    updateTag?: string;
     /** Critical-defect advisory watcher (#1481): runs INDEPENDENTLY of
      *  autoUpdate and force-installs the owner-recommended version when the
      *  local version falls inside an affected range. Default ON. */
-    advisoryCheck: boolean;
+    advisoryCheck?: boolean;
     /** Tiered release-notes visibility (#1870): fetch + cache only — never
      *  installs, never restarts. Default ON. */
-    releaseNotesCheck: boolean;
+    releaseNotesCheck?: boolean;
     /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
     advisoryUrl?: string;
     /** Override for the release-notes document URL (env

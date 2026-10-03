@@ -150,17 +150,20 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
-        // #1870: the self-updater is a silent courier on native lanes — the
-        // "Restart to finish" log line never reaches pi/opencode/dsh users,
-        // so disk runs new while the process runs old. This is the surface
-        // agents actually poll: tell them a restart is actionable NOW, or
-        // that a recommended release exists when auto-update is off.
+        // #1870 + #1977: the self-updater is a silent courier on native
+        // lanes — the "Restart to finish" log line never reaches
+        // pi/opencode/dsh users, so disk runs new while the process runs old.
+        // This is the surface agents actually poll — but by default it is
+        // SILENT (#1977: not every release deserves the user's attention);
+        // it only speaks when the span carries a critical-tier entry,
+        // telling them a restart is actionable NOW, or that a critical fix
+        // exists while auto-update is off.
         extra.push("");
         const lines: string[] = [];
         if (upd.pendingRestart) {
-            lines.push(`UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
+            lines.push(`CRITICAL UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
         } else {
-            lines.push(`UPDATE AVAILABLE (instance-level): newer recommended release on the channel — running ${upd.runningVersion}.`);
+            lines.push(`CRITICAL UPDATE AVAILABLE (instance-level): release with a critical-tier fix on the channel — running ${upd.runningVersion}.`);
         }
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);

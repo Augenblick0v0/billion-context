@@ -72,6 +72,8 @@ export interface V2HttpRequestEvent {
     agent?: unknown;
     model?: { providerID?: unknown; id?: unknown };
     request?: { url?: unknown; headers?: V2Headers | null };
+    url?: unknown;
+    headers?: Record<string, string>;
 }
 
 interface V2ToolEditor {
@@ -105,14 +107,14 @@ interface V2CatalogModelEntry {
 
 export interface V2PluginContext {
     session?: {
-        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => void | Promise<V2Registration | undefined>;
+        hook?: (name: string, cb: (e: V2HttpRequestEvent) => void | Promise<void>) => V2Registration | void | Promise<V2Registration | undefined>;
         synthetic?: (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => Promise<unknown>;
     };
     tool?: {
-        transform?: (cb: (editor: V2ToolEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2ToolEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     command?: {
-        transform?: (cb: (editor: V2CommandEditor) => void) => void | Promise<V2Registration | undefined>;
+        transform?: (cb: (editor: V2CommandEditor) => void) => V2Registration | void | Promise<V2Registration | undefined>;
     };
     event?: { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<{ type?: unknown; data?: Record<string, unknown> }> | undefined };
     /** v2.0.x stable (probed @opencode/cli 2.0.18): ModelApi.list() →
@@ -332,6 +334,29 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
+
+        try {
+            const wsReg = await ctx.session?.hook?.("experimental.ws.handshake", async (e) => {
+                if (pluginDisabled() || e.model?.providerID !== "openai" || typeof e.url !== "string" || !/^wss?:\/\//.test(e.url)) return;
+                const httpUrl = e.url.replace(/^ws/, "http");
+                if (!new URL(httpUrl).pathname.endsWith("/responses")) return;
+                const requestEvent: V2HttpRequestEvent = { sessionID: e.sessionID, agent: e.agent, model: e.model, request: new Request(httpUrl, { headers: e.headers }) };
+                await httpRequestHook(requestEvent);
+                const pinned = proxyBaseFromUrl(typeof requestEvent.request?.url === "string" ? requestEvent.request.url : undefined);
+                if (pinned && !state.proxyBase) {
+                    state.proxyBase = pinned;
+                    refreshWindows(ctx, state);
+                    stampHeaders(requestEvent);
+                }
+                const routed = requestEvent.request;
+                if (!state.proxyBase || typeof routed?.url !== "string" || !routed.url.startsWith(`${state.proxyBase}/bili/`)) return;
+                e.url = routed.url.replace("/bili/http", "/bili/responses/http").replace(/^http/, "ws");
+                e.headers = Object.fromEntries((routed as Request).headers.entries());
+            });
+            if (wsReg) registrations.push(wsReg);
+        } catch {
+            console.warn("[bili-opencode] WebSocket handshake hook unavailable; Responses WebSocket traffic is not intercepted by this host");
+        }
 
         const toolReg = await ctx.tool?.transform?.((editor) => {
             for (const t of V2_BILI_TOOLS) {

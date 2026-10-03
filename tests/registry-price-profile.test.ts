@@ -47,13 +47,14 @@ test("peekRegistryPriceProfile prices w from cache_write when the provider charg
 
 test("peekRegistryPriceProfile rejects rows without a usable input price", () => {
     _resetForTest();
-    _setForTest({}, {
+    const badRows = {
         "a/empty": {},
         "b/zero": { input: 0, output: 5 },
         "c/null": { input: null, output: 5 },
         "d/string": { input: "3", output: 5 },
         "e/negative": { input: -1, output: 5 },
-    });
+    };
+    _setForTest({}, badRows as unknown as Parameters<typeof _setForTest>[1]);
     assert.equal(peekRegistryPriceProfile("empty"), undefined);
     assert.equal(peekRegistryPriceProfile("zero"), undefined);
     assert.equal(peekRegistryPriceProfile("null"), undefined);
@@ -100,7 +101,7 @@ test("bundled snapshot ships cost rows so the offline floor exercises pricing", 
     const anthropicKeys = Object.keys(snap.costs).filter((k) => k.startsWith("anthropic/"));
     assert.ok(anthropicKeys.length >= 1, "an anthropic model carries pricing in the offline floor");
     for (const key of anthropicKeys.slice(0, 5)) {
-        const row = snap.costs[key];
+        const row = snap.costs[key] as { input?: unknown; output?: unknown };
         assert.equal(typeof row.input, "number");
         assert.ok((row.input as number) > 0, `${key} has a usable input price`);
     }

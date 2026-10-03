@@ -53,6 +53,7 @@ test("forward: absolute-URL proxy-mode request reaches the correct upstream (no 
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     const proxy = await startServer(opts);
     await listen(proxy);
@@ -124,6 +125,7 @@ test("forward: a self-targeting absolute-URL request is denied, not forwarded (#
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     const proxy = await startServer(opts);
     await listen(proxy);

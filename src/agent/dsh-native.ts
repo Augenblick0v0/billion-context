@@ -76,7 +76,7 @@ type ToolDefinition = {
 
 type CommandOutcome = { kind: "success" | "error"; text: string };
 
-type PluginContext = {
+export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined };

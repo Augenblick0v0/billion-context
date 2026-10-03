@@ -26,7 +26,7 @@ function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -34,6 +34,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -66,7 +67,7 @@ test("#1001 detectUnannouncedHistoryRewrite: rewritten history (majority of raws
     // incoming = last 8 old + 16 brand-new (opencode kept a tail and appended fresh content)
     const tail: CoreMessage[] = [
         ...all.slice(16),
-        ...Array.from({ length: 16 }, (_, k) => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
+        ...Array.from({ length: 16 }, (_, k): CoreMessage => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
     ];
     const det = detectUnannouncedHistoryRewrite(session, knownBefore, tail.map((m) => m.id));
     assert.equal(det.detected, true, `expected detection (${JSON.stringify(det)})`);
@@ -80,7 +81,7 @@ test("#1001 detectUnannouncedHistoryRewrite: append-only growth is NOT detected"
     const knownBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
     const tail: CoreMessage[] = [
         ...all,
-        ...Array.from({ length: 4 }, (_, k) => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
+        ...Array.from({ length: 4 }, (_, k): CoreMessage => ({ id: `h_new${k}`, role: k % 2 === 0 ? "user" : "assistant", contentType: "text" as const, text: `new ${k}` })),
     ];
     const det = detectUnannouncedHistoryRewrite(session, knownBefore, tail.map((m) => m.id));
     assert.equal(det.detected, false, `append-only must not trip the detector (${JSON.stringify(det)})`);
@@ -154,7 +155,7 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -166,15 +167,23 @@ test("#1001 e2e openai-wire: silent client history rewrite → boundary marked, 
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW, { preserveRecentMessages: 2, preserveRecentTokens: 2000, compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 } }),
         compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/chat/completions`;
     const post = (model: string, messages: Array<{ role: string; content: string }>): Promise<{ status: number; body: string }> =>
         fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": SID }, body: JSON.stringify({ model, max_tokens: 1024, stream: true, messages }) }).then(async (r) => ({ status: r.status, body: await r.text() }));

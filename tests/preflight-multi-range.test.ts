@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -102,6 +103,7 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         log: false,
         debug: false,
         passthrough: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
@@ -113,14 +115,14 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
     const { server: upstream, calls } = makeUpstream((idx) => idx > 1);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     // Window sits between the post-fold floor (un-foldable oldest range +
     // preserved-recent zone ≈ 10.2k for this 24-message history) and the raw
     // total (~26.6k), so folding the later usable ranges brings it under.
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 15_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
@@ -150,11 +152,11 @@ test("#574 truthful exhaustion: every range's summary unusable → 502 only afte
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
@@ -187,11 +189,11 @@ test("#574 budget cap: many unusable ranges → the raised #1933 cap (2x base) b
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {

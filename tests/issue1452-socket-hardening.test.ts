@@ -56,6 +56,11 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
         passthrough: false,
         passthroughSource: null,
         autoUpdate: false,
+        streamErrorShape: "protocol",
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -98,7 +103,7 @@ test("clientError: parse-fail flood is drained and closed with FIN, never destro
         const socket = net.connect(harness.port, "127.0.0.1");
         await once(socket, "connect");
         let sawError: string | null = null;
-        socket.on("error", (e) => { sawError = e.code ?? e.message; });
+        socket.on("error", (e: Error & { code?: string }) => { sawError = e.code ?? e.message; });
         // Guaranteed llhttp parse failure on byte one; the remaining ~64KB
         // stays unread in the kernel buffer — exactly the residual state that
         // makes a destroy() surface as RST to the peer (verified matrix).
@@ -144,7 +149,7 @@ test("lifecycle ledger: client FIN first classifies reason=peer-fin (#1452)", as
         // header above is required so bili keeps the socket open post-response.
         const closed = new Promise<void>((resolve) => {
             const req = http.request(
-                { host: "127.0.0.1", port: harness.port, path: "/v1/chat/completions", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(CHAT_BODY), "connection": "keep-alive" } },
+                { host: "127.0.0.1", port: harness!.port, path: "/v1/chat/completions", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(CHAT_BODY), "connection": "keep-alive" } },
                 (res) => {
                     const s = res.socket as net.Socket;
                     s.once("close", () => resolve());
@@ -197,7 +202,7 @@ test("lifecycle ledger: clock-tie between FIN read and prefinish still classifie
         const base = captured.length;
         const closed = new Promise<void>((resolve) => {
             const req = http.request(
-                { host: "127.0.0.1", port: harness.port, path: "/v1/chat/completions", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(CHAT_BODY), "connection": "keep-alive" } },
+                { host: "127.0.0.1", port: harness!.port, path: "/v1/chat/completions", method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(CHAT_BODY), "connection": "keep-alive" } },
                 (res) => {
                     const s = res.socket as net.Socket;
                     s.once("close", () => resolve());
@@ -263,7 +268,7 @@ test("lifecycle ledger + kat knob: idle keep-alive close classifies reason=idle-
                 s.write(`POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(CHAT_BODY)}\r\nConnection: keep-alive\r\n\r\n${CHAT_BODY}`);
             });
             s.on("data", () => {});
-            s.on("error", (e) => { sawError = e.code ?? e.message; reject(new Error(`client socket error during idle reap: ${sawError}`)); });
+            s.on("error", (e: Error & { code?: string }) => { sawError = e.code ?? e.message; reject(new Error(`client socket error during idle reap: ${sawError}`)); });
             // Await 'end' (peer FIN), not 'close': a raw socket never ends its
             // own side, so 'close' would hang until we destroyed it ourselves.
             s.once("end", () => resolve(sawError));
@@ -278,7 +283,7 @@ test("lifecycle ledger + kat knob: idle keep-alive close classifies reason=idle-
         assert.equal(sawError, null, `idle reap must be a clean FIN, got error ${sawError}`);
         // Destroying our side completes the four-way close; the server-side
         // 'close' (which emits the ledger line) only fires after that.
-        sock?.destroy();
+        (sock as net.Socket | null)?.destroy();
         // Same same-process close-ordering race as the peer-fin test (#1452).
         const deadline = Date.now() + 2000;
         let line = captured.slice(base).find((c) => /closed reason=idle-timeout .* reqs=1$/.test(c.msg));
@@ -290,7 +295,8 @@ test("lifecycle ledger + kat knob: idle keep-alive close classifies reason=idle-
     } finally {
         restoreKat();
         setLogCapture(null);
-        if (sock && !sock.destroyed) sock.destroy();
+        const sockFinal = sock as net.Socket | null;
+        if (sockFinal && !sockFinal.destroyed) sockFinal.destroy();
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
         await close(upstream);
@@ -427,7 +433,7 @@ test("clientError backstop: silent peer after drain-end is terminated, reason=cl
         sock = net.connect({ port: h.port, host: "127.0.0.1", allowHalfOpen: true });
         await once(sock, "connect");
         let sawError: string | null = null;
-        sock.on("error", (e) => { sawError = e.code ?? e.message; });
+        sock.on("error", (e: Error & { code?: string }) => { sawError = e.code ?? e.message; });
         sock.write(Buffer.alloc(65_536, 0));
         const endedInTime = await Promise.race([
             (async () => { await once(sock, "end"); return true; })(),

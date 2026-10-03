@@ -868,9 +868,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
-        // #1870: visibility for the silent courier — one line, same
-        // before-footer slot as the advisory (remote-doc text; the $-escape
-        // below already covers it).
+        // #1870 visibility for the silent courier, #1977 display policy:
+        // silent unless the span carries a critical-tier entry — one line,
+        // same before-footer slot as the advisory (remote-doc text; the
+        // $-escape below already covers it).
         preFooter.push(describeUpdateReady(upd));
     }
     const webUrl = webSessionUrl(deps.webOrigin, session.id);

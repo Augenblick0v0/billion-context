@@ -23,6 +23,12 @@ export const DEFAULT_MITM_DOMAINS = [
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
 
+/** Socket marker: the raw TCP socket backing a MITM TLS leg. The connection
+ *  ledger (#1982) pairs the two records so the raw leg's close — which Node's
+ *  TLSWrap.close() structurally turns into destroy() even on fully graceful
+ *  TLS closes — can be classified with knowledge of how its TLS leg closed. */
+export const MITM_RAW_SOCKET_KEY = "__biliMitmRawSocket";
+
 // A client that rejects our MITM cert (root CA not trusted) can flood the log
 // with hundreds of identical handshake failures. Warn once, with the fix.
 let warnedCertRejected = false;
@@ -272,8 +278,11 @@ function doMitm(
     }
     // Mark the socket so resolveUpstream() can recover the real origin. handle()
     // sees the decrypted request as a plain POST /api/anthropic/v1/messages —
-    // with this marker it routes to https://<host> instead of the default.
-    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}`;
+    // with this marker it routes to https://<host>[:port] instead of the default.
+    // The port must be preserved: dropping it silently misroutes every
+    // non-443 CONNECT to :443 (connect-refused for local gateways).
+    (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}${port === 443 ? "" : `:${port}`}`;
+    (tlsSocket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] = clientSocket;
     // A TLS handshake error (client rejects our cert, abrupt disconnect,
     // reset) emits "error" on the TLSSocket. Without a listener Node treats
     // it as an uncaught exception and crashes the whole proxy. Destroy the

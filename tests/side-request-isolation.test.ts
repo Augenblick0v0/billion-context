@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
@@ -369,7 +370,7 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(opts?.store ?? new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -388,10 +389,17 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port as number;
+    const proxyPort = (proxy.address() as { port: number }).port;
     rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = proxyPort; rig.upstreamPort = upstreamPort;
     return rig;
 }
@@ -467,7 +475,7 @@ test("e2e: side request response still gets render-tag stripping (#460 contract)
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "Generate a short title." }] }) });
         assert.equal(r2.status, 200);
         let raw = "";
-        for await (const chunk of r2.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of r2.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "side-request stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "side-request stream leaked a render close tag");
         assert.equal(JSON.stringify(getSession(SESSION).state), stateAfterMain, "tag-strip pipe must not touch kernel state (session stays off)");

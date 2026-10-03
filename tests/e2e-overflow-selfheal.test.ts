@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -89,6 +90,13 @@ function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
         modelContextLimit: window,
         kernelConfig: defaultConfig(window),
         compress: { injectTool: true, injectNudge: true },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -133,13 +141,13 @@ test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, lear
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
@@ -214,13 +222,13 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
@@ -288,7 +296,7 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -296,7 +304,7 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
     // through the declared window + the one-shot arm. No learning required.
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 8192));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;

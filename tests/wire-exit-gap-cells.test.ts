@@ -12,7 +12,8 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_PREFLIGHT_HOLD_MS = "300";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { emitPreflightError } from "../src/stream-error.ts";
@@ -192,7 +193,7 @@ function startUpstream(forwardStatus: number, forwardBody: string, summaryFails:
     });
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
-            resolve({ server, port: server.address().port, forwards: () => forwards });
+            resolve({ server, port: (server.address() as { port: number }).port, forwards: () => forwards });
         });
     });
 }
@@ -214,6 +215,13 @@ async function startProxy(upstreamPort: number): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } satisfies ProxyOptions);
     await once(proxy, "listening");
@@ -225,7 +233,7 @@ test("gap 3: non-stream + preflight 429 after early commit → structured JSON e
     const proxy = await startProxy(up.port);
     try {
         const r = await timedPost(
-            `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`,
+            `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`,
             { "content-type": "application/json", "x-acp-session": "gap-json-429" },
             JSON.stringify({ model: "gpt-small", max_tokens: 1024, messages: bigConversation() }),
         );
@@ -250,7 +258,7 @@ test("gap 4: non-stream + upstream 400 after early commit → verbatim upstream 
     const proxy = await startProxy(up.port);
     try {
         const r = await timedPost(
-            `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`,
+            `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`,
             { "content-type": "application/json", "x-acp-session": "gap-json-400" },
             JSON.stringify({ model: "gpt-small", max_tokens: 1024, messages: bigConversation() }),
         );
@@ -282,11 +290,11 @@ test("gap 5: repeated client aborts on proxy-openai-sse → upstream destroyed, 
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const proxy = await startProxy(upstream.address().port);
+    const proxy = await startProxy((upstream.address() as { port: number }).port);
     try {
         for (let round = 0; round < 3; round++) {
             const req = http.request(
-                `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstream.address().port}/v1/chat/completions`,
+                `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${(upstream.address() as { port: number }).port}/v1/chat/completions`,
                 { method: "POST", headers: { "content-type": "application/json", "x-acp-session": `gap-storm-${round}` } },
             );
             req.on("response", (res) => {

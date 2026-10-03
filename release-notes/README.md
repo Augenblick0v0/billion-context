@@ -2,9 +2,10 @@
 
 Tiered, model-written release notes consumed by the proxy's visibility
 watcher (`src/update-notes.ts`): acp_status and the `/acp` panel use them to
-tell users and agents "an update is ready — restart to finish" or "a
-recommended release exists", with a per-release summary and the user-side
-span (everything between the running version and the newest release).
+tell users and agents "a critical update is ready — restart to finish" or
+"a critical fix is available" — ONLY for `critical`-tier entries (#1977:
+silent by default) — with a per-release summary and the user-side span
+(everything between the running version and the newest release).
 
 Companion package mechanics mirror `advisories/` (#1481):
 
@@ -21,19 +22,31 @@ Companion package mechanics mirror `advisories/` (#1481):
 |----------|----------|----------------------------------------------------|
 | version  | yes      | Exact released version (semver)                    |
 | date     | no       | `YYYY-MM-DD` release date                          |
-| tier     | yes      | `routine` (default) or `recommended` (restart soon)|
+| tier     | yes      | `routine` (default) / `recommended` (restart soon, record-only) / `critical` (see below) |
 | summary  | yes      | One user-meaningful line, ≤400 chars, model-written|
 
-Rules: newest-first, ≤20 entries, no duplicates. `recommended` is for
-"worth restarting soon" (correctness/cache fixes, self-heal fixes) — NOT for
-marketing. Critical defects stay in `advisories/` — this doc never claims
-critical.
+Rules: newest-first, ≤20 entries, no duplicates. Tier discipline (#1977):
+
+- `routine` — default. The overwhelming majority of releases.
+- `recommended` — "worth restarting soon" (correctness/cache fixes,
+  self-heal fixes); RECORD-ONLY since #1977: it feeds the release log but
+  never surfaces to users. NOT for marketing.
+- `critical` — the release fixes a serious defect users must act on
+  (correctness / data / billing class) that sits BELOW the advisory bar.
+  The only tier that surfaces (`CRITICAL UPDATE READY/AVAILABLE` on
+  acp_status + the `/acp` panel). Use sparingly and deliberately — a
+  nag-per-release here is exactly what #1977 fixed.
+
+Force-upgradeable critical defects stay in `advisories/` (#1481) — entries
+here never trigger the safety chain, they only make an update visible.
 
 ## Release process (enforced by gates)
 
 1. **Prep:** as part of the release prep, add the new version's entry to
    `release-notes/package.json` (tier + summary). The summary is
    model-written: describe what changes FOR THE USER, cite issue/PR numbers.
+   Pick the tier per the discipline above — `critical` only for serious
+   defect fixes users must act on; when in doubt, `routine`.
 2. Merge to master. The publish workflow ships the updated doc.
 3. Dispatch the one-click release (or merge the release PR).
    `release-manual.yml` checks the entry at dispatch time; `release.yml`

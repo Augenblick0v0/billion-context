@@ -439,6 +439,7 @@ function mockCtx() {
     let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
     // #1772 profile diagnostics: replayed through the same dynamic inject path.
     let profileContext: { startedBundles?: readonly string[] } | undefined = undefined;
+    type HostCtx = Parameters<typeof apply>[0];
     // #1945 host event bus: capture ctx.on subscriptions so tests can fire
     // llm/adapters-updated the way dsh's commitRoutes dispatches it.
     const eventListeners = new Map<string, Array<(table: Array<{ kind: string; name?: string; value?: unknown }>) => void>>();
@@ -457,12 +458,12 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
-        inject: (deps: readonly string[], callback: (sub: unknown) => void) => {
+        inject: (deps: readonly string[], callback: (sub: HostCtx) => void) => {
             if (deps.includes("llm") && deps.includes("agentDefaultModel") && llm !== undefined && agentDefaultModel !== undefined) {
-                callback({ llm, agentDefaultModel });
+                callback({ llm, agentDefaultModel } as HostCtx);
             }
             if (deps.includes("profileContext") && profileContext !== undefined) {
-                callback({ profileContext });
+                callback({ profileContext } as HostCtx);
             }
         },
         setModelServices: (l: typeof llm, a: typeof agentDefaultModel) => {

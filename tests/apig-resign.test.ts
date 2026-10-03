@@ -30,9 +30,9 @@ import {
     signApigHeaders,
     type ApigCredential,
 } from "../src/apig-resign.ts";
-import { resolveResignSettings } from "../src/config.ts";
+import { resolveResignSettings, type ProxyOptions } from "../src/config.ts";
 import { bodySignedSchemeOf, installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
@@ -264,7 +264,7 @@ interface RecordedCall {
 }
 
 function recordingFetch(sink: RecordedCall[]): typeof fetch {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    return (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
         const headers: Record<string, string> = {};
@@ -274,7 +274,7 @@ function recordingFetch(sink: RecordedCall[]): typeof fetch {
     }) as typeof fetch;
 }
 
-async function withIntercept<T>(state: NativeInterceptState, fn: (fetch: typeof fetch) => Promise<T>): Promise<{ sink: RecordedCall[]; result: T }> {
+async function withIntercept<T>(state: NativeInterceptState, fn: (fetch: typeof globalThis.fetch) => Promise<T>): Promise<{ sink: RecordedCall[]; result: T }> {
     const saved = globalThis.fetch;
     _resetForTest();
     const sink: RecordedCall[] = [];
@@ -491,7 +491,14 @@ async function startResignProxy(upstreamPort: number, routeResign?: { resign?: R
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: true,
+        releaseNotesCheck: true,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
@@ -682,7 +689,7 @@ test("#1884 review: non-streaming Responses JSON loop re-signs rebuilt rounds be
         sentBodies.push(typeof sentInit?.body === "string" ? sentInit.body : "");
         return new Response(JSON.stringify({ id: "r2", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }] }), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
-    const resignCalls: Array<{ headers: Record<string, string>; body: string }> = [];
+    const resignCalls: Array<{ headers: Record<string, string>; body: string | Buffer }> = [];
     const headers: Record<string, string> = { "content-type": "application/json" };
     try {
         await compressLoopResponsesJson(

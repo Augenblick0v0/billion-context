@@ -312,12 +312,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             if (message !== undefined) nextAnchors[claimed] = anchorFrom(message);
             continue;
         }
+        // An unchanged id means unchanged bytes (kernel deriveMessageId hashes
+        // exactly the fields normalizedIdentity covers), so the stored anchor is
+        // necessarily still valid — reuse it instead of re-normalizing +
+        // re-hashing the full text every pass (#1930-2: keeps steady-state
+        // rounds near-free on 8K-message histories).
+        const prior = anchors[id];
+        if (prior !== undefined) { nextAnchors[id] = prior; continue; }
         const message = byId.get(id);
         if (message !== undefined) nextAnchors[id] = anchorFrom(message);
-        else {
-            const stale = anchors[id];
-            if (stale !== undefined) nextAnchors[id] = stale;
-        }
     }
     let anchorCount = 0;
     for (const id of Object.keys(nextAnchors)) {

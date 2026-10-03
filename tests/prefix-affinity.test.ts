@@ -87,7 +87,7 @@ test("prefix-affinity: short crafted window cannot adopt an unrelated stored ses
     const crafted = [chain[2]!, chain[3]!, chain[4]!];
     const b = r.resolve(crafted);
     assert.ok(b);
-    assert.notEqual(b.sessionId, a.sessionId, "sub-8 leading run must not adopt the stored session");
+    assert.notEqual(b.sessionId, a!.sessionId, "sub-8 leading run must not adopt the stored session");
     assert.equal(b.matchedDepth, 0);
 });
 

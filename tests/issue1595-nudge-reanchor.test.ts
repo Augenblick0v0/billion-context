@@ -10,7 +10,8 @@ import type { Session } from "../src/session.ts";
 import { diagnoseSuccessWithoutUsage, listSessions, reanchorNudgeOnUsageDrop, storeEffectiveConfig, _resetSessionsForTest } from "../src/session.ts";
 import { applyUsageSample } from "../src/plugin.ts";
 import { setLogCapture } from "../src/logger.ts";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -44,7 +45,7 @@ function makeSession(): Session {
     return {
         id: "issue1595-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -52,6 +53,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -230,7 +232,7 @@ async function withProxy(sessionId: string, streamBody: string, jsonBody: string
     const relay = makeRelay(streamBody, jsonBody);
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -248,10 +250,11 @@ async function withProxy(sessionId: string, streamBody: string, jsonBody: string
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     try {
-        await fn(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, logs);
+        await fn(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, logs);
     } finally {
         setLogCapture(null);
         proxy.close();

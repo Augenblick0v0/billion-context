@@ -37,7 +37,7 @@ function compressARange() {
     }
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
     session.state = turn.state;
-    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
+    const ctx: { core: typeof core; config: Config; messages: typeof turn.messages; session: typeof session; log: () => void; compressMessages?: CoreMessage[] } = { core, config, messages: turn.messages, session, log: () => {} };
     const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never);
     assert.match(out, /Compressed m00001–m00002 → 1 block\(s\)/, `compress must succeed: ${out}`);
     const block = [...session.state.blocks].slice(-1)[0]!;

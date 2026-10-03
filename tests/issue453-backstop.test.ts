@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig, type NudgeDecision } from "acp-kernel";
-import { startServer, type ProxyOptions, clampOutputBudget, estimateInputTokens, emergencyNudge } from "../src/server.ts";
+import { startServer, clampOutputBudget, estimateInputTokens, emergencyNudge } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -57,7 +58,7 @@ test("estimateInputTokens: counts system + tools on turn 1 (lastInputTokens=0)",
 });
 
 function mkNudge(over: Partial<Pick<NudgeDecision, "shouldInject" | "contextUsage" | "compressibleRanges">> = {}): NudgeDecision {
-    const breakdown = { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0 };
+    const breakdown = { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0 };
     return { shouldInject: false, reason: "test", compressibleRanges: [], contextUsage: 0, tier: null, breakdown, ...over };
 }
 
@@ -124,6 +125,7 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
         promptCache: { routing: "auto" }, sessionHeader: "x-acp-session",
         log: false, debug: false, passthrough: false, autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     const pPort = (proxy.address() as { port: number }).port;

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting, normalizeUrlKey } from "../src/config.ts";
+import type { ProviderRoutes } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -202,7 +203,6 @@ test("no matching key and unknown model returns undefined", () => {
 // Trailing slashes on config keys are normalized away so they still match.
 // A user typing "https://open.bigmodel.cn/" (trailing slash) must still get
 // the override for requests to that host.
-import { normalizeUrlKey } from "../src/config.ts";
 test("normalizeUrlKey strips trailing slashes", () => {
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn/"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
@@ -211,7 +211,7 @@ test("normalizeUrlKey strips trailing slashes", () => {
 });
 
 test("resolveCompressProtocol: longest-prefix URL match, undefined = default tools", () => {
-    const routes = {
+    const routes: ProviderRoutes = {
         "https://chatgpt.com": { compressProtocol: "marker" },
         "https://ai.comfly.org": { models: { "gpt-5.6-sol": { context: 400000 } } },
     };

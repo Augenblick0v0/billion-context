@@ -58,7 +58,7 @@ test("registers both /acp and /acp-cache (#1146)", async () => {
         const names: string[] = [];
         apply({
             commands: {
-                register: (c) => names.push(c.name),
+                register: (c: { name: string }) => names.push(c.name),
             } as unknown as CommandsService,
         });
         assert.deepEqual(names, ["acp", "acp-cache"]);

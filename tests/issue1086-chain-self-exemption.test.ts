@@ -130,6 +130,13 @@ function makeOpts(upstream: string, extra?: Partial<ProxyOptions>): ProxyOptions
         autoUpdate: false,
         logFile: "off",
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         ...extra,
     };
 }
@@ -586,7 +593,7 @@ test("#1086 T5 liveness: plain-client chat session keeps compressing as it grows
         relay.closeAllConnections?.();
         await close(relay);
     }
-}, { timeout: 120_000 });
+});
 
 // #1101 (F2 of the #1090 deep review): three real paths were never exercised
 // by the tests above — the disk branch of hasProcessedState

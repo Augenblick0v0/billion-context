@@ -93,7 +93,7 @@ test("protectedTools: explicit compress range cannot fold ANY skill load", () =>
     }
     const spanEnd = msgs.find((m) => m.contentType === "text" && m.text?.startsWith("tail message 20"))!;
     const endRef = refOf(spanEnd);
-    assert.ok(/^m\d+$/.test(endRef ?? ""), `range end ref resolved, got ${endRef}`);
+    assert.ok(endRef !== null && /^m\d+$/.test(endRef), `range end ref resolved, got ${endRef}`);
 
     // An explicit range spanning everything up to AND INCLUDING all three
     // skill pairs — the hard exclusion must carve every instance out.

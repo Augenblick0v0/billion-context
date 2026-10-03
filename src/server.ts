@@ -113,10 +113,10 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
+import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -129,6 +129,9 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { installWebSocketBridge } from "./ws-bridge.js";
+import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
+import { currentFetchTransport } from "./fetch-transport.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
@@ -367,6 +370,17 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
+// #1982: budget for the post-response close linger (see installPostResponseLinger).
+// Default 5s mirrors nginx's lingering_time: a peer that FINs promptly costs one
+// RTT of extra hold; a silent peer costs at most this window per fd.
+// Env-overridable like BILI_MITM_HANDSHAKE_TIMEOUT_MS (tests + operator tuning);
+// non-numeric or non-positive values fall back to the default.
+const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
+function postResponseLingerMs(): number {
+    const v = Number.parseInt(process.env.BILI_POST_RESPONSE_LINGER_MS ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -420,7 +434,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const server = http.createServer(async (req, res) => {
+    const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
         const connRec = connRecords.get(req.socket);
         if (connRec) {
@@ -450,13 +464,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 res.end();
             }
         }
-    });
-    // Bili does not support WebSocket. An explicit 'upgrade' listener is
+    };
+    const server = http.createServer(dispatch);
+    // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
+    // phase-2 shell); the Responses codec is the first (and currently only)
+    // entry. Unclaimed upgrades still fall through to the 426 contract below.
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec]);
+    // Unclaimed upgrades retain the immediate HTTP fallback contract.
+    // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
     // versions destroy the socket with no response), delaying clients with
     // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
     // HTTP POST immediately.
-    server.on("upgrade", (req, socket) => {
+    server.on("upgrade", (req, socket, head) => {
+        if (wsUpgrade(req, socket, head)) return;
         log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ? maskHostPortForLog(req.headers.host) : "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
@@ -512,9 +533,92 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         drainArmed: boolean;
         /** #1529: performance.now() when the post-bail backstop destroyed the socket (peer never FINned). */
         backstopAt: number | null;
+        /** #1982: server-side end() was called on this socket (destroySoon stamp; distinguishes it from bare destroys). */
+        ended: boolean;
+        /** #1982: TLS handshake completed (plain-TCP legs start true — nothing to wait for). */
+        secured: boolean;
+        /** #1982: the other leg of a MITM connection (raw TCP ↔ terminated TLS); null elsewhere. */
+        paired: ConnRecord | null;
+        /** #1982: performance.now() when the post-response linger backstop destroyed the socket (peer never FINned). */
+        lingerBackstopAt: number | null;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
     let connSeq = 0;
+    // #1982: turn the proxy-initiated post-response close from abortive into
+    // graceful. Node's destroySoon() — the Connection: close disposition in
+    // resOnFinish — calls end() then destroy() on the SAME TICK (for flushed
+    // responses writableFinished is already true, so destroy is not deferred),
+    // while the response tail / TLS close_notify may still be unACKed in
+    // flight. A kernel closing an fd with unacked send bytes (or unread recv
+    // residual) answers RST instead of FIN; pooled downstream clients surface
+    // it as ECONNRESET (#1982: 196 occurrences measured over two weeks on a
+    // Windows downstream, two of them crashing its process).
+    // Detection: end() is intercepted to stamp rec.ended — prefinish cannot be
+    // used (it fires async, AFTER the same-tick destroy). The peer's close
+    // signal (a TCP FIN, or a TLS close_notify that can only follow ours) is
+    // proof our last byte was received+ACKed — it cannot be sent before
+    // processing ours — so: intercept the destroy, resume() to drain the recv
+    // side, wait for that signal, then destroy; a silent peer costs at most
+    // one fd for the budget window (backstop). Plain-TCP and MITM TLS legs
+    // share the same destroySoon race and get the same treatment.
+    // Deliberately NOT applied to: error-driven destroys (the peer is already
+    // gone — nothing left to protect), pre-handshake teardown, sockets owned
+    // by the clientError drain (#1529), and bare destroys without end() (kat
+    // reaper on idle sockets — empty queues, already clean).
+    const installPostResponseLinger = (socket: net.Socket, rec: ConnRecord): void => {
+        let armed = false;
+        let backstopTimer: ReturnType<typeof setTimeout> | undefined;
+        const origDestroy = socket.destroy.bind(socket);
+        // Node's end() overloads don't compose under .call; flatten to one
+        // signature at this interception boundary (all three call shapes covered).
+        // bind() is load-bearing: called unbound, Socket.end reads
+        // this._writableState off undefined (crash inside destroySoon).
+        const origEnd = socket.end.bind(socket) as unknown as (chunk?: string | Uint8Array, enc?: BufferEncoding, cb?: () => void) => typeof socket;
+        const wrappedEnd = (chunk?: string | Uint8Array, encOrCb?: BufferEncoding | (() => void), cb?: () => void): typeof socket => {
+            rec.ended = true;
+            if (typeof encOrCb === "function") return origEnd(chunk, undefined, encOrCb);
+            return origEnd(chunk, encOrCb, cb);
+        };
+        Object.defineProperty(socket, "end", { value: wrappedEnd, writable: true, configurable: true });
+        const finishLinger = (why: "peer-fin" | "backstop" | "error"): void => {
+            if (!armed) return;
+            armed = false;
+            if (backstopTimer) clearTimeout(backstopTimer);
+            if (socket.destroyed) return;
+            if (why === "backstop") {
+                rec.lingerBackstopAt = performance.now();
+                log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${postResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
+            } else if (why === "peer-fin") {
+                log("debug", `[conn#${rec.id}] ${rec.kind} linger complete: peer close signal received — closing cleanly`);
+            }
+            origDestroy();
+        };
+        const wrappedDestroy = (err?: Error): net.Socket => {
+            if (armed) return socket;
+            if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
+                return origDestroy(err);
+            }
+            // Peer closed first: its FIN already proved delivery, so the destroy
+            // is clean — and waiting for an 'end' that already fired would only
+            // dead-lock into the backstop.
+            if (rec.peerFinAt !== null || socket.readableEnded) {
+                return origDestroy();
+            }
+            armed = true;
+            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${postResponseLingerMs()}ms)`);
+            // http leaves the socket paused between requests; without resume()
+            // the peer's EOF would never reach us and every linger would run
+            // out on the backstop. Draining also removes unread recv residual
+            // (the Linux RST trigger) across the whole window.
+            socket.resume();
+            socket.once("end", () => finishLinger("peer-fin"));
+            socket.once("error", () => finishLinger("error"));
+            backstopTimer = setTimeout(() => finishLinger("backstop"), postResponseLingerMs());
+            backstopTimer.unref?.();
+            return socket;
+        };
+        Object.defineProperty(socket, "destroy", { value: wrappedDestroy, writable: true, configurable: true });
+    };
     server.on("connection", (socket) => {
         const rec: ConnRecord = {
             id: ++connSeq,
@@ -527,8 +631,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             peerFinAt: null,
             drainArmed: false,
             backstopAt: null,
+            ended: false,
+            secured: !(socket instanceof tls.TLSSocket),
+            paired: null,
+            lingerBackstopAt: null,
         };
         connRecords.set(socket, rec);
+        if (socket instanceof tls.TLSSocket) {
+            socket.once("secure", () => { rec.secured = true; });
+            // doMitm stamps the raw TCP leg onto the TLS socket; pair the two
+            // ledger records (raw leg always arrives first — real accept) so
+            // each leg's close classifies with knowledge of the other.
+            const rawLeg = (socket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] as net.Socket | undefined;
+            const rawRec = rawLeg ? connRecords.get(rawLeg) : undefined;
+            if (rawRec) {
+                rec.paired = rawRec;
+                rawRec.paired = rec;
+            }
+        }
         // prefinish fires when end() fully flushes — never on destroy(). That
         // makes it the reliable "server-initiated close" marker without patching
         // the socket object. performance.now() (µs) rather than Date.now():
@@ -556,19 +676,39 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // budget rather than the end marker; the requests>0 guard keeps
             // request-less closes out (the reaper only arms post-response).
             const idleForBudget = rec.requests > 0 && rec.lastResponseEndAt !== null && now - rec.lastResponseEndAt >= keepAliveTimeoutMs;
+            // #1982: the raw TCP leg of a MITM connection is structurally
+            // destroyed by Node's TLSWrap.close() even when the TLS leg closed
+            // fully gracefully — classify it by what its PAIRED tls leg did
+            // instead of reporting a false abortive "destroyed".
+            const pairedClean = rec.paired !== null && rec.paired.secured && rec.paired.errored === null && rec.paired.lingerBackstopAt === null;
             const reason = rec.backstopAt !== null
                 ? "clienterror-backstop"
-                : rec.errored
-                    ? `error(${rec.errored})`
-                    : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
-                        ? "peer-fin"
-                        : idleForBudget
-                            ? "idle-timeout"
-                            : rec.serverEndAt !== null
-                                ? "server-end"
-                                : "destroyed";
-            log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+                : rec.lingerBackstopAt !== null
+                    ? "linger-backstop"
+                    : rec.errored
+                        ? `error(${rec.errored})`
+                        : rec.kind === "tcp" && rec.paired !== null
+                            ? (pairedClean ? "paired-clean" : "destroyed")
+                            : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                                ? "peer-fin"
+                                : idleForBudget
+                                    ? "idle-timeout"
+                                    : rec.serverEndAt !== null
+                                        ? "server-end"
+                                        : "destroyed";
+            // #1982: a bare "destroyed" means nobody ended the socket and no
+            // other marker explains the close — the fd went away possibly with
+            // bytes still in flight, i.e. the peer may have seen RST/ECONNRESET.
+            // Elevate to warn (was debug) so a downstream "RST at T" report
+            // reconciles against this line directly (#1982 request 2); every
+            // intentional path carries its own dedicated marker above.
+            if (reason === "destroyed") {
+                log("warn", `[conn#${rec.id}] ${rec.kind} closed reason=destroyed age=${now - rec.openedAt}ms reqs=${rec.requests} [ABORTIVE — peer may see RST/ECONNRESET]`);
+            } else {
+                log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+            }
         });
+        installPostResponseLinger(socket, rec);
     });
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
@@ -2540,7 +2680,16 @@ async function handle(
         // run through the kernel. Veto on real history artifacts (detectAcpArtifacts
         // is history-scoped, never the top-level tools declarations), so a fresh
         // title-gen still demotes. Read-only; ordered BEFORE the mutating strip.
+        // #1467 WS lanes: envelopes rebuilt from a WebSocket upgrade carry the
+        // bridge's x-bili-ws-lane marker. The #1897 leak mechanism (an omp-style
+        // HTTP host registering bili's tools as extension tools) cannot produce
+        // them, the WS lane is that conversation's mainline, and a side
+        // passthrough cannot speak the lane's upstream transport — so the
+        // all-bili-tools demotion is vetoed for them (side requests on this lane
+        // are identified by the #1699 persona header instead).
+        const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
         const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
+            && !wsLaneEnvelope
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
@@ -3535,6 +3684,11 @@ async function prepareAnthropic(
     // downstream consumer (injectSystem, Prepared.anthropicSystem → loop)
     // inherit the anchor, and the failure path below keeps forwarding it too.
     let sysNotes: string[] = [];
+    // [#1930-3] The client's own system captured BEFORE the anchor
+    // replacement below — fingerprinting the post-anchor value tracks bili's
+    // managed text and hides client-side drift (same rationale as the
+    // responses site; keeps all four wires on one semantic).
+    const clientSystem = parsed.system;
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -3616,7 +3770,7 @@ async function prepareAnthropic(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
-        noteSystemPromptFingerprint(session, parsed.system, { sessionId, log });
+        noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -3861,6 +4015,7 @@ async function prepareOpenai(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4127,6 +4282,7 @@ async function prepareGoogle(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4402,6 +4558,10 @@ async function prepareResponses(
             else item.type = type;
         }
         responsesProjection = projection;
+        // Client's own system text captured BEFORE the anchor reconciliation
+        // below can replace systemParts — fingerprinting the post-anchor value
+        // would track bili's managed text and hide client-side drift (#1930-3).
+        const responsesClientSystem = projection.systemParts.join("\n\n---\n\n");
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
         if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
@@ -4428,6 +4588,7 @@ async function prepareResponses(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isCompactionTrigger) noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4613,7 +4774,14 @@ async function prepareResponses(
     // was already lifted into the developer message at input[1]; forwarding it
     // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+    // #1954: stripping is only lossless when input already holds the full
+    // conversation. Warn when we strip a non-empty id so a native-chaining
+    // (delta) continuation that loses its history is visible, not silent 200s.
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+        const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
+        if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
+        delete rebuilt.previous_response_id;
+    }
     delete rebuilt.instructions;
     // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
     // directive; keep prompt_cache_key. Sent by hermes' codex transport and
@@ -5873,7 +6041,9 @@ async function forward(
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
+    log("info", currentFetchTransport()
+        ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
+        : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -7262,7 +7432,8 @@ function formatBytes(n: number): string {
 function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms`);
+    const view = currentFetchTransport() ? ", view=ws-expanded" : "";
+    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
 }
 
 /** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
