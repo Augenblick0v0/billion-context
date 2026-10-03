@@ -295,6 +295,10 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 所有日志**默认同时写入文件**:`~/.local/state/billion-context/bili.log`(XDG state 目录),同时仍打印到 stderr。覆盖用配置的 `"logFile"` 或 `ACP_LOG_FILE`(`off` 关闭文件)。超过 10 MB 自动轮转(`bili.log.old`)。每个请求的缓存命中统计以 `[acp-usage] round N input=X cached=Y (cache hit Z%)` 打印,可直接从日志衡量前缀缓存健康度。
 
+### 连接生命周期调优（#1982）
+
+客户端侧连接在最终响应结束后优雅关闭:代理主动发起关闭(`Connection: close`)时,最多等待 `BILI_POST_RESPONSE_LINGER_MS`(默认 `5000`)毫秒的对端关闭信号才释放套接字,池化客户端因此看到的是干净的 EOF,而非字节竞态可能产生的 RST。相关旋钮:`BILI_KEEP_ALIVE_TIMEOUT_MS`(空闲回收预算,默认 `5000`)与 `BILI_CLIENT_ERROR_BACKSTOP_MS`(错误排空路径终局兜底,默认 `30000`)——完整语义见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+
 ### 自动更新
 
 代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。

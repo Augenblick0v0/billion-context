@@ -375,6 +375,10 @@ By default the proxy binds `127.0.0.1` and only accepts loopback connections. To
 
 All logs tee to `~/.local/state/billion-context/bili.log` by default (XDG state dir) and still print to stderr. Override with `"logFile"` in config or `ACP_LOG_FILE` (`off` disables the file). Auto-rotates at 10 MB (`bili.log.old`). Per-request cache-hit stats log as `[acp-usage] round N input=X cached=Y (cache hit Z%)` so you can measure prefix-cache health directly from the log.
 
+### Connection lifecycle tuning (#1982)
+
+Client-facing connections close gracefully after the final response: when the proxy initiates the close (`Connection: close`), it waits up to `BILI_POST_RESPONSE_LINGER_MS` (default `5000`) for the client's close signal before releasing the socket, so pooled clients see a clean EOF instead of a possible RST from racing bytes. Related knobs: `BILI_KEEP_ALIVE_TIMEOUT_MS` (idle-reap budget, default `5000`) and `BILI_CLIENT_ERROR_BACKSTOP_MS` (terminal backstop for the error-drain path, default `30000`) — full semantics in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
 ### Self-update
 
 The proxy checks npm on startup and every 3 minutes; a newer version is installed in place and a notice is logged — **restart `bili` to pick it up**, unless you enable opt-in self-restart (`--auto-restart-on-update` flag, env `ACP_AUTO_RESTART_ON_UPDATE=1`, or `"autoRestartOnUpdate": true` in config — default OFF): with zero in-flight requests it verifies the new install, stops accepting connections, drains, spawns a replacement on the same port, and exits once it accepts connections (clients reconnect automatically; session state survives on disk). Safety gates: zero in-flight through the drain window, an install sanity check before re-exec, and a 10-minute cooldown marker so a flapping version can never loop-restart; any failure resumes the original listener and falls back to the plain reminder.
