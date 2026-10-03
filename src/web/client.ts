@@ -1185,7 +1185,7 @@ export const WEB_CLIENT = `(function () {
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
-            ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
@@ -1331,7 +1331,8 @@ export const WEB_CLIENT = `(function () {
         ptInp.parentElement.appendChild(ptWarn);
         ptInp.addEventListener("change", () => commit((d) => {
             const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
-            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+            if (!compressOf(d)) d.compress = {};
+            if (list.length === 0) delete d.compress.protectedTools; else d.compress.protectedTools = list;
         }));
         const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
         prm.type = "number";
