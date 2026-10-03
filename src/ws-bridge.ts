@@ -43,15 +43,35 @@ export interface WsBridgeContext {
     upstreamUrl: string;
     /** The ACP request pipeline entry point (compression, preflight, tools, usage). */
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
+    /** The codec that claimed this upgrade (per-protocol transport policy). */
+    codec: WsBridgeCodec;
 }
 
 export interface WsBridgeCodec {
     /** Log label and admission identity, e.g. "responses-ws". */
     name: string;
-    /** Required `x-bili-plugin` marker value (bili plugin lane identity). */
-    pluginMarker: string;
+    /**
+     * Required `x-bili-plugin` marker value (bili plugin lane identity).
+     * Prefix-lane codecs (no plugin marker on the wire) omit this and admit
+     * on their transport headers instead — same trust level as prefix-mode
+     * HTTP: loopback client, conversation header, tunnel-guarded upstream.
+     */
+    pluginMarker?: string;
+    /**
+     * Header carrying the client's conversation id. Defaults to the plugin
+     * lane header; prefix-lane codecs point this at their client's own
+     * session header (e.g. codex sends `session-id`).
+     */
+    conversationHeader?: string;
     /** Return the upstream URL when this codec claims the upgrade path, else undefined. */
     matchUpgrade(url: string | undefined): string | undefined;
+    /**
+     * Clients of this codec may send an explicit `stream: true` flag inside
+     * response.create frames. Default keeps the strict policy — the flag must
+     * not appear at all (opencode frames carry no stream field; the lane adds
+     * its own). Codex always sends stream:true, so its codec opts in.
+     */
+    readonly allowStreamFlag?: boolean;
     /** Per-connection session factory; log the "connected" line from here. */
     createSession(context: WsBridgeContext): WsBridgeSession;
 }
@@ -79,16 +99,17 @@ export function installWebSocketBridge(
         wss.close();
     });
     return (source, socket, head) => {
-        const conversation = source.headers["x-bili-plugin-conversation"];
-        const conversationId = typeof conversation === "string" ? conversation : "";
-        const admitted = conversationId.trim().length > 0 && isLoopbackAddress(source.socket.remoteAddress);
+        const admitted = isLoopbackAddress(source.socket.remoteAddress);
         const claim = admitted ? codecs.flatMap(candidate => {
-            if (source.headers["x-bili-plugin"] !== candidate.pluginMarker) return [];
+            const conversation = source.headers[candidate.conversationHeader ?? "x-bili-plugin-conversation"];
+            const conversationId = typeof conversation === "string" ? conversation : "";
+            if (conversationId.trim().length === 0) return [];
+            if (candidate.pluginMarker !== undefined && source.headers["x-bili-plugin"] !== candidate.pluginMarker) return [];
             const upstream = candidate.matchUpgrade(source.url);
-            return upstream === undefined ? [] : [{ codec: candidate, upstream }];
+            return upstream === undefined ? [] : [{ codec: candidate, upstream, conversationId }];
         })[0] : undefined;
         if (!claim) return false;
-        const { codec, upstream } = claim;
+        const { codec, upstream, conversationId } = claim;
         // Stamp the codec name onto the upgrade request BEFORE the session is
         // created: codecs rebuild in-process HTTP envelopes from `source`, so
         // every envelope inherits this marker and the request pipeline can tell
@@ -106,7 +127,7 @@ export function installWebSocketBridge(
             wss.handleUpgrade(source, socket, head, peer => {
                 const label = `[${codec.name}] [conn=${++connectionId}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
                 const trace: WsBridgeLog = (level, message) => log(level, `${label} ${message}`);
-                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch });
+                const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec });
                 const entry = { session, peer };
                 sessions.add(entry);
                 peer.on("error", () => {});

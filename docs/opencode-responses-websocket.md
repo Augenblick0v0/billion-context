@@ -60,8 +60,8 @@ per-protocol codec:
   validation, the `previous_response_id` client history contract, the upstream
   WebSocket transport with its continuation checkpoints, and the SSE response
   sink. It is registered as `responsesCodec` in a codec table at the single
-  wiring site (`installWebSocketBridge(server, dispatch, log, [responsesCodec])`
-  in `src/server.ts`).
+  wiring site (`installWebSocketBridge(server, dispatch, log, [responsesCodec,
+  codexResponsesCodec])` in `src/server.ts`).
 
 A second wire protocol is a new codec file plus one table entry — no shell
 changes. The shell contract is `WsBridgeCodec` (name, plugin marker, URL claim,
@@ -70,6 +70,15 @@ receive the labeled logger, the upgraded peer, the upgrade request, the claimed
 upstream URL, and the ACP pipeline entry (`dispatch`), and are expected to
 rebuild protocol-shaped envelopes in-process. `tests/ws-bridge.test.ts` drives
 the shell with a synthetic second codec to keep the codec table honest.
+
+The second real codec is already here: **`codexResponsesCodec`** claims codex
+CLI's Responses-over-WebSocket dial (`/bili/<upstream>/responses`, conversation
+header `session-id`, `stream:true` frames, per-connection prewarm probe with
+`generate:false` relayed verbatim around the pipeline). It is prefix-lane:
+no plugin marker on the wire, admission resting on loopback + conversation
+header + tunnel guard — the same trust level as prefix-mode HTTP. Codex
+replays the full history every turn (`previous_response_id` is never sent),
+so the fold simply shrinks the next replay; see `tests/codex-responses-ws.test.ts`.
 
 Unknown protocols cannot be compressed (folding requires knowing where history
 lives in the wire format); they stay on the #1472 transparent passthrough lane

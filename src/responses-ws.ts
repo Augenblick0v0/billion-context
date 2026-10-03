@@ -390,7 +390,7 @@ class ResponsesWsSession implements WsBridgeSession {
 
     constructor(private readonly context: WsBridgeContext) {
         this.transport = new ResponsesWsUpstream(context.log);
-        context.log("info", "OpenCode Responses socket connected (ACP request pipeline)");
+        context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 
     onMessage(data: Buffer, binary: boolean): void {
@@ -402,7 +402,8 @@ class ResponsesWsSession implements WsBridgeSession {
         try {
             frame = JSON.parse(data.toString());
             if (!object(frame) || frame.type !== "response.create") throw new Error("Unsupported Responses client event");
-            if (frame.stream_id !== undefined || frame.stream !== undefined || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
+            const badStreamFlag = this.context.codec.allowStreamFlag ? (frame.stream !== undefined && frame.stream !== true) : frame.stream !== undefined;
+            if (frame.stream_id !== undefined || badStreamFlag || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
             body = { ...this.history.expand(frame), stream: true };
             if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
         } catch (error) {
@@ -413,14 +414,57 @@ class ResponsesWsSession implements WsBridgeSession {
         }
         this.busy = true;
         const source = this.context.source;
+        const handshakeHeaders: Record<string, string> = {};
+        const connectionHeaders = connectionNamedHeaders(source.headers.connection);
+        for (const [key, value] of Object.entries(source.headers)) {
+            if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") handshakeHeaders[key] = Array.isArray(value) ? value.join(", ") : String(value);
+        }
+        // Prewarm probes (empty input, generate:false) are transport-layer
+        // noise, not conversation turns. Codex sends one on every new
+        // connection and expects only a terminal event back. Routing them
+        // through the ACP pipeline would normalize the empty input into a
+        // synthesized message (#1862) and record a phantom turn in the
+        // kernel's ref sequence, shifting every later fold anchor; injecting
+        // tools and compression prompts into a no-generation request is pure
+        // byte inflation. Forward verbatim on the upstream transport.
+        if (Array.isArray(body.input) && body.input.length === 0 && body.generate === false) {
+            void (async () => {
+                try {
+                    const response = await this.transport.fetch(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body) });
+                    if (response.body === null) {
+                        peer.send(await response.text());
+                        return;
+                    }
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = "";
+                    for (;;) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        for (;;) {
+                            const index = buffer.indexOf("\n\n");
+                            if (index < 0) break;
+                            const block = buffer.slice(0, index);
+                            buffer = buffer.slice(index + 2);
+                            for (const line of block.split("\n")) if (line.startsWith("data: ")) peer.send(line.slice(6));
+                        }
+                    }
+                } catch {
+                    this.context.log("warn", "probe relay failed");
+                    peer.send(errorFrame("invalid_request", "Probe relay failed", 502));
+                } finally {
+                    this.active = undefined;
+                    this.busy = false;
+                }
+            })();
+            return;
+        }
         const req = new http.IncomingMessage(source.socket);
         req.complete = true;
         req.method = "POST";
         req.url = source.url;
-        const connectionHeaders = connectionNamedHeaders(source.headers.connection);
-        for (const [key, value] of Object.entries(source.headers)) {
-            if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") req.headers[key] = value;
-        }
+        Object.assign(req.headers, handshakeHeaders);
         req.headers["content-type"] = "application/json";
         req.push(Buffer.from(JSON.stringify(body)));
         req.push(null);
@@ -463,5 +507,31 @@ export const responsesCodec: WsBridgeCodec = {
     name: "responses-ws",
     pluginMarker: "opencode",
     matchUpgrade: url => /^\/bili\/responses\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(url ?? "")?.[1],
+    createSession: context => new ResponsesWsSession(context),
+};
+
+// Codex CLI (0.147+, provider `supports_websockets = true`, feature flag
+// `responses_websockets`) swaps its HTTP SSE lane for a WebSocket that speaks
+// the same Responses event vocabulary, one JSON text frame per event, with
+// sequential `response.create` requests over one connection (first a probe
+// with `input: []` + `generate: false`, then one full-history-replay request
+// per turn — codex never sends previous_response_id). Captured from a real
+// 0.147.0 client: handshake carries `openai-beta: responses_websockets=…`,
+// `session-id`/`thread-id`, and `x-codex-turn-metadata`; the body carries
+// `store: false`, `stream: true`, `include: [reasoning.encrypted_content]`,
+// `prompt_cache_key`, and `client_metadata`, all of which ride the envelope
+// unchanged. Admission is prefix-lane (no plugin marker): the path is the
+// ordinary prefix-mode shape `/bili/<upstream>/responses` — disjoint from the
+// opencode plugin lane above — keyed on codex's own `session-id` header, so
+// the pipeline resolves the same conversation the HTTP lane would. A foreign
+// client hitting this shape gets a protocol error frame, never silent
+// corruption, and the tunnel guard still gates the upstream.
+export const codexResponsesCodec: WsBridgeCodec = {
+    name: "codex-responses-ws",
+    conversationHeader: "session-id",
+    matchUpgrade: url => /^\/bili\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(url ?? "")?.[1],
+    // Captured codex_cli 0.147.0 frames always carry stream:true; the
+    // response.create body is otherwise the Responses API shape verbatim.
+    allowStreamFlag: true,
     createSession: context => new ResponsesWsSession(context),
 };
