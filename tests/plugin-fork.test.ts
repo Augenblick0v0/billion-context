@@ -552,6 +552,31 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
     } finally { await h.close(); }
 });
 
+test("HTTP manual compression renews an idle context observation without changing billing", async () => {
+    const h = await harness();
+    const realNow = Date.now;
+    try {
+        const before = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        assert(typeof before.contextTokensAt === "number");
+        const commitTime = realNow() + 16 * 60 * 1000;
+        Date.now = () => commitTime;
+        await compress(h);
+        const after = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        assert.equal(after.contextTokensAt, commitTime);
+        assert.equal(after.contextTokensSource, "estimate");
+        assert.notEqual(after.contextGeneration, before.contextGeneration);
+        assert(typeof after.contextTokens === "number" && typeof before.contextTokens === "number");
+        assert(after.contextTokens < before.contextTokens);
+        assert.equal(after.inputTokens, before.inputTokens);
+        const repeated = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        assert.equal(repeated.contextTokensAt, commitTime);
+        assert.equal(repeated.contextGeneration, after.contextGeneration);
+    } finally {
+        Date.now = realNow;
+        await h.close();
+    }
+});
+
 test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", async () => {
     const h = await harness(true);
     try {
