@@ -75,7 +75,7 @@ jobs:
       - name: Verify release-notes entry (#1870)
         # Visibility gate: every stable release must carry a tiered,
         # user-meaningful entry in release-notes/package.json (the entry is
-        # part of the release prep PR, model-written, tier routine|recommended).
+        # part of the release prep PR, model-written, tier routine|recommended|critical).
         # Fails BEFORE tagging/publishing so nothing ships invisible.
         if: steps.check.outputs.is_release == 'true' && steps.pre.outputs.prerelease == 'false'
         run: |
