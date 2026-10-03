@@ -162,7 +162,7 @@ async function runScenario(sc: Scenario): Promise<ProbeResult> {
                 const wantCompress = !demanded && body.length > THRESHOLD && msgRefs.length >= 12;
                 if (wantCompress) demanded = true;
                 res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                const ev = (event: string, data: unknown): void => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+                const ev = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
                 ev("message_start", { type: "message_start", message: { id: `msg_a_${idx}`, role: "assistant", usage: { input_tokens: 100 } } });
                 if (wantCompress) {
                     // Fold everything except the last 6 refs (keep the protected
@@ -206,7 +206,14 @@ async function runScenario(sc: Scenario): Promise<ProbeResult> {
             log: process.env.PROBE1908_LOUD === "1",
             debug: false,
             passthrough: false,
+            passthroughSource: null,
             autoUpdate: false,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
             mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);

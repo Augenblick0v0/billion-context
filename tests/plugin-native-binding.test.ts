@@ -40,7 +40,7 @@ for (const protocol of ["responses", "openai", "anthropic"] as const) {
             upstream.listen(0, "127.0.0.1");
             await once(upstream, "listening");
             const upstreamOrigin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
-            const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamOrigin, routes: { [upstreamOrigin]: { models: { "binding-model": { context: 100000 } } } }, modelContextLimit: 100000, kernelConfig: defaultConfig(100000), compress: { injectTool: true, injectNudge: true }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } });
+            const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamOrigin, routes: { [upstreamOrigin]: { models: { "binding-model": { context: 100000 } } } }, modelContextLimit: 100000, kernelConfig: defaultConfig(100000), compress: { injectTool: true, injectNudge: true }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false, mitm: { enabled: false, domains: [] } });
             await once(proxy, "listening");
             const base = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
             const endpoint = protocol === "responses" ? "responses" : protocol === "openai" ? "chat/completions" : "messages";

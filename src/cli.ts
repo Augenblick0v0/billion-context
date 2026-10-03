@@ -598,7 +598,7 @@ export async function main(): Promise<void> {
             // affected range (rollback-form advisories cover latest too).
             advisoryBlocksVersion,
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,
@@ -619,7 +619,7 @@ export async function main(): Promise<void> {
             advisoryUrl: opts.advisoryUrl,
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,

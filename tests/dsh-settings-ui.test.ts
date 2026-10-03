@@ -70,7 +70,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
             _resetRegisterForTest(proxy.origin);
             const listeners: InjectListener[] = [];
-            apply(uiCtx(listeners));
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
             // attach mode binds register.base synchronously before the async
             // liveness probe, so a startup-time collection already sees it.
             assert.equal(listeners.length, 1);
@@ -90,7 +90,7 @@ test("#1590: index-inject stays silent when no origin is known yet (spawn mode)"
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
             _resetRegisterForTest(undefined);
             const listeners: InjectListener[] = [];
-            apply(uiCtx(listeners));
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
@@ -136,7 +136,7 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
             _resetRegisterForTest("http://127.0.0.1:8787");
             const routes: RouteRow[] = [];
-            apply(routeCtx(routes, []));
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
             assert.equal(routes.length, 1);
             assert.equal(routes[0].kind, "exact");
             assert.equal(routes[0].path, "/bili/origin");
@@ -157,7 +157,7 @@ test("#1809: /bili/origin answers null before binding", async () => {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
             _resetRegisterForTest(undefined);
             const routes: RouteRow[] = [];
-            apply(routeCtx(routes, []));
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
             assert.equal(routes.length, 1);
             const res = new FakeRes();
             await routes[0].handler({}, res);
@@ -195,7 +195,7 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
                 },
                 on: (_event: string, _listener: InjectListener) => {},
             };
-            apply(ctx);
+            apply(ctx as Parameters<typeof apply>[0]);
             assert.equal(effects.length, 1, "registration must be wrapped in the context effect");
             assert.equal(effects[0].label, "bili: /bili/origin route");
             const cleanup = effects[0].fn();
@@ -256,15 +256,15 @@ test("#1590: client bundle registers the settings.section entry bili (wrapper id
         entryPoints: [cfg.entry["agent/dsh-native-client"]],
         bundle: true,
         format: "cjs",
-        platform: cfg.platform,
+        platform: cfg.platform as Parameters<typeof build>[0]["platform"],
         target: cfg.target,
         external: cfg.external,
         banner: cfg.banner,
         footer: cfg.footer,
         write: false,
     });
-    assert.equal(result.outputFiles.length, 1);
-    const code = result.outputFiles[0].text;
+    assert.equal(result.outputFiles!.length, 1);
+    const code = result.outputFiles![0].text;
 
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
@@ -300,7 +300,7 @@ test("#1590: client bundle registers the settings.section entry bili (wrapper id
         useEffect: (fn: () => unknown | (() => void)): void => {
             hookIndex++;
             const r = fn();
-            if (typeof r === "function") cleanups.push(r);
+            if (typeof r === "function") cleanups.push(r as () => void);
         },
     };
     const requireStub = (spec: string): unknown => {
@@ -399,14 +399,14 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
         entryPoints: [cfg.entry["agent/dsh-native-client"]],
         bundle: true,
         format: "cjs",
-        platform: cfg.platform,
+        platform: cfg.platform as Parameters<typeof build>[0]["platform"],
         target: cfg.target,
         external: cfg.external,
         banner: cfg.banner,
         footer: cfg.footer,
         write: false,
     });
-    const code = result.outputFiles[0].text;
+    const code = result.outputFiles![0].text;
 
     type Face = { inject: string[]; apply: (ctx: unknown) => void };
     const mount = (extra: Record<string, unknown>): { component: () => unknown; resetHooks: () => void; runCleanups: () => void } => {
@@ -435,7 +435,7 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
             useEffect: (fn: () => unknown | (() => void)): void => {
                 hookIndex++;
                 const r = fn();
-                if (typeof r === "function") cleanups.push(r);
+                if (typeof r === "function") cleanups.push(r as () => void);
             },
         };
         const requireStub = (spec: string): unknown => {

@@ -55,6 +55,7 @@ test("health + stats expose blindTunnels counts with real hosts (#897)", async (
         passthrough: false,
         autoUpdate: false,
         mitm: { enabled: true, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     };
     let proxy: http.Server | undefined;
     try {

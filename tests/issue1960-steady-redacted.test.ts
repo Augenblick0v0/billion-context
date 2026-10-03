@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, coreToAnthropic } from "acp-kernel/wire";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
 
 // #1960 (steady path): after an in-turn compress, the client (pi) re-sends the
@@ -32,13 +33,14 @@ function makeSession(): Session {
     return {
         id: "issue1960-steady-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100, contextTokens: 100, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
         blockContents: new Map(),
         inFlight: 0,
+        pendingRetrievals: [],
         persisted: false,
     };
 }
@@ -66,7 +68,7 @@ test("#1960 steady path: client-echoed redacted_thinking survives prepare→outb
     const session = makeSession();
     const core = createCore();
     const config = defaultConfig(200000);
-    const { msgs } = anthropicToCore(inbound()) as { msgs: CoreMessage[] };
+    const { msgs } = anthropicToCore(inbound() as AnthropicRequestBody) as { msgs: CoreMessage[] };
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
 
     const outbound = coreToAnthropic(turn.messages) as Array<{ role: string; content: Array<Record<string, unknown>> }>;

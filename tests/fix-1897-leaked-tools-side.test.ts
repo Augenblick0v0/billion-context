@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, IMAGE_FULL_TOOL_NAME } from "acp-kernel";
-import { startServer, type ProxyOptions, stripLeakedBiliTools, BILI_TOOL_NAMES } from "../src/server.ts";
+import { startServer, stripLeakedBiliTools, BILI_TOOL_NAMES } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -128,7 +129,7 @@ async function startRig(): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -147,10 +148,17 @@ async function startRig(): Promise<Rig> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = proxy.address().port as number; rig.upstreamPort = upstreamPort;
+    rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = (proxy.address() as { port: number }).port; rig.upstreamPort = upstreamPort;
     return rig;
 }
 

@@ -95,9 +95,9 @@ function asArr(v: unknown): unknown[] {
 function openaiToolArgs(events: Record<string, unknown>[]): string {
     let out = "";
     for (const ev of events) {
-        for (const ch of asArr(ev["choices"])) {
+        for (const ch of asArr(ev["choices"]) as Array<Record<string, unknown>>) {
             const d = asObj(ch["delta"]);
-            for (const tc of asArr(d["tool_calls"])) {
+            for (const tc of asArr(d["tool_calls"]) as Array<Record<string, unknown>>) {
                 out += asString(asObj(tc["function"])["arguments"]);
             }
         }
@@ -108,7 +108,7 @@ function openaiToolArgs(events: Record<string, unknown>[]): string {
 function openaiContents(events: Record<string, unknown>[]): string {
     let out = "";
     for (const ev of events) {
-        for (const ch of asArr(ev["choices"])) {
+        for (const ch of asArr(ev["choices"]) as Array<Record<string, unknown>>) {
             out += asString(asObj(ch["delta"])["content"]);
         }
     }

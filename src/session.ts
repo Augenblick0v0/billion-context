@@ -351,6 +351,29 @@ export type Session = {
     lockChain?: Promise<unknown>;
 };
 
+/** Server-stamped anonymous-prefix-affinity record (#1115/#1486 lane, written
+ *  in src/server.ts when an anonymous request resolves onto a pfa-* chain or
+ *  mints a fresh one). Typed here so readers don't cast the Record bag. */
+export type AnonymousPrefixAffinityStamp = {
+    depth: number;
+    tailHash: string;
+    via: "prefix" | "new";
+    lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+};
+
+export function peekAnonymousPrefixAffinity(session: Session): AnonymousPrefixAffinityStamp | undefined {
+    const v = session.metadata.anonymousPrefixAffinity;
+    if (!v || typeof v !== "object") return undefined;
+    return v as AnonymousPrefixAffinityStamp;
+}
+
+/** Per-request-resolved context limit stamped by the server (src/server.ts) —
+ *  the window actually in force for this session's traffic. */
+export function peekEffectiveContextLimit(session: Session): number | undefined {
+    const v = session.metadata.effectiveContextLimit;
+    return typeof v === "number" ? v : undefined;
+}
+
 // #833: wire paths resolve the kernel Config per request (global → provider →
 // model compress settings + self-heal + output headroom), while the plugin
 // status/tool API reads sessions with no request context and was falling back
@@ -466,6 +489,12 @@ export async function initSessions(): Promise<void> {
     }
 }
 
+/** Zero-valued stats for a fresh session (#1991) — exported so test fixtures
+ *  can build sessions without retyping every field. */
+export function zeroStats(): Session["stats"] {
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
+}
+
 export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
     const existing = sessions.get(id);
     if (existing) {
@@ -508,7 +537,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: zeroStats(),
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),

@@ -45,7 +45,7 @@ function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout
 function closeServer(s: net.Server | undefined): Promise<void> {
     return new Promise((resolve) => {
         if (!s) { resolve(); return; }
-        s.closeAllConnections?.();
+        (s as net.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
         const t = setTimeout(resolve, 2_000);
         s.on("close", () => { clearTimeout(t); resolve(); });
         // close() stops accepting — without it the server handle keeps the
@@ -55,7 +55,7 @@ function closeServer(s: net.Server | undefined): Promise<void> {
 }
 const PHASE_T0 = Date.now();
 function phase(msg: string): void { process.stderr.write(`[gc-test] t=${Date.now() - PHASE_T0}ms ${msg}\n`); }
-async function onceCap<T>(target: T, ev: string, ms: number): Promise<void[]> {
+async function onceCap<T extends NodeJS.EventEmitter>(target: T, ev: string, ms: number): Promise<void[]> {
     let to: ReturnType<typeof setTimeout>;
     const timeout = new Promise<never>((_, reject) => { to = setTimeout(() => reject(new Error(`${ev} timeout ${ms}ms`)), ms); });
     try { return await Promise.race([once(target, ev), timeout]); } finally { clearTimeout(to!); }
@@ -103,7 +103,7 @@ async function mitmRequest(tag: string, conn: string | undefined): Promise<MitmR
     const { statusLine, socket } = await rawConnectStatus(biliPort, target);
     phase(`mitmRequest(${tag}): CONNECT ok`);
     assert.match(statusLine, /^HTTP\/1\.1 200/, `CONNECT must be accepted: ${statusLine}`);
-    const sock = tls.connect({ socket, ca: rootPem, servername: "localhost", allowHalfOpen: true });
+    const sock = tls.connect({ socket, ca: rootPem, servername: "localhost", allowHalfOpen: true } as tls.ConnectionOptions);
     await onceCap(sock, "secureConnect", 5_000);
     phase(`mitmRequest(${tag}): TLS ok`);
     let sawReset = false;
@@ -249,8 +249,8 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
         },
         stdio: ["ignore", "pipe", "pipe"],
     });
-    child.stdout.on("data", (d: Buffer) => { stdoutBuf += d.toString("utf8"); });
-    child.stderr.on("data", (d: Buffer) => {
+    child.stdout!.on("data", (d: Buffer) => { stdoutBuf += d.toString("utf8"); });
+    child.stderr!.on("data", (d: Buffer) => {
         const text = d.toString("utf8");
         for (const l of text.split("\n")) if (l.trim()) logLines.push(l);
         process.stderr.write(text);

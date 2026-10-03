@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig, type Config } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest, pluginReportedContextWindow, queuePluginRegister, takePendingPluginRegister } from "../src/plugin.ts";
@@ -119,7 +120,7 @@ async function startHarness(
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -132,6 +133,13 @@ async function startHarness(
         modelContextLimit: 400_000,
         kernelConfig: kernelConfig ?? defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true, ...compress },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -141,7 +149,7 @@ async function startHarness(
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     return {
         proxyPort,
@@ -187,7 +195,7 @@ async function callPluginAnthropic(
         return { raw: JSON.stringify(json), events: [], json };
     }
     let raw = "";
-    for await (const chunk of resp.body) {
+    for await (const chunk of resp.body!) {
         raw += Buffer.from(chunk).toString("utf8");
     }
     return { raw, events: parseAnthropicSse(raw), json: undefined };
@@ -263,7 +271,7 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
 // manifest advertises all seven tools again — enabling the features must not
 // shrink the toolset dsh/pi/omp/MCP shims register.
 test("plugin manifest: absorb and acp_rule advertised when enabled in config", async () => {
-    const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true }, rules: { enabled: true } });
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true, toolName: "absorb", minToolTokens: 4000, contextThresholdPct: 0, excludeTools: [] }, rules: { enabled: true } });
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);

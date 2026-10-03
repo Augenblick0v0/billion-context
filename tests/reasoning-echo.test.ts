@@ -491,7 +491,7 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
     });
 
     it("unsigned reasoning still drops (non-thinking claude sessions keep #651)", () => {
-        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
+        const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
         const c = collector();
         const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
         assert.equal(out.length, 3);
@@ -500,7 +500,7 @@ describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant
     });
 
     it("empty-string signature does not arm the gate", () => {
-        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
+        const msgs: BiliMessage[] = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
         const c = collector();
         const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
         assert.equal(out.length, 3);
