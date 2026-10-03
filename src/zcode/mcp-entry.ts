@@ -115,7 +115,7 @@ async function discoverHealthyProxyOrigin(log: (msg: string) => void): Promise<s
     } catch {
         /* unreadable instance file — fall through */
     }
-    candidates.push("http://127.0.0.1:8787");
+    candidates.push(process.env.BILI_MCP_DEFAULT_ORIGIN?.trim() || "http://127.0.0.1:8787");
     for (const origin of candidates) {
         try {
             if (await probeProxyHealth(origin)) return origin;
