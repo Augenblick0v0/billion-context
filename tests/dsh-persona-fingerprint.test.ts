@@ -1,0 +1,267 @@
+// #1916/#1307/#1314: dsh stamps ONE x-bili-plugin-conversation id on every
+// model request of a session — including the auto-review classifyRisk()
+// calls (fixed REVIEW_POLICY system + a freshly-flattened user blob, fired
+// before every tool call under the Auto permission tier). The persona
+// fingerprint keys dsh traffic by id + system hash (kernel subagentNamespace
+// anchor semantics): the FIRST system seen under the id keeps the raw key
+// (the main turn claims it), a different system forks onto `<id>|sub:<fp>`
+// (the review persona), so review traffic stops overwriting the main
+// session's usage baseline (#1916) and evicting its remembered snapshots
+// (#1307). Successive review calls share ONE forked session. Allowlisted by
+// plugin agent (dshPersonaFingerprintApplies) — other agents keep verbatim
+// keying (#1106: system drift mid-id means "same conversation, evolved").
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import { once } from "node:events";
+import { createHash } from "node:crypto";
+import { defaultConfig } from "acp-kernel";
+import { startServer, type ProxyOptions } from "../src/server.ts";
+import { dshPersonaFingerprintApplies, openaiSystemTextForPersona } from "../src/session-id.ts";
+import { _rememberedForTest, _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
+
+process.env.NODE_ENV = "test";
+process.env.BILI_PERSIST = "0";
+
+const MODEL = "claude-sonnet-4-5";
+const MAIN_SYSTEM = "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp.";
+const REVIEW_SYSTEM = "You are the final authorization reviewer for exactly one pending tool call.\nAnswer with one word.";
+
+const forkKey = (conv: string, system: string): string =>
+    `${conv}|sub:${createHash("sha256").update(system, "utf8").digest("hex").slice(0, 16)}`;
+
+test("dshPersonaFingerprintApplies: allowlist is the dsh plugin agent only", () => {
+    assert.equal(dshPersonaFingerprintApplies({ "x-bili-plugin": "dsh" }), true);
+    assert.equal(dshPersonaFingerprintApplies({ "x-bili-plugin": " dsh " }), true, "trimmed match");
+    assert.equal(dshPersonaFingerprintApplies({ "x-bili-plugin": "pi" }), false);
+    assert.equal(dshPersonaFingerprintApplies({ "x-bili-plugin": "test-agent" }), false);
+    assert.equal(dshPersonaFingerprintApplies({}), false);
+    assert.equal(dshPersonaFingerprintApplies({ "x-bili-plugin": ["dsh"] }), false, "array form is not the dsh lane shape");
+});
+
+test("openaiSystemTextForPersona: joins every system message's text", () => {
+    assert.equal(openaiSystemTextForPersona({ messages: [] }), "");
+    assert.equal(openaiSystemTextForPersona({ messages: [{ role: "user", content: "hi" }] }), "");
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "system", content: "A" }, { role: "user", content: "u" }, { role: "system", content: "B" }] }),
+        "A\n\nB",
+    );
+    assert.equal(
+        openaiSystemTextForPersona({
+            messages: [{ role: "system", content: [{ type: "text", text: "part-1" }, { type: "text", text: "part-2" }] }],
+        }),
+        "part-1\n\npart-2",
+        "text parts are joined",
+    );
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "system", content: [{ type: "image_url", image_url: { url: "x" } }] }] }),
+        "",
+        "non-text parts contribute nothing",
+    );
+});
+
+type Rig = { proxyPort: number; upstreamPort: number; proxy: http.Server; upstream: http.Server };
+
+async function startRig(): Promise<Rig> {
+    const upstream = http.createServer((req, res) => {
+        let b = "";
+        req.on("data", (c: Buffer) => (b += c.toString("utf8")));
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                id: "chatcmpl-1",
+                object: "chat.completion",
+                choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+            }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port as number;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        modelContextLimit: 200_000,
+        kernelConfig: defaultConfig(200_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    return { proxyPort: proxy.address().port as number, upstreamPort, proxy, upstream };
+}
+
+async function closeRig(rig: Rig): Promise<void> {
+    rig.proxy.close();
+    await once(rig.proxy, "close");
+    rig.upstream.close();
+    await once(rig.upstream, "close");
+}
+
+const mainMsgs = (n: number): { role: string; content: string }[] =>
+    Array.from({ length: n }, (_, i): { role: string; content: string } => ({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `main-${i + 1}-` + "z".repeat(6000),
+    }));
+
+test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-openai";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const tools = [{ type: "function", function: { name: "bash", description: "run", parameters: { type: "object", properties: {} } } }];
+
+        // Phase 1 — main turn claims the raw key (anchor: MAIN_SYSTEM).
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, tools, messages: [{ role: "system", content: MAIN_SYSTEM }, ...mainMsgs(12)] }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const main = getSession(CONV);
+        assert.ok(main, "main session exists under the raw conversation key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 12, "refs assigned to the main history");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
+
+        // Phase 2 — auto-review shape (fixed REVIEW_POLICY system + flattened
+        // blob) under the SAME conversation id: forks onto `|sub:<fp>`.
+        const review = (blob: string) => ({
+            model: MODEL,
+            max_tokens: 384_000,
+            messages: [
+                { role: "system", content: REVIEW_SYSTEM },
+                { role: "user", content: `Conversation transcript (flattened):\n${blob}\nDecide: risky?` },
+            ],
+        });
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it\nassistant: ok")) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, REVIEW_SYSTEM);
+        const fk = peekSession(fork);
+        assert.ok(fk, "review request landed on its own forked session");
+        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
+        assert.equal(fk.stats.requests, 1, "forked session served the review");
+
+        // Phase 3 — a second review (same policy system, fresh blob) reuses
+        // the SAME forked session (persona stability, not a fork per call).
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
+
+        // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
+        const r4 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, tools, messages: [{ role: "system", content: MAIN_SYSTEM }, ...mainMsgs(4)] }),
+        });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
+
+        // Phase 5 — conversations map discipline (#970): the raw key points at
+        // the MAIN session even though the fork recorded itself; the fork is
+        // reachable under its own suffixed id. (peekSession — getSession is
+        // get-or-create and would mint the very session we are checking for.)
+        const mainId = getSession(CONV).id;
+        assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
+        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+
+        // Phase 6 — a system-less auxiliary call is non-anchoring: verbatim
+        // key, rides the main session (kernel empty-instructions path).
+        const r5 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: mainMsgs(1) }) });
+        assert.equal(r5.status, 200);
+        await r5.text();
+        assert.equal(getSession(CONV)?.stats.requests, 3, "system-less request keeps the raw key");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e anthropic lane: the same persona fork applies to dsh-over-anthropic", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-anthropic";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const turn = (system: string, n: number) => ({
+            model: MODEL,
+            max_tokens: 64_000,
+            system: [{ type: "text", text: system }],
+            messages: Array.from({ length: n }, (_, i): { role: string; content: { type: string; text: string }[] } => ({
+                role: i % 2 === 0 ? "user" : "assistant",
+                content: [{ type: "text", text: `main-${i + 1}-` + "z".repeat(6000) }],
+            })),
+        });
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify(turn(MAIN_SYSTEM, 12)) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(getSession(CONV), "main session exists under the raw key");
+        assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length >= 12, "refs assigned");
+
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: MODEL,
+                max_tokens: 384_000,
+                system: [{ type: "text", text: REVIEW_SYSTEM }],
+                messages: [{ role: "user", content: [{ type: "text", text: "Conversation transcript (flattened):\nuser: build it\nDecide: risky?" }] }],
+            }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, REVIEW_SYSTEM);
+        assert.ok(peekSession(fork), "review request forked onto its own session on the anthropic lane too");
+        assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e allowlist pin: a non-dsh plugin agent with two different systems stays on ONE session", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-plain";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "test-agent", "x-bili-plugin-conversation": CONV };
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, ...mainMsgs(2)] }),
+        });
+        await r1.text();
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: "risky?" }] }),
+        });
+        await r2.text();
+        assert.ok(peekSession(CONV), "session exists under the raw key");
+        assert.equal(peekSession(CONV)?.stats.requests, 2, "both requests rode the same session — no persona fork for non-dsh agents (#1106 verbatim keying)");
+        assert.ok(!peekSession(forkKey(CONV, REVIEW_SYSTEM)), "no forked session was created");
+    } finally {
+        await closeRig(rig);
+    }
+});

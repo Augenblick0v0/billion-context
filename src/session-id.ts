@@ -121,6 +121,72 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
     return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
 }
 
+/** #1916/#1307/#1314: whether the persona fingerprint (session id + system
+ *  hash, "hash 不一样自动分裂") should participate in the compression-session
+ *  key for THIS request. Allowlist by plugin agent, evidence-per-client — the
+ *  same discipline as instructionsFingerprintApplies (#1104/#1107 inverted
+ *  allowlist), applied to the openai/anthropic lanes where the agent rides.
+ *
+ *  dsh is the first entry: it stamps ONE x-bili-plugin-conversation id on
+ *  every model request of a session — including the auto-review
+ *  classifyRisk() calls (Auto permission tier fires one before EVERY tool
+ *  call; fixed REVIEW_POLICY system + a freshly-flattened single-user-blob
+ *  view, #1314 field report). Those review requests used to walk the full
+ *  pipeline under the MAIN conversation id: they overwrote the usage
+ *  baseline (#1916), evicted remembered snapshots (#1307 guard was a partial
+ *  stopgap), and fed orphan-GC — while the review blob is synthesized fresh
+ *  every time, so compressing it has zero reuse value. Keying dsh traffic by
+ *  id + system hash splits the review persona onto its own `|sub:<fp>`
+ *  session (kernel subagentNamespace anchor semantics: the first system
+ *  seen under the id keeps the raw key) so the main conversation's
+ *  compression state, baseline, and tool routing stay untouched, while
+ *  successive review calls still share ONE forked session.
+ *
+ *  Safety of hashing the system: dsh composes its main system ONCE per
+ *  session (event-sourced `system/message` — sections are config-derived;
+ *  the volatile time-context rides a USER message, not the system), so main
+ *  turns hash stably and never fork mid-conversation. A mid-session system
+ *  change (AGENTS.md edit, permission-preset switch, dsh upgrade) forks ONCE
+ *  — same class as a resume re-pay, and semantically right: a different
+ *  operating context IS a different persona. Proxy restart resets the
+ *  kernel's in-memory anchor; the persona that arrives first claims the raw
+ *  key (normally the main turn — review only fires alongside tool calls).
+ *
+ *  Future hosts that reuse one session id across personas must be ADDED HERE
+ *  with traffic evidence (see AGENTS.md §2 Key Design Decisions), never
+ *  enabled wholesale — #1106: for everyone else, system drift mid-id means
+ *  "same conversation, evolved", and forking there resets compression for
+ *  no defending bug. */
+export function dshPersonaFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    const agent = headers["x-bili-plugin"];
+    return typeof agent === "string" && agent.trim() === "dsh";
+}
+
+/** Persona text for the openai chat wire: the concatenation of every
+ *  system-role message's text (string content or text parts). Empty string
+ *  when the request carries no system message — subagentNamespace treats
+ *  that as non-anchoring (verbatim key, no anchor claim), so system-less
+ *  auxiliary calls keep riding the main session. */
+export function openaiSystemTextForPersona(body: { messages?: unknown }): string {
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const texts: string[] = [];
+    for (const m of msgs) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "system") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) texts.push(content);
+        } else if (Array.isArray(content)) {
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+                    const t = (part as { text: string }).text;
+                    if (t.length > 0) texts.push(t);
+                }
+            }
+        }
+    }
+    return texts.join("\n\n");
+}
+
 /**
  * Return only an identity the client already supplied. Generated identities
  * remain proxy-internal so billion-context does not invent upstream headers.
