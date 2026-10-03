@@ -2708,11 +2708,12 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  the two homes lets two paths grow independent WALs over one inode and lose
  *  committed writes (#1917). Generated files are rewritten each launch and
  *  never linked back nor merged into the real home.
- *  The overlay's .env is refresh-protected on EVERY launch, so a stale
- *  generated copy can never merge back into the real home even when a later
- *  launch does not manage it (#1802 review). On normal exit the run's data is
- *  written back into the real home by finalizeCodexHome (#1965); generated
- *  files stay overlay-local throughout.
+ *  The overlay's .env and config.toml are refresh-protected on EVERY launch,
+ *  so a stale generated copy can never merge back into the real home even
+ *  when a later launch does not generate it (#1802 review; config.toml
+ *  symmetric to .env, #1965). On normal exit the run's data is written back
+ *  into the real home by finalizeCodexHome (#1965); generated files stay
+ *  overlay-local throughout.
  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
  *  be built (caller degrades: wire-injected compression still works, native
  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
@@ -2740,12 +2741,12 @@ export function prepareCodexHome(opts: {
             }
         }
     }
-    // ".env" is ALWAYS refresh-protected, even on launches that do not
-    // generate it: a previous routed launch may have left an owned copy in the
-    // overlay, and letting refresh treat that as user data would merge it back
-    // into the real home (#1802 review).
-    const generatedFiles: string[] = [".env"];
-    if (conversationId !== undefined) generatedFiles.push("config.toml");
+    // ".env" and "config.toml" are ALWAYS refresh-protected, even on launches
+    // that do not generate them: a previous routed/MCP launch may have left an
+    // owned copy in the overlay, and letting refresh treat it as user data
+    // would merge it back into the real home (#1802 review; config.toml
+    // symmetric to .env, #1965).
+    const generatedFiles: string[] = [".env", "config.toml"];
     const overlay = `${codexHome}-bili`;
     if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
     if (manageDotEnv) {
@@ -2790,6 +2791,31 @@ export function prepareCodexHome(opts: {
             txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
         } catch {}
         writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    } else {
+        // Non-MCP launch: config.toml must end up SHARED with the real home
+        // (or absent) — drop any owned residue from a previous MCP launch and
+        // re-link from the real one (mirror of the .env handling above).
+        const cfgPath = path.join(overlay, "config.toml");
+        const realCfgPath = path.join(codexHome, "config.toml");
+        let needsLink = false;
+        try {
+            const st = fs.lstatSync(cfgPath);
+            const shared = st.isSymbolicLink()
+                ? fs.readlinkSync(cfgPath) === realCfgPath
+                : isWriteThroughHardlink(cfgPath, realCfgPath, st);
+            if (!shared) {
+                fs.unlinkSync(cfgPath);
+                needsLink = true;
+            }
+        } catch {
+            needsLink = true;
+        }
+        if (needsLink) {
+            try {
+                fs.lstatSync(realCfgPath);
+                linkOverlayEntry(codexHome, overlay, "config.toml");
+            } catch {}
+        }
     }
     return overlay;
 }
