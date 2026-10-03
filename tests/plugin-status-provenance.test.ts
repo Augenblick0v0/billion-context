@@ -6,7 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
@@ -18,6 +19,17 @@ process.env.NODE_ENV = "test";
 const root = mkdtempSync(join(tmpdir(), "bili-status-provenance-"));
 test.after(() => rmSync(root, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
+
+interface StatusResponse {
+    contextTokensSource: "usage" | "estimate" | "unavailable";
+    contextTokens: number | null;
+    contextTokensAt: number | null;
+    contextGeneration: string | null;
+    sessionRevision: string | null;
+    compressCreditTokens: number;
+    inputTokens: number;
+    cachedTokens: number;
+}
 
 async function harness() {
     _resetSessionsForTest();
@@ -53,13 +65,15 @@ async function harness() {
         const r = await fetch(`${origin}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "provenance" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: history }) });
         assert.equal(r.status, 200, await r.text());
     };
-    const request = async (path: string, body?: unknown) => {
+    const request = async <T>(path: string, body?: unknown): Promise<T> => {
         const r = await fetch(origin + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
         assert.equal(r.status, 200);
-        return await r.json();
+        const response: unknown = await r.json();
+        assert(response !== null && typeof response === "object" && !Array.isArray(response));
+        return response as T;
     };
-    const status = () => request("/__bili/plugin/status?conversationId=provenance");
-    const tool = (name: string, args: Record<string, unknown>) => request("/__bili/plugin/tool", { conversationId: "provenance", tool: name, args });
+    const status = () => request<StatusResponse>("/__bili/plugin/status?conversationId=provenance");
+    const tool = (name: string, args: Record<string, unknown>) => request<{ result: string }>("/__bili/plugin/tool", { conversationId: "provenance", tool: name, args });
     const compressArgs = { content: [{ startId: "m00001", endId: "m00002", summary: "The prefix preserves the first user request and second assistant response. Original content remains available for decompression using stable references." }] };
     await send();
     return { status, send, tool, messages, compressArgs, setUsage: (value: typeof usage) => { usage = value; }, holdNext: () => {
@@ -80,10 +94,12 @@ test("HTTP usage -> compress -> decompress -> request keeps context provenance s
         const baseline = session.stats.lastUsageGradeTokens;
         assert.equal(before.contextTokensSource, "usage");
         assert.equal(before.contextTokens, 10000);
+        assert(typeof before.contextTokens === "number" && typeof before.contextTokensAt === "number");
         const compressed = await h.tool("compress", h.compressArgs);
         assert(!compressed.result.includes("FAILED"), compressed.result);
         const folded = await h.status();
         assert.equal(folded.contextTokensSource, "estimate", "manual compression is not a new upstream measurement");
+        assert(typeof folded.contextTokens === "number" && typeof folded.contextTokensAt === "number");
         assert(folded.contextTokens < before.contextTokens);
         assert.equal(folded.contextTokens, Math.max(0, before.contextTokens - folded.compressCreditTokens));
         assert(folded.contextTokensAt >= before.contextTokensAt);
@@ -94,6 +110,7 @@ test("HTTP usage -> compress -> decompress -> request keeps context provenance s
         assert.match(restored.result, /first original/);
         const expanded = await h.status();
         assert.equal(expanded.contextTokensSource, "estimate");
+        assert(typeof expanded.contextTokens === "number");
         assert(expanded.contextTokens > folded.contextTokens, "inline restored material changes the effective context");
         assert.notEqual(expanded.contextGeneration, folded.contextGeneration);
         assert.equal(session.stats.lastInputTokens, inputAfterCompress);
@@ -214,11 +231,13 @@ test("HTTP CCR range decompress accounts for queued restored content without cha
         await h.tool("compress", h.compressArgs);
         const folded = await h.status();
         const baseline = session.stats.lastUsageGradeTokens;
+        assert(typeof folded.contextTokens === "number");
         const restored = await h.tool("decompress", { blockId: "b1", startId: "m00001", endId: "m00001" });
         assert.match(restored.result, /restored 1 item/);
         assert.equal(session.pendingRetrievals.length, 1);
         const current = await h.status();
         assert.equal(current.contextTokensSource, "estimate");
+        assert(typeof current.contextTokens === "number");
         assert(current.contextTokens > folded.contextTokens);
         assert.notEqual(current.contextGeneration, folded.contextGeneration);
         assert.equal(session.stats.lastUsageGradeTokens, baseline);

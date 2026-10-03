@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { applyAbsorb, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest, getSession } from "../src/session.ts";
@@ -20,6 +21,51 @@ const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+
+interface SnapshotResponse {
+    status: string;
+    code?: string;
+    sessionId: string;
+    parentRevision: string;
+    orderedMessages: { rawId: string; ref: string; identityHash: string }[];
+    messages: { text?: string; ref: string; toolIsError: boolean }[];
+}
+
+interface ForkResponse {
+    status: string;
+    code?: string;
+    childConversationId: string;
+    inheritedBlocks: { id: string }[];
+    expandedBlocks: string[];
+    replayed: boolean;
+}
+
+interface StatusResponse {
+    sessionId: string | null;
+    sessionRevision: string | null;
+    fallback?: boolean;
+    contextTokensSource: "usage" | "estimate" | "unavailable";
+    contextTokens: number | null;
+    contextTokensAt: number | null;
+    contextGeneration: string | null;
+    compressCreditTokens: number;
+    inputTokens: number;
+    contextLimit: number | null;
+}
+
+type PluginResponse<Path extends string> = Path extends "/__bili/plugin/manifest"
+    ? { capabilities: { fork: { protocolVersion: number; endpoint: string; snapshotEndpoint: string } } }
+    : Path extends "/__bili/plugin/fork" ? ForkResponse
+    : Path extends "/__bili/plugin/tool" ? { result: string; code?: string }
+    : Path extends `/__bili/plugin/status${string}` ? StatusResponse
+    : SnapshotResponse;
+
+async function responseBody<Path extends string>(response: Response, _path: Path): Promise<PluginResponse<Path>> {
+    const body: unknown = await response.json();
+    assert(body !== null && typeof body === "object" && !Array.isArray(body));
+    // Success fields follow the endpoint fixture; failures are checked via status/code.
+    return body as PluginResponse<Path>;
+}
 
 async function harness(persist = false) {
     const dir = mkdtempSync(join(testRoot, "run-"));
@@ -50,9 +96,9 @@ async function harness(persist = false) {
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
     const origin = `http://127.0.0.1:${paddr.port}`;
-    const request = async (path: string, body?: unknown) => {
+    const request = async <Path extends string>(path: Path, body?: unknown) => {
         const r = await fetch(origin + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-        return { status: r.status, body: await r.json() };
+        return { status: r.status, body: await responseBody(r, path) };
     };
     const messages = [{ role: "user", content: "first original ".repeat(250) }, { role: "assistant", content: "second original ".repeat(250) }, { role: "user", content: "tail original" }];
     const r = await fetch(`${origin}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
@@ -65,7 +111,7 @@ test("plain proxy panel snapshots do not change raw-history persistence", async 
     const h = await harness();
     try {
         const session = getSession("plain-panel");
-        const messages = [{ id: "plain-message", role: "user" as const, text: "raw plain-proxy original" }];
+        const messages = [{ id: "plain-message", role: "user" as const, contentType: "text" as const, text: "raw plain-proxy original" }];
         rememberPluginMessages(session.id, messages, messages);
         assert.equal(session.pluginSnapshot, undefined);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=plain-panel")).status, 409);
@@ -341,9 +387,9 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
             });
             child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
         });
-        const call = async (path: string, body?: unknown) => {
+        const call = async <Path extends string>(path: Path, body?: unknown) => {
             const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-            return { status: r.status, body: await r.json() };
+            return { status: r.status, body: await responseBody(r, path) };
         };
         const restored = await call("/__bili/plugin/snapshot?conversationId=child");
         const restoredStatus = await call("/__bili/plugin/status?conversationId=parent&fallback=latest");
@@ -378,6 +424,7 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
         const before = await h.request("/__bili/plugin/status?conversationId=parent");
         assert.equal(before.body.contextTokensSource, "usage");
         assert.equal(before.body.contextTokens, 10000);
+        assert(typeof before.body.contextTokensAt === "number");
         assert(before.body.contextTokensAt > 0);
         assert.equal(typeof before.body.contextGeneration, "string");
         const again = await h.request("/__bili/plugin/status?conversationId=parent");
@@ -390,6 +437,7 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
         assert(after.body.compressCreditTokens > 0);
         assert.equal(after.body.contextTokensSource, "estimate");
         assert.equal(after.body.contextTokens, Math.max(0, 10000 - after.body.compressCreditTokens));
+        assert(typeof after.body.contextTokensAt === "number");
         assert(after.body.contextTokensAt >= before.body.contextTokensAt);
         assert.notEqual(after.body.contextGeneration, before.body.contextGeneration);
         assert.equal(after.body.inputTokens, 10000);
