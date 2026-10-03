@@ -113,7 +113,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
+import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
@@ -367,6 +367,17 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
+// #1982: budget for the post-response close linger (see installPostResponseLinger).
+// Default 5s mirrors nginx's lingering_time: a peer that FINs promptly costs one
+// RTT of extra hold; a silent peer costs at most this window per fd.
+// Env-overridable like BILI_MITM_HANDSHAKE_TIMEOUT_MS (tests + operator tuning);
+// non-numeric or non-positive values fall back to the default.
+const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
+function postResponseLingerMs(): number {
+    const v = Number.parseInt(process.env.BILI_POST_RESPONSE_LINGER_MS ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -512,9 +523,92 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         drainArmed: boolean;
         /** #1529: performance.now() when the post-bail backstop destroyed the socket (peer never FINned). */
         backstopAt: number | null;
+        /** #1982: server-side end() was called on this socket (destroySoon stamp; distinguishes it from bare destroys). */
+        ended: boolean;
+        /** #1982: TLS handshake completed (plain-TCP legs start true — nothing to wait for). */
+        secured: boolean;
+        /** #1982: the other leg of a MITM connection (raw TCP ↔ terminated TLS); null elsewhere. */
+        paired: ConnRecord | null;
+        /** #1982: performance.now() when the post-response linger backstop destroyed the socket (peer never FINned). */
+        lingerBackstopAt: number | null;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
     let connSeq = 0;
+    // #1982: turn the proxy-initiated post-response close from abortive into
+    // graceful. Node's destroySoon() — the Connection: close disposition in
+    // resOnFinish — calls end() then destroy() on the SAME TICK (for flushed
+    // responses writableFinished is already true, so destroy is not deferred),
+    // while the response tail / TLS close_notify may still be unACKed in
+    // flight. A kernel closing an fd with unacked send bytes (or unread recv
+    // residual) answers RST instead of FIN; pooled downstream clients surface
+    // it as ECONNRESET (#1982: 196 occurrences measured over two weeks on a
+    // Windows downstream, two of them crashing its process).
+    // Detection: end() is intercepted to stamp rec.ended — prefinish cannot be
+    // used (it fires async, AFTER the same-tick destroy). The peer's close
+    // signal (a TCP FIN, or a TLS close_notify that can only follow ours) is
+    // proof our last byte was received+ACKed — it cannot be sent before
+    // processing ours — so: intercept the destroy, resume() to drain the recv
+    // side, wait for that signal, then destroy; a silent peer costs at most
+    // one fd for the budget window (backstop). Plain-TCP and MITM TLS legs
+    // share the same destroySoon race and get the same treatment.
+    // Deliberately NOT applied to: error-driven destroys (the peer is already
+    // gone — nothing left to protect), pre-handshake teardown, sockets owned
+    // by the clientError drain (#1529), and bare destroys without end() (kat
+    // reaper on idle sockets — empty queues, already clean).
+    const installPostResponseLinger = (socket: net.Socket, rec: ConnRecord): void => {
+        let armed = false;
+        let backstopTimer: ReturnType<typeof setTimeout> | undefined;
+        const origDestroy = socket.destroy.bind(socket);
+        // Node's end() overloads don't compose under .call; flatten to one
+        // signature at this interception boundary (all three call shapes covered).
+        // bind() is load-bearing: called unbound, Socket.end reads
+        // this._writableState off undefined (crash inside destroySoon).
+        const origEnd = socket.end.bind(socket) as unknown as (chunk?: string | Uint8Array, enc?: BufferEncoding, cb?: () => void) => typeof socket;
+        const wrappedEnd = (chunk?: string | Uint8Array, encOrCb?: BufferEncoding | (() => void), cb?: () => void): typeof socket => {
+            rec.ended = true;
+            if (typeof encOrCb === "function") return origEnd(chunk, undefined, encOrCb);
+            return origEnd(chunk, encOrCb, cb);
+        };
+        Object.defineProperty(socket, "end", { value: wrappedEnd, writable: true, configurable: true });
+        const finishLinger = (why: "peer-fin" | "backstop" | "error"): void => {
+            if (!armed) return;
+            armed = false;
+            if (backstopTimer) clearTimeout(backstopTimer);
+            if (socket.destroyed) return;
+            if (why === "backstop") {
+                rec.lingerBackstopAt = performance.now();
+                log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${postResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
+            } else if (why === "peer-fin") {
+                log("debug", `[conn#${rec.id}] ${rec.kind} linger complete: peer close signal received — closing cleanly`);
+            }
+            origDestroy();
+        };
+        const wrappedDestroy = (err?: Error): net.Socket => {
+            if (armed) return socket;
+            if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
+                return origDestroy(err);
+            }
+            // Peer closed first: its FIN already proved delivery, so the destroy
+            // is clean — and waiting for an 'end' that already fired would only
+            // dead-lock into the backstop.
+            if (rec.peerFinAt !== null || socket.readableEnded) {
+                return origDestroy();
+            }
+            armed = true;
+            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${postResponseLingerMs()}ms)`);
+            // http leaves the socket paused between requests; without resume()
+            // the peer's EOF would never reach us and every linger would run
+            // out on the backstop. Draining also removes unread recv residual
+            // (the Linux RST trigger) across the whole window.
+            socket.resume();
+            socket.once("end", () => finishLinger("peer-fin"));
+            socket.once("error", () => finishLinger("error"));
+            backstopTimer = setTimeout(() => finishLinger("backstop"), postResponseLingerMs());
+            backstopTimer.unref?.();
+            return socket;
+        };
+        Object.defineProperty(socket, "destroy", { value: wrappedDestroy, writable: true, configurable: true });
+    };
     server.on("connection", (socket) => {
         const rec: ConnRecord = {
             id: ++connSeq,
@@ -527,8 +621,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             peerFinAt: null,
             drainArmed: false,
             backstopAt: null,
+            ended: false,
+            secured: !(socket instanceof tls.TLSSocket),
+            paired: null,
+            lingerBackstopAt: null,
         };
         connRecords.set(socket, rec);
+        if (socket instanceof tls.TLSSocket) {
+            socket.once("secure", () => { rec.secured = true; });
+            // doMitm stamps the raw TCP leg onto the TLS socket; pair the two
+            // ledger records (raw leg always arrives first — real accept) so
+            // each leg's close classifies with knowledge of the other.
+            const rawLeg = (socket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] as net.Socket | undefined;
+            const rawRec = rawLeg ? connRecords.get(rawLeg) : undefined;
+            if (rawRec) {
+                rec.paired = rawRec;
+                rawRec.paired = rec;
+            }
+        }
         // prefinish fires when end() fully flushes — never on destroy(). That
         // makes it the reliable "server-initiated close" marker without patching
         // the socket object. performance.now() (µs) rather than Date.now():
@@ -556,19 +666,39 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // budget rather than the end marker; the requests>0 guard keeps
             // request-less closes out (the reaper only arms post-response).
             const idleForBudget = rec.requests > 0 && rec.lastResponseEndAt !== null && now - rec.lastResponseEndAt >= keepAliveTimeoutMs;
+            // #1982: the raw TCP leg of a MITM connection is structurally
+            // destroyed by Node's TLSWrap.close() even when the TLS leg closed
+            // fully gracefully — classify it by what its PAIRED tls leg did
+            // instead of reporting a false abortive "destroyed".
+            const pairedClean = rec.paired !== null && rec.paired.secured && rec.paired.errored === null && rec.paired.lingerBackstopAt === null;
             const reason = rec.backstopAt !== null
                 ? "clienterror-backstop"
-                : rec.errored
-                    ? `error(${rec.errored})`
-                    : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
-                        ? "peer-fin"
-                        : idleForBudget
-                            ? "idle-timeout"
-                            : rec.serverEndAt !== null
-                                ? "server-end"
-                                : "destroyed";
-            log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+                : rec.lingerBackstopAt !== null
+                    ? "linger-backstop"
+                    : rec.errored
+                        ? `error(${rec.errored})`
+                        : rec.kind === "tcp" && rec.paired !== null
+                            ? (pairedClean ? "paired-clean" : "destroyed")
+                            : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                                ? "peer-fin"
+                                : idleForBudget
+                                    ? "idle-timeout"
+                                    : rec.serverEndAt !== null
+                                        ? "server-end"
+                                        : "destroyed";
+            // #1982: a bare "destroyed" means nobody ended the socket and no
+            // other marker explains the close — the fd went away possibly with
+            // bytes still in flight, i.e. the peer may have seen RST/ECONNRESET.
+            // Elevate to warn (was debug) so a downstream "RST at T" report
+            // reconciles against this line directly (#1982 request 2); every
+            // intentional path carries its own dedicated marker above.
+            if (reason === "destroyed") {
+                log("warn", `[conn#${rec.id}] ${rec.kind} closed reason=destroyed age=${now - rec.openedAt}ms reqs=${rec.requests} [ABORTIVE — peer may see RST/ECONNRESET]`);
+            } else {
+                log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+            }
         });
+        installPostResponseLinger(socket, rec);
     });
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
