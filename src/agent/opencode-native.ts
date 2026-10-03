@@ -299,7 +299,7 @@ export function _resetNativeStateForTest(): void {
 
 // ———— OpenCode 1.x native surface (V1 `.server()`) ————————————————————
 
-type ZodLike = typeof import("zod");
+export type ZodLike = typeof import("zod");
 
 interface V1ToolContext {
     sessionID: string;

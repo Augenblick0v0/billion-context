@@ -76,7 +76,9 @@ export interface OmpProvider {
 }
 
 export interface OmpConfig {
-    providers: Record<string, OmpProvider>;
+    /** Discovery tolerates a lane with no discovered providers (`?? {}` at
+     *  every read site) — optional here matches that (#1991 item 5). */
+    providers?: Record<string, OmpProvider>;
 }
 
 export interface OpencodeProvider {
@@ -86,7 +88,9 @@ export interface OpencodeProvider {
 }
 
 export interface OpencodeConfig {
-    providers: Record<string, OpencodeProvider>;
+    /** Discovery tolerates a lane with no discovered providers (`?? {}` at
+     *  every read site) — optional here matches that (#1991 item 5). */
+    providers?: Record<string, OpencodeProvider>;
 }
 
 /** opencode's built-in "zen" gateway (`opencode auth login`): the baseURL
@@ -1037,7 +1041,7 @@ export function readPiConfig(piHome: string): PiConfig {
  * so it tolerates the file's base indent.
  */
 export function parseOmpYaml(text: string): OmpConfig {
-    const result: OmpConfig = { providers: {} };
+    const providers: Record<string, OmpProvider> = {};
     let providersIndent = -1;
     let providerIndent = -1;
     let currentProvider: string | null = null;
@@ -1050,7 +1054,7 @@ export function parseOmpYaml(text: string): OmpConfig {
         if (pending === undefined || currentProvider === null) { pending = undefined; return; }
         const win = toModelWindow(pending.id, pending.contextWindow, pending.maxOutput);
         if (win) {
-            const prov = result.providers[currentProvider]!;
+            const prov = providers[currentProvider]!;
             prov.models = [...(prov.models ?? []), win];
         }
         pending = undefined;
@@ -1072,7 +1076,7 @@ export function parseOmpYaml(text: string): OmpConfig {
             const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
             if (m) {
                 currentProvider = m[1];
-                if (!result.providers[currentProvider]) result.providers[currentProvider] = {};
+                if (!providers[currentProvider]) providers[currentProvider] = {};
             } else {
                 currentProvider = null;
             }
@@ -1093,12 +1097,12 @@ export function parseOmpYaml(text: string): OmpConfig {
                 flushPending();
             } else if (modelsIndent < 0 || indent <= modelsIndent) {
                 const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
-                if (m) result.providers[currentProvider]!.baseUrl = m[1];
+                if (m) providers[currentProvider]!.baseUrl = m[1];
             }
         }
     }
     flushPending();
-    return result;
+    return { providers };
 }
 
 export function readOmpConfig(ompHome: string): OmpConfig {
