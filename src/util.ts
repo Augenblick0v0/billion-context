@@ -48,6 +48,22 @@ export function safeJsonParse(s: string): unknown {
     }
 }
 
+/**
+ * #1954 safety signal. bili's Responses adapter replays `input` as the FULL
+ * conversation and strips `previous_response_id`, so it CANNOT materialize the
+ * history a native-chaining continuation references. When we strip a non-empty
+ * id, this returns an operator-facing warning: the request still succeeds with
+ * HTTP 200, so without it the context loss is silent. Keys off the id ALONE —
+ * not off `store` — because Responses stores responses by default, so an omitted
+ * `store` still leaves the referenced response resolvable upstream; judging on
+ * explicit `store:true` would miss the common case. Returns null when there is
+ * nothing to warn about (absent / empty / non-string id).
+ */
+export function strippedResponseIdWarning(prevId: unknown): string | null {
+    if (typeof prevId !== "string" || prevId.length === 0) return null;
+    return `responses previous_response_id=${prevId} stripped without rebuilding referenced history (#1954): bili replays input as full history, so a Responses native-chaining (delta) continuation loses prior turns upstream yet still returns 200. Send full input/output history, or set ACP_KEEP_RESPONSE_ID=1 to preserve the id.`;
+}
+
 /** True if a socket remote address is loopback. Covers the IPv4 127.0.0.0/8
  *  block and IPv6 ::1, including the IPv4-mapped ::ffff:127.x.x.x form Node
  *  reports for dual-stack sockets. Shared by the admin-endpoint gate
@@ -55,6 +71,37 @@ export function safeJsonParse(s: string): unknown {
  *  the two security checks cannot drift apart. */
 export function isLoopbackAddress(addr: string | undefined): boolean {
     return !!addr && (addr.startsWith("127.") || addr === "::1" || addr.startsWith("::ffff:127."));
+}
+
+/** #1933: reduce an upstream URL/origin to a comparable route key
+ *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
+ *  from the forward path, full URLs with paths from resolveUpstream — and the
+ *  baseline-provenance / calibration checks compare keys, so both must land on
+ *  the same form. Unparseable input falls back to its trimmed raw value. */
+export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
+    if (!u) return undefined;
+    try {
+        return new URL(u).origin;
+    } catch {
+        const t = u.trim();
+        return t || undefined;
+    }
+}
+
+/** #1933 F1: apply the session's learned estimator scale k̂ to a raw local
+ *  text estimate. The chars/4 estimator is a proxy whose ratio to real billing
+ *  varies per upstream, so it may only decide on the route where k̂ was
+ *  learned: both origins known and equal → scaled; either unknown or the
+ *  routes differ → raw estimate unchanged (legacy behavior). */
+export function applyEstimateCalibration(raw: number, k: number | undefined, kOrigin: string | undefined, origin: string | undefined): number {
+    // Invalid factors (null/0/NaN/±Infinity — e.g. a corrupted persisted
+    // session.stats field) must degrade to no-correction, never zero or
+    // poison the reading: raw×0 would blind the estimate arm entirely.
+    if (k === undefined || !Number.isFinite(k) || k <= 0 || raw <= 0) return raw;
+    const a = normalizeUpstreamOrigin(origin);
+    const b = normalizeUpstreamOrigin(kOrigin);
+    if (a === undefined || b === undefined || a !== b) return raw;
+    return raw * k;
 }
 
 export type WireProtocol = "anthropic" | "openai" | "responses" | "google";

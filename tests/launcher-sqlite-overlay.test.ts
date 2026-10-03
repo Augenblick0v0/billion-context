@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { prepareCodexHome, refreshOverlayHome, isSqliteMain, SQLITE_ORIGIN_FILE } from "../src/launcher.js";
+import { prepareCodexHome, refreshOverlayHome, isSqliteMain, finalizeCodexHome, SQLITE_ORIGIN_FILE } from "../src/launcher.js";
 
 const crequire = createRequire(import.meta.url);
 
@@ -620,4 +620,272 @@ test("relative legacy symlink to the real main is migrated too (#1919)", (t) => 
     assert.equal(st.nlink, 1);
     assert.deepEqual(fs.readFileSync(path.join(overlay, "state_5.sqlite")), realMainBefore);
     assert.deepEqual(fs.readFileSync(path.join(real, "state_5.sqlite")), realMainBefore, "real main untouched");
+});
+
+test("second launch keeps the overlay-created database active in the new overlay (#1951)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, "config.toml"), 'model = "audit-model"\n');
+    // First launch: fresh real home, no database yet.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    // The client run inside that overlay creates its session database there
+    // (one sentinel row), then the launch ends.
+    buildDb(root, overlay, "state_5.sqlite", "1:first-session", "", true);
+    // Second launch: the set merges back into the real home AND the copy phase
+    // must re-import it into this launch's active home.
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    assert.ok(fs.existsSync(path.join(real, "state_5.sqlite")), "db merged back into the real home");
+    const overlayDb = path.join(overlay, "state_5.sqlite");
+    assert.ok(fs.existsSync(overlayDb), "second launch's active CODEX_HOME keeps the database (#1951)");
+    const st = fs.lstatSync(overlayDb);
+    assert.ok(st.isFile(), "overlay db is a regular file");
+    assert.equal(st.nlink, 1, "overlay db stays a private copy, never a shared link");
+    assert.deepEqual(rowsOf(overlayDb), [1]);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite")), [1]);
+    for (const dir of [real, overlay]) {
+        for (const n of fs.readdirSync(dir)) {
+            assert.ok(!n.includes("bili-conflict"), `unexpected conflict file ${path.join(dir, n)}`);
+        }
+    }
+    const origin = JSON.parse(fs.readFileSync(path.join(overlay, SQLITE_ORIGIN_FILE), "utf8")) as Record<string, unknown>;
+    assert.ok(origin["state_5.sqlite"], "fresh copy carries the #1919 provenance snapshot");
+    // Third launch: the documented #1919 steady state — the unmodified overlay
+    // copy is silently dropped and re-copied, no divergence noise.
+    const errs = capturedErrors(() => {
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml", ".env"]));
+    });
+    assert.ok(!errs.some((e) => e.includes("distinct") || e.includes("bili-conflict")), `unexpected divergence noise: ${errs.join(" | ")}`);
+    assert.ok(fs.existsSync(overlayDb), "steady state keeps the active overlay db");
+    assert.deepEqual(rowsOf(overlayDb), [1]);
+    assert.deepEqual(rowsOf(path.join(real, "state_5.sqlite")), [1]);
+});
+
+test("finalizeCodexHome: clean exit writes the run's db and files into a fresh real home (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+    const cfgText = '[model]\nname = "x"\n';
+    fs.writeFileSync(path.join(codexHome, "config.toml"), cfgText);
+    fs.writeFileSync(path.join(codexHome, ".env"), "MY_VAR=keep\n");
+
+    const overlay = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-42", manageRouting: true });
+    assert.equal(overlay, `${codexHome}-bili`);
+    // The run: the client creates its state db and one plain file under the
+    // overlay; sessions/ is shared with the real home.
+    buildDb(root, overlay!, "state_5.sqlite", "1:a,2:b", "", true);
+    fs.writeFileSync(path.join(overlay!, "run-note.txt"), "from-run\n");
+    fs.writeFileSync(path.join(overlay!, "sessions", "s1.jsonl"), '{"id":1}\n');
+
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, overlay!, [".env", "config.toml"])));
+    assert.equal(errs.length, 0, `a clean exit must be silent: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(path.join(codexHome, "state_5.sqlite")), [1, 2], "run's db readable in the real home without another bili start");
+    assert.ok(quickCheckOk(path.join(codexHome, "state_5.sqlite")));
+    assert.equal(fs.readFileSync(path.join(codexHome, "run-note.txt"), "utf8"), "from-run\n", "run-created files merge back too");
+    assert.ok(!fs.existsSync(path.join(overlay!, "run-note.txt")));
+    assert.equal(fs.readFileSync(path.join(codexHome, "sessions", "s1.jsonl"), "utf8"), '{"id":1}\n', "shared-link writes already landed in the real home");
+    assert.equal(fs.readFileSync(path.join(codexHome, ".env"), "utf8"), "MY_VAR=keep\n", "generated .env never leaves the overlay");
+    assert.equal(fs.readFileSync(path.join(codexHome, "config.toml"), "utf8"), cfgText, "generated config.toml never leaves the overlay");
+    for (const n of fs.readdirSync(codexHome)) {
+        assert.ok(!n.startsWith(".bili-"), `no bili metadata in the real home: ${n}`);
+        assert.ok(!n.includes("bili-conflict"), `no conflict on a clean exit: ${n}`);
+    }
+    assert.ok(fs.existsSync(path.join(overlay!, ".env")), "owned .env stays for the next launch");
+    // The next bili launch imports the written-back db into its fresh overlay copy.
+    const ov2 = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-43", manageRouting: true });
+    assert.deepEqual(rowsOf(path.join(ov2!, "state_5.sqlite")), [1, 2], "second launch sees the written-back rows (#1951)");
+});
+
+test("finalizeCodexHome: existing db merges back silently and the next launch imports it (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "[x]\n");
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b,3:c", "", true);
+
+    const ov1 = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-1", manageRouting: false });
+    assert.equal(ov1, `${codexHome}-bili`);
+    const ovp = path.join(ov1!, "state_5.sqlite");
+    const rep = path.join(codexHome, "state_5.sqlite");
+    const db = new sqliteCtor(ovp);
+    db.prepare("INSERT INTO t VALUES(4, 'viaOverlay')").run();
+    db.close();
+    const T = Date.now() / 1000;
+    touch(ovp, T);
+    touch(rep, T - 60);
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov1!, [".env", "config.toml"])));
+    assert.ok(!errs.some((e) => e.includes("diverge") || e.includes("distinct") || e.includes("could not merge")), `steady-state merge must be silent: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1, 2, 3, 4]);
+    assert.ok(quickCheckOk(rep));
+    for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no conflict file: ${n}`);
+    assert.ok(!fs.existsSync(ovp), "merged set leaves the overlay");
+    const ov2 = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-2", manageRouting: false });
+    assert.deepEqual(rowsOf(path.join(ov2!, "state_5.sqlite")), [1, 2, 3, 4], "next launch imports the merged rows");
+});
+
+test("finalizeCodexHome: concurrent native run advanced the real db — both generations survive (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "[x]\n");
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b,3:c", "", true);
+
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-c", manageRouting: false });
+    assert.ok(ov);
+    const ovp = path.join(ov!, "state_5.sqlite");
+    const rep = path.join(codexHome, "state_5.sqlite");
+    const d1 = new sqliteCtor(ovp);
+    d1.prepare("INSERT INTO t VALUES(4, 'bili')").run();
+    d1.close();
+    // A native codex meanwhile commits straight into the REAL home.
+    const d2 = new sqliteCtor(rep);
+    d2.prepare("INSERT INTO t VALUES(9, 'native')").run();
+    d2.close();
+    const T = Date.now() / 1000;
+    touch(rep, T);
+    touch(ovp, T - 60);
+    const errs = capturedErrors(() => finalizeCodexHome(codexHome, ov!, [".env", "config.toml"]));
+    assert.ok(errs.some((e) => e.includes("diverge") || e.includes("distinct")), `true divergence must be reported loudly: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1, 2, 3, 9], "newer native generation wins");
+    const conflict = path.join(codexHome, "state_5.sqlite.bili-conflict");
+    assert.ok(fs.existsSync(conflict), "the bili generation is preserved, never overwritten");
+    assert.deepEqual(rowsOf(conflict), [1, 2, 3, 4]);
+    assert.ok(quickCheckOk(rep));
+    assert.ok(quickCheckOk(conflict));
+    assert.ok(!fs.existsSync(ovp), "overlay set consumed");
+});
+
+test("finalizeCodexHome: blocked real slot keeps the whole set in the overlay and retry succeeds (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "[x]\n");
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b,3:c", "", true);
+
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-b", manageRouting: false });
+    assert.ok(ov);
+    const ovp = path.join(ov!, "state_5.sqlite");
+    const rep = path.join(codexHome, "state_5.sqlite");
+    // A DIRECTORY where the db should be makes every rename onto it fail —
+    // the Windows-style open-file lock stand-in used by the startup-path test.
+    fs.renameSync(rep, `${rep}.bak`);
+    fs.mkdirSync(rep);
+    // The run left a CRASHED set behind: its new row checkpointed into main
+    // (the copy already holds 1-3), tail row stuck in an uncheckpointed WAL.
+    buildDb(root, ov!, "state_5.sqlite", "4:d", "5:e", false);
+    let errs = capturedErrors(() => assert.equal(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"]), false));
+    assert.ok(errs.some((e) => e.includes("could not merge")), `blocked merge must be reported: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(ovp), [1, 2, 3, 4, 5], "set intact in the overlay, WAL still replayable");
+    assert.ok(quickCheckOk(ovp));
+    assert.ok(fs.statSync(rep).isDirectory(), "blocked slot untouched");
+    for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no partial conflict state: ${n}`);
+    // Lock released: restore the original real db and retry.
+    fs.rmdirSync(rep);
+    fs.renameSync(`${rep}.bak`, rep);
+    errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"])));
+    assert.ok(!errs.some((e) => e.includes("diverge") || e.includes("distinct") || e.includes("could not merge")), `retry after unblock must be silent: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1, 2, 3, 4, 5]);
+    assert.ok(quickCheckOk(rep));
+    assert.ok(!fs.existsSync(ovp), "set moved out of the overlay");
+});
+
+test("finalizeCodexHome: a crashed client's WAL travels with its main into a fresh real home (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "[x]\n");
+
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-k", manageRouting: false });
+    assert.ok(ov);
+    // The client was killed mid-run: row 10 checkpointed into main, row 11
+    // stuck in an uncheckpointed WAL.
+    buildDb(root, ov!, "state_5.sqlite", "10:x", "11:y", false);
+    const ovp = path.join(ov!, "state_5.sqlite");
+    const walBefore = fs.readFileSync(`${ovp}-wal`);
+    const rep = path.join(codexHome, "state_5.sqlite");
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"])));
+    assert.equal(errs.length, 0, `unit move into an empty slot must be silent: ${JSON.stringify(errs)}`);
+    assert.deepEqual(fs.readFileSync(`${rep}-wal`), walBefore, "WAL moved as a unit with its main — no splice");
+    assert.deepEqual(rowsOf(rep), [10, 11]);
+    assert.ok(quickCheckOk(rep));
+    assert.ok(!fs.existsSync(ovp), "set consumed from the overlay");
+});
+
+test("finalizeCodexHome: missing or untouched overlay is a silent no-op (#1965)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "[x]\n");
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b", "", true);
+
+    assert.ok(finalizeCodexHome(codexHome, path.join(root, "no-such-overlay"), [".env", "config.toml"]), "missing overlay → nothing pending");
+
+    // Spawn-failure degradation: prepare ran, the client never did — the
+    // byte-identical overlay copy must merge back without noise.
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-n", manageRouting: false });
+    assert.ok(ov);
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"])));
+    assert.equal(errs.length, 0, `untouched overlay must finalize silently: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(path.join(codexHome, "state_5.sqlite")), [1, 2]);
+    assert.ok(quickCheckOk(path.join(codexHome, "state_5.sqlite")));
+    for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no conflict file: ${n}`);
+});
+
+test("finalizeCodexHome: a leftover lease directory never merges into the real home (#1965)", (t) => {
+    const root = mkRoot(t);
+    const codexHome = path.join(root, "real");
+    fs.mkdirSync(codexHome, { recursive: true });
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b", "", true);
+
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-n", manageRouting: false });
+    assert.ok(ov);
+    // Simulate a failed lease release (e.g. Windows EBUSY): the lock dir with
+    // its owner record is still sitting in the overlay at finalize time.
+    const leaseDir = path.join(ov, ".bili-launch.lock");
+    fs.mkdirSync(leaseDir, { recursive: true });
+    fs.writeFileSync(path.join(leaseDir, "owner.json"), JSON.stringify({ pid: process.pid, token: "tok", ts: Date.now() }));
+    buildDb(root, ov, "state_5.sqlite", "3:c", "", true);
+
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"])));
+    assert.equal(errs.length, 0, `finalize must stay silent: ${JSON.stringify(errs)}`);
+    assert.equal(rowsOf(path.join(codexHome, "state_5.sqlite")).length, 3, "db still merges back");
+    const realNames = fs.readdirSync(codexHome);
+    assert.ok(!realNames.includes(".bili-launch.lock"), `lease dir leaked into the real home: ${JSON.stringify(realNames)}`);
+    for (const n of realNames) assert.ok(!n.startsWith(".bili-"), `no bili metadata in the real home: ${n}`);
 });

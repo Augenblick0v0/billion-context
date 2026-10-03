@@ -239,3 +239,27 @@ test("prepareCodexHome: unreadable real .env after a routed launch keeps the rea
         rmrf(`${dir}-bili`);
     }
 });
+
+test("prepareCodexHome: a later non-MCP launch shares the real config.toml again, never bakes MCP residue (#1965)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-env-"));
+    try {
+        const cfgText = 'model = "gpt-6"\n';
+        fs.writeFileSync(path.join(dir, "config.toml"), cfgText);
+        // Launch A injects MCP → owns a generated config.toml in the overlay.
+        const ovA = prepareCodexHome({ codexHome: dir, origin: ORIGIN, caPath: CA, conversationId: "conv-A", manageRouting: false });
+        assert.ok(ovA);
+        assert.ok(!fs.lstatSync(path.join(ovA, "config.toml")).isSymbolicLink(), "launch A owns a generated config.toml");
+        assert.ok(fs.readFileSync(path.join(ovA, "config.toml"), "utf8").includes("[mcp_servers.bili]"));
+        // Launch B needs no MCP block: the owned residue must not merge into
+        // the user's real config — sharing must be restored instead.
+        const ovB = prepareCodexHome({ codexHome: dir, origin: ORIGIN, caPath: CA, manageRouting: false });
+        assert.ok(ovB);
+        const st = fs.lstatSync(path.join(ovB, "config.toml"));
+        assert.ok(st.isSymbolicLink() || st.nlink > 1, "launch B shares the real config.toml again");
+        assert.equal(fs.readFileSync(path.join(dir, "config.toml"), "utf8"), cfgText, "real config never absorbed the MCP block");
+        assert.ok(!fs.existsSync(`${path.join(dir, "config.toml")}.bili-conflict`), "no conflict residue left in the real home");
+    } finally {
+        rmrf(dir);
+        rmrf(`${dir}-bili`);
+    }
+});

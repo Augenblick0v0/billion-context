@@ -12,6 +12,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { normalizeUpstreamOrigin } from "./util.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -628,9 +629,38 @@ export function recordCacheSample(
  *  caller keeps its own settle-decision gate, log line, collapse watch and
  *  outputTokens update; `reportedCached === null` means the provider reported
  *  no cache tokens (recordCacheSample quarantines that sample). */
+// #1933 F1: estimator calibration constants. The local chars/4 estimate is a
+// proxy whose ratio to real billing varies per upstream (observed 1.3–2.5× on
+// one relay vs ~1.0× on another in the same session), so k̂ is learned per
+// route and only applied on that route. Samples below MIN are noise (tiny
+// requests), clamps bound a single pathological sample from wrecking the EMA
+// and pin the correction to the deflate direction only (max 1, see below).
+const CALIBRATION_MIN_ESTIMATE = 2000;
+// Plausibility band for admitting a sample: outside it, the report and the
+// payload it bills demonstrably don't correspond (placeholder billing, relay
+// echo, mock upstreams) — a ratio there must never teach a factor.
+const CALIBRATION_SAMPLE_MIN = 0.2;
+const CALIBRATION_SAMPLE_MAX = 5;
+// Final clamp on the published factor: bounds how far calibration can move
+// any decision away from the raw estimate. One-way by design: the clamp max
+// is 1, so a learned factor can only DEFLATE the estimate (fire later than
+// the raw proxy would), never inflate it. Routes whose billing runs ABOVE
+// the local estimate (samples >1) publish k̂=1 — legacy raw behavior — and
+// stay covered by the overflow arm / learn-on-failure ladder instead. This
+// eliminates the class "calibration itself causes an earlier trigger": the
+// observed #1933 damage was over-triggering (37% window tax, fold churn),
+// while the opposite error already has a backstop. Discussion: PR #1940.
+const CALIBRATION_CLAMP_MIN = 0.25;
+const CALIBRATION_CLAMP_MAX = 1;
+// Evidence requirements: ≥2 recent same-route samples agreeing within ×2.
+// One lucky/degenerate pair must not flip every estimate on the route.
+const CALIBRATION_SAMPLE_WINDOW = 3;
+const CALIBRATION_CONSISTENCY_RATIO = 2;
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
@@ -646,12 +676,48 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        // #1933 F2: record which route measured this baseline — the gate uses
+        // it to demote the baseline when the current request routes elsewhere.
+        const settleOrigin = normalizeUpstreamOrigin(s.upstream);
+        if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // #1933 F1: consume the pending pair — the local text estimate of the
+        // payload THIS report bills, recorded at prepare time. Same route
+        // required. Admitted samples (plausibility band) accumulate in a
+        // per-origin ring; the factor is published only once ≥2 recent samples
+        // agree within ×2, and cleared again when they stop agreeing — until
+        // then the raw estimate decides (legacy behavior).
+        const pendingEst = session.stats.lastLocalTextEstimate;
+        const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+        if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
+            const rawSample = s.total / pendingEst;
+            let ring = session.stats.calibrationRing;
+            if (!ring || ring.origin !== settleOrigin) ring = { origin: settleOrigin, values: [] };
+            if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
+                ring.values.push(rawSample);
+                if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+                const spread = Math.max(...ring.values) / Math.min(...ring.values);
+                if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
+                    const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
+                    session.stats.calibratedEstimate = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
+                    session.stats.calibratedEstimateOrigin = settleOrigin;
+                } else {
+                    delete session.stats.calibratedEstimate;
+                    delete session.stats.calibratedEstimateOrigin;
+                }
+            }
+            session.stats.calibrationRing = ring;
+        }
         // #1110: a real usage report retires the one-shot overflow arm.
         delete session.stats.overflowArmTokens;
         // #1595: a real report landing far below a stale-high nudge reference
         // retires that reference too (one call covers all three lanes).
         reanchorNudgeOnUsageDrop(session);
     }
+    // #1933 F1: roll the pending pair forward to the current turn's value —
+    // it will be consumed by the NEXT report (or cleared when the lane
+    // provides none, so a stale pair can never be mispaired).
+    session.stats.lastLocalTextEstimate = localTextEstimate;
+    session.stats.lastLocalTextEstimateOrigin = localTextEstimate !== undefined ? normalizeUpstreamOrigin(s.upstream) : undefined;
     if (s.reportedCached !== null && s.total > 0) {
         session.stats.cachedTokens += s.reportedCached;
         session.stats.cacheSamples += 1;

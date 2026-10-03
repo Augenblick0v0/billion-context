@@ -113,10 +113,10 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
-import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
+import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -367,6 +367,17 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
+// #1982: budget for the post-response close linger (see installPostResponseLinger).
+// Default 5s mirrors nginx's lingering_time: a peer that FINs promptly costs one
+// RTT of extra hold; a silent peer costs at most this window per fd.
+// Env-overridable like BILI_MITM_HANDSHAKE_TIMEOUT_MS (tests + operator tuning);
+// non-numeric or non-positive values fall back to the default.
+const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
+function postResponseLingerMs(): number {
+    const v = Number.parseInt(process.env.BILI_POST_RESPONSE_LINGER_MS ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
+}
+
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -512,9 +523,92 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         drainArmed: boolean;
         /** #1529: performance.now() when the post-bail backstop destroyed the socket (peer never FINned). */
         backstopAt: number | null;
+        /** #1982: server-side end() was called on this socket (destroySoon stamp; distinguishes it from bare destroys). */
+        ended: boolean;
+        /** #1982: TLS handshake completed (plain-TCP legs start true — nothing to wait for). */
+        secured: boolean;
+        /** #1982: the other leg of a MITM connection (raw TCP ↔ terminated TLS); null elsewhere. */
+        paired: ConnRecord | null;
+        /** #1982: performance.now() when the post-response linger backstop destroyed the socket (peer never FINned). */
+        lingerBackstopAt: number | null;
     }
     const connRecords = new Map<net.Socket, ConnRecord>();
     let connSeq = 0;
+    // #1982: turn the proxy-initiated post-response close from abortive into
+    // graceful. Node's destroySoon() — the Connection: close disposition in
+    // resOnFinish — calls end() then destroy() on the SAME TICK (for flushed
+    // responses writableFinished is already true, so destroy is not deferred),
+    // while the response tail / TLS close_notify may still be unACKed in
+    // flight. A kernel closing an fd with unacked send bytes (or unread recv
+    // residual) answers RST instead of FIN; pooled downstream clients surface
+    // it as ECONNRESET (#1982: 196 occurrences measured over two weeks on a
+    // Windows downstream, two of them crashing its process).
+    // Detection: end() is intercepted to stamp rec.ended — prefinish cannot be
+    // used (it fires async, AFTER the same-tick destroy). The peer's close
+    // signal (a TCP FIN, or a TLS close_notify that can only follow ours) is
+    // proof our last byte was received+ACKed — it cannot be sent before
+    // processing ours — so: intercept the destroy, resume() to drain the recv
+    // side, wait for that signal, then destroy; a silent peer costs at most
+    // one fd for the budget window (backstop). Plain-TCP and MITM TLS legs
+    // share the same destroySoon race and get the same treatment.
+    // Deliberately NOT applied to: error-driven destroys (the peer is already
+    // gone — nothing left to protect), pre-handshake teardown, sockets owned
+    // by the clientError drain (#1529), and bare destroys without end() (kat
+    // reaper on idle sockets — empty queues, already clean).
+    const installPostResponseLinger = (socket: net.Socket, rec: ConnRecord): void => {
+        let armed = false;
+        let backstopTimer: ReturnType<typeof setTimeout> | undefined;
+        const origDestroy = socket.destroy.bind(socket);
+        // Node's end() overloads don't compose under .call; flatten to one
+        // signature at this interception boundary (all three call shapes covered).
+        // bind() is load-bearing: called unbound, Socket.end reads
+        // this._writableState off undefined (crash inside destroySoon).
+        const origEnd = socket.end.bind(socket) as unknown as (chunk?: string | Uint8Array, enc?: BufferEncoding, cb?: () => void) => typeof socket;
+        const wrappedEnd = (chunk?: string | Uint8Array, encOrCb?: BufferEncoding | (() => void), cb?: () => void): typeof socket => {
+            rec.ended = true;
+            if (typeof encOrCb === "function") return origEnd(chunk, undefined, encOrCb);
+            return origEnd(chunk, encOrCb, cb);
+        };
+        Object.defineProperty(socket, "end", { value: wrappedEnd, writable: true, configurable: true });
+        const finishLinger = (why: "peer-fin" | "backstop" | "error"): void => {
+            if (!armed) return;
+            armed = false;
+            if (backstopTimer) clearTimeout(backstopTimer);
+            if (socket.destroyed) return;
+            if (why === "backstop") {
+                rec.lingerBackstopAt = performance.now();
+                log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${postResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
+            } else if (why === "peer-fin") {
+                log("debug", `[conn#${rec.id}] ${rec.kind} linger complete: peer close signal received — closing cleanly`);
+            }
+            origDestroy();
+        };
+        const wrappedDestroy = (err?: Error): net.Socket => {
+            if (armed) return socket;
+            if (err || rec.errored !== null || rec.drainArmed || !rec.secured || !rec.ended || rec.lastResponseEndAt === null) {
+                return origDestroy(err);
+            }
+            // Peer closed first: its FIN already proved delivery, so the destroy
+            // is clean — and waiting for an 'end' that already fired would only
+            // dead-lock into the backstop.
+            if (rec.peerFinAt !== null || socket.readableEnded) {
+                return origDestroy();
+            }
+            armed = true;
+            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${postResponseLingerMs()}ms)`);
+            // http leaves the socket paused between requests; without resume()
+            // the peer's EOF would never reach us and every linger would run
+            // out on the backstop. Draining also removes unread recv residual
+            // (the Linux RST trigger) across the whole window.
+            socket.resume();
+            socket.once("end", () => finishLinger("peer-fin"));
+            socket.once("error", () => finishLinger("error"));
+            backstopTimer = setTimeout(() => finishLinger("backstop"), postResponseLingerMs());
+            backstopTimer.unref?.();
+            return socket;
+        };
+        Object.defineProperty(socket, "destroy", { value: wrappedDestroy, writable: true, configurable: true });
+    };
     server.on("connection", (socket) => {
         const rec: ConnRecord = {
             id: ++connSeq,
@@ -527,8 +621,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             peerFinAt: null,
             drainArmed: false,
             backstopAt: null,
+            ended: false,
+            secured: !(socket instanceof tls.TLSSocket),
+            paired: null,
+            lingerBackstopAt: null,
         };
         connRecords.set(socket, rec);
+        if (socket instanceof tls.TLSSocket) {
+            socket.once("secure", () => { rec.secured = true; });
+            // doMitm stamps the raw TCP leg onto the TLS socket; pair the two
+            // ledger records (raw leg always arrives first — real accept) so
+            // each leg's close classifies with knowledge of the other.
+            const rawLeg = (socket as unknown as Record<string, unknown>)[MITM_RAW_SOCKET_KEY] as net.Socket | undefined;
+            const rawRec = rawLeg ? connRecords.get(rawLeg) : undefined;
+            if (rawRec) {
+                rec.paired = rawRec;
+                rawRec.paired = rec;
+            }
+        }
         // prefinish fires when end() fully flushes — never on destroy(). That
         // makes it the reliable "server-initiated close" marker without patching
         // the socket object. performance.now() (µs) rather than Date.now():
@@ -556,19 +666,39 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // budget rather than the end marker; the requests>0 guard keeps
             // request-less closes out (the reaper only arms post-response).
             const idleForBudget = rec.requests > 0 && rec.lastResponseEndAt !== null && now - rec.lastResponseEndAt >= keepAliveTimeoutMs;
+            // #1982: the raw TCP leg of a MITM connection is structurally
+            // destroyed by Node's TLSWrap.close() even when the TLS leg closed
+            // fully gracefully — classify it by what its PAIRED tls leg did
+            // instead of reporting a false abortive "destroyed".
+            const pairedClean = rec.paired !== null && rec.paired.secured && rec.paired.errored === null && rec.paired.lingerBackstopAt === null;
             const reason = rec.backstopAt !== null
                 ? "clienterror-backstop"
-                : rec.errored
-                    ? `error(${rec.errored})`
-                    : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
-                        ? "peer-fin"
-                        : idleForBudget
-                            ? "idle-timeout"
-                            : rec.serverEndAt !== null
-                                ? "server-end"
-                                : "destroyed";
-            log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+                : rec.lingerBackstopAt !== null
+                    ? "linger-backstop"
+                    : rec.errored
+                        ? `error(${rec.errored})`
+                        : rec.kind === "tcp" && rec.paired !== null
+                            ? (pairedClean ? "paired-clean" : "destroyed")
+                            : rec.peerFinAt !== null && (rec.serverEndAt === null || rec.peerFinAt <= rec.serverEndAt)
+                                ? "peer-fin"
+                                : idleForBudget
+                                    ? "idle-timeout"
+                                    : rec.serverEndAt !== null
+                                        ? "server-end"
+                                        : "destroyed";
+            // #1982: a bare "destroyed" means nobody ended the socket and no
+            // other marker explains the close — the fd went away possibly with
+            // bytes still in flight, i.e. the peer may have seen RST/ECONNRESET.
+            // Elevate to warn (was debug) so a downstream "RST at T" report
+            // reconciles against this line directly (#1982 request 2); every
+            // intentional path carries its own dedicated marker above.
+            if (reason === "destroyed") {
+                log("warn", `[conn#${rec.id}] ${rec.kind} closed reason=destroyed age=${now - rec.openedAt}ms reqs=${rec.requests} [ABORTIVE — peer may see RST/ECONNRESET]`);
+            } else {
+                log("debug", `[conn#${rec.id}] ${rec.kind} closed reason=${reason} age=${now - rec.openedAt}ms reqs=${rec.requests}`);
+            }
         });
+        installPostResponseLinger(socket, rec);
     });
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
@@ -3535,6 +3665,11 @@ async function prepareAnthropic(
     // downstream consumer (injectSystem, Prepared.anthropicSystem → loop)
     // inherit the anchor, and the failure path below keeps forwarding it too.
     let sysNotes: string[] = [];
+    // [#1930-3] The client's own system captured BEFORE the anchor
+    // replacement below — fingerprinting the post-anchor value tracks bili's
+    // managed text and hides client-side drift (same rationale as the
+    // responses site; keeps all four wires on one semantic).
+    const clientSystem = parsed.system;
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -3616,7 +3751,7 @@ async function prepareAnthropic(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
-        noteSystemPromptFingerprint(session, parsed.system, { sessionId, log });
+        noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -3758,6 +3893,13 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
+    // char-count upper bound) — settleUsageReport pairs it with this turn's
+    // usage report to learn the per-route estimate-calibration factor k̂.
+    session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
@@ -3854,6 +3996,7 @@ async function prepareOpenai(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4013,6 +4156,13 @@ async function prepareOpenai(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -4113,6 +4263,7 @@ async function prepareGoogle(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4388,6 +4539,10 @@ async function prepareResponses(
             else item.type = type;
         }
         responsesProjection = projection;
+        // Client's own system text captured BEFORE the anchor reconciliation
+        // below can replace systemParts — fingerprinting the post-anchor value
+        // would track bili's managed text and hide client-side drift (#1930-3).
+        const responsesClientSystem = projection.systemParts.join("\n\n---\n\n");
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
         if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
@@ -4414,6 +4569,7 @@ async function prepareResponses(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log });
+        if (!isCompactionTrigger) noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
@@ -4599,7 +4755,14 @@ async function prepareResponses(
     // was already lifted into the developer message at input[1]; forwarding it
     // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+    // #1954: stripping is only lossless when input already holds the full
+    // conversation. Warn when we strip a non-empty id so a native-chaining
+    // (delta) continuation that loses its history is visible, not silent 200s.
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+        const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
+        if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
+        delete rebuilt.previous_response_id;
+    }
     delete rebuilt.instructions;
     // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
     // directive; keep prompt_cache_key. Sent by hermes' codex transport and
@@ -4631,6 +4794,13 @@ async function prepareResponses(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -5331,7 +5501,7 @@ async function preflightCompressIfNeeded(
     // single source of truth for that size (#1493) — armFailureShrink measures
     // the same quantity so a no-usage failure can't arm lastInputTokens to raw-
     // history scale and fire preflight on a payload that actually fits.
-    const { textEstimate, overheadEstimate, imageTokens, payloadEstimate } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+    const { textEstimate, overheadEstimate, imageTokens } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
@@ -5356,12 +5526,36 @@ async function preflightCompressIfNeeded(
     // (#604) on a measured (folded) payload describes a different view and
     // must not pull preflight into multi-minute runs over a payload whose own
     // post-fold estimate fits the window.
-    const baselineFloor = prepared.processedMessages.length > 0
+    const baselineFloorRaw = prepared.processedMessages.length > 0
         ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
         : session.stats.lastInputTokens;
+    // #1933 F2: a usage baseline is only authoritative for the route that
+    // measured it — provider billing scales differ per upstream (the incident:
+    // ~257K local estimate vs 59-63% real usage on one route; after a mid-
+    // session model switch the stale cross-route baseline kept arming preflight
+    // on payloads the new upstream billed far below the window). Demote to
+    // untrusted when the request now routes elsewhere; the payload's own
+    // (calibrated) estimate then judges it. Unprovenanced baselines (sessions
+    // started before this field existed) keep the legacy behavior.
+    let baselineFloor = baselineFloorRaw;
+    const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
+    const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
+    if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${baselineOrigin}, request now routes to ${currentOrigin} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
+        baselineFloor = 0;
+    }
+    // #1933 F1: scale the local text estimate by the per-route calibration
+    // factor k̂ learned from this session's own usage reports (local estimate ÷
+    // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
+    // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
+    // i.e. today's behavior.
+    const kFactor = session.stats.calibratedEstimate;
+    const kOrigin = session.stats.calibratedEstimateOrigin;
+    const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
+    const calibratedPayload = calibratedText + imageTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
-        : Math.max(baselineFloor, payloadEstimate);
+        : Math.max(baselineFloor, calibratedPayload);
     // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
     // text vs `target − imageReserve`. Exact algebraic rewrite of the old
     // total-view trigger: subtracting the constant reserve from both sides of
@@ -5374,12 +5568,12 @@ async function preflightCompressIfNeeded(
     // fits, nor keep it armed after the text has been folded down.
     const textChannel = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate
-        : textEstimate + overheadEstimate;
+        : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
     if (limit <= 0 || !model || !triggerFires) return prepared;
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
+    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -5460,7 +5654,7 @@ async function preflightCompressIfNeeded(
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // Anonymous sessions need the conservative upper bound to prove that fit.
         if (payloadFitsWindow) {
-            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${payloadEstimate}/${limit}); forwarding as-is`);
+            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }
         if (unknownBaseline) {
@@ -5502,7 +5696,11 @@ async function preflightCompressIfNeeded(
     // nothing is foldable (no summarization call is spent in that case). The
     // old pre-check failed fast here on the normal-config compressibleRanges,
     // which excluded the soft zone — bricking the #330 livelock.
-    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}); preflight compressing before forward`);
+    // #1933 F4: the trigger line now carries both measurement scales — the
+    // provider-billed baseline and the (calibrated) local estimate — so a
+    // false trigger is diagnosable from the log alone instead of requiring a
+    // cross-reference between gate and nudge lines.
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
@@ -5540,6 +5738,7 @@ async function preflightCompressIfNeeded(
                 imageReserve: imageTokens,
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
+                upstreamOrigin: currentOrigin,
             },
             prepared.originalMessages,
         );
@@ -5581,9 +5780,14 @@ async function preflightCompressIfNeeded(
             session.stats.lastInputTokensSource = "estimate";
         }
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms`);
+        // Same calibrated caliber as the trigger above — gate, per-round exit
+        // and this final fit must judge the payload on one scale (#1933 F1).
+        // The baseline anchor above stays raw deliberately: it is a floor for
+        // future meters, and a deflated (k̂ < 1) value would only delay the
+        // next trigger, never advance it.
         const fits = unknownBaseline
             ? result.fitsWindow
-            : rebuiltTextSize + imageTokens < limit;
+            : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
