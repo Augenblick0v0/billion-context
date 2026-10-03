@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -471,7 +472,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
         assert.equal(fork.status, 201);
         const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
         const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
-        child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: new URL("../", import.meta.url).pathname, env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
+        child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
         child.stderr!.on("data", (b) => { stderr += b.toString(); });
         const port = await new Promise<number>((resolve, reject) => {
@@ -483,6 +484,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
                 if (port) { clearTimeout(timer); resolve(Number(port[1])); }
             });
             child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
+            child!.once("error", (error) => { clearTimeout(timer); reject(error); });
         });
         const call = async <Path extends string>(path: Path, body?: unknown) => {
             const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -510,7 +512,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
         assert.match(original.body.result, /second original/);
         assert(!original.body.result.includes("tail original"));
     } finally {
-        if (child && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
+        if (child?.pid && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
         await h.close();
     }
 });
