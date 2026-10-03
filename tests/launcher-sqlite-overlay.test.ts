@@ -866,3 +866,26 @@ test("finalizeCodexHome: missing or untouched overlay is a silent no-op (#1965)"
     assert.ok(quickCheckOk(path.join(codexHome, "state_5.sqlite")));
     for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no conflict file: ${n}`);
 });
+
+test("finalizeCodexHome: a leftover lease directory never merges into the real home (#1965)", (t) => {
+    const root = mkRoot(t);
+    const codexHome = path.join(root, "real");
+    fs.mkdirSync(codexHome, { recursive: true });
+    buildDb(root, codexHome, "state_5.sqlite", "1:a,2:b", "", true);
+
+    const ov = prepareCodexHome({ codexHome, origin: "http://127.0.0.1:8899", caPath: "/nonexistent/ca.pem", conversationId: "conv-n", manageRouting: false });
+    assert.ok(ov);
+    // Simulate a failed lease release (e.g. Windows EBUSY): the lock dir with
+    // its owner record is still sitting in the overlay at finalize time.
+    const leaseDir = path.join(ov, ".bili-launch.lock");
+    fs.mkdirSync(leaseDir, { recursive: true });
+    fs.writeFileSync(path.join(leaseDir, "owner.json"), JSON.stringify({ pid: process.pid, token: "tok", ts: Date.now() }));
+    buildDb(root, ov, "state_5.sqlite", "3:c", "", true);
+
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(codexHome, ov!, [".env", "config.toml"])));
+    assert.equal(errs.length, 0, `finalize must stay silent: ${JSON.stringify(errs)}`);
+    assert.equal(rowsOf(path.join(codexHome, "state_5.sqlite")).length, 3, "db still merges back");
+    const realNames = fs.readdirSync(codexHome);
+    assert.ok(!realNames.includes(".bili-launch.lock"), `lease dir leaked into the real home: ${JSON.stringify(realNames)}`);
+    for (const n of realNames) assert.ok(!n.startsWith(".bili-"), `no bili metadata in the real home: ${n}`);
+});

@@ -2637,6 +2637,7 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
         name === SQLITE_ORIGIN_FILE ||
         name === `${SQLITE_ORIGIN_FILE}.tmp` ||
         name === path.basename(overlayLockPath(overlay)) ||
+        name === path.basename(overlayLeaseDir(overlay)) || // release-failure residue must never merge into the real home
         generatedSet.has(name) ||
         [...generatedSet].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
     let overlayEntries: string[];
