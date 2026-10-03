@@ -5778,17 +5778,35 @@ async function preflightCompressIfNeeded(
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
     if (result.compressedRanges > 0) {
-        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
         const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
         outbound = rebuilt;
+        // #1987: anchor the usage baseline to what ACTUALLY ships — the rebuilt
+        // normal-config payload (text + wire overhead; images excluded per the
+        // #857 never-persist-the-image-floor rule: a bytes-mode image floor
+        // overestimates pixel-billing upstreams ~100× and would poison the
+        // upward window self-heal). The preflight-side anchor used the kernel's
+        // no-emergency-truncate view, which keeps tool outputs prepare() trims
+        // near the window edge — so the post-compression reading could EXCEED
+        // the trigger-time reading ("~42619 tokens saved (2309870 → 2818817)")
+        // and inflate every later meter until a real usage report landed.
+        const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
+        const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
+        if (rebuiltTextSize > session.stats.lastInputTokens) {
+            session.stats.lastInputTokens = rebuiltTextSize;
+            session.stats.lastInputTokensSource = "estimate";
+        }
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms`);
         // Same calibrated caliber as the trigger above — gate, per-round exit
         // and this final fit must judge the payload on one scale (#1933 F1).
+        // The baseline anchor above stays raw deliberately: it is a floor for
+        // future meters, and a deflated (k̂ < 1) value would only delay the
+        // next trigger, never advance it.
         const fits = unknownBaseline
             ? result.fitsWindow
-            : applyEstimateCalibration(estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
+            : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
