@@ -51,7 +51,7 @@
 ### Build & Test Commands
 
 ```sh
-npm run typecheck      # tsc --noEmit --project tsconfig.build.json
+npm run typecheck      # tsc --noEmit --project tsconfig.json (root gate covers tests/ since 2e6e508a)
 npm run build          # tsup + dist-import-annotations check
 node --import tsx --test tests/pi-inprocess-*.test.ts   # targeted ported + wiring suite
 ```
@@ -61,7 +61,8 @@ node --import tsx --test tests/pi-inprocess-*.test.ts   # targeted ported + wiri
 - New/modified test files: 78 flat `tests/pi-inprocess-*.test.ts` (77 ported + 1 wiring) plus fixtures/helper.
 - Test count (targeted battery: all pi-inprocess suites + directly-affected existing suites `pi-native`, `hermes-native`, `update-notes`, `logger-session-tag`): **876 total, 873 pass, 0 fail, 3 skip**.
 - Key scenarios verified: compress/decompress/search/status/cache/state/meter (incl. k-hat calibration + hysteresis) behavior parity with bcp; sidecar format byte-compat (legacy bcp files load, extras carried, producer rewritten on save); stand-down on every ownership signal; kill-switch delegates to server-based path without spawning anything in-process; contract entry importable with stable schema.
-- Full regression (whole-repo `npm test` + e2e) left to CI on the PR head per local-testing discipline.
+- Real-pi E2E suite (`tests/e2e/e2e-native-pi.test.ts`) updated for the default flip: the original four #1239 tests are pinned to the server-based lane via `BILI_PI_INPROC=0`; a new fifth test exercises the default in-process lane (every request direct — no stamping, zero proxy instances; in-process `acp_status`/`compress`; real fold evidenced by ≥1 block in a `.acp.json` sidecar; `/acp` exits clean); `ACP_AUTO_UPDATE=0` is set for every spawned pi so neither lane's updater can reach the real npm registry from CI. Verified locally **5/5 green** against real pi 0.83.6; the `e2e-native-pi` CI job is green on the PR head.
+- Full regression (whole-repo `npm test` + remaining e2e jobs) left to CI on the PR head per local-testing discipline.
 
 ### Results
 
