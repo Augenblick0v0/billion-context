@@ -1327,7 +1327,9 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
  *  route — in direct-URL mode the model traffic does not reach the proxy and
  *  the binding cannot happen). When the overlay cannot be built the injection
  *  degrades to nothing (wire mode still compresses server-side) with a
- *  warning. */
+ *  warning. OverlayBusyError (#1952: another live launch owns the overlay) is
+ *  PROPAGATED, not degraded — runLaunch aborts the launch, because degrading
+ *  to the real home would silently drop the MCP tools and the .env protection. */
 export function prepareCodexMcpInjection(opts: {
     codexHome: string;
     origin: string;
@@ -1377,11 +1379,35 @@ export function prepareCodexMcpInjection(opts: {
  * real-home entry are merged into the real home (recursively; mtime-newer-wins
  * for files, losers preserved as `<name>.bili-conflict`) and only removed from
  * the overlay when the merge fully succeeded; entries the real home lacks are
- * kept as-is. A `.bili-launch.pid` marker warns when two launches share the
- * overlay (each launch rewrites the generated file with its own proxy origin).
+ * kept as-is.
+ *
+ * Ownership (#1952): the overlay is EXCLUSIVE per live launch. Before any
+ * merge/write, refresh takes an atomic lease (`<overlay>/.bili-launch.lock/`
+ * dir + owner record with pid + token); a second live launch refuses with
+ * OverlayBusyError instead of clobbering the first one's generated .env / MCP
+ * config / pid marker (the old warn-and-continue behavior let the last writer
+ * win the routing). Stale leases from crashed launches are reclaimed
+ * automatically (dead owner pid); a partially written owner record reads as
+ * BUSY — conservative, manual unlock is deleting the lock dir. The legacy
+ * `.bili-launch.pid` marker is still honored as a liveness hint so a pre-#1952
+ * launch (which creates no lock dir) keeps its overlay too. runLaunch releases
+ * the lease in its finally, after the client exits and the proxy is stopped.
  */
 function overlayLockPath(overlay: string): string {
     return path.join(overlay, ".bili-launch.pid");
+}
+
+// Conservative liveness for ownership decisions (unlike instance.ts'
+// isPidAlive): any kill error other than ESRCH reads as ALIVE, so a lease is
+// never reclaimed from an owner we cannot verify.
+function holderPidAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
 }
 
 function livePidHoldsOverlay(overlay: string): number | undefined {
@@ -1392,13 +1418,122 @@ function livePidHoldsOverlay(overlay: string): number | undefined {
         return undefined;
     }
     const pid = Number.parseInt(raw.trim(), 10);
-    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return undefined;
-    try {
-        process.kill(pid, 0);
-    } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+    if (pid === process.pid) return undefined;
+    return holderPidAlive(pid) ? pid : undefined;
+}
+
+/** #1952: thrown when another LIVE bili launch owns the shared `-bili`
+ *  overlay. The refused launch made no writes — the holder's generated files
+ *  stay byte-identical. Manual unlock (crashed holder whose pid was reused, or
+ *  any stuck state): delete `<overlay>/.bili-launch.lock/`. */
+export class OverlayBusyError extends Error {
+    readonly code = "BILI_OVERLAY_BUSY";
+    constructor(readonly overlay: string, readonly holderPid?: number) {
+        super(
+            (holderPid !== undefined
+                ? `another bili launch (pid ${holderPid}) is using the shared overlay ${overlay} — only one bili launch per home runs at a time; wait for it to exit`
+                : `the shared overlay ${overlay} is held by a launch whose owner record is incomplete or unverifiable — if no bili launch of this home is running, remove ${overlayLeaseDir(overlay)} to unlock`)
+                + " (this launch made no changes)",
+        );
+        this.name = "OverlayBusyError";
     }
-    return pid;
+}
+
+function overlayLeaseDir(overlay: string): string {
+    return path.join(overlay, ".bili-launch.lock");
+}
+
+function overlayOwnerPath(overlay: string): string {
+    return path.join(overlayLeaseDir(overlay), "owner.json");
+}
+
+interface OverlayLeaseRecord {
+    dir: string;
+    ownerFile: string;
+    token: string;
+}
+
+let activeOverlayLease: OverlayLeaseRecord | undefined;
+
+function writeOwner(ownerFile: string, token: string): void {
+    fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token, ts: Date.now() }, null, 2));
+}
+
+function readOwner(ownerFile: string): { pid?: number; token?: string } {
+    try {
+        const rec = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as Record<string, unknown>;
+        return {
+            ...(typeof rec.pid === "number" ? { pid: rec.pid } : {}),
+            ...(typeof rec.token === "string" ? { token: rec.token } : {}),
+        };
+    } catch {
+        return {};
+    }
+}
+
+/** #1952: atomically claim exclusive ownership of the overlay before any
+ *  refresh/write (see the module doc above). Reentrant within one process —
+ *  sequential prepares in the same launch (or test suite) just refresh the
+ *  record. Throws OverlayBusyError when a foreign live launch holds it. */
+export function acquireOverlayLease(overlay: string): void {
+    // Cross-version guard first: pre-#1952 launches leave only the legacy
+    // marker. A live foreign pid in it means an older bili owns the overlay —
+    // refuse rather than clobber its generated files.
+    const legacyHolder = livePidHoldsOverlay(overlay);
+    if (legacyHolder !== undefined) throw new OverlayBusyError(overlay, legacyHolder);
+    const dir = overlayLeaseDir(overlay);
+    const ownerFile = overlayOwnerPath(overlay);
+    const take = (): boolean => {
+        const token = randomUUID();
+        try {
+            fs.mkdirSync(dir);
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+            return false;
+        }
+        try {
+            writeOwner(ownerFile, token);
+        } catch {
+            // Crash window between mkdir and the owner write: the bare dir
+            // stays — an incomplete record reads as busy (manual unlock).
+        }
+        activeOverlayLease = { dir, ownerFile, token };
+        return true;
+    };
+    if (take()) return;
+    const owner = readOwner(ownerFile);
+    if (owner.pid === process.pid) {
+        try {
+            const token = randomUUID();
+            writeOwner(ownerFile, token);
+            activeOverlayLease = { dir, ownerFile, token };
+        } catch {
+            activeOverlayLease = undefined;
+        }
+        return;
+    }
+    if (owner.pid !== undefined && !holderPidAlive(owner.pid)) {
+        // Stale lease from a crashed launch: reclaim once. The atomic mkdir in
+        // take() stays the arbiter if another reclaim runs in parallel.
+        try {
+            fs.rmSync(dir, { recursive: true, force: true });
+        } catch {}
+        if (take()) return;
+    }
+    throw new OverlayBusyError(overlay, owner.pid);
+}
+
+/** Release the lease taken by acquireOverlayLease (runLaunch's finally).
+ *  Token-verified: a record rewritten out from under us (reclaimed) is left
+ *  untouched. Idempotent. */
+export function releaseOverlayLease(): void {
+    const lease = activeOverlayLease;
+    activeOverlayLease = undefined;
+    if (lease === undefined) return;
+    try {
+        if (readOwner(lease.ownerFile).token !== lease.token) return;
+        fs.rmSync(lease.dir, { recursive: true, force: true });
+    } catch {}
 }
 
 /**
@@ -1815,12 +1950,10 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
     } catch {
         return false;
     }
-    const holder = livePidHoldsOverlay(overlay);
-    if (holder !== undefined) {
-        console.error(
-            `bili: another bili launch (pid ${holder}) is using ${overlay} — concurrent launches share this overlay and the last one's proxy port wins in the generated config.`,
-        );
-    }
+    // #1952: exclusive ownership BEFORE any merge/write — a foreign live
+    // launch holding this overlay gets a hard refusal (OverlayBusyError), not
+    // the old warn-and-clobber. The marker below stays informational.
+    acquireOverlayLease(overlay);
     try {
         fs.writeFileSync(overlayLockPath(overlay), `${process.pid}\n`);
     } catch {}
@@ -1904,8 +2037,14 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
                 }
             }
         }
+        // A SUCCESSFUL merge can introduce a db the real home did not hold
+        // when realEntries was snapshotted above (fresh home + db created by
+        // this launch's client) — the copy phase below must re-import it or
+        // the next launch's active home starts with no database (#1951).
+        const mergedBases = new Set<string>();
         for (const base of dbSets) {
-            if (!mergeSqliteSet(overlay, realHome, base)) {
+            if (mergeSqliteSet(overlay, realHome, base)) mergedBases.add(base);
+            else {
                 console.error(
                     `bili: could not merge the SQLite set ${base} / ${base}-wal / ${base}-shm into ${realHome} ` +
                         `(the real db is likely open/locked) — kept in the overlay, retry on the next launch.`,
@@ -1931,6 +2070,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
             if (!st.isFile()) continue;
             realDbBases.add(entry);
         }
+        // Merged-in bases are sqlite mains by construction (dbSets came from
+        // isSqliteMain) and a successful merge guarantees their main now sits
+        // in the real home — they join the copy inventory even though they were
+        // absent from the pre-merge realEntries snapshot (#1951).
+        for (const base of mergedBases) realDbBases.add(base);
         const realDbMembers = new Set<string>();
         for (const base of realDbBases) {
             for (const m of sqliteSetMembers(base)) realDbMembers.add(m);
@@ -1938,7 +2082,11 @@ export function refreshOverlayHome(realHome: string, overlay: string, generatedF
         let accessible = 0;
         let total = 0;
         const linkFailures: string[] = [];
-        for (const entry of realEntries) {
+        const copyPhaseEntries = [...realEntries];
+        for (const base of mergedBases) {
+            if (!realEntries.has(base)) copyPhaseEntries.push(base);
+        }
+        for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
@@ -2466,9 +2614,10 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  The overlay's .env is refresh-protected on EVERY launch, so a stale
  *  generated copy can never merge back into the real home even when a later
  *  launch does not manage it (#1802 review).
- *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
- *  be built (caller degrades: wire-injected compression still works, native
- *  MCP tools / the .env protection do not). */
+  *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
+  *  be built (caller degrades: wire-injected compression still works, native
+  *  MCP tools / the .env protection do not). Throws OverlayBusyError BEFORE any
+  *  write when another live launch owns the overlay (#1952) — callers abort. */
 export function prepareCodexHome(opts: {
     codexHome: string;
     origin: string;
@@ -3688,6 +3837,16 @@ export async function stopProxyGuarded(
     stopProxy(handle);
 }
 
+/** #1952: the shared overlay is owned by another live launch — stop THIS
+ *  launch's proxy (plainly throwing here would leak the detached proxy child,
+ *  since prepare runs after ensureProxyRunning) and exit non-zero. The client
+ *  is never spawned on this path. */
+async function abortLaunchOnBusyOverlay(handle: ProxyHandle, err: OverlayBusyError, deps: LauncherDeps): Promise<void> {
+    console.error(`bili: ${err.message}`);
+    await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
+    process.exit(1);
+}
+
 /** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
  *  tokens get wrapped in double quotes, so a space-free launch produces a
  *  byte-identical line to the old shell:true form. A token containing an
@@ -4126,7 +4285,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // overrides the env fallback).
         env.PI_CACHE_RETENTION = "long";
         const dshHomeDir = resolveDshHome(process.env);
-        dshOverlayHome = routes.httpRewrites.length > 0 ? prepareDshHome(dshHomeDir, origin, routes.httpRewrites) : undefined;
+        try {
+            dshOverlayHome = routes.httpRewrites.length > 0 ? prepareDshHome(dshHomeDir, origin, routes.httpRewrites) : undefined;
+        } catch (err) {
+            if (!(err instanceof OverlayBusyError)) throw err;
+            await abortLaunchOnBusyOverlay(handle, err, deps);
+            return;
+        }
         if (dshOverlayHome) {
             env.DSH_HOME = dshOverlayHome;
         } else if (routes.httpRewrites.length > 0) {
@@ -4366,13 +4531,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // $CODEX_HOME/.env (load_dotenv overrides spawn env after start);
         // direct-URL launches only need it to carry the MCP server block.
         if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
-            const inj = prepareCodexMcpInjection({
-                codexHome: resolveCodexHome(process.env),
-                origin,
-                caPath: codexCaPath,
-                conversationId: codexConversationId,
-                manageRouting: !directUrl,
-            });
+            let inj: ReturnType<typeof prepareCodexMcpInjection>;
+            try {
+                inj = prepareCodexMcpInjection({
+                    codexHome: resolveCodexHome(process.env),
+                    origin,
+                    caPath: codexCaPath,
+                    conversationId: codexConversationId,
+                    manageRouting: !directUrl,
+                });
+            } catch (err) {
+                if (!(err instanceof OverlayBusyError)) throw err;
+                await abortLaunchOnBusyOverlay(handle, err, deps);
+                return;
+            }
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
             if (inj.warning) console.error(`bili: ${inj.warning}`);
@@ -4448,6 +4620,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         code = 1;
     } finally {
         await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
+        releaseOverlayLease();
         if (gooseOverlay) {
             try {
                 finalizeGooseHome(gooseOverlay);

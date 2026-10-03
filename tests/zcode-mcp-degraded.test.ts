@@ -34,6 +34,7 @@ function sandboxEnv(sandbox: string, extra: Record<string, string> = {}): NodeJS
         "BILLION_CONTEXT_ATTACH",
         "BILLION_CONTEXT_PLUGIN",
         "BILI_MCP_PROXY",
+        "BILI_MCP_DEFAULT_ORIGIN",
         "BILI_PROVIDER_REWRITES",
         "BILI_MITM_HOSTS",
         "BILI_ZCODE_ROUTE",
@@ -91,7 +92,7 @@ test("mcp-entry serves an idle handshake instead of dying pre-initialize (#1892 
     const sandbox = mkdtempSync(path.join(tmpdir(), "zcode-degraded-idle-"));
     try {
         writeEmptyPersonalStore(sandbox);
-        const env = sandboxEnv(sandbox, { ZCODE_DATA_BASE_DIR: path.join(sandbox, "zcode-data") });
+        const env = sandboxEnv(sandbox, { ZCODE_DATA_BASE_DIR: path.join(sandbox, "zcode-data"), BILI_MCP_DEFAULT_ORIGIN: "http://127.0.0.1:1" });
         const h = spawnEntry(env);
         linesHolder = h.lines;
         try {

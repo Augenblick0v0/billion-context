@@ -986,6 +986,56 @@ test("apply() runtime-info (#1812): a failed window resolve retries after the co
     }
 });
 
+
+// #1942: the host's llm service is a class instance, so resolveModelInfo
+// needs its receiver. Called detached (pre-fix) every resolve threw
+// "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
+// and the process never stamped x-bili-plugin-context-window. A plain
+// object stub cannot catch this: it does not depend on 	his.
+test("apply() runtime-info (#1942): binds resolveModelInfo to its service receiver, so a class-shaped llm service still stamps the window header", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-bind-"));
+    let detached: string | undefined = undefined;
+    // Shaped like dsh-llm: resolveModelInfo reaches its own state through
+    // 	his, so a detached call throws instead of silently working.
+    class LlmService {
+        async resolveModelInfo(): Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number }> {
+            try {
+                return { context: { contextWindow: this.capacity() }, defaultMaxTokens: 32768 };
+            } catch (err) {
+                detached = err instanceof Error ? err.message : String(err);
+                throw err;
+            }
+        }
+        private capacity(): number {
+            return 1_000_000;
+        }
+    }
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            ctx.setModelServices(new LlmService(), { currentSelection: () => ({ provider: "workbuddy", model: "space-bunny" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (bind)");
+            ctx.setInitiator({ session: { id: "session-bind" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // the model id is stamped either way (the failure-shaped cache keeps
+            // it), so wait on whichever outcome lands first and then assert the
+            // receiver survived
+            await waitFor(() => stamp()?.["x-bili-plugin-model"] === "space-bunny" || detached !== undefined, "the window resolve settled");
+            assert.equal(detached, undefined, `resolveModelInfo lost its service receiver: ${String(detached)}`);
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "bound resolve stamped the context-window header");
+            assert.equal(stamp()?.["x-bili-plugin-model"], "space-bunny");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("apply() runtime-info (#1945): an adapter-registration event clears the boot-race cooldown instead of waiting it out", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-adapters-"));

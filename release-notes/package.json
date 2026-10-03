@@ -9,8 +9,20 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-01",
+    "updated": "2026-10-03",
     "releases": [
+      {
+        "version": "0.1.181",
+        "date": "2026-10-03",
+        "tier": "recommended",
+        "summary": "Window & preflight accuracy wave: dsh context windows resolve again after every resolveModelInfo call failed on a detached receiver (#1943); preflight no longer fires at 59–63% real usage — local estimates are now calibrated against provider-reported usage (#1940, #1933); pi virtual-model selections no longer double-compress (#1962); re-signed SDK-HMAC-SHA256 egress on armed tunnels (#1884)."
+      },
+      {
+        "version": "0.1.180",
+        "date": "2026-10-02",
+        "tier": "recommended",
+        "summary": "OpenCode WebSocket traffic is intercepted again — compression and usage stats no longer silently no-op on OpenCode ≥ 2.0.20 (#1844)."
+      },
       {
         "version": "0.1.179",
         "date": "2026-10-01",

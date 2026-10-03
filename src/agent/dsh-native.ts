@@ -32,11 +32,13 @@
 // left to the kernel's natural ingest diff (#395 gap, acceptable: manual
 // /compact is rare and auto mode is off).
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -216,7 +218,12 @@ function refreshModelInfo(origin: string | undefined): void {
         if (modelInfo.cached.contextWindow !== undefined) return;
         if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
     }
-    const resolve = svc.llm?.resolveModelInfo;
+    // The host registers llm as a service object, so resolveModelInfo needs its
+    // receiver; called detached below, this threw
+    // "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
+    // for every provider and model, and the failure-shaped cache (#1812) then
+    // left the process without x-bili-plugin-context-window.
+    const resolve = svc.llm?.resolveModelInfo?.bind(svc.llm);
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;
@@ -819,6 +826,98 @@ export function apply(ctx: PluginContext): void {
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
         const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        console.error(line);
+        persistClientEvent(line);
+    };
+
+    // #1884 re-sign arm: bind the host's credential service (dynamic inject —
+    // a host without it keeps the #1886 direct fallback), then expose a
+    // resolver that walks the enabled CodeArts accounts in the host's
+    // account-pool state ($DSH_HOME/jet-hub/state.json) in pool order and
+    // returns the first resolvable credential — same first-usable semantics
+    // as the CodeArts plugin's own account selection. BILI_CODEARTS_REF
+    // pins a specific credential ref instead. The loopback markers carry
+    // ak/sk/token to the proxy, which re-signs every egress body it produces
+    // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
+    // a credential expires the upstream 401 is visible and the plugin's next
+    // successful refresh re-arms through this same resolver. The pinned ref
+    // comes from resolveResignSettings(): env BILI_CODEARTS_REF wins over the
+    // config file's "resign": {"credentialRef": …}.
+    let credentialsService: { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined;
+    if (typeof ctx.inject === "function") {
+        try {
+            ctx.inject(["credentials"], (sub) => {
+                const svc = (sub as { credentials?: unknown }).credentials;
+                if (svc !== undefined && typeof svc === "object") credentialsService = svc as typeof credentialsService;
+            });
+        } catch {
+            // inject is best-effort: without the service signed traffic rides
+            // the direct fallback (uncompressed, signature intact), as before.
+        }
+    } else {
+        const svc = (ctx as { credentials?: unknown }).credentials;
+        if (svc !== undefined && typeof svc === "object") credentialsService = svc as typeof credentialsService;
+    }
+    const codeartsRefCandidates = (): { ref: string; nickname?: string }[] => {
+        const pinned = resolveResignSettings().credentialRef;
+        if (pinned !== undefined && pinned.trim() !== "") return [{ ref: pinned.trim() }];
+        try {
+            const home = process.env.DSH_HOME ?? path.join(homedir(), ".dsh");
+            const raw = readFileSync(path.join(home, "jet-hub", "state.json"), "utf8");
+            const accounts = (JSON.parse(raw) as { accounts?: Array<Record<string, unknown>> }).accounts ?? [];
+            const out: { ref: string; nickname?: string }[] = [];
+            for (const account of accounts) {
+                if (account["provider"] !== "codearts") continue;
+                if (account["enabled"] === false) continue;
+                const ref = account["credentialRef"];
+                if (typeof ref !== "string" || ref === "") continue;
+                const nickname = account["nickname"];
+                out.push({ ref, nickname: typeof nickname === "string" ? nickname : undefined });
+            }
+            return out;
+        } catch {
+            return [];
+        }
+    };
+    let resignCache: { cred: { ak: string; sk: string; token?: string }; at: number } | undefined;
+    const RESIGN_CACHE_MS = 10_000;
+    state.resignCredentialFor = async () => {
+        if (credentialsService?.resolve === undefined) return undefined;
+        const now = Date.now();
+        if (resignCache !== undefined && now - resignCache.at < RESIGN_CACHE_MS) return resignCache.cred;
+        for (const { ref } of codeartsRefCandidates()) {
+            try {
+                const resolved = await credentialsService.resolve(ref);
+                const value = resolved?.value;
+                if (typeof value !== "string" || value === "") continue;
+                const parsed = JSON.parse(value) as Record<string, unknown>;
+                const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
+                const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
+                if (ak === "" || sk === "") continue;
+                const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
+                const cred = { ak, sk, token };
+                resignCache = { cred, at: now };
+                return cred;
+            } catch {
+                // unresolvable / malformed account: pool order says try the next
+            }
+        }
+        return undefined;
+    };
+    const signedUrlSeen = new Set<string>();
+    state.onSignedModelUrl = (rawUrl) => {
+        const key = (() => {
+            try {
+                const u = new URL(rawUrl);
+                return `${u.origin}${u.pathname}`;
+            } catch {
+                return rawUrl.split("?")[0];
+            }
+        })();
+        if (signedUrlSeen.has(key)) return;
+        if (signedUrlSeen.size >= 64) return;
+        signedUrlSeen.add(key);
+        const line = `bili-native-dsh: signed model request observed (${key}) — #1884 re-sign arm engaged when a credential resolves; otherwise it goes direct (uncompressed, signature intact)`;
         console.error(line);
         persistClientEvent(line);
     };

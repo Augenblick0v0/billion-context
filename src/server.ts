@@ -8,10 +8,10 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
-import type { CompressSettings, ProxyOptions } from "./config.js";
+import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
@@ -79,6 +79,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -107,7 +108,7 @@ import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, instructionsFingerprintApplies, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -115,7 +116,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -1022,6 +1023,19 @@ function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): R
 // 0 = no cap.
 function imageTokenCapFor(opts: ProxyOptions, upstreamUrl: string | undefined): number {
     return findRoute(opts.routes, upstreamUrl)?.imageTokenCap ?? opts.imageTokenCap ?? 0;
+}
+
+// #1884: per-provider, per-scheme re-sign policy — the matched route
+// entry's `resign["<scheme>"]` block (level 2) wins per-field over the
+// global `resign` root, env over both, the same cascade family as
+// imageBillingFor. Resolved AFTER routing so the provider (and its model
+// filter) is known before the re-sign action runs — the repo's route-first
+// ordering, not action-first-then-filter. `scheme` is the request's own
+// Authorization scheme, so passthrough/refusal is pinned to exactly the
+// signature on the wire. Host-side consumers (native intercept, dsh lane)
+// run pre-route and keep the root cascade.
+function resignSettingsFor(opts: ProxyOptions, upstreamUrl: string | undefined, scheme: string = APIG_RESIGN_SCHEME): ResignSettings {
+    return resolveResignSettings(process.env, findRoute(opts.routes, upstreamUrl)?.resign, scheme);
 }
 
 // #1843 L1: the IMAGE-channel reserve for a payload — the prior-based estimate
@@ -1974,6 +1988,28 @@ async function handle(
                   clientProvided: !!convHeader,
               }
             : undefined;
+        // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
+        // conversation id on every model request of a session, INCLUDING the
+        // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
+        // freshly-flattened user blob, fired before every tool call under the
+        // Auto permission tier). Keying dsh traffic by id + system hash splits
+        // those review requests onto their own `|sub:<fp>` session so they
+        // stop overwriting the main session's usage baseline (#1916) and
+        // evicting its remembered snapshots (#1307), while successive review
+        // calls still share ONE forked session. Allowlisted by plugin agent
+        // (evidence-per-client discipline, see dshPersonaFingerprintApplies)
+        // because for everyone else system drift mid-id means "same
+        // conversation, evolved" and forking would reset compression for no
+        // defending bug (#1106). The kernel's anchor semantics keep the FIRST
+        // system seen under the id on the raw key — the main turn claims it,
+        // reviews fork; an empty system is non-anchoring (verbatim key), so
+        // system-less auxiliary calls keep riding the main session.
+        const dshPersona = dshPersonaFingerprintApplies(req.headers);
+        const personaSystemText = protocol === "openai"
+            ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
+            : protocol === "anthropic"
+              ? systemTextsForSplit.join("\n\n")
+              : "";
         const conversation = protocol === "google"
             ? (googleIdentity?.value ?? googleSignal)
             : protocol === "anthropic"
@@ -1986,9 +2022,13 @@ async function handle(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : anthropicIdentity?.value ?? anthropicSignal)
+                  : dshPersona
+                    ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
+                    : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? openaiIdentity?.value ?? openaiSignal
+              ? (dshPersona
+                    ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
+                    : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain
                 // directly — do NOT route it through subagentNamespace (the
@@ -2022,6 +2062,17 @@ async function handle(
                            (parsed as ResponsesRequestBody).instructions,
                        )
                      : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
+        // #1916/#1307: true when the dsh persona fingerprint actually split
+        // this request onto a suffixed session key (kernel anchor mismatch).
+        // Used by the recordPluginSession branch below so the fork records
+        // under its split id instead of stealing the raw conversation key
+        // from the main session (same single-valued-map discipline as #970).
+        const rawPersonaIdentity = protocol === "openai"
+            ? (openaiIdentity?.value ?? openaiSignal)
+            : protocol === "anthropic"
+              ? (anthropicIdentity?.value ?? anthropicSignal)
+              : undefined;
+        const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2285,8 +2336,11 @@ async function handle(
             // /acp lookups and MCP tool routing (last writer wins). The raw
             // key keeps pointing at the MAIN session; the subagent session
             // stays reachable via its verbatim split id and its canonical
-            // pfa-* (printed in wire notes).
-            recordPluginSession(claudeSub !== undefined ? conversation : (pluginConversation ?? conversation), session.id);
+            // pfa-* (printed in wire notes). personaForked (#1916/#1307:
+            // dsh review persona split onto a `|sub:<fp>` session) gets the
+            // same discipline — the fork records under its suffixed id and
+            // the raw key stays owned by the main session.
+            recordPluginSession((claudeSub !== undefined || personaForked) ? conversation : (pluginConversation ?? conversation), session.id);
         }
         // #1206: first request of this session — identify the client and scan
         // its plugin registry for a co-resident THIRD-PARTY compression plugin
@@ -2923,6 +2977,51 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
+            // #1884 (un-armed signed traffic): a request that already carries a
+            // body-covering signature (SDK-HMAC-SHA256 family — CodeArts APIG)
+            // and arrives WITHOUT the re-sign arm cannot survive any body
+            // rewrite: prepare* injects the compress tool + system notes, and
+            // the compress loop re-sends rebuilt rounds, so the upstream
+            // rejects every mutated request with 401 (APIG.0301 body-hash
+            // mismatch). Default: REFUSE (403, actionable message) — silently
+            // forwarding byte-untouched would silently disable compression;
+            // the user opted into bili, not into a pass-through tunnel.
+            // BILI_RESIGN_PASSTHROUGH=1 opts in to byte-untouched forwarding
+            // (no session, no compression, signature intact — the /bili/-
+            // prefix twin of the native lane's #1886 fallback);
+            // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
+            // handling: the request rides the normal rewrite path).
+            const guardScheme = inboundSignedScheme(req.headers);
+            const resignMarker = String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "");
+            // An armed request is only ARMABLE when its credential marker decodes:
+            // a mangled/missing credential cannot be re-signed, so it must take
+            // the same refuse/opt-in-passthrough path as an un-armed signed
+            // request instead of entering the rewrite pipeline with a stale
+            // signature that is guaranteed to 401 upstream (APIG.0301).
+            const resignArmable = resignMarker === APIG_RESIGN_SCHEME && decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) !== undefined;
+            // Route-first (#1884): the provider is resolved before the action —
+            // the guard consults the matched route entry's `resign` block, so
+            // policy follows the provider/model scoping the rest of the system
+            // uses (env > providers.<url>.resign > global resign root).
+            const guardResign = resignSettingsFor(opts, route?.rewrittenUrl ?? upstreamOrigin, guardScheme);
+            if (
+                guardScheme !== undefined &&
+                !resignArmable &&
+                guardResign.enabled
+            ) {
+                if (guardResign.passthrough) {
+                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign["${guardScheme}"].passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
+                    forwarded = true;
+                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
+                    return;
+                }
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign["${guardScheme}"].passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
+                forwarded = true;
+                res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
+                res.end(refusal.body);
+                return;
+            }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
                 forwarded = true;
@@ -3659,6 +3758,13 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    // #1933 F1: billed-caliber twin of the row above (chars/4 instead of
+    // char-count upper bound) — settleUsageReport pairs it with this turn's
+    // usage report to learn the per-route estimate-calibration factor k̂.
+    session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+        + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
@@ -3914,6 +4020,13 @@ async function prepareOpenai(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
+            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -4532,6 +4645,13 @@ async function prepareResponses(
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
+        // see the anthropic-lane counterpart above.
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
+        if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
@@ -4919,6 +5039,9 @@ function buildForwardTarget(
     for (const [k, v] of Object.entries(req.headers)) {
         const lower = k.toLowerCase();
         if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
+        // #1884: loopback re-sign markers are internal to the bili tunnel —
+        // they must never reach the upstream (they carry the credential).
+        if (lower === APIG_RESIGN_HEADER || lower === APIG_RESIGN_CREDENTIAL_HEADER) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     // #300: stamp the chain marker AFTER copying inbound headers so it wins
@@ -5229,7 +5352,7 @@ async function preflightCompressIfNeeded(
     // single source of truth for that size (#1493) — armFailureShrink measures
     // the same quantity so a no-usage failure can't arm lastInputTokens to raw-
     // history scale and fire preflight on a payload that actually fits.
-    const { textEstimate, overheadEstimate, imageTokens, payloadEstimate } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+    const { textEstimate, overheadEstimate, imageTokens } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
@@ -5254,12 +5377,36 @@ async function preflightCompressIfNeeded(
     // (#604) on a measured (folded) payload describes a different view and
     // must not pull preflight into multi-minute runs over a payload whose own
     // post-fold estimate fits the window.
-    const baselineFloor = prepared.processedMessages.length > 0
+    const baselineFloorRaw = prepared.processedMessages.length > 0
         ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
         : session.stats.lastInputTokens;
+    // #1933 F2: a usage baseline is only authoritative for the route that
+    // measured it — provider billing scales differ per upstream (the incident:
+    // ~257K local estimate vs 59-63% real usage on one route; after a mid-
+    // session model switch the stale cross-route baseline kept arming preflight
+    // on payloads the new upstream billed far below the window). Demote to
+    // untrusted when the request now routes elsewhere; the payload's own
+    // (calibrated) estimate then judges it. Unprovenanced baselines (sessions
+    // started before this field existed) keep the legacy behavior.
+    let baselineFloor = baselineFloorRaw;
+    const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
+    const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
+    if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${baselineOrigin}, request now routes to ${currentOrigin} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
+        baselineFloor = 0;
+    }
+    // #1933 F1: scale the local text estimate by the per-route calibration
+    // factor k̂ learned from this session's own usage reports (local estimate ÷
+    // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
+    // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
+    // i.e. today's behavior.
+    const kFactor = session.stats.calibratedEstimate;
+    const kOrigin = session.stats.calibratedEstimateOrigin;
+    const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
+    const calibratedPayload = calibratedText + imageTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
-        : Math.max(baselineFloor, payloadEstimate);
+        : Math.max(baselineFloor, calibratedPayload);
     // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
     // text vs `target − imageReserve`. Exact algebraic rewrite of the old
     // total-view trigger: subtracting the constant reserve from both sides of
@@ -5272,12 +5419,12 @@ async function preflightCompressIfNeeded(
     // fits, nor keep it armed after the text has been folded down.
     const textChannel = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate
-        : textEstimate + overheadEstimate;
+        : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
     if (limit <= 0 || !model || !triggerFires) return prepared;
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : payloadEstimate) < limit;
+    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -5358,7 +5505,7 @@ async function preflightCompressIfNeeded(
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // Anonymous sessions need the conservative upper bound to prove that fit.
         if (payloadFitsWindow) {
-            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${payloadEstimate}/${limit}); forwarding as-is`);
+            log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
         }
         if (unknownBaseline) {
@@ -5400,7 +5547,11 @@ async function preflightCompressIfNeeded(
     // nothing is foldable (no summarization call is spent in that case). The
     // old pre-check failed fast here on the normal-config compressibleRanges,
     // which excluded the soft zone — bricking the #330 livelock.
-    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}); preflight compressing before forward`);
+    // #1933 F4: the trigger line now carries both measurement scales — the
+    // provider-billed baseline and the (calibrated) local estimate — so a
+    // false trigger is diagnosable from the log alone instead of requiring a
+    // cross-reference between gate and nudge lines.
+    log("warn", `[${session.id}] context ${tokenCount} tokens reached preflight target ${compressionTarget} (model window ${limit}, model=${model}; usage-baseline=${baselineFloor > 0 ? baselineFloor : "none"} local-est=${Math.round(calibratedText)}${kFactor !== undefined ? ` raw=${Math.round(textEstimate + overheadEstimate)} k̂=${kFactor.toFixed(2)}` : ""}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
@@ -5438,6 +5589,7 @@ async function preflightCompressIfNeeded(
                 imageReserve: imageTokens,
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
+                upstreamOrigin: currentOrigin,
             },
             prepared.originalMessages,
         );
@@ -5464,9 +5616,11 @@ async function preflightCompressIfNeeded(
         // to this single client request.
         session.stats.requests -= 1;
         outbound = rebuilt;
+        // Same calibrated caliber as the trigger above — gate, per-round exit
+        // and this final fit must judge the payload on one scale (#1933 F1).
         const fits = unknownBaseline
             ? result.fitsWindow
-            : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
+            : applyEstimateCalibration(estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
@@ -5596,6 +5750,30 @@ async function forward(
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    // #1884 re-sign arm: the native lane tunneled this request with the
+    // signing credential (x-bili-resign markers — stripped in
+    // buildForwardTarget, they must never reach the upstream). Every egress
+    // body below — initial send, role-ladder retry, overflow refold,
+    // compress-loop rounds, degenerate continuation refetch — is re-signed
+    // just before it hits the wire, so the rewritten body and the signature
+    // always agree. A failed re-sign logs and sends the previous signature:
+    // the upstream's 401 stays visible instead of a synthetic bili error.
+    const fwdResign = resignSettingsFor(opts, upstreamUrl);
+    const resignCtx =
+        fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
+            ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
+            : undefined;
+    if (resignCtx !== undefined) {
+        log("info", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign arm active (${APIG_RESIGN_SCHEME}) — every egress body is re-signed (#1884)`);
+    }
+    const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
+        if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;
+        try {
+            resignApig(hdrs, resignCtx, req.method ?? "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
+        } catch (err) {
+            log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
+        }
+    };
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
     // The kernel decides (turn kind / verbosity / lower-effort); bili only lands it.
@@ -5782,6 +5960,10 @@ async function forward(
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
+    // #1884: sign the FINAL wire body right before the send — everything
+    // upstream of this point (prepare* injection, compat, steering) already
+    // mutated it, so any inbound signature is stale here.
+    if (req.method !== "GET" && req.method !== "HEAD") applyResign(headers, wireBody);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -5919,6 +6101,7 @@ async function forward(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
+                        applyResign(headers, fixed.body);
                         r = await fetchWithTimeout(upstreamUrl, { ...init, body: fixed.body }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
@@ -6059,6 +6242,7 @@ async function forward(
                 const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
                 if (refolded) {
                     try {
+                        applyResign(headers, refolded);
                         const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
@@ -6285,7 +6469,7 @@ async function forward(
                     protocol: prepared.protocol,
                     wireBody,
                     upstreamUrl,
-                    reqHeaders: buildForwardHeaders(headers),
+                    reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                     proxyUrl,
                     signal: clientAbort.signal,
                     session: prepared.session,
@@ -6307,7 +6491,7 @@ async function forward(
                             protocol: "responses",
                             body,
                             upstreamUrl,
-                            reqHeaders: buildForwardHeaders(headers),
+                            reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
                             dispatcher,
                             signal: clientAbort.signal,
@@ -6331,7 +6515,7 @@ async function forward(
                             protocol: prepared.protocol,
                             body,
                             upstreamUrl,
-                            reqHeaders: buildForwardHeaders(headers),
+                            reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
                             dispatcher,
                             signal: clientAbort.signal,
@@ -6365,7 +6549,7 @@ async function forward(
                     firstResponse: upstream,
                     clearFirstTimer: clearUpstreamTimer,
                     upstreamUrl,
-                    reqHeaders: buildForwardHeaders(headers),
+                    reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                     dispatcher,
                     originalBody: wireBody,
                     signal: clientAbort.signal,
@@ -6396,7 +6580,7 @@ async function forward(
                 protocol: prepared.protocol,
                 wireBody,
                 upstreamUrl,
-                reqHeaders: buildForwardHeaders(headers),
+                reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                 proxyUrl,
                 signal: clientAbort.signal,
                 session: prepared.session,
@@ -6434,7 +6618,7 @@ async function forward(
                         protocol: "responses",
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6474,7 +6658,7 @@ async function forward(
                         protocol: "responses",
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6493,7 +6677,7 @@ async function forward(
                         protocol: p.protocol,
                         body,
                         upstreamUrl,
-                        reqHeaders: buildForwardHeaders(headers),
+                        reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
                         dispatcher,
                         signal: clientAbort.signal,
@@ -6631,7 +6815,7 @@ async function forward(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform },
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -6684,7 +6868,7 @@ async function forward(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders, wireTransform },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
@@ -6781,6 +6965,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #1884: re-sign the retry body before it hits the wire (armed
+         *  re-sign lane only; undefined on unsigned traffic). */
+        resign?: (headers: Record<string, string>, body: string | Buffer) => void;
     },
 ): Promise<Buffer> {
     let buffer = await readStreamToBuffer(stream, fakeBufCap());
@@ -6794,6 +6981,7 @@ async function resolveFakeCompletion(
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
+                opts.resign?.(opts.reqHeaders, hinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {
