@@ -426,7 +426,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            return forwardTool(base, sid, tool.name, args, exec.signal);
+            return forwardTool(base, sid, tool.name, args, exec.signal, true);
         },
     };
 }
@@ -644,7 +644,7 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
         };
     }
     try {
-        const report = await forwardTool(base, target, "acp_cache", {});
+        const report = await forwardTool(base, target, "acp_cache", {}, undefined, true);
         return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

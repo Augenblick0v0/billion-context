@@ -59,7 +59,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -83,7 +83,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const data = JSON.parse(body) as { conversationId: string; tool: string; args: unknown };
+                const data = JSON.parse(body) as { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean };
                 toolCalls.push(data);
                 res.writeHead(200, { "content-type": "application/json" });
                 if (data.tool === "compress") {
@@ -705,7 +705,9 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         const out = await pi.tools[0]!.execute("call-1", { content: [] }, undefined, undefined, fakeCtx(proxy));
         assert.equal(out.content[0]!.text, "[Compressed m00001-m00002 -> b1]");
         assert.equal(out.isError, undefined);
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] } }]);
+        // #2072: the pi host stamps its session-manager id as a confirmed
+        // native caller — the captured wire body carries the flag.
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);

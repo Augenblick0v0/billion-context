@@ -10,7 +10,7 @@ import { once } from "node:events";
 import { createAcpCommandHooks, type OpencodeClient } from "../src/agent/opencode-acp-command.ts";
 import { wrapCacheReport } from "../src/acp-panel.ts";
 
-type ToolCall = { conversationId: string; tool: string; args: unknown };
+type ToolCall = { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean };
 type Rendered = { sid: string; text: string };
 
 function startToolProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: ToolCall[]; close(): Promise<void> }> {
@@ -69,7 +69,8 @@ test("/acp-cache forwards acp_cache and renders the wrapped report via session.p
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
         await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "ses_x" }), HANDLED);
-        assert.deepEqual(proxy.calls, [{ conversationId: "ses_x", tool: "acp_cache", args: {} }]);
+        // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
+        assert.deepEqual(proxy.calls, [{ conversationId: "ses_x", tool: "acp_cache", args: {}, nativeCaller: true }]);
         assert.equal(prompts.length, 1);
         assert.equal(prompts[0].sid, "ses_x");
         assert.equal(prompts[0].text, wrapCacheReport("REPORT-BODY"));
