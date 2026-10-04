@@ -80,9 +80,11 @@ test("opencode scan: known conflict + keyword entries, self/context7 skipped", (
     clearScanCache();
     const root = tmp("bili-1206-oc-");
     const cwd = tmp("bili-1206-oc-cwd-");
+    assertTestOwned(path.join(root, ".config", "opencode", "opencode.json"), root);
     writeFile(path.join(root, ".config", "opencode", "opencode.json"), JSON.stringify({
         plugin: ["opencode-acp@stable", "@scope/context-compressor", "billion-context", "context7", "context-dashboard", { name: "memory-compactor" }],
     }));
+    assertTestOwned(path.join(cwd, ".opencode", "opencode.json"), cwd);
     writeFile(path.join(cwd, ".opencode", "opencode.json"), JSON.stringify({ plugin: ["compact-helper"] }));
     const res = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd });
     const names = res.findings.map((f) => f.entry);
@@ -108,9 +110,11 @@ test("opencode scan: no config at all yields empty result without throwing", () 
 
 test("opencode scan: project walk never climbs past the git root", () => {
     const base = tmp("bili-1206-oc-repo-");
+    assertTestOwned(path.join(base, "opencode.json"), base);
     writeFile(path.join(base, "opencode.json"), JSON.stringify({ plugin: ["acp-decoy"] }));
     const repo = path.join(base, "repo");
     fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+    assertTestOwned(path.join(repo, "opencode.json"), base);
     writeFile(path.join(repo, "opencode.json"), JSON.stringify({ plugin: ["acp-inner"] }));
     const deep = path.join(repo, "src", "nested");
     fs.mkdirSync(deep, { recursive: true });
@@ -123,6 +127,7 @@ test("opencode scan: project walk never climbs past the git root", () => {
 
 test("opencode scan: without a .git anchor the walk stops at cwd", () => {
     const tree = tmp("bili-1206-oc-nogit-");
+    assertTestOwned(path.join(tree, "opencode.json"), tree);
     writeFile(path.join(tree, "opencode.json"), JSON.stringify({ plugin: ["acp-parent"] }));
     const child = path.join(tree, "child");
     fs.mkdirSync(child, { recursive: true });
@@ -208,6 +213,7 @@ test("kimi scan: installed.json ids scanned, billion-context skipped", () => {
     const root = tmp("bili-1206-kimi-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), KIMI_CODE_HOME: path.join(root, "kimi") };
     const pluginsDir = path.join(resolveKimiHome(env), "plugins");
+    assertTestOwned(path.join(pluginsDir, "installed.json"), root);
     writeFile(path.join(pluginsDir, "installed.json"), JSON.stringify({
         version: 1,
         plugins: [
@@ -228,11 +234,15 @@ test("hermes scan: plugin dirs matched by dir name only, bili skipped", () => {
     const pluginsDir = path.join(resolveHermesHome(env), "plugins");
     fs.mkdirSync(path.join(pluginsDir, "billion-context"), { recursive: true });
     fs.mkdirSync(path.join(pluginsDir, "weather"), { recursive: true });
-    writeFile(path.join(pluginsDir, "context-compactor", "plugin.yaml"), "name: context-compactor\n");
+    const compactorManifest = path.join(pluginsDir, "context-compactor", "plugin.yaml");
+    const forecastManifest = path.join(pluginsDir, "forecast-tools", "plugin.yaml");
+    assertTestOwned(compactorManifest, root);
+    assertTestOwned(forecastManifest, root);
     // bare-'context' read-only tool: dropped by the tightened keyword set (#1736)
     fs.mkdirSync(path.join(pluginsDir, "context-viewer"), { recursive: true });
     // A keyword-rich manifest that must NOT match — hermes matches dir names only.
-    writeFile(path.join(pluginsDir, "forecast-tools", "plugin.yaml"), "description: summarizes context for weather forecasts\n");
+    writeFile(compactorManifest, "name: context-compactor\n");
+    writeFile(forecastManifest, "description: summarizes context for weather forecasts\n");
     const res = scanClientPlugins("hermes", { env, cwd: root });
     assert.deepEqual(res.findings.map((f) => f.entry), ["context-compactor"]);
 });
@@ -250,6 +260,7 @@ test("dsh scan: profile deps scanned; bare-'context' dashboard dropped, action-t
     clearScanCache();
     const root = tmp("bili-1206-dsh-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    assertTestOwned(path.join(root, "dsh", "profiles", "main", "package.json"), root);
     writeFile(path.join(root, "dsh", "profiles", "main", "package.json"), JSON.stringify({
         dependencies: {
             "billion-context": "^0.1.0",
@@ -278,6 +289,7 @@ test("claude scan: enabledPlugins keys + plugins dir scanned", () => {
     clearScanCache();
     const root = tmp("bili-1206-claude-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), CLAUDE_CONFIG_DIR: path.join(root, "claude") };
+    assertTestOwned(path.join(root, "claude", "settings.json"), root);
     writeFile(path.join(root, "claude", "settings.json"), JSON.stringify({
         enabledPlugins: { "context-compressor": true, "theme-dark": true },
     }));
@@ -299,6 +311,7 @@ test("scan results are cached within TTL and invalidated by clearScanCache", () 
     const root = tmp("bili-1206-cache-");
     const cwd = tmp("bili-1206-cache-cwd-");
     const cfgFile = path.join(root, ".config", "opencode", "opencode.json");
+    assertTestOwned(cfgFile, root);
     writeFile(cfgFile, JSON.stringify({ plugin: ["opencode-acp"] }));
     const first = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd });
     assert.equal(first.findings.length, 1);
