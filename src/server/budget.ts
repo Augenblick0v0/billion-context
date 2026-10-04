@@ -206,7 +206,13 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: OutputBudgetField,
-    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number },
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number; /** #2096: the headroom-adjusted window nudge/preflight enforce
+     *  (nativeWindow minus the output reservation). LOG HONESTY ONLY — the cap is
+     *  deliberately computed against nativeWindow (the true upstream constraint
+     *  input+out <= window), never against this one: when max_tokens > 25% of the
+     *  window the overflow boundary lies BELOW the headroom target, so capping
+     *  against it would no-op exactly when post-compression turns need the
+     *  guarantee most (#453). */ headroomWindow?: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
@@ -218,6 +224,11 @@ export function clampOutgoingOutput(
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
-        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)`);
+        // #2096: in the band (headroom target, native window) the clamp can only
+        // guarantee native-window fit — preflight/compression is what can pull
+        // the input back under the enforced target. Say so instead of advertising
+        // rescue right before the turn dies.
+        const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && inputEstimate >= ctx.headroomWindow;
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
     }
 }
