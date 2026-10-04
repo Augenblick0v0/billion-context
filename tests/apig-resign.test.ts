@@ -232,6 +232,18 @@ test("#1884 detection: bodySignedSchemeOf reads fetch(input, init) shapes", () =
     assert.equal(bodySignedSchemeOf("http://127.0.0.1:9/v1/chat/completions", { method: "POST", headers: { authorization: "Bearer x" } }), undefined);
 });
 
+test("#2090 detection: shape-based — gateway-invented signature shapes are caught, plain auth is not", () => {
+    assert.equal(inboundSignedScheme({ "x-ofm-signature": "abc" }), "x-ofm-signature", "the reported dsh free-model plugin header");
+    assert.equal(inboundSignedScheme({ "x-foo-content-sha256": "aa" }), "x-foo-content-sha256");
+    assert.equal(inboundSignedScheme({ authorization: "OFM-HMAC-SHA256 ts=1" }), "ofm-hmac-sha256", "custom HMAC auth token detected by shape");
+    assert.equal(inboundSignedScheme({ authorization: "Bearer sk-123", "x-ofm-signature": "abc" }), "x-ofm-signature", "shaped header caught when auth is plain bearer");
+    assert.equal(inboundSignedScheme({ authorization: "SDK-HMAC-SHA256 Access=X", "x-ofm-signature": "abc" }), "sdk-hmac-sha256", "authorization scheme wins over shaped headers");
+    assert.equal(inboundSignedScheme({ "z-zeta-signature": "1", "a-alpha-signature": "2" }), "a-alpha-signature", "multiple shaped headers resolve deterministically (sorted)");
+    assert.equal(inboundSignedScheme({ "x-signature-expires": "1700000000" }), undefined, "must END in -signature / -content-sha256");
+    assert.equal(inboundSignedScheme({ authorization: "Basic dXNlcjpwYXNz" }), undefined);
+    assert.equal(bodySignedSchemeOf("http://127.0.0.1:9/v1/chat/completions", { method: "POST", headers: { "x-ofm-signature": "abc" } }), "x-ofm-signature", "native lane shares the same detector");
+});
+
 test("#1884 markers: credential encode/decode roundtrip, garbage tolerated", () => {
     const enc = encodeApigCredential(CRED);
     assert.deepEqual(decodeApigCredential(enc), { ak: "AKTEST123", sk: "SKTEST456", token: "tok-789" });
@@ -383,24 +395,51 @@ test("#1884 intercept: BILI_RESIGN=0 → signed branch un-deployed, normal takeo
     });
 });
 
-test("#1884 intercept: AWS4 (unsupported scheme) → refused by default; direct only with the opt-in", async () => {
-    const { sink, result } = await withIntercept(armedState(), async (fetch) =>
+test("#2090 intercept: non-built-in scheme (AWS4) → DIRECT by default (fail-open — no credential source can ever re-sign it)", async () => {
+    const dispatches: string[] = [];
+    const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+    const { sink, result } = await withIntercept(state, async (fetch) =>
         fetch("http://127.0.0.1:9199/v1/chat/completions", {
             method: "POST",
             headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
             body: "{}",
         }));
-    assert.equal(sink.length, 0, "default is refusal, not silent passthrough");
-    assert.equal(result.status, 403);
-    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
-        const { sink: sink2 } = await withIntercept(armedState(), async (fetch) =>
+    assert.equal(sink.length, 1, "default is fail-open direct, not local refusal (#2090)");
+    assert.equal(result.status, 200, "recordingFetch answered — the request went out untouched");
+    assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "original URL, never rewritten through the proxy");
+    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined, "no arm marker on a direct send");
+    assert.deepEqual(dispatches, ["direct"]);
+});
+
+test("#2090 intercept: x-ofm-signature (the reported bug) → DIRECT by default, signature intact", async () => {
+    const dispatches: string[] = [];
+    const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+    const { sink, result } = await withIntercept(state, async (fetch) =>
+        fetch("http://127.0.0.1:9199/eac/v1/chat/completions", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
+            body: JSON.stringify({ model: "eac-1", messages: [{ role: "user", content: "hi" }] }),
+        }));
+    assert.equal(sink.length, 1, "forwarded, not refused or rewritten");
+    assert.equal(result.status, 200);
+    assert.equal(sink[0].url, "http://127.0.0.1:9199/eac/v1/chat/completions", "original URL — the pre-#2090 code let this ride the rewrite path into an upstream 401");
+    assert.equal(sink[0].headers["x-ofm-signature"], "deadbeef", "signature header untouched");
+    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
+    assert.deepEqual(dispatches, ["direct"]);
+});
+
+test("#2090 intercept: resign.<scheme>.enabled=false un-deploys the branch (pre-resign rewrite path restored)", async () => {
+    await withConfigFile({ resign: { "x-ofm-signature": { enabled: false } } }, async () => {
+        const dispatches: string[] = [];
+        const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+        const { sink } = await withIntercept(state, async (fetch) =>
             fetch("http://127.0.0.1:9199/v1/chat/completions", {
                 method: "POST",
-                headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
+                headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
                 body: "{}",
             }));
-        assert.equal(sink2[0].url, "http://127.0.0.1:9199/v1/chat/completions");
-        assert.equal(sink2[0].headers[APIG_RESIGN_HEADER], undefined);
+        assert.equal(sink[0].url, "http://127.0.0.1:40001/bili/http://127.0.0.1:9199/v1/chat/completions", "escape hatch: falls through to the rewrite path exactly like unsigned traffic");
+        assert.deepEqual(dispatches, ["rewrite"]);
     });
 });
 
@@ -597,6 +636,53 @@ test("e2e #1884: signed without the arm + BILI_RESIGN_PASSTHROUGH=1 → byte-unt
             upstream.closeAllConnections?.();
         }
     });
+});
+
+// #2090: custom-scheme signatures have no credential source anywhere, so the
+// /bili/-lane guard fails open to byte-untouched forwarding BY DEFAULT. The
+// verifying upstream above would 401 any non-SDK signature, so this lane uses
+// a plain recording upstream that accepts everything and lets the assertions
+// check byte fidelity directly.
+function startRecordingUpstream(): Promise<{ server: http.Server; port: number; calls: UpstreamRecord[] }> {
+    const calls: UpstreamRecord[] = [];
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            calls.push({ method: req.method ?? "POST", url: req.url ?? "/", headers: req.headers, body: Buffer.concat(chunks) });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ id: "cmpl-test", choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+        });
+    });
+    return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+            resolve({ server, port: (server.address() as { port: number }).port, calls });
+        });
+    });
+}
+
+test("e2e #2090: x-ofm-signature through /bili/ → byte-untouched passthrough BY DEFAULT (no config, no env)", async () => {
+    const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
+    const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/eac/v1/chat/completions`;
+        const bodyStr = chatBody("deepseek-v4.1-flash", "ofm-failopen-1");
+        const r = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-ofm-signature": sha256Hex(bodyStr) },
+            body: bodyStr,
+        });
+        const rBody = await r.text();
+        assert.equal(r.status, 200, `fail-open forwards byte-untouched so the upstream signature stays valid: ${rBody}`);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
+        assert.equal(String(calls[0].headers["x-ofm-signature"]), sha256Hex(bodyStr), "signature header preserved");
+    } finally {
+        proxy.close();
+        (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+        upstream.close();
+        upstream.closeAllConnections?.();
+    }
 });
 
 // ---------------------------------------------------------------------------

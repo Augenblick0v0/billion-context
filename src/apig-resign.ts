@@ -26,11 +26,19 @@ import { configFile } from "./paths.js";
  * arming signed requests (they fall through to the normal takeover path —
  * pre-#1884 behavior) and the server-side guard stays silent.
  *
- * A signed request that cannot be re-signed (no credential resolvable, or a
- * scheme we cannot sign) is REFUSED by default — 403 with an actionable
- * message. Silently forwarding byte-untouched would silently disable
- * compression; the user opted into bili, not into a pass-through tunnel.
- * BILI_RESIGN_PASSTHROUGH=1 opts in to verbatim no-compression forwarding.
+ * A BUILT-IN-scheme request that cannot be re-signed (no credential
+ * resolvable) is REFUSED by default — 403 with an actionable message,
+ * because its fix (provide the signing credential) is actionable. Every
+ * OTHER detected signature can never be re-signed here — there is no
+ * credential source outside the built-in scheme — so refusing it would only
+ * convert a working link into a hard failure: those go DIRECT by default
+ * (#2090), uncompressed, signature intact, loudly logged once per URL. The
+ * false-positive cost of over-detection is one uncompressed link; the miss
+ * cost is a hard 401 surfacing in someone else's plugin UI — the asymmetry
+ * decides. Escape hatches keep their meaning: resign["<scheme>"].passthrough
+ * / BILI_RESIGN_PASSTHROUGH=1 (now the effective default for non-built-in
+ * schemes), and resign["<scheme>"].enabled=false / BILI_RESIGN=0 un-deploy
+ * the branch entirely (pre-#1884 rewrite behavior).
  *
  * Credential refresh is intentionally NOT ported: the plugin refreshes its
  * own credentials; when they expire, the upstream 401 is visible and the
@@ -109,17 +117,35 @@ function hmacSha256Hex(key: Uint8Array, data: Uint8Array): string {
     return createHmac("sha256", key).update(data).digest("hex");
 }
 
-/** Body-covering signature schemes we can detect on the wire. */
-const BODY_SIGNED_AUTH = /^(?:SDK-HMAC-SHA256|AWS4-HMAC-SHA256|HMAC-SHA256)\b/i;
+/** #2090: body-covering signatures are a long tail — every gateway/plugin
+ *  invents its own header set (the dsh free-model plugin ships
+ *  `x-ofm-signature`, AWS ships `x-amz-content-sha256`, CodeArts ships
+ *  `SDK-HMAC-SHA256`), so a closed name whitelist keeps missing new shapes
+ *  and silently lets signed bodies through the rewrite path (upstream then
+ *  rejects with 401 SignatureDoesNotMatch, and the symptom lands in
+ *  someone else's plugin UI as "invalid credentials"). Detection is
+ *  SHAPE-based instead of name-listed: an Authorization scheme token naming
+ *  an HMAC construction, or any request header whose name ends in
+ *  `-signature` / `-content-sha256`. Bearer/Basic/API-key auth never match. */
+function isBodySignatureHeaderName(name: string): boolean {
+    const n = name.toLowerCase();
+    return n.endsWith("-signature") || n.endsWith("-content-sha256");
+}
 
 /** Detect a body-covering signature from request headers (lowercased keys,
- *  as node delivers them). Returns the scheme token or undefined. */
+ *  as node delivers them; the native lane normalizes Headers into this
+ *  shape before calling). Returns the scheme token (lowercased) or
+ *  undefined for unsigned traffic. Deterministic: the Authorization scheme
+ *  wins over shaped headers, and shaped headers are scanned in sorted-name
+ *  order. The returned token doubles as the per-scheme config key
+ *  (`resign["<token>"]`). */
 export function inboundSignedScheme(headers: Record<string, string | string[] | undefined>): string | undefined {
     const auth = String(headers["authorization"] ?? "").trim();
-    const match = BODY_SIGNED_AUTH.exec(auth);
-    if (match !== null) return match[0].toLowerCase();
-    if (headers["x-sdk-content-sha256"] !== undefined) return "x-sdk-content-sha256";
-    if (headers["x-amz-content-sha256"] !== undefined) return "x-amz-content-sha256";
+    const token = auth.split(/\s+/)[0] ?? "";
+    if (token !== "" && /hmac/i.test(token)) return token.toLowerCase();
+    for (const name of Object.keys(headers).sort()) {
+        if (isBodySignatureHeaderName(name)) return name.toLowerCase();
+    }
     return undefined;
 }
 

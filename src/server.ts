@@ -3299,18 +3299,19 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
-            // #1884 (un-armed signed traffic): a request that already carries a
-            // body-covering signature (SDK-HMAC-SHA256 family — CodeArts APIG)
-            // and arrives WITHOUT the re-sign arm cannot survive any body
-            // rewrite: prepare* injects the compress tool + system notes, and
-            // the compress loop re-sends rebuilt rounds, so the upstream
-            // rejects every mutated request with 401 (APIG.0301 body-hash
-            // mismatch). Default: REFUSE (403, actionable message) — silently
-            // forwarding byte-untouched would silently disable compression;
-            // the user opted into bili, not into a pass-through tunnel.
-            // BILI_RESIGN_PASSTHROUGH=1 opts in to byte-untouched forwarding
-            // (no session, no compression, signature intact — the /bili/-
-            // prefix twin of the native lane's #1886 fallback);
+            // #1884/#2090 (un-armed signed traffic): a request that already
+            // carries a body-covering signature (SDK-HMAC-SHA256 family —
+            // CodeArts APIG, or any gateway-invented scheme the shape-based
+            // detector catches, e.g. x-ofm-signature) and arrives WITHOUT a
+            // working re-sign arm cannot survive any body rewrite: prepare*
+            // injects the compress tool + system notes, and the compress loop
+            // re-sends rebuilt rounds, so the upstream rejects every mutated
+            // request with 401 (APIG.0301 body-hash mismatch /
+            // SignatureDoesNotMatch). Built-in scheme without a decodable
+            // credential: REFUSE (403, actionable message) — its fix is
+            // actionable. Every OTHER scheme can never be re-signed here, so
+            // refusing it only converts a working link into a hard failure:
+            // those forward byte-untouched by default (#2090), loudly logged.
             // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
             // handling: the request rides the normal rewrite path).
             const guardScheme = inboundSignedScheme(req.headers);
@@ -3331,8 +3332,13 @@ async function handle(
                 !resignArmable &&
                 guardResign.enabled
             ) {
-                if (guardResign.passthrough) {
-                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign["${guardScheme}"].passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
+                // #2090: only the built-in scheme has a credential source; any
+                // other detected signature can never be re-signed here, so the
+                // pre-#2090 refuse-by-default would hard-fail links that work
+                // fine verbatim — fail open to byte-untouched forwarding.
+                const failOpen = guardScheme !== APIG_RESIGN_SCHEME;
+                if (failOpen || guardResign.passthrough) {
+                    log("warn", `[signed-passthrough] request carries a ${guardScheme} body-covering signature without a working re-sign arm — forwarding byte-untouched, no compression (${failOpen ? "default for non-re-signable schemes (#2090)" : `opt-in via resign["${guardScheme}"].passthrough / BILI_RESIGN_PASSTHROUGH`})`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;

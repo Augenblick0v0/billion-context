@@ -10,7 +10,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, inboundSignedScheme, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -167,6 +167,22 @@ let warnedReanchor = false;
 const dispatchDepth = new AsyncLocalStorage<number>();
 let warnedReentry = false;
 
+// #2090: signed requests going direct (fail-open default for non-built-in
+// schemes, explicit passthrough otherwise) must be LOUD in host logs — the
+// pre-#2090 symptom was a silent 401 surfacing in another plugin's UI.
+// Once per URL, never per request.
+const signedDirectSeen = new Set<string>();
+function noteSignedDirect(url: string, scheme: string, why: string): void {
+    let key = url.split("?")[0];
+    try {
+        const u = new URL(url);
+        key = `${u.origin}${u.pathname}`;
+    } catch { /* keep the raw query-stripped form */ }
+    if (signedDirectSeen.has(key) || signedDirectSeen.size >= 128) return;
+    signedDirectSeen.add(key);
+    console.warn(`bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
+}
+
 /** #1410: the dead-closure signature. A wrapper whose owner nulled its
  *  closure locals dies exactly like this ("baseFetch is not a function").
  *  Network failures NEVER match: undici throws "fetch failed", provider SDKs
@@ -221,10 +237,12 @@ export function isModelApiUrl(url: string): boolean {
     }
 }
 
-/** True when a request's headers carry a body-covering signature (#1884).
- *  Detected from either init.headers or a Request-object input — the two
- *  forms a dispatch can arrive in. Returns the scheme token (e.g.
- *  "sdk-hmac-sha256") or undefined for unsigned traffic. */
+/** Detect a body-covering signature from either init.headers or a
+ *  Request-object input — the two forms a dispatch can arrive in — by
+ *  normalizing to lowercased header names and delegating to the single
+ *  shape-based detector shared with the proxy guard (#1884/#2090). Returns
+ *  the scheme token (e.g. "sdk-hmac-sha256") or undefined for unsigned
+ *  traffic. */
 export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
     let headers: Headers | undefined;
     if (init?.headers !== undefined) headers = new Headers(init.headers);
@@ -236,15 +254,10 @@ export function bodySignedSchemeOf(input: string | URL | Request, init?: Request
         }
     }
     if (headers === undefined) return undefined;
-    const auth = (headers.get("authorization") ?? "").trim();
-    const match = BODY_SIGNED_AUTH.exec(auth);
-    if (match !== null) return match[0].toLowerCase();
-    if (headers.has("x-sdk-content-sha256")) return "x-sdk-content-sha256";
-    if (headers.has("x-amz-content-sha256")) return "x-amz-content-sha256";
-    return undefined;
+    const record: Record<string, string> = {};
+    for (const [name, value] of headers) record[name] = value;
+    return inboundSignedScheme(record);
 }
-
-const BODY_SIGNED_AUTH = /^(?:SDK-HMAC-SHA256|AWS4-HMAC-SHA256|HMAC-SHA256)\b/i;
 
 /** True when the URL addresses bili's own control plane (`/__bili/*`,
  *  `/__acp/*`, or a `/bili/<protocol>/<url>` tunnel) — expected direct
@@ -703,20 +716,23 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
-        // #1884: a body-covering signature cannot survive a rewrite — routing
-        // these through the proxy un-armed makes the upstream reject every
-        // request with 401 (APIG.0301 body hash mismatch / SigV4
+        // #1884/#2090: a body-covering signature cannot survive a rewrite —
+        // routing these through the proxy un-armed makes the upstream reject
+        // every request with 401 (APIG.0301 body hash mismatch / SigV4
         // SignatureDoesNotMatch). When the host can supply the signing
-        // credential (dsh credential service), the request tunnels WITH a
-        // re-sign arm: bili re-signs every egress body it produces. Without a
-        // credential (or for schemes we cannot re-sign) the request is
-        // REFUSED locally (403, actionable message): silent verbatim
-        // forwarding would silently disable compression, and an un-armed
-        // tunnel 401s upstream anyway. Passthrough/refusal are decided
-        // PER SCHEME — the lookup key is the request's own Authorization
-        // scheme, so opting one signature into verbatim forwarding never
-        // opens another (config `resign["<scheme>"].passthrough`, env
-        // BILI_RESIGN_PASSTHROUGH wins; BILI_RESIGN=0 un-deploys the whole
+        // credential (dsh credential service, built-in scheme only), the
+        // request tunnels WITH a re-sign arm: bili re-signs every egress
+        // body it produces. Without a credential the request goes DIRECT
+        // (uncompressed, signature intact, logged once per URL): for
+        // non-built-in schemes there is NO credential source anywhere, so
+        // the pre-#2090 local refusal only converted a working link into a
+        // hard failure (#2090); the built-in scheme still refuses by default
+        // because its fix (provide the credential) is actionable.
+        // Passthrough/refusal are decided PER SCHEME — the lookup key is the
+        // request's own signature scheme, so opting one signature into
+        // verbatim forwarding never opens another (config
+        // `resign["<scheme>"].passthrough`, env BILI_RESIGN_PASSTHROUGH wins;
+        // BILI_RESIGN=0 or `resign["<scheme>"].enabled=false` un-deploy the
         // branch — signed bodies fall through to the normal takeover path,
         // pre-#1884 behavior).
         let resignExtra: Record<string, string> | undefined;
@@ -732,11 +748,13 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 }
             }
             if (cred === undefined) {
-                if (!resignPassthroughEnabled(undefined, signedScheme)) {
+                const failOpen = signedScheme !== APIG_RESIGN_SCHEME;
+                if (!failOpen && !resignPassthroughEnabled(undefined, signedScheme)) {
                     state.onDispatch?.(url, "refused");
                     const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
                     return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
                 }
+                noteSignedDirect(url, signedScheme, failOpen ? "no re-sign credential exists for this scheme — byte-untouched, no compression" : "passthrough opt-in — byte-untouched, no compression");
                 state.onDispatch?.(url, "direct");
                 return send(input, init);
             }
@@ -918,6 +936,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     if (opts.anchor !== undefined) moduleAnchor = opts.anchor;
     observedFetches = moduleAnchor !== undefined ? [moduleAnchor] : [];
     knownDeadFetches.clear();
+    signedDirectSeen.clear();
     warnedReanchor = false;
     warnedReentry = false;
     if (preInstallDesc !== undefined) {

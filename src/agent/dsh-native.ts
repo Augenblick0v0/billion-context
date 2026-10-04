@@ -38,6 +38,7 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { APIG_RESIGN_SCHEME } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -975,7 +976,7 @@ export function apply(ctx: PluginContext): void {
         return undefined;
     };
     const signedUrlSeen = new Set<string>();
-    state.onSignedModelUrl = (rawUrl) => {
+    state.onSignedModelUrl = (rawUrl, scheme) => {
         const key = (() => {
             try {
                 const u = new URL(rawUrl);
@@ -987,7 +988,9 @@ export function apply(ctx: PluginContext): void {
         if (signedUrlSeen.has(key)) return;
         if (signedUrlSeen.size >= 64) return;
         signedUrlSeen.add(key);
-        const line = `bili-native-dsh: signed model request observed (${key}) — #1884 re-sign arm engaged when a credential resolves; otherwise it goes direct (uncompressed, signature intact)`;
+        const line = scheme === APIG_RESIGN_SCHEME
+            ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or direct with passthrough configured)`
+            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: forwarding DIRECT by default (uncompressed, signature intact) so the upstream signature stays valid (#2090)`;
         console.error(line);
         persistClientEvent(line);
     };
