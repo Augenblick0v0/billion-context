@@ -9,8 +9,8 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
 import { defaultConfig, type Config } from "acp-kernel";
-import { startServer } from "../src/server.ts";
-import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
+import { startServer, type ProxyOptions } from "../src/server.ts";
+import { type CompressSettings } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession } from "../src/session.ts";
