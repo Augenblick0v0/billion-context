@@ -348,6 +348,23 @@ client through bili, either resend the full input/output history or set
 now logs a `warn` (#1954). Full chaining support is tracked as #1973. See the
 [official migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
 
+### Run mode: `bili codex` pins embedded (#1867)
+
+Since ~0.156 Codex can attach to (or auto-start) a machine-wide shared
+background server whose model traffic uses the environment that was present
+**when the daemon started**, not when a session starts. The launcher's proxy is
+session-scoped (its port dies with the process), so a long-lived daemon cannot
+route through it safely: if codex starts first without bili's env, later
+`bili codex` sessions silently attach to it and bypass compression entirely;
+if bili starts first, the surviving daemon keeps pointing at a dead port. The
+launcher therefore passes `--no-daemon` explicitly — after probing
+`codex --help` for the flag (older binaries launch unchanged) and only when the
+user has not already pinned a mode (`--no-daemon` or `--remote`). Result:
+deterministic embedded runs, no per-launch fallback warning, no silent bypass.
+The #321 budget `-c` args are kept verbatim (embedded mode honors them
+identically). If you want the shared background server, run native `codex`
+directly — no compression, but tools still work via `bili plugin install codex`.
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
 Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of

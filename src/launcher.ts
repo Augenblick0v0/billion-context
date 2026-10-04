@@ -34,7 +34,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { execFileSync, spawn, type StdioOptions } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import {
     claimStartingMarker,
@@ -2956,6 +2956,48 @@ export function opencodeMajorVersion(command: string): number {
     return major;
 }
 
+/** #1867: true when the user already pinned codex's run mode themselves — an
+ *  explicit `--no-daemon` (embedded) or `--remote [url]` (remote app server).
+ *  In either case bili must not add its own `--no-daemon`: the first would be a
+ *  duplicate, and codex hard-errors on --no-daemon combined with --remote. */
+export function codexRunModePinned(args: readonly string[]): boolean {
+    return args.some((a) => a === "--no-daemon" || a === "--remote" || a.startsWith("--remote="));
+}
+
+const codexNoDaemonCache = new Map<string, boolean>();
+
+/** #1867: whether a Codex CLI binary accepts `--no-daemon`, probed from its
+ *  `--help` output (cached per resolved command). The probe spawns the binary
+ *  exactly the way runClient will (planClientSpawn) with a short timeout; any
+ *  failure defaults to false — injecting a flag the binary does not know would
+ *  break the launch, while skipping it only restores the pre-probe behavior.
+ *  Mirrors the opencodeMajorVersion() precedent. spawnSync (not execFileSync):
+ *  its options accept windowsVerbatimArguments, which the #679 cmd.exe wrap needs. */
+export function codexSupportsNoDaemon(
+    command: string,
+    prefixArgs: readonly string[],
+    platform: NodeJS.Platform = process.platform,
+): boolean {
+    const key = JSON.stringify([command, ...prefixArgs]);
+    const hit = codexNoDaemonCache.get(key);
+    if (hit !== undefined) return hit;
+    let supported = false;
+    try {
+        const plan = planClientSpawn(command, [...prefixArgs, "--help"], process.env, platform);
+        const res = spawnSync(plan.command, plan.args, {
+            timeout: 5000,
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsVerbatimArguments: plan.windowsVerbatimArguments,
+            windowsHide: true,
+        });
+        // line-anchored exact-flag match: clap lists each option on its own
+        // indented line; \b would fail anyway since '-' is not a word char
+        if (res.status === 0 && !res.error) supported = /(?:^|\n)[ \t]*--no-daemon[ \t]*(?:\r?\n|$)/.test(res.stdout.toString("utf8"));
+    } catch {}
+    codexNoDaemonCache.set(key, supported);
+    return supported;
+}
+
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
  * (JSONC-tolerant, merged) config with the discovered providers' baseURL
@@ -4641,6 +4683,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else {
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
+            if (!codexRunModePinned(params.clientArgs)) {
+                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env);
+                if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
+                    clientArgs = ["--no-daemon", ...clientArgs];
+                    console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
+                }
+            }
             const budgetArgs = await resolveCodexBudgetArgs({
                 model: config.codex?.model,
                 clientWindow: config.codex?.contextWindow,
