@@ -161,10 +161,18 @@ export const WEB_CLIENT = `(function () {
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
     let latestAlerts = [];
 
+    function sortKeysDeep(x) {
+        if (Array.isArray(x)) return x.map(sortKeysDeep);
+        if (x !== null && typeof x === "object") { const o = {}; Object.keys(x).sort().forEach((k) => { o[k] = sortKeysDeep(x[k]); }); return o; }
+        return x;
+    }
+    function canonCfgText(s) {
+        try { return JSON.stringify(sortKeysDeep(JSON.parse(s))); } catch (e) { return "\u0000" + s; }
+    }
     let cfgSavedSnap = null;
     function refreshDirtyFlag() {
         const el = $("cfg-file-edit");
-        const dirty = Boolean(el && cfgSavedSnap !== null && el.value !== cfgSavedSnap);
+        const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
     }
