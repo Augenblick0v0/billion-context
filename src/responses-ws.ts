@@ -19,6 +19,7 @@ function object(value: unknown): value is JsonObject {
 }
 
 function describeEventType(frame: unknown): string {
+    if (frame === null) return "null";
     if (!object(frame)) return Array.isArray(frame) ? "array" : String(typeof frame);
     return typeof frame.type === "string" ? frame.type : "<missing type>";
 }
