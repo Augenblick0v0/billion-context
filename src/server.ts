@@ -12,7 +12,7 @@ import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js
 export type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
@@ -1629,8 +1629,24 @@ async function handle(
             }
         }
         upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
+        // #1909: user-declared wire protocol (providers[<url-prefix>].protocol)
+        // outranks the built-in suffix heuristics — explicit intent beats
+        // inference. Looked up by the FULL destination URL (route.rewrittenUrl
+        // keeps the mitm:// scheme for MITM lanes, so mitm:// keys work here
+        // like every other provider field); the /bili/<protocol>/ explicit
+        // marker still outranks the declaration. POST-with-body only, same
+        // gate as the built-in table. Resolved through the prefix hierarchy
+        // (deepest EXPLICIT declarer wins) so a path-scoped key never shadows
+        // the host key's other settings.
+        const declaredProtocol = req.method === "POST" && bodyBuffer.length > 0
+            ? resolveDeclaredProtocol(
+                opts.routes,
+                route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${url}`,
+            )
+            : undefined;
         protocol =
             route?.explicitProtocol
+            ?? declaredProtocol
             ?? (req.method === "POST" && bodyBuffer.length > 0
                 ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
                     ? "openai"
@@ -5981,7 +5997,7 @@ async function forward(
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
         const roles = { ...configured, ...learned };
-        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? inferWireProtocol(req.url ?? "");
+        const protocol = prepared?.protocol ?? route?.explicitProtocol ?? resolveDeclaredProtocol(opts.routes, upstreamUrl) ?? inferWireProtocol(req.url ?? "");
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
         if (protocol === "openai" || protocol === "responses") {
