@@ -1315,6 +1315,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         outputTokens: session.stats.outputTokens,
         cachedTokens: session.stats.cachedTokens,
         requests: session.stats.requests,
+        // #2110: epoch ms of the last landed fold (model-driven compress OR
+        // preflight — both stamp it in applyRanges), null until the first fold
+        // in this process. The pi/omp plugin's takeover watchdog reads this to
+        // distinguish "owning compaction" from "compaction actually producing".
+        lastCompressAt: session.lastCompress?.at ?? null,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
         compressibleRanges: nudge?.compressibleRanges ?? null,
         panel,

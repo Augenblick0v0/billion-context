@@ -62,6 +62,9 @@ type FakeProxy = {
     toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
+    /** Extra fields merged into the 200 /__bili/plugin/status body (tests mutate
+     *  this between calls to simulate fold progress, #2110). */
+    statusBody: Record<string, unknown>;
     close(): Promise<void>;
 };
 
@@ -69,6 +72,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     const toolCalls: FakeProxy["toolCalls"] = [];
     const registers: FakeProxy["registers"] = [];
     const runtimeInfos: FakeProxy["runtimeInfos"] = [];
+    const statusBody: Record<string, unknown> = {};
     const server = http.createServer((req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
@@ -126,7 +130,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
                 res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: true, contextTokens: 1234 }));
+                res.end(JSON.stringify({ ok: true, contextTokens: 1234, ...statusBody }));
             }
             return;
         }
@@ -136,7 +140,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, registers, runtimeInfos, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    return { origin, toolCalls, registers, runtimeInfos, statusBody, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -483,6 +487,172 @@ test("#1382: compaction cancel requires evidence the proxy carries this conversa
         });
     } finally {
         await identityProxy.close();
+    }
+});
+
+test("#2110: takeover watchdog releases auto compaction when no proxy fold lands", async () => {
+    // #2110: the cancel is deterministic but bili's replacement is not — when the
+    // nudge gates starve (slow-growth session: pendingT1 < threshold AND growth
+    // < floor on every pass) or a preflight fold never lands, cancelling every
+    // native pass leaves the session growing into overflow with zero compression
+    // (issue repro: "Auto-compaction cancelled" spam until 348% of the effective
+    // window). The watchdog requires fold evidence per cancelled pass —
+    // /__bili/plugin/status lastCompressAt, stamped by BOTH model-driven compress
+    // and preflight folds — and releases the pass back to the host's native
+    // compaction after a bounded streak without it. A surviving native pass is
+    // safe (#395 archives its blocks); the release self-heals both ways.
+    const stampLocalEvidence = async (proxy: FakeProxy, pi: FakePi, sid: string): Promise<Record<string, unknown>> => {
+        const ctx = fakeCtx(proxy, sid);
+        await pi.events.get("session_start")!({}, ctx);
+        await waitForTools(pi, 2);
+        const headers: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers }, ctx);
+        assert.equal(headers["x-bili-plugin-conversation"], sid, "local carriage evidence stamped");
+        return ctx;
+    };
+
+    // (A) Stale fold timestamp: the first pass takes the fold as baseline, each
+    // further pass without a NEWER fold counts against the streak; at the limit
+    // the pass is released, and the next pass starts a FRESH streak (the proxy
+    // gets another chance once the native pass has run).
+    const stale = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: stale.origin }, async () => {
+            stale.statusBody.lastCompressAt = 1_000_000;
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 3, timeoutMs: 60_000 } })(pi as never);
+            const ctx = await stampLocalEvidence(stale, pi, "sess-stale");
+            const handler = pi.events.get("session_before_compact")!;
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "fold seen → baseline, cancelled");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "stale #1 → still cancelled");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "stale #2 → still cancelled");
+            assert.equal(await handler({ reason: "threshold" }, ctx), undefined, "stale #3 hits the streak limit → native compaction released");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "post-release → fresh streak, proxy gets another chance");
+        });
+    } finally {
+        await stale.close();
+    }
+
+    // (B) Fold progress keeps the takeover armed indefinitely: a newer
+    // lastCompressAt on every pass resets the streak, so count or time can never
+    // release a healthy takeover.
+    const healthy = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: healthy.origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 3, timeoutMs: 60_000 } })(pi as never);
+            const ctx = await stampLocalEvidence(healthy, pi, "sess-healthy");
+            const handler = pi.events.get("session_before_compact")!;
+            for (let i = 0; i < 6; i++) {
+                healthy.statusBody.lastCompressAt = Date.now() + i;
+                assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, `advancing fold ${i} keeps the takeover armed`);
+            }
+        });
+    } finally {
+        await healthy.close();
+    }
+
+    // (C) Wall-clock timeout releases even below the streak limit: a takeover
+    // dead for long enough is dead, regardless of how few passes fired.
+    const slow = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: slow.origin }, async () => {
+            slow.statusBody.lastCompressAt = 1_000_000;
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 100, timeoutMs: 30 } })(pi as never);
+            const ctx = await stampLocalEvidence(slow, pi, "sess-slow");
+            const handler = pi.events.get("session_before_compact")!;
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "baseline within the window");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "stale #1 within the window");
+            await sleep(40);
+            assert.equal(await handler({ reason: "threshold" }, ctx), undefined, "timeout elapsed → native compaction released");
+        });
+    } finally {
+        await slow.close();
+    }
+
+    // (D) Older proxy WITHOUT the field: the historical unconditional cancel
+    // stays — we cannot distinguish "old proxy folding fine" from "old proxy
+    // starving", so the release path activates only for proxies that advertise
+    // the field.
+    const old = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: old.origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 2, timeoutMs: 60_000 } })(pi as never);
+            const ctx = await stampLocalEvidence(old, pi, "sess-old-proxy");
+            const handler = pi.events.get("session_before_compact")!;
+            for (let i = 0; i < 5; i++) {
+                assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, `field absent → legacy unconditional cancel (${i})`);
+            }
+        });
+    } finally {
+        await old.close();
+    }
+
+    // (E) New proxy, NO fold yet this process (lastCompressAt: null): null is
+    // not fold evidence, so the streak runs from the first pass (no free
+    // baseline credit) and the limit releases.
+    const fresh = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: fresh.origin }, async () => {
+            fresh.statusBody.lastCompressAt = null;
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 3, timeoutMs: 60_000 } })(pi as never);
+            const ctx = await stampLocalEvidence(fresh, pi, "sess-fresh");
+            const handler = pi.events.get("session_before_compact")!;
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "null fold #1 → cancelled");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "null fold #2 → cancelled");
+            assert.equal(await handler({ reason: "threshold" }, ctx), undefined, "null fold #3 hits the limit → released");
+        });
+    } finally {
+        await fresh.close();
+    }
+
+    // (F) Unknown-conversation status counts as missing evidence too (#1382(E)'s
+    // local-evidence case, sustained over time): a live-but-unaware proxy cannot
+    // produce folds either, so the same streak releases.
+    const unaware = await startFakeProxy({ statusOk: false });
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: unaware.origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 3, timeoutMs: 60_000 } })(pi as never);
+            const ctx = await stampLocalEvidence(unaware, pi, "sess-unaware");
+            const handler = pi.events.get("session_before_compact")!;
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "unknown conversation #1 → cancelled");
+            assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "unknown conversation #2 → cancelled");
+            assert.equal(await handler({ reason: "threshold" }, ctx), undefined, "unknown conversation #3 hits the limit → released");
+        });
+    } finally {
+        await unaware.close();
+    }
+
+    // (G) omp parity + remote-probe ownership: the announced-auto path rides the
+    // same watchdog, and the status the ownership probe already fetched is
+    // reused (no second round-trip).
+    const ompProxy = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: ompProxy.origin }, async () => {
+            ompProxy.statusBody.lastCompressAt = 1_000_000;
+            const omp = makeFakePi();
+            createBiliPlugin("omp", { takeover: { maxStaleCancels: 3, timeoutMs: 60_000 } })(omp as never);
+            const ctx: Record<string, unknown> = {
+                sessionManager: { getSessionId: () => "sess-omp-watchdog" },
+                model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" },
+                cwd: "/tmp",
+            };
+            const handler = omp.events.get("session_before_compact")!;
+            const fire = async (): Promise<unknown> => {
+                omp.events.get("auto_compaction_start")!({}, undefined);
+                return await handler({}, ctx);
+            };
+            assert.deepEqual(await fire(), { cancel: true }, "omp: fold seen → baseline, cancelled");
+            assert.deepEqual(await fire(), { cancel: true }, "omp: stale #1 → cancelled");
+            assert.deepEqual(await fire(), { cancel: true }, "omp: stale #2 → cancelled");
+            assert.equal(await fire(), undefined, "omp: stale #3 hits the limit → released");
+        });
+    } finally {
+        await ompProxy.close();
     }
 });
 

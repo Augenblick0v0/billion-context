@@ -326,6 +326,17 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
+// #2110: takeover watchdog defaults — how many consecutive cancelled
+// auto-compaction passes without a newer proxy fold (streak) or how much wall
+// time (timeout) may elapse before bili releases compaction ownership back to
+// the host's native pass. Hardcoded on purpose (config-surface discipline):
+// the remedy for a broken proxy is fixing/updating it, not tuning plugin
+// constants. The test seam is the factory opts below, not an env var.
+const TAKEOVER_MAX_STALE_CANCELS = 8;
+const TAKEOVER_TIMEOUT_MS = 600_000;
+
+type TakeoverEntry = { activeSince: number; staleCancels: number; knownFoldAt: number };
+
 type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
@@ -409,10 +420,13 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
-export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
+export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number; takeover?: { maxStaleCancels?: number; timeoutMs?: number } }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #2110: per-conversation takeover watchdog state (see takeoverVerdict).
+        const takeoverLimits = { maxStaleCancels: opts?.takeover?.maxStaleCancels ?? TAKEOVER_MAX_STALE_CANCELS, timeoutMs: opts?.takeover?.timeoutMs ?? TAKEOVER_TIMEOUT_MS };
+        const takeovers = new Map<string, TakeoverEntry>();
         // #1217: -p single-shot fires round 1 before session_start's manifest
         // fetch can resolve, leaving the request unmarked → anonymous
         // proxy-mode session. Prime the fetch at load time: the launcher
@@ -487,12 +501,19 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // content-hash identity, where avoiding double compression still
         // wins). Probe failure (proxy down/hung) means NO evidence → defer to
         // native compaction: a surviving native pass is safe (#395), a wrong
-        // cancel overflows the session. The handlers are async on purpose —
-        // pi's runner awaits session_before_compact handlers (verified in
-        // pi-coding-agent dist) before consulting .cancel/.compaction.
-        const ownsCompaction = async (ctx: Ctx | undefined, branchEntries?: unknown): Promise<boolean> => {
+        // cancel overflows the session. #2110 adds the layer above ownership:
+        // owning compaction is necessary but not sufficient — the takeover must
+        // actually PRODUCE folds; when it doesn't (nudge-gate starvation, a
+        // preflight fold that never lands), the watchdog releases passes back
+        // to the host's native compaction after a bounded streak of
+        // evidence-less cancels (takeoverVerdict below). The handlers are
+        // async on purpose — pi's runner awaits session_before_compact
+        // handlers (verified in pi-coding-agent dist) before consulting
+        // .cancel/.compaction.
+        type OwnershipVerdict = { owned: boolean; proxyBase?: string; status?: Record<string, unknown> };
+        const ownsCompaction = async (ctx: Ctx | undefined, branchEntries?: unknown): Promise<OwnershipVerdict> => {
             const proxyBase = proxyBaseForCtx(ctx, branchEntries);
-            if (proxyBase === undefined) return false;
+            if (proxyBase === undefined) return { owned: false };
             const baseUrl = ctx?.model?.baseUrl;
             if (typeof baseUrl === "string" && baseUrl.length > 0 && !/^https?:\/\//i.test(baseUrl)) {
                 // #1392: an opaque-scheme baseUrl (e.g. pi-claude-bridge's "claude-bridge")
@@ -501,24 +522,89 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 // evidence below (carriedSids / status probe) still decides, so unrouted traffic
                 // never cancels and #1382 cannot recur for a newly-opted-in provider class.
                 const provider = ctx?.model?.provider;
-                if (!(typeof provider === "string" && provider.length > 0 && nonHttpProvidersFromEnv().has(provider))) return false;
+                if (!(typeof provider === "string" && provider.length > 0 && nonHttpProvidersFromEnv().has(provider))) return { owned: false };
             }
             const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
-            if (sid === undefined || sid.length === 0) return true;
-            if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return true;
+            if (sid === undefined || sid.length === 0) return { owned: true };
+            if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return { owned: true, proxyBase };
             try {
-                return (await fetchStatus(proxyBase, sid)) !== undefined;
+                const status = await fetchStatus(proxyBase, sid);
+                return status === undefined ? { owned: false } : { owned: true, proxyBase, status };
             } catch (err) {
                 console.error(`bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
+                return { owned: false };
+            }
+        };
+        // #2110: the cancel is deterministic but bili's REPLACEMENT is not — when
+        // the nudge gates starve (slow-growth sessions: pendingT1 < threshold AND
+        // growth < floor on every pass) or a preflight fold never lands, cancelling
+        // every native pass leaves the session growing into overflow with zero
+        // compression ("Auto-compaction cancelled" spam until 348% of the effective
+        // window). Watch the takeover itself: every cancelled pass must be backed by
+        // evidence that a proxy fold actually landed since the previous one —
+        // /__bili/plugin/status lastCompressAt, stamped by BOTH model-driven compress
+        // and preflight folds (applyRanges). A streak of cancelled passes without a
+        // newer fold (or an unreachable/unknown status) means the takeover produces
+        // nothing: release the pass back to the host's native compaction instead. A
+        // surviving native pass is safe (#395 archives the blocks it makes
+        // unreachable), and the release self-heals both ways — after a native pass
+        // the context sits below the threshold so the hook stops firing, and if the
+        // proxy resumes folding the credit below re-arms the takeover immediately.
+        // A status WITHOUT the field (an older proxy) keeps the historical
+        // unconditional cancel: we cannot distinguish "old proxy folding fine" from
+        // "old proxy starving", and flipping that behavior mid-version would silently
+        // change mixed-version installs.
+        const takeoverVerdict = async (sid: string, verdict: OwnershipVerdict): Promise<boolean> => {
+            // Evidence: reuse the status the remote-probe ownership check already
+            // fetched; local-evidence owners get one extra loopback read per event.
+            let status = verdict.status;
+            if (status === undefined && verdict.proxyBase !== undefined) {
+                try {
+                    status = await fetchStatus(verdict.proxyBase, sid);
+                } catch {
+                    status = undefined;
+                }
+            }
+            const now = Date.now();
+            let entry = takeovers.get(sid);
+            if (status !== undefined && "lastCompressAt" in status) {
+                const foldAt = status.lastCompressAt;
+                if (typeof foldAt === "number" && (entry === undefined || foldAt > entry.knownFoldAt)) {
+                    // A fold landed since we last saw one — the takeover is alive.
+                    takeovers.set(sid, { activeSince: now, staleCancels: 0, knownFoldAt: foldAt });
+                    return false;
+                }
+                // null (no fold yet this process) or a repeat of the same fold:
+                // falls through to the stale counter below.
+            } else if (status !== undefined) {
                 return false;
             }
+            if (entry === undefined) {
+                if (takeovers.size >= 64) {
+                    const oldest = takeovers.keys().next().value;
+                    if (oldest !== undefined) takeovers.delete(oldest);
+                }
+                entry = { activeSince: now, staleCancels: 0, knownFoldAt: Number.NEGATIVE_INFINITY };
+                takeovers.set(sid, entry);
+            }
+            entry.staleCancels += 1;
+            if (entry.staleCancels < takeoverLimits.maxStaleCancels && now - entry.activeSince < takeoverLimits.timeoutMs) {
+                return false;
+            }
+            takeovers.delete(sid);
+            console.error(`bili-plugin(${agent}): takeover watchdog (#2110) — ${entry.staleCancels} consecutive cancelled auto-compaction passes without a newer proxy fold over ${Math.round((now - entry.activeSince) / 1000)}s; releasing this pass to the host's native compaction`);
+            return true;
         };
         if (agent === "pi" || agent === "omp") {
             if (agent === "pi") {
                 pi.on("session_before_compact", async (event, ctx) => {
                     const ev = event as unknown as { reason?: unknown; branchEntries?: unknown };
                     if (ev.reason !== "threshold" && ev.reason !== "overflow") return undefined;
-                    if (!(await ownsCompaction(ctx, ev.branchEntries))) return undefined;
+                    const verdict = await ownsCompaction(ctx, ev.branchEntries);
+                    if (!verdict.owned) return undefined;
+                    const sid = ctx === undefined ? "" : sessionIdOf(ctx) ?? "";
+                    if (sid.length === 0) return { cancel: true };
+                    if (await takeoverVerdict(sid, verdict)) return undefined;
                     return { cancel: true };
                 });
             } else {
@@ -531,8 +617,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 });
                 pi.on("session_before_compact", async (event, ctx) => {
                     if (!autoPending) return undefined;
-                    if (!(await ownsCompaction(ctx))) return undefined;
+                    const verdict = await ownsCompaction(ctx);
+                    if (!verdict.owned) return undefined;
                     autoPending = false;
+                    const sid = ctx === undefined ? "" : sessionIdOf(ctx) ?? "";
+                    if (sid.length === 0) return { cancel: true };
+                    if (await takeoverVerdict(sid, verdict)) return undefined;
                     return { cancel: true };
                 });
             }
