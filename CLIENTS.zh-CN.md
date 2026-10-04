@@ -91,6 +91,31 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
+## Pi(pi.dev coding agent)
+
+Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
+
+**路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
+
+**WebSocket 缺口(#2073)。** WebSocket 连接从不经过 `globalThis.fetch`,所以 pi 的 WS 模型传输在握手成功时整体绕过原生拦截:
+
+| Provider / 传输 | 状态 |
+|---|---|
+| 全部 HTTP provider | ✅ 覆盖 —— 具名 plugin-mode 会话 |
+| `openai-codex-responses`(ChatGPT backend-api),`transport: "sse"` | ✅ 覆盖 —— 与任何 HTTP provider 无异 |
+| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ❌ WS 成功期间绕过代理 —— ACP 工具照常注册、调用照常到达代理,但该会话没有任何模型请求到过代理,会话状态不存在。工具调用在路由阶段失败(`unknown plugin conversation` + `NO MODEL REQUESTS`,#1158 诊断)。#2072 落地前失败形态比「大声」更糟:*兄弟*子代理会话的过期 outbound witness 可能静默用别人的会话状态应答(#2063)—— 此类会话的状态面板在核对 bili.log 之前不可信 |
+| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(归入 #2073 跟踪) |
+
+**Codex provider 的绕行办法。** 在 pi 配置里强制 SSE 车道(`~/.pi/agent/settings.json`;项目 `.pi/settings.json` 可覆盖):
+
+```json
+{ "transport": "sse" }
+```
+
+默认值 `"auto"` 先试 WS、握手失败才回退 SSE;旧布尔键 `"websockets": false` 会自动迁移。该键全局生效,但只有支持多传输的 provider(目前是 codex provider)消费它,纯 HTTP provider 不受影响。Windows + Pi 1.0.2 实机验证(#2063 owner 复现):显式 `sse` 携带正确会话 ID 进入 bili。
+
+已立项的修法(客户端侧 `globalThis.WebSocket` 拦截,#2073 中 owner-gated)是可行而非推测:pi 在 WS 升级握手上发送与 SSE 相同的 `session-id` 头(值 = pi 会话 ID),Node 内置 WebSocket 会转发构造器 `headers`(Node 22 实测),且代理侧已经会讲这条线 —— WS 桥按 `/bili/<upstream>/responses` 前缀形状准入、恰好以该 header 键控(`src/ws-bridge.ts`、`src/responses-ws.ts` `codexResponsesCodec`)。
+
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
 部分客户端(VS Code 系 IDE:CodeBuddy、Cursor、Windsurf……)只提供一个 HTTP **代理**设置(`http.proxy`、`codingcopilot.httpProxyURL` 等),没有可改写的模型 base-URL。这类客户端不走普通的 `/bili/…` 请求,而是把 `CONNECT <模型域名>:443` 发给代理。只有当模型域名在 bili 的 **MITM 白名单**里时这条路径才会被解密;否则 bili 只做盲隧道(不透明转发),永远看不到——也就无法压缩——模型请求(#897)。
