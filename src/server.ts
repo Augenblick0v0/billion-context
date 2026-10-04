@@ -3407,7 +3407,9 @@ export function warnResponsesReasoningPairs(
     }
 }
 
-/** #1567 hardening: a plugin-fold block's in-place anchor is redundant ONLY
+/** Carrier-evidence index for stripKernelSummaries (#2042).
+ *
+ *  #1567 hardening: a plugin-fold block's in-place anchor is redundant ONLY
  *  while the client's own compress pair for that exact fold actually rides
  *  the (post-prepare) history. The pair is recognized by tool name plus the
  *  folded range quoted in its call args — flat {startId,endId} or
@@ -3420,28 +3422,52 @@ export function warnResponsesReasoningPairs(
  *  is absent here and its anchor correctly survives. Unparseable args count
  *  as no match (anchor kept — fail-safe direction). Blocks predating range
  *  recording (no startRef/endRef) degrade to "any compress call present",
- *  the pre-hardening prefix-strip behavior. */
-function inboundCompressPairPresent(messages: BiliMessage[], b: { startRef?: string; endRef?: string }): boolean {
-    const loose = !b.startRef || !b.endRef;
+ *  the pre-hardening prefix-strip behavior.
+ *
+ *  #2042: the evidence is collected in ONE pass over the (post-kernel)
+ *  history instead of rescanning it per active block (O(B×N) → O(N+B+R)).
+ *  It MUST be rebuilt from THIS history on every call — the kernel may have
+ *  pruned earlier pairs since prepare, so no pre-prepare cache may be
+ *  reused. Compress-call args are parsed lazily (only when an active plugin
+ *  block with recorded refs needs exact matching) and each call's args are
+ *  parsed at most ONCE, whereas the old per-block scan reparsed them for
+ *  every block. */
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>> } {
+    const callIds = new Set<string>();
+    const compressCalls: BiliMessage[] = [];
     for (const m of messages) {
-        if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME) continue;
-        if (loose) return true;
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(m.text ?? "");
-        } catch {
-            continue;
-        }
-        const obj = parsed as { startId?: string; endId?: string; content?: unknown };
-        const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
-        for (const r of ranges) {
-            if (r?.startId === b.startRef && r?.endId === b.endRef) return true;
-        }
+        if (m.contentType !== "tool-call") continue;
+        if (m.toolCallId) callIds.add(m.toolCallId);
+        if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
     }
-    return false;
+    let rangePairs: Map<string, Set<string>> | null = null;
+    const ensureRangePairs = (): Map<string, Set<string>> => {
+        if (!rangePairs) {
+            rangePairs = new Map<string, Set<string>>();
+            for (const c of compressCalls) {
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(c.text ?? "");
+                } catch {
+                    continue;
+                }
+                const obj = parsed as { startId?: string; endId?: string; content?: unknown };
+                const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
+                for (const r of ranges) {
+                    if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
+                    let ends = rangePairs.get(r.startId);
+                    if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
+                    ends.add(r.endId);
+                }
+            }
+        }
+        return rangePairs;
+    };
+    return { callIds, compressCalls, ensureRangePairs };
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
+    const { callIds, compressCalls, ensureRangePairs } = buildCarrierIndex(messages);
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
@@ -3449,12 +3475,15 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
         // the client can never echo, so the plain id match is unsatisfiable for
         // them — yet the client's own re-sent compress pair IS their carrier by
         // contract, making the in-place anchor redundant. Strip it, but only
-        // while that pair actually rides the (post-prepare) history
-        // (inboundCompressPairPresent): a pruned or contract-violating client
-        // must never lose the summary outright (zero carriers).
+        // while that pair actually rides the (post-prepare) history: a pruned
+        // or contract-violating client must never lose the summary outright
+        // (zero carriers).
         // Preflight blocks (no compressCallId) keep skipping above: no tool
         // call exists for them, so their anchor is the only carrier.
-        if (isPluginFoldCallId(b.compressCallId) ? inboundCompressPairPresent(messages, b) : messages.some((m) => m.contentType === "tool-call" && m.toolCallId === b.compressCallId)) {
+        const present = isPluginFoldCallId(b.compressCallId)
+            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureRangePairs().get(b.startRef)?.has(b.endRef) ?? false)
+            : callIds.has(b.compressCallId);
+        if (present) {
             carried.add(`acp_summary_${b.blockId}`);
         }
     }
