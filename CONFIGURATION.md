@@ -59,6 +59,286 @@ The config file is a pure override layer — every field is optional. Anything u
 
 Status legend: **ACTIVE** = currently used | **DEPRECATED** = accepted but no effect | **EXPERIMENTAL** = may change
 
+<!-- bili:gen param-ref -->
+This index is generated from `website/config-reference/*.yaml` — edit the seed, then run `node tools/gen-config-docs.mjs generate`; do not hand-edit this block.
+
+**Server & core**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `port` | number | 8787 | ACP_PORT, PORT | TCP port the proxy listens on (user zone; lane-spawned proxies use BILI_ZONE_PORT instead). |
+| `host` | string | 127.0.0.1 | ACP_HOST | Bind address. 127.0.0.1 = loopback only; :: = dual-stack; 0.0.0.0 exposes outward (no auth — trusted networks only). |
+| `sessionHeader` | string | x-acp-session | ACP_SESSION_HEADER | HTTP header carrying the conversation id; same value shares compression state. |
+| `log` | boolean | true | ACP_LOG | Per-request logging master switch. |
+| `logFile` | string | XDG state path (off disables the file, keeps stderr) | ACP_LOG_FILE | Explicit path for bili.log; auto-rotates at 10 MB. |
+| `debug` | boolean | false | ACP_DEBUG | Verbose per-request logging. |
+| `dumpSse` | string | unset (directory) | ACP_DUMP_SSE | Directory to dump raw SSE frames for debugging, including loop-originated responses. |
+| `passthrough` | boolean | false | ACP_PASSTHROUGH | Global raw-relay switch: forward every request without compression, tool injection, or nudging. |
+
+**Upstream & billing**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `upstream` | string | https://api.anthropic.com | ACP_UPSTREAM | Fallback upstream base URL when a request matches no provider route. |
+| `proxy` | string | unset (direct) | BILI_UPSTREAM_PROXY | Global outbound proxy for the proxy's own egress. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 rejected. |
+| `upstreamProxy` | string | unset | — | Web-UI manual proxy tier (written by the dashboard's proxy editor); sits below BILI_UPSTREAM_PROXY in resolution order. |
+| `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | How the global proxy is sourced: auto (env/system discovery), manual (Web-UI value only), direct (never use a proxy). |
+| `providers` | record url-prefix → route entry | {} | — | Route table: URL-prefix keys to per-provider entries (models, compress, compat, …). See the Providers section. |
+| `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit. |
+| `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | Global image-token estimation basis; live-read per request, beats every per-provider setting. |
+| `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | Global per-image token ceiling applied on top of the resolved billing mode; live-read per request. |
+
+**Behavior toggles**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
+| `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
+| `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
+| `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | Identified clients resuming under a new session id inherit the parent's ref assignments and fully-present compression blocks. |
+| `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | Body-content detection of bili→bili chains (off: body scanning can false-positive on CCR/model-echoed text); by default only x-bili-hop drives chain recognition. |
+| `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | Emit the model-visible <bili-chain/> checkpoint carrier on egress (off: models treat it as phantom input and burn tokens). |
+| `stableSystemAnchor` | boolean | false | BILI_STABLE_SYSTEM_ANCHOR | Best-effort wire-layer prefix-cache anchor: re-sends the first-seen head system bytes even when the client changes them (plain-proxy lanes only). |
+| `compat` | { roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? } | {} (disabled) | — | Global wire-compat block: role remaps, strict-schema field drops, stream error shape, cache-control handling. |
+| `compat.roles` | record role → role | {} | — | Map message roles to the names your upstream accepts (e.g. developer→system); exact-match roles only, per-provider entries win per key. |
+| `compat.dropFields` | string[] (dot paths) | [] | — | Dot-path fields stripped from every forwarded body for strict-schema gateways that 400 on unknown fields; global + per-provider lists union additively. |
+| `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | How upstream stream failures are presented after the 200 is committed: protocol-native error frames (default) or the legacy synthesized-completion shape. |
+| `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Stop stamping Anthropic-lane cache_control breakpoints entirely (escape hatch for upstreams/relays with their own breakpoint policy). |
+| `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued). |
+| `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
+| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
+| `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
+| `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
+
+**MITM lane**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `providersPath` | string | unset | ACP_PROVIDERS | Path to an external providers.json (legacy/shared routes file); beats both inline providers and the config-file location. |
+| `mitm.enabled` | boolean | true | BILI_MITM | HTTPS interception switch for login clients that hard-code their upstream; domains are whitelisted on first sight. |
+| `mitm.domains` | string[] | [] | BILI_MITM_DOMAINS | Explicit MITM whitelist domains (unioned with first-sight auto-whitelisting). |
+| `mitm.handshakeTimeoutMs` | number | 10000 | BILI_MITM_HANDSHAKE_TIMEOUT_MS | TLS handshake timeout for intercepted connections. |
+
+**Process & persistence**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `network` | object | {} (all defaults) | — | Transport timeouts, watchdogs and replay policy for upstream calls. |
+| `network.upstreamTimeoutMs` | number | 720000 | BILI_UPSTREAM_TIMEOUT_MS | Hard ceiling on a single upstream call (12 min covers slow deep-thinking models). |
+| `network.requestWatchdogMs` | number | 2× upstreamTimeoutMs | BILI_REQUEST_WATCHDOG_MS | Absolute watchdog that force-aborts a stuck upstream socket even when the per-call timer was never armed. |
+| `network.keepAliveTimeoutMs` | number | 5000 | BILI_KEEP_ALIVE_TIMEOUT_MS | Idle keep-alive timeout for pooled upstream sockets. |
+| `network.clientErrorBackstopMs` | number | 30000 | BILI_CLIENT_ERROR_BACKSTOP_MS | Backstop that aborts a client connection that stops reading a committed response. |
+| `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | How often bound-address exposure warnings repeat in the log; 0 disables them entirely. |
+| `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | Downstream stream keep-alive ping interval between model chunks; 0 disables pinging. |
+| `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | How long a failed preflight holds before the request is allowed through unreconciled. |
+| `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | Cooldown after a dead-end preflight before retrying reconciliation for the same session. |
+| `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | Maximum transport-failure replays of an identical request before surfacing the error. |
+| `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | Base backoff delay between replays (exponential). |
+| `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | Cap on how much one compression may shrink history (anti-collapse guard). |
+| `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings). |
+| `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop). |
+| `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
+| `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
+| `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | Zstd-compress persisted session files (1/true enables). |
+| `persist.debounceMs` | number | 500 | BILI_PERSIST_DEBOUNCE_MS | Write debounce window for session files. |
+| `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | Token-size tail of recent messages kept as raw text for export fidelity. |
+| `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | Consecutive EPERM write failures before alerting in the log. |
+| `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | Repeat interval for the EPERM alert; 0 logs it once. |
+| `sessions` | object | {} (all defaults) | — | Session-table size cap and opt-in garbage collection. |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | In-memory session table cap (LRU eviction of idle sessions). |
+| `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | Opt-in garbage collection of stale persisted sessions (user data is never pruned silently without this flag). |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age threshold in days. |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC token-size threshold per session record. |
+| `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval. |
+| `plugin.snapshotCapBytes` | number | 16777216 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Size cap for fork-API public snapshots served to native plugins. |
+
+**Updates & advisories**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | Automatic npm version checks (every ~3 min); disable via ACP_AUTO_UPDATE=0 or --no-auto-update. |
+| `autoRestartOnUpdate` | boolean | false | ACP_AUTO_RESTART_ON_UPDATE | Restart the daemon automatically once a newer version has been installed. |
+| `updateTag` | string | latest | ACP_UPDATE_TAG | npm dist-tag channel for self-updates: latest (default), dev, or pr. |
+| `update` | object | {} (all defaults) | — | Self-update channel settings. |
+| `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
+| `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | Interval between npm registry version checks. |
+| `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected. |
+| `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | Override URL for the advisory feed. |
+| `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Release-notes feed for the web panel (fetch + cache only; never installs anything). |
+| `releaseNotesUrl` | string | unset (built-in feed) | BILI_RELEASE_NOTES_URL | Override URL for the release-notes feed. |
+
+**Diagnostics & tuning**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `diagnostics` | object | {} (all defaults) | — | Local troubleshooting knobs (dumps, render/injection toggles, count-tokens passthrough). |
+| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | Dump full request/response bodies to the log for troubleshooting. |
+| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | Log outgoing upstream request metadata per call. |
+| `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | Directory for raw wire dumps. |
+| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | Persist upstream 4xx responses to disk for post-mortem inspection. |
+| `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | Size cap for a single 4xx dump file. |
+| `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | Disable all ACP tag rendering (raw wire study mode). |
+| `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | Stop injecting the acp_compress tool definition into requests. |
+| `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | Stop appending the compression doctrine to system prompts. |
+| `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | Forward /v1/messages/count_tokens to the upstream instead of answering locally. |
+| `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | ACP injection surface for compression: native tools (default) or legacy prompt markers. |
+| `fakeCompletion` | object | {} (all defaults) | — | Retry loop that re-requests when a final chunk arrives truncated. |
+| `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | How many times a truncated final completion may be re-requested; 0 disables the loop. |
+| `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | Buffer size cap for the retry loop's accumulated stream. |
+| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | Handle Codex /responses/compact inside bili (intercept, default) or forward it upstream (pass). |
+| `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve. |
+| `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | Size cap (blocks) for temporary decompressed content held in-session. |
+
+**Compression (global level)**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | Effective context window (tokens or N%): denominator of the usage ratio and a hard preflight wall; highest-priority window source. |
+| `compress.maxContextLimit` | number \| "N%" | "75%" | — | Forced-compression nudge threshold: once history passes this share of the window the nudge fires immediately, bypassing growth gates. Not a hard cap. |
+| `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
+| `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
+| `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
+| `compress.preserveRecentMessages` | number | kernel ≈5 | — | The most recent messages stay soft-protected from folds. |
+| `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
+| `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
+| `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
+| `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
+| `compress.stripImagesKeepRecent` | number | 5 | — | With stripImages on, images inside the N newest messages are kept. |
+| `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
+| `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. |
+| `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). |
+| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
+| `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
+| `compress.stripImages` | boolean | false | — | Strip image payloads from foldable history. |
+| `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
+| `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. |
+| `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
+| `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
+| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
+| `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of large tool results into short abstracts; originals go to the content store. |
+| `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
+| `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
+| `compress.imageCompression` | object | opt-in (disabled) | — | Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only. |
+| `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | Override the kernel doctrine texts; load-bearing for quality — gated behind acknowledgePromptsRisk. |
+| `compress.reasoningGuard` | object | off | — | Auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (up to 3 continue-nudge rounds). |
+| `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | Appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests. |
+| `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q ratios normalized to the input price (write/cache-read/output); report-only — never affects triggers or the wire. |
+| `compress.acknowledgePromptsRisk` | boolean | false | — | Must be true before custom prompts take effect. |
+| `compress.absorb.enabled` | boolean | false | — | Enable the absorb distillation block. |
+| `compress.absorb.minToolTokens` | number | 1000 | — | Minimum estimated token size of a tool result eligible for absorption. |
+| `compress.absorb.contextThresholdPct` | number \| % | unset | — | Only absorb when context usage passes this share of the window. |
+| `compress.absorb.excludeTools` | string[] | [] | — | Tool names excluded from absorption. |
+| `compress.absorb.toolName` | string | "absorb" | — | Registered name of the absorb tool. |
+| `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
+| `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
+| `compress.ccr.excludeTools` | string[] | [] | — | Tool names excluded from CCR storage. |
+| `compress.ccr.toolName` | string | "acp_retrieve" | — | Registered name of the retrieval tool. |
+| `compress.ccr.maxHeadChars` | number | 96 | — | Maximum head-excerpt length left inline at the storage pointer. |
+| `compress.imageCompression.enabled` | boolean | false | — | Enable lossy image downscaling (requires the optional sharp dependency). |
+| `compress.imageCompression.minTokens` | number | 512 | — | Only downscale images whose counted tokens exceed this. |
+| `compress.imageCompression.maxDimension` | number | 1280 | — | Largest output dimension after downscaling. |
+| `compress.imageCompression.quality` | number | 80 | — | Encoder quality (1–100). |
+| `compress.imageCompression.format` | string | "webp" | — | Output image format. |
+| `compress.prompts.compressPhilosophy` | string | unset (kernel text) | — | Override of the compression philosophy doctrine paragraph. |
+| `compress.prompts.howToCompressRules` | string | unset (kernel text) | — | Override of the compression how-to rules. |
+| `compress.prompts.tier2DistillRules` | string | unset (kernel text) | — | Override of the tier-2 distillation rules. |
+| `compress.prompts.tier3CondenseRules` | string | unset (kernel text) | — | Override of the tier-3 condensation rules. |
+| `compress.reasoningGuard.enabled` | boolean | false | — | Enable reasoning-lattice auto-repair. |
+| `compress.reasoningGuard.maxContinue` | number | 3 | — | Maximum continue-nudge rounds per truncation. |
+| `compress.reasoningGuard.maxTierN` | number | (built-in) | — | Upper bound on the repaired lattice tier index. |
+| `compress.reasoningGuard.markerText` | string | "Continue thinking..." | — | Marker text that signals a truncated reasoning lattice. |
+| `compress.reasoningGuard.base` | number | (built-in) | — | Base offset parameter of the repair lattice. |
+| `compress.reasoningGuard.offset` | number | (built-in) | — | Offset step parameter of the repair lattice. |
+| `compress.reasoningGuard.debugLog` | boolean | false | — | Verbose logging for the repair loop. |
+| `compress.outputSteering.enabled` | boolean | false | — | Enable the conciseness directive appended to the system-prompt tail. |
+| `compress.outputSteering.verbosityLevel` | number (0–4) | 2 | — | Target verbosity level for the directive. |
+| `compress.outputSteering.effortRouting` | boolean | (built-in) | — | Route effort hints alongside the directive. |
+| `compress.priceProfile.w` | number | unset (registry) | — | Write-price ratio relative to the input price. |
+| `compress.priceProfile.r` | number | unset (registry) | — | Cache-read price ratio relative to the input price. |
+| `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
+| `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
+| `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
+| `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
+
+**Provider route fields**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `models` | record name → { context?, output?, compress?, benefit? } | {} | — | Per-model declarations: context window, output ceiling, per-model compression overrides; not a traffic filter. |
+| `models.context` | number | unset (model registry) | — | Context window tokens declared for this model name. |
+| `models.output` | number | unset | — | Output token ceiling declared for this model name. |
+| `models.compress` | object | unset | — | Level-3 compression overrides for this model (deepest in the global→provider→model merge). |
+| `models.benefit` | boolean | false | — | Marks free-quota billing for this model in the economics ledger. |
+| `proxy` | string ("" = explicit direct) | unset | — | Per-route outbound proxy URL. |
+| `compressProtocol` | "tools" (default) \| "marker" | "tools" | — | Which ACP injection surface this lane speaks. |
+| `protocol` | "anthropic" \| "openai" \| "responses" \| "google" | inferred from the URL marker | — | Declare this lane's wire protocol; a client-side /bili/<protocol>/ URL marker outranks the declaration. |
+| `compress` | object (level 2) | unset | — | Any compress field can be overridden here — level 2 of the global→provider→model merge. |
+| `compat` | { roles?, dropFields? } | {} | — | Per-route wire-compat overrides; provider entries beat the global block per key; dropFields union additively. |
+| `direct` | boolean | false | — | Client-side exemption: traffic for this upstream is never pointed at bili at all. |
+| `passthrough` | boolean | false | — | Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams. |
+| `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (→ pixels) | — | Image-token counting basis for this route; bytes is an explicit opt-in for byte relays. |
+| `imageTokenCap` | number | unset (uncapped) | — | Per-image token cost cap for this route. |
+| `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | Per-route overrides of the global resign map (level 2, deepest wins). |
+| `bind` | string (named entries only) | unset | — | Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert. |
+| `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
+
+**Environment-only variables**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). |
+| `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | Where session records are stored (path relocation). |
+| `BILI_ENCRYPTION_KEY` | string | unset | — | Key material for encrypted persisted payloads (secret). |
+| `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | Host allowlist for the MITM tunnel lane. |
+| `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | Toggle for reclaiming the global fetch patch on shutdown. |
+| `BILI_CONFLICT_SCAN` | boolean-ish | off | — | Enable the install-lane conflict scanner probe. |
+| `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | number | (built-in) | — | Tolerance for future-skewed chain checkpoint timestamps. |
+| `BILI_CHAIN_RECENT_WINDOW_MS` | number | (built-in) | — | Recent-window size for chain checkpoint validation. |
+| `BILI_ZONE_PORT` | number | 18787 base (derived per lane) | — | Base port for lane-spawned proxy zones (port relocation). |
+| `BILI_ZCODE_ROUTE` | string | unset | — | Route selection for the zcode lane. |
+| `BILI_ZCODE_PORT` | number | unset | — | Port pin for the zcode lane. |
+| `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | Fixed-signing mode for the zcode credential lane. |
+| `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
+| `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
+| `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
+| `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
+| `BILI_MCP_PROXY` | string | unset | — | Spawn channel: MCP proxy target for plugin-hosted tools. |
+| `BILI_PARENT_PID` | number | unset | — | Spawn channel: parent process id for lifecycle supervision. |
+| `BILI_STRICT_PORT` | number | unset | — | Spawn channel: exact-port requirement (squatters refused loudly instead of hopping). |
+| `BILI_OPENCODE_ACP_SPEC` | string | unset | — | Spawn channel: ACP spec marker for opencode-native lanes. |
+| `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | Launcher channel: model-window overrides passed into spawned clients. |
+| `BILI_LAUNCHER_LANE` | string | unset | — | Launcher channel: lane identity of the spawning bili process. |
+| `BILI_LAUNCHER_PLUGIN` | string | unset | — | Launcher channel: plugin-mode handoff marker. |
+| `BILI_LAUNCHER_DIRECT` | boolean-ish | off | — | Launcher channel: bypass the injected proxy for this launch. |
+| `BILI_INHERITED_HTTP_PROXY` | string | unset | — | Launcher channel: inherited http_proxy value preserved across the spawn boundary. |
+| `BILI_INHERITED_HTTPS_PROXY` | string | unset | — | Launcher channel: inherited https_proxy value preserved across the spawn boundary. |
+| `BILI_INHERITED_ALL_PROXY` | string | unset | — | Launcher channel: inherited all_proxy value preserved across the spawn boundary. |
+| `BILI_INHERITED_NO_PROXY` | string | unset | — | Launcher channel: inherited no_proxy value preserved across the spawn boundary. |
+| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | Host posture: marks a claude-native plugin process. |
+| `BILI_NATIVE_DSH` | boolean-ish | off | — | Host posture: marks a dsh-native plugin process. |
+| `BILI_NATIVE_KIMI` | boolean-ish | off | — | Host posture: marks a kimi-native plugin process. |
+| `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: marks an omp-native plugin process. |
+| `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | Host posture: marks an opencode-native plugin process. |
+| `BILI_NATIVE_PI` | boolean-ish | off | — | Host posture: marks a pi-native plugin process. |
+| `BILI_NATIVE_ZCODE` | boolean-ish | off | — | Host posture: marks a zcode-native plugin process. |
+| `BILI_PI_BIN` | string | pi (PATH lookup) | — | Host posture: explicit binary path for the pi client binary. |
+| `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | Host posture: explicit binary path for the dsh client binary. |
+| `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | Test hook: retry interval for model-info lookups. |
+| `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | Test hook: retry interval for dsh lane operations. |
+| `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | Test hook: recovery sweep interval for the dsh lane. |
+| `ACP_DUMP_DIR` | string | unset | — | Base directory override for wire dump output (path relocation). |
+| `BILI_STREAM_STALL_MS` | number | (built-in) | — | Stall-detection timeout for committed upstream streams (no-byte silence before abort). |
+| `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | Explicit binary override for the launched client (resolved on PATH). |
+| `BILI_CONVERSATION_ID` | string | unset (per-spawn UUID written by bili) | — | Per-spawn conversation UUID handed to MCP children whose host passes no session id (headless self-registration). |
+| `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` | string (JSON id→maxOutput map) | unset | — | Launcher channel: per-model max-output map handed to the spawned proxy for output-headroom reservation. |
+| `BILI_LAUNCH_TOKEN` | string | unset (generated per launch) | — | Launch token authenticating lane-internal endpoints between a launcher and its spawned proxy (secret). |
+| `BILI_MCP_DEFAULT_ORIGIN` | string | http://127.0.0.1:8787 | — | Fallback proxy origin candidate for MCP entry points. |
+| `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | Opt out of resumed-session orphan adoption when several host sessions share one proxy. |
+| `BILI_MITM_HOSTS` | string[] (csv) | unset | — | Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS). |
+| `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
+
+<!-- /bili:gen -->
+
 ---
 
 ## Server Settings
@@ -1099,53 +1379,99 @@ Environment variables take precedence over the config file. They are useful for 
 
 File keys resolve only when the matching env var is unset. Defaults in parentheses are the built-ins.
 
+<!-- bili:gen env-map -->
 | Env var | Config key | Default |
-|---------|------------|---------|
-| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | `720000` |
-| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | `2×` upstream timeout |
-| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | `3` |
-| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | `1500` |
-| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset (no steering) |
-| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | `5000` |
-| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | `30000` |
-| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | `3600000` |
-| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | `15000` |
-| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
-| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
-| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
-| `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | `5000` |
-| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
-| `BILI_PERSIST` | `persist.enabled` | `true` |
-| `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
-| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | `500` |
-| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | `16384` |
-| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | `5` |
-| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | `0` |
-| `BILI_MAX_SESSIONS` | `sessions.max` | `256` |
-| `BILI_SESSION_GC` | `sessions.gc.enabled` | `false` |
-| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
-| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
-| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | `16777216` |
-| `BILI_UPDATE_REGISTRY` | `update.registry` | npm public registry |
-| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
-| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
-| `BILI_CODEX_COMPACT` | `codexCompact` | `"intercept"` |
-| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | `50` |
-| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | `false` |
-| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | `true` |
-| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | `<state dir>/raw` |
-| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | `false` |
-| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | `2097152` |
-| `ACP_RENDER_NONE` | `diagnostics.renderNone` | `false` |
-| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | `false` |
-| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | `false` |
-| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | `false` |
-| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | `"tools"` |
-| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | `false` |
-| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | `false` |
-| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | `0` |
-| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | `16777216` |
+|---------|------------|--------|
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false |
+| `ACP_AUTO_UPDATE` | `autoUpdate` | true |
+| `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
+| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |
+| `ACP_COMPRESS_TOOL` | `compress.injectTool` | true |
+| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | false |
+| `ACP_DEBUG` | `debug` | false |
+| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | false |
+| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | true |
+| `ACP_DUMP_SSE` | `dumpSse` | unset (directory) |
+| `ACP_HOST` | `host` | 127.0.0.1 |
+| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | false |
+| `ACP_LOG` | `log` | true |
+| `ACP_LOG_FILE` | `logFile` | XDG state path (off disables the file, keeps stderr) |
+| `ACP_MODEL_CONTEXT_LIMIT` | `modelContextLimit` | 200000 |
+| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | false |
+| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | false |
+| `ACP_PASSTHROUGH` | `passthrough` | false |
+| `ACP_PORT` | `port` | 8787 |
+| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | auto |
+| `ACP_PROVIDERS` | `providersPath` | unset |
+| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | <state dir>/raw |
+| `ACP_RENDER_NONE` | `diagnostics.renderNone` | false |
+| `ACP_SESSION_HEADER` | `sessionHeader` | x-acp-session |
+| `ACP_UPDATE_TAG` | `updateTag` | latest |
+| `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
+| `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
+| `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
+| `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
+| `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
+| `BILI_CLAUDE_NATIVE_PORT` | `claude.nativePort` | unset (lane sticky zone port) |
+| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
+| `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
+| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
+| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
+| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
+| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
+| `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
+| `BILI_FORK_ADOPTION` | `forkAdoption` | false |
+| `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
+| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
+| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
+| `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
+| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
+| `BILI_MITM` | `mitm.enabled` | true |
+| `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
+| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
+| `BILI_NATIVE_ATTACH_EXTERNAL` | `native.attachExternal` | false |
+| `BILI_NON_HTTP_PROVIDERS` | `compactionOptIn` | false |
+| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | false |
+| `BILI_PERSIST` | `persist.enabled` | true |
+| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | 500 |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | 0 (no repeats) |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
+| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
+| `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
+| `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
+| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
+| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
+| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 16777216 (0 disables snapshots) |
+| `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
+| `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
+| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | 1500 (0 disables the delay) |
+| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | 3 (1 disables replays) |
+| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | 2× upstreamTimeoutMs |
+| `BILI_RESIGN` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESIGN_BENEFIT` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
+| `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
+| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
+| `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
+| `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
+| `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
+| `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
+| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PORT` | `port` | 8787 |
+<!-- /bili:gen -->
 
 | Variable | Effect |
 |----------|--------|

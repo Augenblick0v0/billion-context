@@ -171,31 +171,35 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
         <table class="client-table param-table">
           <thead><tr><th data-i18n="d.cf.th_param">Parameter</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
           <tbody>
-            <tr><td class="mono">modelContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mcl">·</td></tr>
-            <tr><td class="mono">maxContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mxcl">·</td></tr>
-            <tr><td class="mono">emergencyThresholdPercent</td><td class="mech">number | %</td><td data-i18n="cw.etc">·</td></tr>
-            <tr><td class="mono">outputHeadroomMaxPct</td><td class="mech">number | %</td><td data-i18n="cw.ohmp">·</td></tr>
-            <tr><td class="mono">nudgeGrowthTokens</td><td class="mech">number</td><td data-i18n="cw.ngt">·</td></tr>
-            <tr><td class="mono">preserveRecentMessages</td><td class="mech">number</td><td data-i18n="cw.prm">·</td></tr>
-            <tr><td class="mono">preserveRecentTokens</td><td class="mech">number</td><td data-i18n="cw.prt">·</td></tr>
-            <tr><td class="mono">minCompressRangeChars</td><td class="mech">number (deprecated alias: minCompressRange)</td><td data-i18n="cw.mrc">·</td></tr>
-            <tr><td class="mono">reconcile</td><td class="mech">"off" | "warn" | "repair"</td><td data-i18n="cw.rec">·</td></tr>
-            <tr><td class="mono">promptPack</td><td class="mech">string (builtin: "default", "lean")</td><td data-i18n="cw.ppk">·</td></tr>
-            <tr><td class="mono">stripImagesKeepRecent</td><td class="mech">number</td><td data-i18n="cw.sikr">·</td></tr>
-            <tr><td class="mono">tiers</td><td class="mech">bool</td><td data-i18n="cw.tiers">·</td></tr>
-            <tr><td class="mono">protectedTools</td><td class="mech">string[]</td><td data-i18n="ct.pt">·</td></tr>
-            <tr><td class="mono">protectedLatestTools</td><td class="mech">string[]</td><td data-i18n="ct.plt">·</td></tr>
-            <tr><td class="mono">neverPreserveRecentTools</td><td class="mech">string[] ([] valid)</td><td data-i18n="ct.nprt">·</td></tr>
-            <tr><td class="mono">preserveRecentTools</td><td class="mech">string[]</td><td data-i18n="ct.prt2">·</td></tr>
-            <tr><td class="mono">stripImages</td><td class="mech">bool</td><td data-i18n="ct.si">·</td></tr>
-            <tr><td class="mono">visibilityMarkers</td><td class="mech">bool</td><td data-i18n="ct.vm">·</td></tr>
-            <tr><td class="mono">rules</td><td class="mech">bool</td><td data-i18n="ct.rules">·</td></tr>
-            <tr><td class="mono">injectTool</td><td class="mech">bool</td><td data-i18n="ct.it">·</td></tr>
-            <tr><td class="mono">injectNudge</td><td class="mech">bool</td><td data-i18n="ct.in">·</td></tr>
-            <tr><td class="mono">reasoning</td><td class="mech">{ drop?, threshold? }</td><td data-i18n="ct.rz">·</td></tr>
+<!-- bili:gen compress-table -->
+            <tr><td class="mono">modelContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mcl">Effective context window (tokens or "N%"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default.</td></tr>
+            <tr><td class="mono">maxContextLimit</td><td class="mech">number | "N%"</td><td data-i18n="cw.mxcl">Forced-compression nudge threshold (default "75%"): once history passes this share of the window the nudge fires immediately, bypassing the growth gates. Not a hard cap.</td></tr>
+            <tr><td class="mono">emergencyThresholdPercent</td><td class="mech">number | %</td><td data-i18n="cw.etc">Default "95%": emergency truncation of oversized tool outputs when history passes this share of the window (must be ≥ maxContextLimit).</td></tr>
+            <tr><td class="mono">outputHeadroomMaxPct</td><td class="mech">number | %</td><td data-i18n="cw.ohmp">Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens.</td></tr>
+            <tr><td class="mono">nudgeGrowthTokens</td><td class="mech">number</td><td data-i18n="cw.ngt">Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens.</td></tr>
+            <tr><td class="mono">preserveRecentMessages</td><td class="mech">number</td><td data-i18n="cw.prm">Kernel default ≈5: the most recent messages stay soft-protected from folds.</td></tr>
+            <tr><td class="mono">preserveRecentTokens</td><td class="mech">number</td><td data-i18n="cw.prt">Kernel default ≈5000: the most recent tokens stay soft-protected from folds.</td></tr>
+            <tr><td class="mono">minCompressRangeChars</td><td class="mech">number (deprecated alias: minCompressRange)</td><td data-i18n="cw.mrc">Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold.</td></tr>
+            <tr><td class="mono">reconcile</td><td class="mech">"off" | "warn" | "repair"</td><td data-i18n="cw.rec">"off" | "warn" | "repair" (default repair): reconcile folded state when the client rewinds or rewrites history between turns.</td></tr>
+            <tr><td class="mono">promptPack</td><td class="mech">string (builtin: "default", "lean")</td><td data-i18n="cw.ppk">Compression prompt pack, resolved project pack → user pack → builtin. Builtins: "default" and "lean" (one-line tool descriptions). Not gated by acknowledgePromptsRisk.</td></tr>
+            <tr><td class="mono">stripImagesKeepRecent</td><td class="mech">number</td><td data-i18n="cw.sikr">With stripImages on, images inside the N newest messages (default 5) are kept.</td></tr>
+            <tr><td class="mono">tiers</td><td class="mech">boolean</td><td data-i18n="cw.tiers">On by default: tiered T1→T3 distillation spreads folding cost across generations.</td></tr>
+            <tr><td class="mono">protectedTools</td><td class="mech">string[]</td><td data-i18n="ct.pt">Hard exclusion across all history: results of listed tools never fold (use with care).</td></tr>
+            <tr><td class="mono">protectedLatestTools</td><td class="mech">string[]</td><td data-i18n="ct.plt">Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists).</td></tr>
+            <tr><td class="mono">neverPreserveRecentTools</td><td class="mech">string[] ([] valid)</td><td data-i18n="ct.nprt">Excluded from the recent protection zone (immediately compressible); default ["decompress", "search_context", "read", "bash"]. An empty array is valid — it excludes nothing (maximum protection).</td></tr>
+            <tr><td class="mono">preserveRecentTools</td><td class="mech">string[]</td><td data-i18n="ct.prt2">Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo.</td></tr>
+            <tr><td class="mono">stripImages</td><td class="mech">boolean</td><td data-i18n="ct.si">Strip image payloads from foldable history (off by default).</td></tr>
+            <tr><td class="mono">visibilityMarkers</td><td class="mech">boolean</td><td data-i18n="ct.vm">Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration).</td></tr>
+            <tr><td class="mono">rules</td><td class="mech">boolean</td><td data-i18n="ct.rules">Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command.</td></tr>
+            <tr><td class="mono">injectTool</td><td class="mech">boolean</td><td data-i18n="ct.it">Register the acp_compress tool for clients (on by default; global level only).</td></tr>
+            <tr><td class="mono">injectNudge</td><td class="mech">boolean</td><td data-i18n="ct.in">Send growth nudges as the window fills (on by default; global level only).</td></tr>
+            <tr><td class="mono">reasoning</td><td class="mech">{ drop?, threshold? }</td><td data-i18n="ct.rz">{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false.</td></tr>
+<!-- /bili:gen -->
           </tbody>
         </table>
-        <ul class="obj-list">          <li data-i18n-html="co.absorb"><code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName "absorb"</span>).</li>
+        <ul class="obj-list">
+<!-- bili:gen compress-objlist -->
+          <li data-i18n-html="co.absorb"><code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName "absorb"</span>).</li>
           <li data-i18n-html="co.ccr"><code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName "acp_retrieve", maxHeadChars</span>).</li>
           <li data-i18n-html="co.search"><code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results.</li>
           <li data-i18n-html="co.img"><code>imageCompression</code> — opt-in lossy downscale via optional sharp before sending (<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format "webp"</span>); <code>image_full</code> restores originals; proxy mode only.</li>
@@ -204,76 +208,81 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li data-i18n-html="co.os"><code>outputSteering</code> — <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>: appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests.</li>
           <li data-i18n-html="co.pp"><code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire.</li>
           <li data-i18n-html="co.apr"><code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect.</li>
+<!-- /bili:gen -->
         </ul>
         <h3 data-i18n="d.cf.t_routes">providers — route table fields</h3>
         <p class="hint" data-i18n-html="d.cf.routes_intro">Keys are upstream URL prefixes — longest match wins, boundary-safe. <code>https://</code> keys match /bili/ traffic; <code>mitm://</code> keys match login-client traffic on the MITM lane. An entry with no fields is still an ordinary compressed lane.</p>
         <table class="client-table param-table">
           <thead><tr><th data-i18n="d.cf.th_param">Field</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
           <tbody>
-            <tr><td class="mono">models</td><td class="mech">record name→{context?, output?, compress?, benefit?}</td><td data-i18n="cr.models">·</td></tr>
-            <tr><td class="mono">proxy</td><td class="mech">string ("" = explicit direct)</td><td data-i18n="cr.proxy">·</td></tr>
-            <tr><td class="mono">compressProtocol</td><td class="mech">"tools" (default) | "marker"</td><td data-i18n="cr.cp">·</td></tr>
-            <tr><td class="mono">protocol</td><td class="mech">"anthropic" | "openai" | "responses" | "google"</td><td data-i18n="cr.proto">·</td></tr>
-            <tr><td class="mono">compress</td><td class="mech">object (level 2)</td><td data-i18n="cr.compress">·</td></tr>
-            <tr><td class="mono">compat</td><td class="mech">{ roles?, dropFields? }</td><td data-i18n="cr.compat">·</td></tr>
-            <tr><td class="mono">direct</td><td class="mech">bool</td><td data-i18n="cr.direct">·</td></tr>
-            <tr><td class="mono">passthrough</td><td class="mech">bool</td><td data-i18n="cr.pt">·</td></tr>
-            <tr><td class="mono">imageBilling</td><td class="mech">"auto" | "pixels" | "bytes"</td><td data-i18n="cr.ib">·</td></tr>
-            <tr><td class="mono">imageTokenCap</td><td class="mech">number</td><td data-i18n="cr.itc">·</td></tr>
-            <tr><td class="mono">resign</td><td class="mech">scheme → {enabled?, passthrough?, credentialRef?}</td><td data-i18n="cr.resign">·</td></tr>
-            <tr><td class="mono">bind</td><td class="mech">string (named entries only)</td><td data-i18n="cr.bind">·</td></tr>
-            <tr><td class="mono">compactionOptIn</td><td class="mech">bool</td><td data-i18n="cr.optin">·</td></tr>
+<!-- bili:gen routes-table -->
+            <tr><td class="mono">models</td><td class="mech">record name → { context?, output?, compress?, benefit? }</td><td data-i18n-html="cr.models">Record of model name → <span class='mech'>{context?, output?, compress?, benefit?}</span>: declares each model's context window, output ceiling, and per-model compression overrides (benefit marks free-quota billing). Not a traffic filter.</td></tr>
+            <tr><td class="mono">proxy</td><td class="mech">string ("" = explicit direct)</td><td data-i18n="cr.proxy">Per-route outbound proxy URL; empty string = explicitly direct.</td></tr>
+            <tr><td class="mono">compressProtocol</td><td class="mech">"tools" (default) | "marker"</td><td data-i18n="cr.cp">Which ACP injection surface this lane speaks: native tools (default) or prompt markers.</td></tr>
+            <tr><td class="mono">protocol</td><td class="mech">"anthropic" | "openai" | "responses" | "google"</td><td data-i18n="cr.proto">Declare this lane's wire protocol. A client-side /bili/&lt;protocol&gt;/ URL marker outranks the declaration; unparseable bodies relay verbatim.</td></tr>
+            <tr><td class="mono">compress</td><td class="mech">object (level 2)</td><td data-i18n="cr.compress">Any compress field can be overridden here — level 2 of the global→provider→model merge (per-field, deepest wins).</td></tr>
+            <tr><td class="mono">compat</td><td class="mech">{ roles?, dropFields? }</td><td data-i18n="cr.compat">{ roles?, dropFields? } — remap roles the upstream rejects (e.g. developer→system); provider entries beat the global block per key; dropFields strips fields strict schemas reject (additive union).</td></tr>
+            <tr><td class="mono">direct</td><td class="mech">boolean</td><td data-i18n="cr.direct">Client-side exemption: traffic for this upstream is never pointed at bili at all — unlike passthrough, it does not even terminate there.</td></tr>
+            <tr><td class="mono">passthrough</td><td class="mech">boolean</td><td data-i18n="cr.pt">Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams.</td></tr>
+            <tr><td class="mono">imageBilling</td><td class="mech">"auto" | "pixels" | "bytes"</td><td data-i18n="cr.ib">Image-token counting basis for this route: auto (→ pixels), pixels, or bytes (explicit opt-in for byte relays).</td></tr>
+            <tr><td class="mono">imageTokenCap</td><td class="mech">number</td><td data-i18n="cr.itc">Per-image token cost cap for this route; unset = uncapped.</td></tr>
+            <tr><td class="mono">resign</td><td class="mech">scheme → { enabled?, passthrough?, credentialRef? }</td><td data-i18n="cr.resign">Per-route overrides of the global resign map (level 2, deepest wins).</td></tr>
+            <tr><td class="mono">bind</td><td class="mech">string (named entries only)</td><td data-i18n="cr.bind">Named (non-URL) entry: deep-merged onto the bound URL lane at config load as an alias. Without bind a named entry stays routing-inert.</td></tr>
+            <tr><td class="mono">compactionOptIn</td><td class="mech">boolean</td><td data-i18n="cr.optin">Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS.</td></tr>
+<!-- /bili:gen -->
           </tbody>
         </table>
         <h3 data-i18n="d.cf.t_top">Other top-level fields</h3>
         <ul class="cfg-list top-list">
+<!-- bili:gen top-list -->
           <li class="tg" data-i18n-html="tg.core"><strong>Server &amp; core</strong></li>
-          <li data-i18n-html="tt.port"></li>
-          <li data-i18n-html="tt.host"></li>
-          <li data-i18n-html="tt.sessionheader"></li>
-          <li data-i18n-html="tt.log"></li>
-          <li data-i18n-html="tt.logfile"></li>
-          <li data-i18n-html="tt.debug"></li>
-          <li data-i18n-html="tt.pt3"></li>
-          <li data-i18n-html="tt.dumsse"></li>
+          <li data-i18n-html="tt.port"><code>port</code> — listen port (default 8787).</li>
+          <li data-i18n-html="tt.host"><code>host</code> — bind address (default 127.0.0.1; "::" is dual-stack, 0.0.0.0 exposes outward).</li>
+          <li data-i18n-html="tt.sessionheader"><code>sessionHeader</code> — HTTP header carrying the session id (default x-acp-session).</li>
+          <li data-i18n-html="tt.log"><code>log</code> — file logging master switch (on by default).</li>
+          <li data-i18n-html="tt.logfile"><code>logFile</code> — explicit path for bili.log (env ACP_LOG_FILE wins).</li>
+          <li data-i18n-html="tt.debug"><code>debug</code> — verbose per-request logging.</li>
+          <li data-i18n-html="tt.dumsse"><code>dumpSse</code> — raw SSE stream dump level for debugging.</li>
+          <li data-i18n-html="tt.pt3"><code>passthrough</code> — global raw-relay switch (off by default; ACP_PASSTHROUGH / --passthrough win over the file).</li>
           <li class="tg" data-i18n-html="tg.up"><strong>Upstream &amp; billing</strong></li>
-          <li data-i18n-html="tt.upstream"></li>
-          <li data-i18n-html="tt.proxy"></li>
-          <li data-i18n-html="tt.mcl2"></li>
-          <li data-i18n-html="tt.ib2"></li>
-          <li data-i18n-html="tt.itc2"></li>
+          <li data-i18n-html="tt.upstream"><code>upstream</code> — fallback upstream base URL (ACP_UPSTREAM overrides).</li>
+          <li data-i18n-html="tt.proxy"><code>proxy</code> — global outbound proxy. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY env → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 is rejected.</li>
+          <li data-i18n-html="tt.mcl2"><code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit.</li>
+          <li data-i18n-html="tt.ib2"><code>imageBilling</code> — global image-token estimation: "auto" (default → pixels), "pixels" or "bytes" (explicit opt-in for byte relays).</li>
+          <li data-i18n-html="tt.itc2"><code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live).</li>
           <li class="tg" data-i18n-html="tg.beh"><strong>Behavior toggles</strong></li>
-          <li data-i18n-html="tt.mask"></li>
-          <li data-i18n-html="tt.subagent"></li>
-          <li data-i18n-html="tt.chain"></li>
-          <li data-i18n-html="tt.stamp"></li>
-          <li data-i18n-html="tt.anchor"></li>
-          <li data-i18n-html="tt.resinherit"></li>
-          <li data-i18n-html="tt.fork"></li>
-          <li data-i18n-html="tt.compat"></li>
+          <li data-i18n-html="tt.mask"><code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked).</li>
+          <li data-i18n-html="tt.subagent"><code>subagentSplit</code> — Claude subagents get their own session namespace (on by default).</li>
+          <li data-i18n-html="tt.fork"><code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default).</li>
+          <li data-i18n-html="tt.resinherit"><code>resumeInheritance</code> — inherited refs/blocks on resume (cc --resume) (on by default).</li>
+          <li data-i18n-html="tt.chain"><code>chainContentDetection</code> — recognize bili-owned traffic by body content (off; false-positive risk).</li>
+          <li data-i18n-html="tt.stamp"><code>chainEgressStamp</code> — model-visible stamp on egress messages (off; burns tokens).</li>
+          <li data-i18n-html="tt.anchor"><code>stableSystemAnchor</code> — best-effort wire-layer prefix-cache anchor (off; plain-proxy lanes).</li>
+          <li data-i18n-html="tt.compat"><code>compat</code> — wire-compatibility block: role remaps, stream error shape, strict-schema field drops, cache-control handling.</li>
           <li class="tg" data-i18n-html="tg.mitm"><strong>MITM lane</strong></li>
-          <li data-i18n-html="tt.mitm"></li>
-          <li data-i18n-html="tt.mitm2"></li>
-          <li data-i18n-html="tt.ppath"></li>
+          <li data-i18n-html="tt.ppath"><code>providersPath</code> — external routes file path (env ACP_PROVIDERS beats both it and inline providers).</li>
+          <li data-i18n-html="tt.mitm"><code>mitm.enabled</code> / <code>mitm.domains</code> — HTTPS interception switch and whitelist domains for login clients.</li>
+          <li data-i18n-html="tt.mitm2"><code>mitm.handshakeTimeoutMs</code> — TLS handshake timeout (default 10000).</li>
           <li class="tg" data-i18n-html="tg.proc"><strong>Process blocks</strong></li>
-          <li data-i18n-html="tt.network"></li>
-          <li data-i18n-html="tt.persist"></li>
-          <li data-i18n-html="tt.sessions"></li>
-          <li data-i18n-html="tt.snap"></li>
-          <li data-i18n-html="tt.update"></li>
+          <li data-i18n-html="tt.network"><code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>.</li>
+          <li data-i18n-html="tt.persist"><code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>.</li>
+          <li data-i18n-html="tt.sessions"><code>sessions</code> — <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> — GC is opt-in; user data is never pruned silently.</li>
+          <li data-i18n-html="tt.snap"><code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 16 MiB; 0 disables snapshots).</li>
+          <li data-i18n-html="tt.update"><code>update</code> — self-update channel: <span class='mech'>registry "npmjs" · checkIntervalMs 180000</span>.</li>
           <li class="tg" data-i18n-html="tg.diag"><strong>Diagnostics &amp; updates</strong></li>
-          <li data-i18n-html="tt.diag"></li>
-          <li data-i18n-html="tt.fake"></li>
-          <li data-i18n-html="tt.advisory"></li>
-          <li data-i18n-html="tt.rnotes"></li>
-          <li data-i18n-html="tt.utag"></li>
-          <li data-i18n-html="tt.aupd"></li>
-          <li data-i18n-html="tt.arst"></li>
+          <li data-i18n-html="tt.diag"><code>diagnostics</code> — local troubleshooting knobs: <span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol "tools"</span>.</li>
+          <li data-i18n-html="tt.fake"><code>fakeCompletion</code> — retry loop for truncated final chunks: <span class='mech'>retries 0 (opt-in) · bufCapBytes 16 MiB</span>.</li>
+          <li data-i18n-html="tt.aupd"><code>autoUpdate</code> — automatic version checks (on by default; disable via ACP_AUTO_UPDATE=0 or --no-auto-update).</li>
+          <li data-i18n-html="tt.arst"><code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (opt-in).</li>
+          <li data-i18n-html="tt.utag"><code>updateTag</code> — npm dist-tag channel: latest (default), dev, or pr.</li>
+          <li data-i18n-html="tt.advisory"><code>advisoryCheck</code> / <code>advisoryUrl</code> — critical-defect advisory watcher (on by default; force-installs the recommended fix when your version is affected).</li>
+          <li data-i18n-html="tt.rnotes"><code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> — release-notes feed for the panel (on by default; fetch + cache only, never installs).</li>
           <li class="tg" data-i18n-html="tg.adv"><strong>Advanced scalars</strong></li>
-          <li data-i18n-html="tt.ccx"></li>
-          <li data-i18n-html="ttl.ttl"></li>
-          <li data-i18n-html="ttl.tmp"></li>
-          <li data-i18n-html="tt.nat"></li>
+          <li data-i18n-html="tt.ccx"><code>codexCompact</code> — intercept | pass (default intercept): handle Codex /responses/compact inside bili or forward upstream.</li>
+          <li data-i18n-html="ttl.ttl"><code>ccrRetrievalTtlMs</code> — lifetime of CCR retrieval pointers (default 600000; 0 disables retrieval).</li>
+          <li data-i18n-html="ttl.tmp"><code>decompressTmpCap</code> — size cap for temporary decompressed blocks (default 50).</li>
+          <li data-i18n-html="tt.nat"><code>native.attachExternal</code> — let launcher-less native plugins attach to an external daemon (off by default).</li>
+<!-- /bili:gen -->
         </ul>
         <p data-i18n="d.cf.env">Environment variables win over the config file — precedence: env &gt; file &gt; built-in default, and a set variable owns the knob even if its value looks invalid. Common ones:</p>
         <div class="codebox">
