@@ -5,7 +5,7 @@ import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
-import { resolveOutputHeadroomCap } from "./util.js";
+import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import { parseCompatDropFields } from "./compat-drop.js";
@@ -47,6 +47,20 @@ export type ProviderRoute = {
      *  (for upstreams that cannot coexist with a declared tools field).
      *  Default / "tools" = native function tools. */
     compressProtocol?: "tools" | "marker";
+    /** #1909: declared wire protocol for this key's requests — forces the
+     *  pipeline to treat matching POSTs as this protocol regardless of the
+     *  built-in path-suffix table (relays that hang model endpoints off
+     *  custom paths; MITM'd clients that cannot carry a /bili/ explicit
+     *  marker). Resolved independently of every other field: ALL matching
+     *  keys are scanned longest-prefix-first and the deepest key that
+     *  EXPLICITLY declares `protocol` wins, so a host-level declaration keeps
+     *  applying under a silent path-scoped key without duplication. The OTHER
+     *  fields keep findRoute's single-entry longest-key semantics — a
+     *  protocol-only path key still becomes the winning entry under its
+     *  subtree for them. The /bili/<protocol>/ URL marker still outranks it; the
+     *  body must still parse as the declared protocol or it relays verbatim
+     *  (#1284). Invalid values reject the config load loudly. */
+    protocol?: WireProtocol;
     /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
     compress?: CompressSettings;
     /** Per-provider wire-compat overrides. `roles` maps message roles to the
@@ -73,12 +87,24 @@ export type ProviderRoute = {
      *  as every other provider field, so it is generic across lanes (an MITM
      *  lane could honor it by skipping interception for the domain). */
     direct?: boolean;
-    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4)
-     *  (conservative, matches byte-counting relays); "pixels" = dimension-
-     *  based tile estimate (matches first-party pixel-tile upstreams);
-     *  "auto" (default) classifies known first-party pixel hosts. Wins over
-     *  the global `imageBilling`; env BILI_IMAGE_BILLING wins over both. */
+    /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4), an
+     *  EXPLICIT opt-in for byte-counting relays only; "pixels" = dimension-
+     *  based tile estimate; "auto" (default) resolves to pixels for every host
+     *  (#1843: base64/4 as an implicit default was a ±1500% estimate that
+     *  poisoned every window gate). Wins over the global `imageBilling`; env
+     *  BILI_IMAGE_BILLING wins over both. */
     imageBilling?: ImageBillingMode;
+    /** #1843 L3: per-image token ceiling for this route — clamps each image's
+     *  estimated cost (both billing modes). Wins over the global
+     *  `imageTokenCap`; env BILI_IMAGE_TOKEN_CAP wins over both. Positive
+     *  integer; undefined/unset = no cap. */
+    imageTokenCap?: number;
+    /** #1884 level-2 scheme-keyed re-sign overrides for this provider:
+     *  key = lowercase signature scheme (e.g. "sdk-hmac-sha256"), per-field
+     *  deepest wins over the global `resign` block (env still wins over
+     *  both). The model-level knob lives one level deeper —
+     *  `models.<name>.benefit` on this same provider key (#1884 level 3). */
+    resign?: ResignSchemeMap;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -90,6 +116,13 @@ export type ModelEntry = {
     /** Per-model compression overrides (level 3 of 3, wins over provider
      *  and global). See CompressSettings. */
     compress?: CompressSettings;
+    /** #1884 level-3: this model bills against the CodeArts free quota —
+     *  re-signed requests for it carry the signed `maas_type: benefit`
+     *  header. `true` / `false` are explicit (false opts a default-set model
+     *  out); unset falls through to the built-in fallback set
+     *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
+     *  this like every other knob. */
+    benefit?: boolean;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -407,6 +440,21 @@ export type CompressSettings = {
      *  every report face. Merged sub-field-wise across the three levels like
      *  `absorb`. */
     priceProfile?: { w?: number; r?: number; q?: number };
+    /** [#1921] Fold-state reconciliation — how the proxy reacts when the
+     *  resent history no longer contains a folded message's content-hash id
+     *  (client restart/resume re-serialized the history, formatting churn on
+     *  tool results, duplicate-cluster shift after a deletion; see
+     *  src/fold-reconcile.ts). `"repair"` (default) matches each missing
+     *  covered id against an inbound candidate via its protocol-stable
+     *  toolCallId or its normalized identity (NFC + whitespace-collapsed text
+     *  equality at the same duplicate ordinal inside the aligned churn
+     *  region) and rewrites the fold blocks' covered ids, so the fold
+     *  survives byte churn. `"warn"` computes and logs the matches but never
+     *  rewrites. `"off"` disables the layer entirely (pre-#1921 behavior).
+     *  Env `BILI_FOLD_RECONCILE` (off|warn|repair) overrides every level.
+     *  Real edits never match (normalized text differs) and honestly
+     *  re-enter the wire unfolded, exactly as before. */
+    reconcile?: "off" | "warn" | "repair";
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -442,13 +490,18 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 ];
 
 // Relay/vLLM deployments serve models under "prefix/name" ids that miss
-// every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the bare
-// basename too; the full name keeps precedence (#736).
+// every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i, #736). The
+// bare basename is the PRIMARY family signal: a family rule describes the
+// MODEL, and testing the full id first lets the provider segment hijack the
+// match ("Kimi/glm-5" → ^kimi 200K instead of ^glm-5 1M; "deepseek/
+// deepseek-r1" skips the specific ^deepseek-(r1|v3|ocr) rule because of the
+// "/" and falls to broad ^deepseek 1M — #2074). The full id remains the
+// FALLBACK for tails carrying no family signal whose provider segment does
+// ("qwen/qwq-32b").
 function modelRoots(model: string): string[] {
-    const roots = [model];
     const slash = model.lastIndexOf("/");
-    if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
-    return roots;
+    if (slash > 0 && slash < model.length - 1) return [model.slice(slash + 1), model];
+    return [model];
 }
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
@@ -562,6 +615,31 @@ export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: str
     return findRoute(routes, upstreamUrl)?.compressProtocol;
 }
 
+/** #1909: the user-declared wire protocol for this destination — scans ALL
+ *  matching keys longest-prefix-first and returns the deepest key that
+ *  explicitly declares `protocol`. Unlike findRoute (single longest entry,
+ *  every field from it), this one field resolves through the prefix hierarchy:
+ *  a host-level declaration inherits down onto path-scoped keys that stay
+ *  silent, and a path-scoped declaration needs no duplication of the host
+ *  entry to take effect. The other fields keep findRoute's single-entry
+ *  semantics — a protocol-only path key still wins for them under its subtree.
+ *  undefined = no
+ *  declaration anywhere → callers fall back to the built-in path-suffix
+ *  inference. The query string is ignored (same as the built-in table). */
+export function resolveDeclaredProtocol(routes: ProviderRoutes, url: string | undefined): WireProtocol | undefined {
+    if (!url) return undefined;
+    const path = url.split("?", 2)[0];
+    let best: WireProtocol | undefined;
+    let bestLen = -1;
+    for (const key of Object.keys(routes)) {
+        if (routes[key].protocol === undefined) continue;
+        if (path === key || path.startsWith(key + "/")) {
+            if (key.length > bestLen) { bestLen = key.length; best = routes[key].protocol; }
+        }
+    }
+    return best;
+}
+
 export type ProxyOptions = {
     port: number;
     host: string;
@@ -597,16 +675,21 @@ export type ProxyOptions = {
      *  plain-object key paths of client-fixed fields to strip before forward
      *  for strict-schema gateways that 400 on unknown fields; per-provider
      *  lists union onto it additively. Empty = byte-for-byte transparent. */
-    compat: { roles: Record<string, string>; dropFields?: string[] };
+    compat?: { roles: Record<string, string>; dropFields?: string[] };
     /** #1455: how upstream stream failures are presented to the client on the
      *  anthropic/openai wire — "protocol" (default) = protocol-native error
      *  frames; "completion" = legacy synthesized-completion shape for hosts
      *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
      *  wins over the file's compat.streamErrorShape. */
-    streamErrorShape: "protocol" | "completion";
+    streamErrorShape?: "protocol" | "completion";
     /** Global-level image billing mode (#767); per-provider route entries
-     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
+     *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto
+     *  (= pixels for every host since #1843). */
     imageBilling?: ImageBillingMode;
+    /** #1843 L3: global per-image token ceiling; per-provider route entries
+     *  override it, env BILI_IMAGE_TOKEN_CAP overrides both. Positive integer;
+     *  undefined/unset = no cap. */
+    imageTokenCap?: number;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -615,19 +698,25 @@ export type ProxyOptions = {
     /** Where `passthrough` came from: "env" (ACP_PASSTHROUGH or --passthrough
      *  flag), "file" (config `passthrough: true`), or null (default off).
      *  Drives the #405 boot warning and the web panel's source display. */
-    passthroughSource: "env" | "file" | null;
+    passthroughSource?: "env" | "file" | null;
     autoUpdate: boolean;
     /** Opt-in self-restart when a newer version is already installed on disk
      *  (#811): re-exec at zero in-flight requests. Default OFF. */
-    autoRestartOnUpdate: boolean;
+    autoRestartOnUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
-    updateTag: string;
+    updateTag?: string;
     /** Critical-defect advisory watcher (#1481): runs INDEPENDENTLY of
      *  autoUpdate and force-installs the owner-recommended version when the
      *  local version falls inside an affected range. Default ON. */
-    advisoryCheck: boolean;
+    advisoryCheck?: boolean;
+    /** Tiered release-notes visibility (#1870): fetch + cache only — never
+     *  installs, never restarts. Default ON. */
+    releaseNotesCheck?: boolean;
     /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
     advisoryUrl?: string;
+    /** Override for the release-notes document URL (env
+     *  BILI_RELEASE_NOTES_URL wins) (#1870). */
+    releaseNotesUrl?: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -699,7 +788,7 @@ export type ProxyOptions = {
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
  *  WITHOUT `bind` they are inert (longest-prefix matching never hits a name),
  *  so loadRoutes warns loudly instead of letting them sit dead (#1469). */
-const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "compat", "imageBilling"] as const;
+const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
 // the same named-provider warning (same pattern as the absorb warnings below).
@@ -1053,6 +1142,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {}, dropFields: parseCompatDropFields(fileConfig.compat?.dropFields) ?? [] },
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
+        imageTokenCap: parseImageTokenCap(fileConfig.imageTokenCap),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -1067,7 +1157,11 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // Default ON: unlike autoRestartOnUpdate, this never touches process
         // liveness — it only installs files and warns (#1481).
         advisoryCheck: (env.BILI_ADVISORY_CHECK ?? (fileConfig.advisoryCheck === false ? "0" : "1")) !== "0",
+        // Default ON: same reasoning as advisoryCheck — pure visibility (fetch
+        // + cache; never installs, never restarts) (#1870).
+        releaseNotesCheck: (env.BILI_RELEASE_NOTES_CHECK ?? (fileConfig.releaseNotesCheck === false ? "0" : "1")) !== "0",
         advisoryUrl: env.BILI_ADVISORY_URL || fileConfig.advisoryUrl || undefined,
+        releaseNotesUrl: env.BILI_RELEASE_NOTES_URL || fileConfig.releaseNotesUrl || undefined,
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -1149,8 +1243,14 @@ type FileConfig = {
     /** Set `false` to disable the critical-defect advisory watcher (#1481);
      *  env BILI_ADVISORY_CHECK wins when set. */
     advisoryCheck?: boolean;
+    /** Set `false` to disable the tiered release-notes visibility watcher
+     *  (#1870); env BILI_RELEASE_NOTES_CHECK wins when set. */
+    releaseNotesCheck?: boolean;
     /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
     advisoryUrl?: string;
+    /** Override for the release-notes document URL (env
+     *  BILI_RELEASE_NOTES_URL wins) (#1870). */
+    releaseNotesUrl?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -1160,7 +1260,23 @@ type FileConfig = {
      *  `compress`. */
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
-    mitm?: { enabled?: boolean; domains?: string[] };
+    /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
+    mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
+    /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
+     *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
+     *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
+     *  behavior; env BILI_RESIGN=0 wins). `passthrough: true` opts into
+     *  verbatim forwarding for requests signed with THAT scheme that cannot
+     *  be re-signed (no credential) instead of the default local 403
+     *  refusal (env BILI_RESIGN_PASSTHROUGH=1 wins) — scoping passthrough
+     *  by scheme pins exactly which signature may tunnel. The model-level
+     *  free-quota knob is NOT here — it lives at level 3:
+     *  `providers.<url>.models.<name>.benefit: true|false` (env
+     *  BILI_RESIGN_BENEFIT wins over the whole tree).
+     *  `credentialRef` pins the dsh credentials-service ref used for
+     *  re-signing instead of account-pool discovery (env BILI_CODEARTS_REF
+     *  wins). */
+    resign?: ResignSchemeMap;
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;
@@ -1200,12 +1316,19 @@ type FileConfig = {
      *  `streamErrorShape` (#1455): "protocol" (default) presents upstream
      *  stream failures as protocol-native error frames; "completion" restores
      *  the legacy shape that delivered the failure text inside a synthesized
-     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file. */
-    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[] };
+     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file.
+     *  `noCacheControl` (#2030): set `true` to stop stamping Anthropic
+     *  cache_control marks entirely (env BILI_NO_CACHE_CONTROL wins).
+     *  `keepResponseId` (#2030): set `true` to preserve previous_response_id
+     *  on rebuilt Responses requests (env ACP_KEEP_RESPONSE_ID=1 wins). */
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
     imageBilling?: string;
+    /** #1843 L3: global per-image token ceiling (positive integer); per-route
+     *  `imageTokenCap` overrides it, env BILI_IMAGE_TOKEN_CAP wins over both. */
+    imageTokenCap?: number;
     /** Claude-native port override (#964/#1660): an explicit port for the
      *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
@@ -1218,6 +1341,82 @@ type FileConfig = {
      *  their own armed session proxy instead (#1322). Env
      *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
     native?: { attachExternal?: boolean };
+    /** Network & timing knobs (#2030) — every field was an env-only variable
+     *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
+     *  Resolved by src/knobs.ts. */
+    network?: {
+        /** Upstream fetch timeout (was BILI_UPSTREAM_TIMEOUT_MS; default 720000). */
+        upstreamTimeoutMs?: number;
+        /** Request watchdog budget (was BILI_REQUEST_WATCHDOG_MS; default 2× upstream timeout). */
+        requestWatchdogMs?: number;
+        /** Server keep-alive timeout (was BILI_KEEP_ALIVE_TIMEOUT_MS; default 5000). */
+        keepAliveTimeoutMs?: number;
+        /** Client-error backstop (was BILI_CLIENT_ERROR_BACKSTOP_MS; default 30000). */
+        clientErrorBackstopMs?: number;
+        /** Exposure log interval, 0 disables (was BILI_EXPOSURE_LOG_INTERVAL_MS; default 3600000). */
+        exposureLogIntervalMs?: number;
+        /** Preflight stream keep-alive hold, 0 disables (was BILI_STREAM_KEEPALIVE_MS; default 15000). */
+        streamKeepAliveMs?: number;
+        /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
+        preflightHoldMs?: number;
+        /** Preflight dead-end cooldown (was BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS; default 300000). */
+        preflightDeadEndCooldownMs?: number;
+        /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
+        replayRetryMax?: number;
+        /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
+        replayRetryBaseMs?: number;
+        /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
+        maxShrinkPerCompress?: number;
+        /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
+        proxyKeepAliveMaxMs?: number;
+        /** Post-response close linger budget (#1982; was env-only BILI_POST_RESPONSE_LINGER_MS; default 5000). */
+        postResponseLingerMs?: number;
+    };
+    /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
+    persist?: {
+        enabled?: boolean;
+        zstd?: boolean;
+        debounceMs?: number;
+        tailTokens?: number;
+        epermAlertThreshold?: number;
+        epermAlertRepeatMs?: number;
+    };
+    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*. */
+    sessions?: {
+        max?: number;
+        gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
+    };
+    /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
+     *  wire-history snapshot retained per plugin session for the public
+     *  fork API — beyond the cap the session stops being forkable (409)
+     *  instead of retaining an unbounded raw copy. Default 16 MiB; `0`
+     *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
+    plugin?: { snapshotCapBytes?: number };
+    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
+    update?: { registry?: string; checkIntervalMs?: number };
+    /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
+     *  ACP_RAW_DUMP_DIR / BILI_DUMP_4XX* / ACP_RENDER_NONE / ACP_NO_INJECT_TOOL /
+     *  ACP_NO_COMPRESS_PROMPT / ACP_COUNT_TOKENS_PASSTHROUGH / ACP_COMPRESS_PROTOCOL. */
+    diagnostics?: {
+        dumpBody?: boolean;
+        dumpReq?: boolean;
+        rawDumpDir?: string;
+        dump4xx?: boolean;
+        dump4xxMaxBytes?: number;
+        renderNone?: boolean;
+        noInjectTool?: boolean;
+        noCompressPrompt?: boolean;
+        countTokensPassthrough?: boolean;
+        compressProtocol?: string;
+    };
+    /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
+    fakeCompletion?: { retries?: number; bufCapBytes?: number };
+    /** Codex compaction kill-switch (#2030) — was BILI_CODEX_COMPACT ("intercept" | "pass"). */
+    codexCompact?: string;
+    /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
+    ccrRetrievalTtlMs?: number;
+    /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
+    decompressTmpCap?: number;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1254,11 +1453,15 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "port", "host", "upstream", "providersPath", "providers", "proxy",
     "modelContextLimit", "sessionHeader", "log", "debug", "dumpSse",
     "passthrough", "autoUpdate", "autoRestartOnUpdate", "updateTag",
-    "advisoryCheck", "advisoryUrl", "upstreamProxy", "upstreamProxyMode",
+    "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
+    "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
-    "compat", "imageBilling", "claude", "native",
+    "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
+    // #2030 subsystem blocks:
+    "network", "persist", "sessions", "plugin", "update", "diagnostics",
+    "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1273,6 +1476,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
+    "reconcile",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -1293,13 +1497,103 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] ignoring unknown top-level config key(s): ${unknown.join(", ")}${hint}`);
 }
 
-function loadConfigFile(): FileConfig {
-    const parsed = safeReadJson(configFile());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
-        return parsed as FileConfig;
+// #2078: parse-once cache for loadConfigFile(). Every knob resolves its file
+// tier through this reader per call (~5-10 calls per request once #2030
+// landed), and each call used to do a full readFileSync + JSON.parse. The raw
+// file TEXT is the invalidation key, deliberately NOT (mtime, size): back-to-
+// back rewrites can land on the same sub-ms mtime on common filesystems
+// (measured), so a stat-keyed cache serves stale values right after a web-UI
+// Apply or a test-seam write. Re-reading the text per call is a page-cache hit
+// (~µs); JSON.parse is the expensive half and now runs only when content
+// actually changed. Hot-reload stays exact: any external rewrite is visible on
+// the next call; a missing file is never cached (reappearing files show up
+// immediately). Callers treat the returned object as READ-ONLY (shared across
+// calls until the content changes) — audited: all current consumers only read
+// fields.
+let configFileCache: { raw: string; value: FileConfig } | null = null;
+
+export function loadConfigFile(): FileConfig {
+    const path = configFile();
+    let raw: string | undefined;
+    let value: FileConfig | undefined;
+    try {
+        raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
+        const cached = configFileCache;
+        if (cached && cached.raw === raw) return cached.value;
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
+            value = parsed as FileConfig;
+        } else {
+            value = {};
+        }
+    } catch (e) {
+        // Same surface as safeReadJson: silent on ENOENT, loud otherwise.
+        // Corrupt-but-present content IS cached (as {}) so one bad save does
+        // not re-log and re-fail-parse on every knob call until it is fixed.
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+            loggerLog("error", `[acp-config] failed to parse ${path}: ${String(e)}`);
+        }
+        if (raw !== undefined) value = {};
     }
-    return {};
+    if (raw === undefined || value === undefined) return {};
+    configFileCache = { raw, value };
+    return value;
+}
+
+/** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
+export interface ResignFileSettings {
+    enabled?: boolean;
+    passthrough?: boolean;
+    credentialRef?: string;
+}
+
+/** The scheme bili can re-sign out of the box: Huawei CodeArts APIG's
+ *  SDK-HMAC-SHA256. The `resign` block is keyed by signature scheme name
+ *  (lowercase, as it appears on the wire's Authorization header) so the
+ *  field stays generic — adding a second re-signable scheme later adds a
+ *  key, not a redesign (#1884). */
+export const RESIGN_BUILTIN_SCHEME = "sdk-hmac-sha256";
+
+/** Scheme-keyed re-sign policy: key = lowercase Authorization scheme
+ *  (e.g. "sdk-hmac-sha256"). The built-in key resolves out of the box
+ *  (defaults below); other body-covering schemes can be scoped their own
+ *  `passthrough` opt-in without opening the built-in one. */
+export type ResignSchemeMap = Record<string, ResignFileSettings>;
+
+/** Resolved #1884 re-sign settings: env vars win over the config file, the
+ *  file wins over the defaults (same precedence family as
+ *  resolveClaudeNativePort / chainContentDetection). `credentialRef` stays
+ *  undefined when neither env nor file sets it — the signer then falls back
+ *  to account-pool discovery. The free-quota model knob is resolved
+ *  separately at level 3 (ModelEntry.benefit). */
+export interface ResignSettings {
+    enabled: boolean;
+    passthrough: boolean;
+    credentialRef?: string;
+}
+
+/** Per-field precedence: env var > provider-level block (`providers.<url>.resign`,
+ *  level 2) > global file block > default. Provider resolution happens AFTER
+ *  routing — the provider and its model filter are known before the re-sign
+ *  action runs (the repo's route-first ordering; #1884). Host-side callers
+ *  (native intercept, dsh lane) pass no provider — they run before any route
+ *  exists and take the root cascade. `scheme` scopes the lookup to one
+ *  signature: the built-in key resolves with defaults when the file says
+ *  nothing about it (out-of-box), and a scheme the file only mentions under
+ *  a different key never leaks into another key's policy. */
+export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, provider: ResignSchemeMap = {}, scheme: string = RESIGN_BUILTIN_SCHEME): ResignSettings {
+    const key = scheme.trim().toLowerCase();
+    const file = loadConfigFile().resign?.[key] ?? {};
+    const providerBlock = provider?.[key] ?? {};
+    const enabled = env.BILI_RESIGN !== undefined ? env.BILI_RESIGN !== "0" : providerBlock.enabled !== undefined ? providerBlock.enabled : file.enabled !== false;
+    const passthrough = env.BILI_RESIGN_PASSTHROUGH !== undefined
+        ? env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true"
+        : providerBlock.passthrough !== undefined
+            ? providerBlock.passthrough
+            : file.passthrough === true;
+    const credentialRef = env.BILI_CODEARTS_REF?.trim() || providerBlock.credentialRef || file.credentialRef || undefined;
+    return { enabled, passthrough, credentialRef };
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane
@@ -1407,10 +1701,12 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
+        const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
+        if (declaredProtocol !== undefined) route.protocol = declaredProtocol;
         if (obj.compress) route.compress = obj.compress;
         const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
@@ -1422,6 +1718,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (typeof obj.direct === "boolean") route.direct = obj.direct;
         const imageBilling = parseImageBilling(obj.imageBilling);
         if (imageBilling) route.imageBilling = imageBilling;
+        const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
+        if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
@@ -1431,6 +1729,22 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
 
 export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
+}
+
+/** Strict #1909 validation: an invalid providers.protocol value THROWS
+ *  (config-load failure / web 400) instead of being silently dropped — a
+ *  dropped declaration would leave the user staring at "unrecognized path"
+ *  passthrough logs with no signal about why their config had no effect. */
+function parseDeclaredWireProtocol(v: unknown): WireProtocol | undefined {
+    if (v === undefined) return undefined;
+    if (v === "anthropic" || v === "openai" || v === "responses" || v === "google") return v;
+    throw new Error(`[acp-config] providers.protocol must be one of: anthropic, openai, responses, google (got ${JSON.stringify(v)})`);
+}
+
+/** #1843 L3: per-image token ceiling — positive integer only (lenient like
+ *  parseImageBilling: anything else is dropped, never a throw). */
+export function parseImageTokenCap(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {

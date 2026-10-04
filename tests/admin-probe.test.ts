@@ -115,7 +115,14 @@ async function makeBili(): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");

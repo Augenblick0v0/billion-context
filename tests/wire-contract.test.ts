@@ -52,9 +52,14 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, VALIDATORS, startFakeUpstream, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
+
+test("WC-013: WebSocket transport envelopes omit HTTP-only fields", () => {
+    assert.deepEqual(validateResponsesWsCreate({ type: "response.create", input: [] }), []);
+    for (const key of ["stream", "background", "stream_options"]) assert.match(validateResponsesWsCreate({ type: "response.create", [key]: true })[0], /WC-013/);
+});
 
 test("WC-012 validates compaction IDs without changing function-call ID rules", () => {
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "compaction", id: "cmp_real", encrypted_content: "opaque" }] }), []);
@@ -62,16 +67,16 @@ test("WC-012 validates compaction IDs without changing function-call ID rules", 
     assert.match(VALIDATORS.responses({ input: [{ type: "compaction", id: "fc_bili_local" }] })[0], /WC-012/);
 });
 
-test("WC-014: strict anthropic upstream rejects input+max_tokens overflow, accepts a fitting budget", async () => {
+test("WC-015: strict anthropic upstream rejects input+max_tokens overflow, accepts a fitting budget", async () => {
     const fake = await startFakeUpstream("anthropic", { window: 200_000 });
     try {
         const base = { model: "claude-test", stream: false, messages: [{ role: "user", content: "x".repeat(640_000) }] };
         const over = await fetch(`${fake.url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...base, max_tokens: 60_000 }) });
         assert.equal(over.status, 400);
-        assert.match(await over.text(), /WC-014/);
+        assert.match(await over.text(), /WC-015/);
         const fits = await fetch(`${fake.url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...base, max_tokens: 20_000 }) });
         assert.equal(fits.status, 200);
-        assert.equal(fake.violations.filter((v) => v.startsWith("WC-014")).length, 1);
+        assert.equal(fake.violations.filter((v) => v.startsWith("WC-015")).length, 1);
     } finally {
         await fake.close();
     }
@@ -118,7 +123,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
                 messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
             },
-            // WC-014: 640k chars ≈ 160k tokens; + 60k max_tokens overflows the 200k probe window.
+            // WC-015: 640k chars ≈ 160k tokens; + 60k max_tokens overflows the 200k probe window.
             { model: "m", max_tokens: 60_000, messages: [{ role: "user", content: "x".repeat(640_000) }] },
         ],
         "openai-chat": [
@@ -127,6 +132,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
         ],
         responses: [
+            { type: "response.create", input: [], stream: true },
             { input: [{ type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary" }] },
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },
@@ -134,6 +140,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [], input: [{ type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" }] },
             { input: [{ type: "configuration_update", reasoning: { effort: "medium" } }, { type: "configuration_update", reasoning: { effort: "high" } }] },
             { model: "m", input: [], reasoning: { effort: "high", summary: "auto" } },
+            { input: [{ role: "user", content: "u" }, { role: "system", content: "s" }] },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
@@ -141,7 +148,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
         ],
     };
     // Size-budget rules need model metadata: declare the anthropic window so
-    // WC-014's clause is live in these probes (other wires ignore the field).
+    // WC-015's clause is live in these probes (other wires ignore the field).
     const probeCtx: Partial<Record<Wire, { window?: number }>> = { anthropic: { window: 200_000 } };
     for (const rule of WIRE_RULES) {
         const enforced = probes[rule.wire].some((body) =>
@@ -412,6 +419,9 @@ async function startRig(fakeUrl: string, model: string, compressOverrides: Recor
         passthroughSource: null,
         autoRestartOnUpdate: false,
         updateTag: "latest",
+        streamErrorShape: "protocol",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

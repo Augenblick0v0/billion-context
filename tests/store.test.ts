@@ -73,7 +73,7 @@ test("parseCompressSettings: ccr key validates shape and types", () => {
     assert.deepEqual(okFull.ccr, { enabled: true, minToolTokens: 500, excludeTools: ["webfetch"], toolName: "fetch_original", maxHeadChars: 64 });
 
     // toolName is trimmed; empty after trim is invalid
-    assert.equal(parseCompressSettings({ ccr: { toolName: "  lookup  " } }).ccr?.toolName, "lookup");
+    assert.equal(parseCompressSettings({ ccr: { toolName: "  lookup  " } })?.ccr?.toolName, "lookup");
     assert.equal(parseCompressSettings({ ccr: { toolName: "   " } }), undefined);
     // wrong types reject the whole settings block (fail loudly, #155)
     assert.equal(parseCompressSettings({ ccr: { enabled: "yes" } }), undefined);

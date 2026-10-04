@@ -32,7 +32,7 @@ export function proxyBaseFromUrl(baseUrl: string | undefined): string | undefine
         const segments = url.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] !== "bili") return undefined;
         const rest = url.pathname.slice(url.pathname.indexOf("bili") + "bili".length);
-        if (!/^\/https?:\/\//.test(rest)) return undefined;
+        if (!/^\/(?:responses\/)?https?:\/\//.test(rest)) return undefined;
         return `${url.protocol}//${url.host}`;
     } catch {
         return undefined;
@@ -243,11 +243,18 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<string> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+    // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
+    // by the host's own session manager — declare it so a stale sibling witness
+    // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
+    // Truthiness guard (not .length): a host passing a non-string id degrades to
+    // the legacy id-less wire instead of throwing (same shape as src/mcp.ts).
+    if (nativeCaller && conversationId) body.nativeCaller = true;
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args: args ?? {} }),
+        body: JSON.stringify(body),
     }, TOOL_TIMEOUT_MS, signal);
     const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
     if (!ok || !data?.ok) {
@@ -284,6 +291,23 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     if (!ok || !json || typeof json !== "object") return undefined;
     const version = (json as { version?: unknown }).version;
     return typeof version === "string" && version.length > 0 ? version : undefined;
+}
+
+/** #1603: one-line staleness warning for status UIs — the on-disk install is
+ *  newer than the running process, so a host restart is needed to activate the
+ *  new code. Soft-fail by design (same contract as fetchStatus): undefined when
+ *  not stale OR the proxy can't be reached — a failed probe must never break /acp. */
+export async function fetchStaleNotice(proxyBase: string): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/status`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const s = json as { stale?: unknown; version?: unknown; diskVersion?: unknown; autoRestartOnUpdate?: unknown };
+    if (s.stale !== true) return undefined;
+    const running = typeof s.version === "string" ? s.version : "?";
+    const installed = typeof s.diskVersion === "string" ? s.diskVersion : "?";
+    const tail = s.autoRestartOnUpdate === true
+        ? " — auto-restart is enabled but did not fire this cycle; check the bili log"
+        : " — restart the host to activate (or enable --auto-restart-on-update)";
+    return `⚠️ billion-context is stale: running v${running} but v${installed} is installed${tail}.`;
 }
 
 /** #1365: poll the attach liveness probe until it answers or the deadline

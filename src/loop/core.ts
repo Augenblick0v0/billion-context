@@ -4,8 +4,11 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import { estimateCoreMessages } from "../preflight.js";
+import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
-import { handleAcpCache, noteForwardedBody, settleUsageReport } from "../cache-ledger.js";
+import { handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
@@ -25,6 +28,7 @@ import { classifyUpstreamFailure, type UpstreamFailureKind } from "../upstream-f
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
@@ -76,6 +80,17 @@ function isLoopThinking(m: CoreMessage): boolean {
 
 function stripLoopThinking(messages: CoreMessage[]): CoreMessage[] {
     return messages.filter((m) => !isLoopThinking(m));
+}
+
+// #1960: Anthropic's "cannot be modified" 400 means the latest assistant
+// message we sent differs from its own original response in a thinking-family
+// block. The degraded strip-retry cannot undo that — the message is still
+// rewritten (e.g. a redacted_thinking block lost in rebuild), so the retry
+// guarantees a second 400 plus a swapped error. Propagate the original error
+// immediately; the NEXT client request carries the client's own faithful
+// history, which is what recovers the session.
+function isThinkingModifiedError(e: unknown): boolean {
+    return e instanceof UpstreamHttpError && /cannot be modified/i.test(e.body);
 }
 
 // #1453 client-facing labels for transport failures that end the turn in-band.
@@ -159,6 +174,11 @@ export interface LoopCtx {
      *  silently left zero bytes on disk to diagnose. Name is decided here;
      *  the callback must be best-effort (never throw into the stream path). */
     dumpSse?: (name: string, stream: ReadableStream<Uint8Array>) => void;
+    /** #1843 L1: route identity for image-cost learning, resolved by the host
+     *  at loop setup (the loop has no access to the provider route table):
+     *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
+     *  present, each sent round captures its image facts alongside the body. */
+    imageLearn?: { host: string; fp: string };
 }
 
 export interface RequestOptions {
@@ -169,11 +189,30 @@ export interface RequestOptions {
      *  degraded retry, rebuilt rounds — so re-sent bodies carry the same
      *  compat the initial forward() applied. Returns the body to serialize. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #1884: re-sign every re-sent body before it hits the wire (armed
+     *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
+     *  the body, so a signature computed for an earlier round is stale. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
+
+// #1960: one round's assistant message parts, in STREAM order. The rebuilt
+// latest assistant message must match the upstream response byte-for-byte
+// (Anthropic verifies thinking-family blocks verbatim), so reasoning
+// segments, text runs and redacted_thinking blocks are recorded as they
+// arrive instead of being re-laid out as [reasoning…, text, tool…].
+type RoundPart =
+    | { kind: "reasoning"; text: string; signature: string }
+    | { kind: "text"; text: string }
+    | { kind: "redacted"; data: string };
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
+    // #1960: Anthropic redacted_thinking arrives whole in content_block_start
+    // (opaque base64 `data`). The loop must rebuild it byte-exact in position
+    // on re-request — Anthropic rejects modified thinking-family blocks — so
+    // it is its own event instead of riding the (empty) reasoning seal.
+    | { kind: "redacted_thinking"; data: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     // #1766: keys on the upstream terminal frame that bili does not model
@@ -328,7 +367,23 @@ export async function* runCompressLoop(
     const fetchUpstream = (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
-        noteForwardedBody(ctx.session, JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body));
+        const wireBodyStr = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body);
+        requestOptions.resign?.(requestOptions.headers, wireBodyStr);
+        noteForwardedBody(ctx.session, wireBodyStr);
+        // #1843 L1: capture the round's image facts for the learning layer — the
+        // text side must mirror what outboundPayloadBreakdown bills (messages +
+        // wire overhead) so observed image mass = billed total - textSide.
+        if (ctx.imageLearn && ctx.protocol) {
+            const nImages = countImagesInRawBody(ctx.protocol, wireBodyStr);
+            if (nImages > 0) {
+                noteForwardedImageFacts(ctx.session, {
+                    nImages,
+                    textSide: estimateCoreMessages(coreMessages) + estimateWireOverhead(ctx.protocol, wireBodyStr),
+                    host: ctx.imageLearn.host,
+                    fp: ctx.imageLearn.fp,
+                });
+            }
+        }
         return fetchWithRetry(
             requestOptions.url,
             {
@@ -397,7 +452,7 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
             let assistantText = "";
             let assistantReasoning = "";
-            const reasoningSegments: { text: string; signature: string }[] = [];
+            const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
@@ -451,7 +506,7 @@ export async function* runCompressLoop(
             for (;;) {
                 assistantText = "";
                 assistantReasoning = "";
-                reasoningSegments.length = 0;
+                roundParts.length = 0;
                 reasoningSealed = true;
                 calls.length = 0;
                 usage = {};
@@ -469,6 +524,12 @@ export async function* runCompressLoop(
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
+                        let tp = roundParts[roundParts.length - 1];
+                        if (!tp || tp.kind !== "text") {
+                            tp = { kind: "text", text: "" };
+                            roundParts.push(tp);
+                        }
+                        tp.text += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
                             yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
@@ -476,10 +537,10 @@ export async function* runCompressLoop(
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
-                        let seg = reasoningSegments[reasoningSegments.length - 1];
-                        if (reasoningSealed || !seg) {
-                            seg = { text: "", signature: "" };
-                            reasoningSegments.push(seg);
+                        let seg = roundParts[roundParts.length - 1];
+                        if (reasoningSealed || !seg || seg.kind !== "reasoning") {
+                            seg = { kind: "reasoning", text: "", signature: "" };
+                            roundParts.push(seg);
                             reasoningSealed = false;
                         }
                         seg.text += ev.delta;
@@ -492,6 +553,8 @@ export async function* runCompressLoop(
                                 yield fwd(adapter.emitReasoning(ev.delta));
                             }
                         }
+                    } else if (ev.kind === "redacted_thinking") {
+                        roundParts.push({ kind: "redacted", data: ev.data });
                     } else if (ev.kind === "tool_call") {
                         calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
                     } else if (ev.kind === "usage") {
@@ -802,32 +865,48 @@ export async function* runCompressLoop(
                 // must be passed back"). Relies on the invariant that the single
                 // production call site (server.ts) always populates ctx.protocol.
                 const requiresThinkingSignature = ctx.protocol === "anthropic" || ctx.protocol === "google";
-                if (reasoningSegments.length > 0) {
-                    for (let i = 0; i < reasoningSegments.length; i++) {
-                        const seg = reasoningSegments[i];
-                        if (seg.text.length === 0 || (requiresThinkingSignature && seg.signature.length === 0)) continue;
+                let reasoningIdx = 0;
+                let textIdx = 0;
+                let redactedIdx = 0;
+                for (const part of roundParts) {
+                    if (part.kind === "reasoning") {
+                        if (part.text.length === 0 || (requiresThinkingSignature && part.signature.length === 0)) continue;
+                        reasoningIdx += 1;
                         const reasoningMsg: BiliMessage = {
-                            id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
+                            id: reasoningIdx === 1 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${reasoningIdx}`,
                             role: "assistant",
                             contentType: "reasoning",
-                            text: seg.text,
-                            reasoningContent: seg.text,
-                            ...(seg.signature.length > 0
+                            text: part.text,
+                            reasoningContent: part.text,
+                            ...(part.signature.length > 0
                                 ? ctx.protocol === "google"
-                                    ? { googleThoughtSignature: seg.signature }
-                                    : { thinkingSignature: seg.signature }
+                                    ? { googleThoughtSignature: part.signature }
+                                    : { thinkingSignature: part.signature }
                                 : {}),
                         };
                         coreMessages.push(reasoningMsg);
+                    } else if (part.kind === "text") {
+                        if (part.text.length === 0) continue;
+                        textIdx += 1;
+                        coreMessages.push({
+                            id: textIdx === 1 ? `acp_loop_r${round}_asst` : `acp_loop_r${round}_asst_${textIdx}`,
+                            role: "assistant",
+                            contentType: "text",
+                            text: part.text,
+                        });
+                    } else {
+                        // #1960: byte-exact, position-exact replay of the opaque
+                        // block; coreToAnthropic re-emits rawAnthropicBlock verbatim.
+                        redactedIdx += 1;
+                        const redactedMsg: BiliMessage = {
+                            id: redactedIdx === 1 ? `acp_loop_r${round}_redacted` : `acp_loop_r${round}_redacted_${redactedIdx}`,
+                            role: "assistant",
+                            contentType: "text",
+                            text: "[redacted_thinking]",
+                            rawAnthropicBlock: { type: "redacted_thinking", data: part.data },
+                        };
+                        coreMessages.push(redactedMsg);
                     }
-                }
-                if (assistantText.length > 0) {
-                    coreMessages.push({
-                        id: `acp_loop_r${round}_asst`,
-                        role: "assistant",
-                        contentType: "text",
-                        text: assistantText,
-                    });
                 }
                 for (const pr of proxyResults) {
                     if (functionCallIds.has(pr.callId)) {
@@ -974,7 +1053,7 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
 
             let newBody = withStrictEchoRepair(adapter.buildRequest(coreMessages, systemPrompt, requestBody));
-            if (process.env.ACP_DUMP_BODY === "1") {
+            if (knobBodyDumpEnabled()) {
                 try {
                     const fs = await import("node:fs");
                     const path = await import("node:path");
@@ -1001,6 +1080,7 @@ export async function* runCompressLoop(
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
+                        isThinkingModifiedError(e) ||
                         (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
                         !coreMessages.some(isLoopThinking)
                     ) {

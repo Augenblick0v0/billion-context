@@ -14,7 +14,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { _rememberedForTest, _resetPluginStateForTest, rememberPluginMessages } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -85,7 +86,7 @@ async function startRig(): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -104,11 +105,18 @@ async function startRig(): Promise<Rig> {
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxyPort: proxy.address().port as number, upstreamPort, proxy, upstream };
+    return { proxyPort: (proxy.address() as { port: number }).port, upstreamPort, proxy, upstream };
 }
 
 async function closeRig(rig: Rig): Promise<void> {

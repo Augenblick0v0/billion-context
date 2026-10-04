@@ -77,7 +77,11 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
         if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
-        if (code === "EPROTO" || code.startsWith("ERR_TLS") || code.startsWith("ERR_SSL") || code.startsWith("CERT_")) return "tls";
+        // #1987: OpenSSL/undici certificate-TRUST codes (corporate interception /
+        // MITM) are TLS failures too — before this they classified as "unknown",
+        // losing the CA-remediation hint in logs and status output.
+        if (code === "EPROTO" || code.startsWith("ERR_TLS") || code.startsWith("ERR_SSL") || code.startsWith("CERT_")
+            || code.startsWith("DEPTH_ZERO_") || code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" || code === "SELF_SIGNED_CERT_IN_CHAIN" || code === "UNABLE_TO_GET_ISSUER_CERT_LOCALLY") return "tls";
     }
     return "unknown";
 }

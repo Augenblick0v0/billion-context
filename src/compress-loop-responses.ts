@@ -16,6 +16,7 @@ import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
+import { revoiceMidSystemDevelopers } from "./util.js";
 
 interface CompressLoopResponsesCtx {
     core: CompressionCore;
@@ -37,6 +38,10 @@ interface RequestOptions {
     /** Final-stage wire transform (compat.roles, #552) — same contract as the
      *  unified loop's RequestOptions.wireTransform. */
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
+    /** #1884: re-sign hook for the armed tunnel — same contract as the unified
+     *  loop's RequestOptions.resign (loop/core.ts): invoked with the outgoing
+     *  headers and the final round body right before egress. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 interface FunctionCallAccumulator {
@@ -185,11 +190,18 @@ export async function compressLoopResponsesJson(
         for (const injection of drainPendingRetrievals(ctx.session)) {
             inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
         }
-        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
+        // #1999 residual: this re-request rides mid-history developer items
+        // (the visibility marker above, retrieval injections, and any
+        // client-origin mid system/developer from the raw body) — re-voice them
+        // as user while preserving the leading system/developer prefix so
+        // strict single-system backends accept the round trip.
+        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(revoiceMidSystemDevelopers(inputItems)));
+        const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        requestOptions.resign?.(requestOptions.headers, roundBody);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
-            body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody),
+            body: roundBody,
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
             // #189: correlate the rejection with the rewrite that preceded it.

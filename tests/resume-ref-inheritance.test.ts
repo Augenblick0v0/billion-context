@@ -50,7 +50,7 @@ function sseLine(obj: unknown): string {
 function parseRefIds(body: string): string[] {
     const ids: string[] = [];
     const re = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>/g;
-    let m: RegExp.ExecArray | null = null;
+    let m: RegExpExecArray | null = null;
     while ((m = re.exec(body)) !== null) ids.push(m[1]!);
     return ids;
 }
@@ -162,6 +162,7 @@ function proxyOpts(relayUrl: string, flags: { forkAdoption: boolean; resumeInher
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
         }),
         compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
         forkAdoption: flags.forkAdoption,
         resumeInheritance: flags.resumeInheritance,
         sessionHeader: "x-acp-session",
@@ -169,6 +170,13 @@ function proxyOpts(relayUrl: string, flags: { forkAdoption: boolean; resumeInher
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         mitm: { enabled: false, domains: [] },
     };
 }

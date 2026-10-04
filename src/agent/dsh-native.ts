@@ -32,11 +32,13 @@
 // left to the kernel's natural ingest diff (#395 gap, acceptable: manual
 // /compact is rare and auto mode is off).
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -45,6 +47,13 @@ export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
 
 const RETRY_INTERVAL_MS = 10000;
+/** #2082: BILI_DSH_RETRY_INTERVAL_MS — test/ops knob to shrink the retry
+ *  wall without wall-clock waits (same pattern as BILI_MODEL_INFO_RETRY_MS). */
+function retryIntervalMs(): number {
+    const raw = process.env.BILI_DSH_RETRY_INTERVAL_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
+}
 
 type AgentLike = { session?: { id?: unknown } | undefined };
 // #1677: DSH's command executor hands the invoking agent to the handler via the
@@ -74,7 +83,7 @@ type ToolDefinition = {
 
 type CommandOutcome = { kind: "success" | "error"; text: string };
 
-type PluginContext = {
+export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined };
@@ -213,7 +222,12 @@ function refreshModelInfo(origin: string | undefined): void {
         if (modelInfo.cached.contextWindow !== undefined) return;
         if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
     }
-    const resolve = svc.llm?.resolveModelInfo;
+    // The host registers llm as a service object, so resolveModelInfo needs its
+    // receiver; called detached below, this threw
+    // "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
+    // for every provider and model, and the failure-shaped cache (#1812) then
+    // left the process without x-bili-plugin-context-window.
+    const resolve = svc.llm?.resolveModelInfo?.bind(svc.llm);
     if (resolve === undefined) {
         modelInfo.cached = { provider, model };
         return;
@@ -419,7 +433,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            return forwardTool(base, sid, tool.name, args, exec.signal);
+            return forwardTool(base, sid, tool.name, args, exec.signal, true);
         },
     };
 }
@@ -441,7 +455,11 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.toolsReady || base === undefined) return;
     register.pending = (async () => {
         const tools = await fetchManifest(base, "anthropic");
-        for (const tool of tools) ctx.tools.register(toolDefinition(tool));
+        // #2082: land on the CURRENT context, not the one that started this
+        // flight — a re-activation mid-fetch must not register into (or die
+        // on) the deactivated context captured at call time.
+        const target = activeCtx ?? ctx;
+        for (const tool of tools) target.tools.register(toolDefinition(tool));
         register.toolsReady = true;
     })()
         .catch((err: unknown) => {
@@ -458,7 +476,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
             // an armed retryAt would gate the NEXT base's first heal behind a
             // 10s wall — exactly the windows-22 CI deadlock (#1783).
-            if (register.base === base) register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            if (register.base === base) register.retryAt = Date.now() + retryIntervalMs();
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
@@ -467,7 +485,47 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     return register.pending;
 }
 
+// #2082: recovery retries are traffic-driven (headersFor on model
+// requests, statusOutcome on /acp). When the user goes idle — or the model
+// already gave up on the missing tools, exactly the #2082 report — nothing
+// re-arms them, so a proxy that recovered in the meantime sits unused until
+// the next request. A detached repeating timer keeps the loop running while
+// the tools are down and clears itself on the first healthy (or dead) tick.
+// BILI_DSH_RECOVERY_INTERVAL_MS: test hook to shrink the cadence (also an
+// ops knob); absent it tracks RETRY_INTERVAL_MS. Tests that do not opt in
+// never start a timer at all (NODE_TEST_CONTEXT guard keeps suites quiet).
+let recoveryTimer: NodeJS.Timeout | undefined;
+// #2082: the LATEST context seen by apply()/maybeRetry. Every async recovery
+// path (the timer tick below, an in-flight registration landing after a
+// re-activation) must resolve its context at landing time, not from a capture
+// taken when the retry was armed — a captured context may already be
+// deactivated by then (dsh reload / profile switch), and registering into it
+// throws "inactive context" and would re-poison register.dead, exactly what
+// this fix removes.
+let activeCtx: PluginContext | undefined;
+function recoveryIntervalMs(): number {
+    const raw = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
+}
+function armRecoveryTimer(): void {
+    if (recoveryTimer !== undefined) return;
+    if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.BILI_DSH_RECOVERY_INTERVAL_MS === undefined) return;
+    recoveryTimer = setInterval(() => {
+        if (register.dead || register.toolsReady) {
+            if (recoveryTimer !== undefined) clearInterval(recoveryTimer);
+            recoveryTimer = undefined;
+            return;
+        }
+        const ctx = activeCtx;
+        if (ctx !== undefined) maybeRetry(ctx);
+    }, recoveryIntervalMs());
+    recoveryTimer.unref?.();
+}
+
 function maybeRetry(ctx: PluginContext): void {
+    activeCtx = ctx;
+    if (!register.dead && !register.toolsReady) armRecoveryTimer();
     if (register.dead || register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
@@ -476,9 +534,18 @@ function maybeRetry(ctx: PluginContext): void {
         // without this branch the plugin never recovers and tools die for
         // good. Self-heal: re-arm the respawn every retry interval until a
         // proxy comes back (attach mode arms one since #1130).
-        const respawn = state.respawn;
-        if (respawn === undefined) return;
-        register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+        let respawn = state.respawn;
+        if (respawn === undefined) {
+            // #2082: nothing armed the respawn hook — a plan edge (attach
+            // landing after a dead spawn chain) or an apply() that ran under
+            // the NODE_TEST_CONTEXT spawn guard. A base-less register with no
+            // respawn armed stays dead forever; arm the fallback here so the
+            // retry chain below has something to drive.
+            if (_spawnForTest === undefined && process.env.NODE_TEST_CONTEXT !== undefined) return;
+            respawn = singleFlight(_spawnForTest ?? bootstrap);
+            state.respawn = respawn;
+        }
+        register.retryAt = Date.now() + retryIntervalMs();
         void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
@@ -637,7 +704,7 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
         };
     }
     try {
-        const report = await forwardTool(base, target, "acp_cache", {});
+        const report = await forwardTool(base, target, "acp_cache", {}, undefined, true);
         return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -651,6 +718,31 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+
+    // #2082: a fresh activation invalidates the "host tearing down" verdict.
+    // Without this reset, ONE registerTools rejection carrying "inactive
+    // context" (a cordis deactivate/reactivate cycle — dsh reloading the
+    // plugin after the desktop profile copy was swapped in place, a profile
+    // switch, a settings toggle) poisons register.dead for the whole process
+    // lifetime: every later maybeRetry() returns immediately and the bili
+    // tools never come back until dsh restarts.
+    // #2101: a re-activation ALSO invalidates a SUCCESSFUL registration.
+    // Registrations die with their context: the tools registered into the
+    // previous activation are disposed when that context deactivates, but
+    // register.toolsReady keeps its stale stamp — and every
+    // registerTools()/maybeRetry() early-returns on it, so the new context
+    // never gets the bili tools (the #2082 symptom reached from the success
+    // ordering: a settings toggle, a profile switch or a plugin reload
+    // AFTER a healthy boot loses the tools until dsh restarts). Clear the
+    // stale stamp so the retry loop re-registers into the live context;
+    // retryAt goes with it (#1783: a fresh activation must not stand behind
+    // a stale back-off wall).
+    if (register.toolsReady && activeCtx !== undefined && activeCtx !== ctx) {
+        register.toolsReady = false;
+        register.retryAt = 0;
+    }
+    register.dead = false;
+    activeCtx = ctx;
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
@@ -808,6 +900,98 @@ export function apply(ctx: PluginContext): void {
         persistClientEvent(line);
     };
 
+    // #1884 re-sign arm: bind the host's credential service (dynamic inject —
+    // a host without it keeps the #1886 direct fallback), then expose a
+    // resolver that walks the enabled CodeArts accounts in the host's
+    // account-pool state ($DSH_HOME/jet-hub/state.json) in pool order and
+    // returns the first resolvable credential — same first-usable semantics
+    // as the CodeArts plugin's own account selection. BILI_CODEARTS_REF
+    // pins a specific credential ref instead. The loopback markers carry
+    // ak/sk/token to the proxy, which re-signs every egress body it produces
+    // (src/apig-resign.ts). Credential refresh stays the plugin's job: when
+    // a credential expires the upstream 401 is visible and the plugin's next
+    // successful refresh re-arms through this same resolver. The pinned ref
+    // comes from resolveResignSettings(): env BILI_CODEARTS_REF wins over the
+    // config file's "resign": {"credentialRef": …}.
+    let credentialsService: { resolve?: (ref: string) => Promise<{ value?: string } | undefined> } | undefined;
+    if (typeof ctx.inject === "function") {
+        try {
+            ctx.inject(["credentials"], (sub) => {
+                const svc = (sub as { credentials?: unknown }).credentials;
+                if (svc !== undefined && typeof svc === "object") credentialsService = svc as typeof credentialsService;
+            });
+        } catch {
+            // inject is best-effort: without the service signed traffic rides
+            // the direct fallback (uncompressed, signature intact), as before.
+        }
+    } else {
+        const svc = (ctx as { credentials?: unknown }).credentials;
+        if (svc !== undefined && typeof svc === "object") credentialsService = svc as typeof credentialsService;
+    }
+    const codeartsRefCandidates = (): { ref: string; nickname?: string }[] => {
+        const pinned = resolveResignSettings().credentialRef;
+        if (pinned !== undefined && pinned.trim() !== "") return [{ ref: pinned.trim() }];
+        try {
+            const home = process.env.DSH_HOME ?? path.join(homedir(), ".dsh");
+            const raw = readFileSync(path.join(home, "jet-hub", "state.json"), "utf8");
+            const accounts = (JSON.parse(raw) as { accounts?: Array<Record<string, unknown>> }).accounts ?? [];
+            const out: { ref: string; nickname?: string }[] = [];
+            for (const account of accounts) {
+                if (account["provider"] !== "codearts") continue;
+                if (account["enabled"] === false) continue;
+                const ref = account["credentialRef"];
+                if (typeof ref !== "string" || ref === "") continue;
+                const nickname = account["nickname"];
+                out.push({ ref, nickname: typeof nickname === "string" ? nickname : undefined });
+            }
+            return out;
+        } catch {
+            return [];
+        }
+    };
+    let resignCache: { cred: { ak: string; sk: string; token?: string }; at: number } | undefined;
+    const RESIGN_CACHE_MS = 10_000;
+    state.resignCredentialFor = async () => {
+        if (credentialsService?.resolve === undefined) return undefined;
+        const now = Date.now();
+        if (resignCache !== undefined && now - resignCache.at < RESIGN_CACHE_MS) return resignCache.cred;
+        for (const { ref } of codeartsRefCandidates()) {
+            try {
+                const resolved = await credentialsService.resolve(ref);
+                const value = resolved?.value;
+                if (typeof value !== "string" || value === "") continue;
+                const parsed = JSON.parse(value) as Record<string, unknown>;
+                const ak = typeof parsed["access_key_id"] === "string" ? parsed["access_key_id"] : "";
+                const sk = typeof parsed["secret_access_key"] === "string" ? parsed["secret_access_key"] : "";
+                if (ak === "" || sk === "") continue;
+                const token = typeof parsed["security_token"] === "string" ? parsed["security_token"] : "";
+                const cred = { ak, sk, token };
+                resignCache = { cred, at: now };
+                return cred;
+            } catch {
+                // unresolvable / malformed account: pool order says try the next
+            }
+        }
+        return undefined;
+    };
+    const signedUrlSeen = new Set<string>();
+    state.onSignedModelUrl = (rawUrl) => {
+        const key = (() => {
+            try {
+                const u = new URL(rawUrl);
+                return `${u.origin}${u.pathname}`;
+            } catch {
+                return rawUrl.split("?")[0];
+            }
+        })();
+        if (signedUrlSeen.has(key)) return;
+        if (signedUrlSeen.size >= 64) return;
+        signedUrlSeen.add(key);
+        const line = `bili-native-dsh: signed model request observed (${key}) — #1884 re-sign arm engaged when a credential resolves; otherwise it goes direct (uncompressed, signature intact)`;
+        console.error(line);
+        persistClientEvent(line);
+    };
+
     state.headersFor = (_url) => {
         maybeRetry(ctx);
         if (!register.toolsReady) return undefined;
@@ -907,6 +1091,11 @@ export function apply(ctx: PluginContext): void {
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. */
 export function _resetRegisterForTest(base: string | undefined): void {
+    if (recoveryTimer !== undefined) {
+        clearInterval(recoveryTimer);
+        recoveryTimer = undefined;
+    }
+    activeCtx = undefined;
     register.base = base;
     register.toolsReady = false;
     register.dead = false;
@@ -915,6 +1104,13 @@ export function _resetRegisterForTest(base: string | undefined): void {
     modelInfo.cached = undefined;
     modelInfo.services = undefined;
     modelInfo.refreshing = false;
+}
+
+/** Test hook (#2082): drive the recovery loop directly — production callers
+ *  are traffic-side (headersFor / statusOutcome); tests trigger the same
+ *  path without fabricating model traffic. */
+export function maybeRetryForTest(ctx: PluginContext): void {
+    maybeRetry(ctx);
 }
 
 /** Test hook (#1797): resolve once every in-flight attach/recovery chain has

@@ -4,13 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { prepareCodexHome, renderCodexDotEnv } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const ORIGIN = "http://127.0.0.1:8787";
 const CA = "/home/user/.local/share/billion-context/ca/combined-ca.pem";
-
-function rmrf(dir: string): void {
-    fs.rmSync(dir, { recursive: true, force: true });
-}
 
 test("renderCodexDotEnv: socks5h proxies (upper + lower case) are replaced with the launch origin (#1802)", () => {
     const user = [
@@ -237,6 +234,30 @@ test("prepareCodexHome: unreadable real .env after a routed launch keeps the rea
 
         assert.ok(fs.statSync(path.join(dir, ".env")).isDirectory(), "real .env entry untouched");
         assert.ok(!fs.existsSync(`${path.join(dir, ".env")}.bili-conflict`), "no conflict residue left in the real home");
+    } finally {
+        rmrf(dir);
+        rmrf(`${dir}-bili`);
+    }
+});
+
+test("prepareCodexHome: a later non-MCP launch shares the real config.toml again, never bakes MCP residue (#1965)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-env-"));
+    try {
+        const cfgText = 'model = "gpt-6"\n';
+        fs.writeFileSync(path.join(dir, "config.toml"), cfgText);
+        // Launch A injects MCP → owns a generated config.toml in the overlay.
+        const ovA = prepareCodexHome({ codexHome: dir, origin: ORIGIN, caPath: CA, conversationId: "conv-A", manageRouting: false });
+        assert.ok(ovA);
+        assert.ok(!fs.lstatSync(path.join(ovA, "config.toml")).isSymbolicLink(), "launch A owns a generated config.toml");
+        assert.ok(fs.readFileSync(path.join(ovA, "config.toml"), "utf8").includes("[mcp_servers.bili]"));
+        // Launch B needs no MCP block: the owned residue must not merge into
+        // the user's real config — sharing must be restored instead.
+        const ovB = prepareCodexHome({ codexHome: dir, origin: ORIGIN, caPath: CA, manageRouting: false });
+        assert.ok(ovB);
+        const st = fs.lstatSync(path.join(ovB, "config.toml"));
+        assert.ok(st.isSymbolicLink() || st.nlink > 1, "launch B shares the real config.toml again");
+        assert.equal(fs.readFileSync(path.join(dir, "config.toml"), "utf8"), cfgText, "real config never absorbed the MCP block");
+        assert.ok(!fs.existsSync(`${path.join(dir, "config.toml")}.bili-conflict`), "no conflict residue left in the real home");
     } finally {
         rmrf(dir);
         rmrf(`${dir}-bili`);

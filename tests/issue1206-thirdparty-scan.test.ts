@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -26,7 +26,8 @@ function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        pendingRetrievals: [],
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -42,10 +43,20 @@ function writeFile(file: string, content: string): void {
     fs.writeFileSync(file, content);
 }
 
-// Hermetic env: every client home resolves under root, nothing leaks to the
-// developer's real home directories.
+// Hermetic env: pins HOME + XDG_CONFIG_HOME under root. (#2038) This alone does
+// NOT pin pi/omp — those resolvers fall back to os.homedir() (the REAL process
+// home) when PI_HOME / PI_CODING_AGENT_DIR are unset, so their tests supply the
+// var explicitly and assertTestOwned below guards every fixture write.
 function hermeticEnv(root: string): NodeJS.ProcessEnv {
     return { HOME: root, XDG_CONFIG_HOME: path.join(root, ".config") };
+}
+
+// #2038: refuse any fixture write escaping its temp root — an unresolved
+// client home would otherwise target the developer's real ~/.pi / ~/.omp config.
+function assertTestOwned(file: string, root: string): void {
+    const rel = path.relative(root, file);
+    assert.ok(!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`),
+        `refusing to write outside test-owned root ${root}: ${file}`);
 }
 
 test("conflictScanEnabled defaults on, honors 0/false", () => {
@@ -69,9 +80,11 @@ test("opencode scan: known conflict + keyword entries, self/context7 skipped", (
     clearScanCache();
     const root = tmp("bili-1206-oc-");
     const cwd = tmp("bili-1206-oc-cwd-");
+    assertTestOwned(path.join(root, ".config", "opencode", "opencode.json"), root);
     writeFile(path.join(root, ".config", "opencode", "opencode.json"), JSON.stringify({
         plugin: ["opencode-acp@stable", "@scope/context-compressor", "billion-context", "context7", "context-dashboard", { name: "memory-compactor" }],
     }));
+    assertTestOwned(path.join(cwd, ".opencode", "opencode.json"), cwd);
     writeFile(path.join(cwd, ".opencode", "opencode.json"), JSON.stringify({ plugin: ["compact-helper"] }));
     const res = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd });
     const names = res.findings.map((f) => f.entry);
@@ -97,9 +110,11 @@ test("opencode scan: no config at all yields empty result without throwing", () 
 
 test("opencode scan: project walk never climbs past the git root", () => {
     const base = tmp("bili-1206-oc-repo-");
+    assertTestOwned(path.join(base, "opencode.json"), base);
     writeFile(path.join(base, "opencode.json"), JSON.stringify({ plugin: ["acp-decoy"] }));
     const repo = path.join(base, "repo");
     fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+    assertTestOwned(path.join(repo, "opencode.json"), base);
     writeFile(path.join(repo, "opencode.json"), JSON.stringify({ plugin: ["acp-inner"] }));
     const deep = path.join(repo, "src", "nested");
     fs.mkdirSync(deep, { recursive: true });
@@ -112,6 +127,7 @@ test("opencode scan: project walk never climbs past the git root", () => {
 
 test("opencode scan: without a .git anchor the walk stops at cwd", () => {
     const tree = tmp("bili-1206-oc-nogit-");
+    assertTestOwned(path.join(tree, "opencode.json"), tree);
     writeFile(path.join(tree, "opencode.json"), JSON.stringify({ plugin: ["acp-parent"] }));
     const child = path.join(tree, "child");
     fs.mkdirSync(child, { recursive: true });
@@ -139,15 +155,28 @@ test("opencode scan: without a .git anchor the walk stops at cwd", () => {
     }
 });
 
+test("#2038: assertTestOwned allows writes under root, rejects escaping it (incl. real home)", () => {
+    const root = tmp("bili-1206-2038-guard-");
+    assert.doesNotThrow(() => assertTestOwned(path.join(root, ".pi", "agent", "settings.json"), root));
+    // The original defect: an unresolved client home resolved to the REAL process
+    // home and the fixture write clobbered the user's actual ~/.pi / ~/.omp config.
+    assert.throws(() => assertTestOwned(path.join(os.homedir(), ".pi", "agent", "settings.json"), root));
+    assert.throws(() => assertTestOwned("/etc/passwd", root));
+});
+
 test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili-self skipped", () => {
     clearScanCache();
     const root = tmp("bili-1206-pi-");
     const cwd = tmp("bili-1206-pi-cwd-");
-    const home = resolvePiHome(hermeticEnv(root));
+    // #2038: pin pi's home under root via PI_HOME (a bare hermetic env would let
+    // resolvePiHome fall back to os.homedir() and target the real ~/.pi).
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_HOME: path.join(root, ".pi", "agent") };
+    const home = resolvePiHome(env);
+    assertTestOwned(path.join(home, "settings.json"), root);
     writeFile(path.join(home, "settings.json"), JSON.stringify({
         packages: ["npm:billion-context-pi", "npm:context-compactor", "npm:context-forge", "/u/node_modules/billion-context/dist/agent/pi.js"],
     }));
-    const res = scanClientPlugins("pi", { env: hermeticEnv(root), cwd });
+    const res = scanClientPlugins("pi", { env, cwd });
     const bcp = res.findings.find((f) => f.entry === "npm:billion-context-pi");
     assert.equal(bcp?.match, "known");
     assert.equal(bcp?.knownId, "billion-context-pi");
@@ -159,7 +188,11 @@ test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili
 test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", () => {
     clearScanCache();
     const root = tmp("bili-1206-omp-");
-    const home = resolveOmpHome(hermeticEnv(root));
+    // #2038: pin omp's home under root via PI_CODING_AGENT_DIR (the only var
+    // resolveOmpHome honors besides its ~/.omp/agent default = real process home).
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_CODING_AGENT_DIR: path.join(root, ".omp", "agent") };
+    const home = resolveOmpHome(env);
+    assertTestOwned(path.join(home, "config.yml"), root);
     writeFile(path.join(home, "config.yml"), [
         "model: m",
         "extensions:",
@@ -169,7 +202,7 @@ test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", (
         "providers:",
         "  default: openai",
     ].join("\n"));
-    const res = scanClientPlugins("omp", { env: hermeticEnv(root), cwd: root });
+    const res = scanClientPlugins("omp", { env, cwd: root });
     assert.equal(res.findings.length, 1, "action-token kept, bare-'context' dropped (#1736)");
     assert.equal(res.findings[0]?.entry, "npm:context-compactor");
     assert.equal(res.findings[0]?.match, "keyword");
@@ -180,6 +213,7 @@ test("kimi scan: installed.json ids scanned, billion-context skipped", () => {
     const root = tmp("bili-1206-kimi-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), KIMI_CODE_HOME: path.join(root, "kimi") };
     const pluginsDir = path.join(resolveKimiHome(env), "plugins");
+    assertTestOwned(path.join(pluginsDir, "installed.json"), root);
     writeFile(path.join(pluginsDir, "installed.json"), JSON.stringify({
         version: 1,
         plugins: [
@@ -200,28 +234,37 @@ test("hermes scan: plugin dirs matched by dir name only, bili skipped", () => {
     const pluginsDir = path.join(resolveHermesHome(env), "plugins");
     fs.mkdirSync(path.join(pluginsDir, "billion-context"), { recursive: true });
     fs.mkdirSync(path.join(pluginsDir, "weather"), { recursive: true });
-    writeFile(path.join(pluginsDir, "context-compactor", "plugin.yaml"), "name: context-compactor\n");
+    const compactorManifest = path.join(pluginsDir, "context-compactor", "plugin.yaml");
+    const forecastManifest = path.join(pluginsDir, "forecast-tools", "plugin.yaml");
+    assertTestOwned(compactorManifest, root);
+    assertTestOwned(forecastManifest, root);
     // bare-'context' read-only tool: dropped by the tightened keyword set (#1736)
     fs.mkdirSync(path.join(pluginsDir, "context-viewer"), { recursive: true });
     // A keyword-rich manifest that must NOT match — hermes matches dir names only.
-    writeFile(path.join(pluginsDir, "forecast-tools", "plugin.yaml"), "description: summarizes context for weather forecasts\n");
+    writeFile(compactorManifest, "name: context-compactor\n");
+    writeFile(forecastManifest, "description: summarizes context for weather forecasts\n");
     const res = scanClientPlugins("hermes", { env, cwd: root });
     assert.deepEqual(res.findings.map((f) => f.entry), ["context-compactor"]);
 });
 
-test("#920: opencode-acp is design-absorbed only under bili's own opencode mode", () => {
-    const known: ThirdPartyFinding = { client: "opencode", entry: "opencode-acp", source: "global", match: "known", knownId: "opencode-acp" };
-    assert.equal(isDesignAbsorbed(known, "opencode"), true);
-    assert.equal(isDesignAbsorbed(known, undefined), false, "wire mode: still a conflict");
-    assert.equal(isDesignAbsorbed(known, "pi"), false);
+test("#920/#2045: bili's own sibling compressors are design-benign only under that client's own mode", () => {
+    const ocKnown: ThirdPartyFinding = { client: "opencode", entry: "opencode-acp", source: "global", match: "known", knownId: "opencode-acp" };
+    assert.equal(isDesignBenign(ocKnown, "opencode"), true);
+    assert.equal(isDesignBenign(ocKnown, undefined), false, "wire mode: still a conflict");
+    assert.equal(isDesignBenign(ocKnown, "pi"), false);
+    const piKnown: ThirdPartyFinding = { client: "pi", entry: "npm:billion-context-pi", source: "/h/.pi/agent/settings.json", match: "known", knownId: "billion-context-pi" };
+    assert.equal(isDesignBenign(piKnown, "pi"), true, "#2045: stands down via BILLION_CONTEXT_NATIVE/PROXY — no web popup");
+    assert.equal(isDesignBenign(piKnown, undefined), false, "wire/plain-proxy mode: still a conflict");
+    assert.equal(isDesignBenign(piKnown, "opencode"), false);
     const suspected: ThirdPartyFinding = { client: "opencode", entry: "acp-helper", source: "global", match: "keyword" };
-    assert.equal(isDesignAbsorbed(suspected, "opencode"), false, "keyword tier is never absorbed");
+    assert.equal(isDesignBenign(suspected, "opencode"), false, "keyword tier is never benign");
 });
 
 test("dsh scan: profile deps scanned; bare-'context' dashboard dropped, action-token compressors kept (#1736)", () => {
     clearScanCache();
     const root = tmp("bili-1206-dsh-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    assertTestOwned(path.join(root, "dsh", "profiles", "main", "package.json"), root);
     writeFile(path.join(root, "dsh", "profiles", "main", "package.json"), JSON.stringify({
         dependencies: {
             "billion-context": "^0.1.0",
@@ -250,6 +293,7 @@ test("claude scan: enabledPlugins keys + plugins dir scanned", () => {
     clearScanCache();
     const root = tmp("bili-1206-claude-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), CLAUDE_CONFIG_DIR: path.join(root, "claude") };
+    assertTestOwned(path.join(root, "claude", "settings.json"), root);
     writeFile(path.join(root, "claude", "settings.json"), JSON.stringify({
         enabledPlugins: { "context-compressor": true, "theme-dark": true },
     }));
@@ -271,6 +315,7 @@ test("scan results are cached within TTL and invalidated by clearScanCache", () 
     const root = tmp("bili-1206-cache-");
     const cwd = tmp("bili-1206-cache-cwd-");
     const cfgFile = path.join(root, ".config", "opencode", "opencode.json");
+    assertTestOwned(cfgFile, root);
     writeFile(cfgFile, JSON.stringify({ plugin: ["opencode-acp"] }));
     const first = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd });
     assert.equal(first.findings.length, 1);

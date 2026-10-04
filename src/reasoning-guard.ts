@@ -223,6 +223,9 @@ export interface GuardParams {
     res: SseSink;
     config: ReasoningGuardConfig;
     log: (msg: string) => void;
+    /** #1884: re-sign each rebuilt round before it hits the wire (armed
+     *  re-sign lane only; undefined on unsigned traffic). */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 interface FoldState {
@@ -530,6 +533,7 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
             st.roundNo++;
             const nextBody = nextRoundBody(st.baseBody, [...st.origInput, ...st.replayTail]);
             let roundRes: Awaited<ReturnType<typeof fetchWithTimeout>>;
+            p.resign?.(p.reqHeaders, JSON.stringify(nextBody));
             try {
                 roundRes = await fetchWithTimeout(p.upstreamUrl, {
                     method: "POST",

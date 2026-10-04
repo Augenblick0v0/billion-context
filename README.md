@@ -103,7 +103,7 @@ Pick by your client:
 
 | Client | Use |
 |---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili pi` (launcher) or `bili plugin install pi` (native); standalone [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) remains usable — details: [CLIENTS.md](CLIENTS.md#pi-pidev-coding-agent) |
 | **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x — full guide: [OpenCode](CLIENTS.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane) — details: [CLIENTS.md](CLIENTS.md) |
@@ -375,11 +375,19 @@ By default the proxy binds `127.0.0.1` and only accepts loopback connections. To
 
 All logs tee to `~/.local/state/billion-context/bili.log` by default (XDG state dir) and still print to stderr. Override with `"logFile"` in config or `ACP_LOG_FILE` (`off` disables the file). Auto-rotates at 10 MB (`bili.log.old`). Per-request cache-hit stats log as `[acp-usage] round N input=X cached=Y (cache hit Z%)` so you can measure prefix-cache health directly from the log.
 
+### Connection lifecycle tuning (#1982)
+
+Client-facing connections close gracefully after the final response: when the proxy initiates the close (`Connection: close`), it waits up to `BILI_POST_RESPONSE_LINGER_MS` (default `5000`) for the client's close signal before releasing the socket, so pooled clients see a clean EOF instead of a possible RST from racing bytes. Related knobs: `BILI_KEEP_ALIVE_TIMEOUT_MS` (idle-reap budget, default `5000`) and `BILI_CLIENT_ERROR_BACKSTOP_MS` (terminal backstop for the error-drain path, default `30000`) — full semantics in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
 ### Self-update
 
 The proxy checks npm on startup and every 3 minutes; a newer version is installed in place and a notice is logged — **restart `bili` to pick it up**, unless you enable opt-in self-restart (`--auto-restart-on-update` flag, env `ACP_AUTO_RESTART_ON_UPDATE=1`, or `"autoRestartOnUpdate": true` in config — default OFF): with zero in-flight requests it verifies the new install, stops accepting connections, drains, spawns a replacement on the same port, and exits once it accepts connections (clients reconnect automatically; session state survives on disk). Safety gates: zero in-flight through the drain window, an install sanity check before re-exec, and a 10-minute cooldown marker so a flapping version can never loop-restart; any failure resumes the original listener and falls back to the plain reminder.
 
 While the running process is behind the on-disk install ("stale"), the web UI shows a banner (running vs installed version, auto-restart state) and `GET /__bili/status` returns `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` for scripting (`advisory` is the active critical-defect entry or `null`, see below). Disable permanently via `"autoUpdate": false` in config or `ACP_AUTO_UPDATE=0`.
+
+In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs embedded in a long-lived host), "restart bili" means restarting the **host**: the embedded process cannot exit on its own, so a host left open keeps serving whatever code it started with, silently missing every fix auto-update reports as installed (#1603). Enable `--auto-restart-on-update` to have it self-restart at a safe point, or run `/acp` — the status panel now appends a one-line staleness warning (running vs installed version) whenever the on-disk install is ahead of the live process.
+
+When an install keeps failing (unwritable or host-managed dir, network error, …), auto-update no longer re-downloads and retries on every 3-minute cycle forever. After three consecutive failures it backs off exponentially (5 min → 10 → 20 …, capped at 6 h), logs a one-time actionable hint (fix permissions / npm prefix, reinstall user-level, or disable via `"autoUpdate": false` / `ACP_AUTO_UPDATE=0`), and logs nothing further about the failure while cooling down (no download, no retry line); it resumes as soon as the failure clears or a different version is targeted (#1603).
 
 ### Critical-defect advisories (forced updates)
 
@@ -390,6 +398,28 @@ Independent of auto-update (#1481): even with `autoUpdate` off, the proxy polls 
 The full configuration reference — config file location, top-level keys,
 providers, compression tuning, environment variables — lives in
 **[CONFIGURATION.md](CONFIGURATION.md)**.
+
+### Config file
+
+One JSON document at `~/.config/billion-context/billion-context.json`
+(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`).
+Precedence when several sources set the same knob: **CLI flag (where one exists) > env var > config file > built-in default** — every env var keeps working as the override tier.
+
+What's inside (details in CONFIGURATION.md):
+
+- `providers` — per-provider routing table: upstream override, model context windows, per-provider/model compress tuning, wire-protocol declaration, compaction opt-in.
+- `compress` — three-level compression tuning (global → provider → model): thresholds, nudge cadence, preservation rules, prompts, tiers.
+- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
+
+Minimal example:
+
+```json
+{
+  "network": { "upstreamTimeoutMs": 900000 },
+  "persist": { "zstd": true },
+  "sessions": { "gc": { "enabled": true, "maxAgeDays": 14 } }
+}
+```
 
 Two knobs people look for first:
 

@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import http from "node:http";
 import net from "node:net";
+import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -58,7 +59,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -82,7 +83,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const data = JSON.parse(body) as { conversationId: string; tool: string; args: unknown };
+                const data = JSON.parse(body) as { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean };
                 toolCalls.push(data);
                 res.writeHead(200, { "content-type": "application/json" });
                 if (data.tool === "compress") {
@@ -194,7 +195,7 @@ function makeFakePi(): FakePi {
         commands,
         providers,
         get registerCalls() { return registerCallCount; },
-        on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
+        on: (event, handler) => events.set(event, handler as (event: unknown, ctx: unknown) => unknown),
         registerTool: (tool) => {
             registerCallCount++;
             const i = tools.findIndex((t) => t.name === tool.name);
@@ -550,6 +551,138 @@ test("#1392: non-http(s) provider rides bili only when opted in AND carried", as
     }
 });
 
+test("#1961: virtual-model selection resolves compaction ownership from the physical route", async () => {
+    // pi 0.99+ virtual models (router/auto, api "pi-virtual") carry an empty
+    // baseUrl — the selection names a router, not a destination. With no
+    // BILLION_CONTEXT_PROXY in env (manual /bili/-wrapped models.json routing),
+    // detectProxyBase("") had nothing to read, so ownsCompaction bailed even
+    // though the physical requests reached the proxy → double compression.
+    // Ownership now resolves from where the traffic actually went: the latest
+    // non-failed assistant response's registry baseUrl, then the rewrites
+    // manifest, then the env fallback — keeping the carriage-evidence gates
+    // (#1382/#1392) intact.
+    const knownProxy = await startFakeProxy({ statusOk: true });
+    const unknownProxy = await startFakeProxy({ statusOk: false });
+    try {
+        const assistantEntry = (provider: string, model: string, stopReason = "stop") => ({
+            type: "message",
+            message: { role: "assistant", content: [], api: "anthropic-messages", provider, model, stopReason, usage: {}, timestamp: Date.now() },
+        });
+        const virtualCtx = (branch: unknown, extra: Record<string, unknown> = {}) => ({
+            sessionManager: { getSessionId: () => "sess-virtual", getBranch: () => branch },
+            model: { contextWindow: 1000000, baseUrl: "", provider: "router", id: "auto", api: "pi-virtual" },
+            cwd: "/tmp",
+            ...extra,
+        });
+        const run = async (env: Record<string, string | undefined>, ctx: unknown, eventBranchEntries?: unknown): Promise<unknown> => {
+            let result: unknown;
+            await withEnv(env, async () => {
+                const pi = makeFakePi();
+                createBiliPlugin("pi")(pi as never);
+                const handler = pi.events.get("session_before_compact")!;
+                const event: Record<string, unknown> = { reason: "threshold" };
+                if (eventBranchEntries !== undefined) event.branchEntries = eventBranchEntries;
+                result = await handler(event, ctx);
+            });
+            return result;
+        };
+        // Shaped like the REAL host surface: pi 0.99 ModelRegistry exposes
+        // find(provider, modelId), not getModel — a stub inventing a
+        // non-existent method once let this tier pass tests as dead code on
+        // the live host (#1943 lesson, restated for #1961).
+        const wrappedRegistry = (origin: string) => ({ find: (provider: string, modelId: string) => (provider === "anthropic" && modelId === "claude-x" ? { baseUrl: `${origin}/bili/https://api.anthropic.com/v1` } : undefined) });
+        const noProxyEnv = { BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined };
+
+        // (A) The reported repro: no env, the registry holds the physically
+        // routed (manually /bili/-wrapped) baseUrl of the model that answered
+        // → the exact proxy is resolved and confirms carriage → cancel.
+        assert.deepEqual(
+            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: wrappedRegistry(knownProxy.origin) }), [assistantEntry("anthropic", "claude-x")]),
+            { cancel: true },
+            "registry-wrapped physical route resolves the proxy without env",
+        );
+
+        // (B) Same route, but the proxy never saw this conversation → the
+        // carriage gate still vetoes: resolving WHICH proxy must not bypass #1382.
+        assert.equal(
+            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: wrappedRegistry(unknownProxy.origin) }), [assistantEntry("anthropic", "claude-x")]),
+            undefined,
+            "resolved but uncarried conversation → native compaction proceeds",
+        );
+
+        // (C) Host without modelRegistry on the ctx AND no branchEntries on the
+        // event: falls back to ctx.sessionManager.getBranch(), then to the
+        // launcher rewrites manifest for the answering provider.
+        assert.deepEqual(
+            await run({ BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: JSON.stringify({ anthropic: `${knownProxy.origin}/bili/https://api.anthropic.com/v1` }) }, virtualCtx([assistantEntry("anthropic", "claude-x")])),
+            { cancel: true },
+            "getBranch + manifest rewrite resolve the proxy",
+        );
+
+        // (D) No evidence anywhere: raw upstream baseUrl, no manifest, no env →
+        // the traffic genuinely bypassed the proxy → native compaction proceeds.
+        assert.equal(
+            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: { find: () => ({ baseUrl: "https://api.anthropic.com/v1" }) } }), [assistantEntry("anthropic", "claude-x")]),
+            undefined,
+            "unwrapped upstream + no env → no proxy candidate",
+        );
+
+        // (E) Failed routing attempts are skipped when finding the last response
+        // (mirrors pi's findLatestResponse).
+        assert.deepEqual(
+            await run(noProxyEnv, virtualCtx([assistantEntry("anthropic", "claude-x"), assistantEntry("openai", "gpt-x", "error")], { modelRegistry: wrappedRegistry(knownProxy.origin) }), [assistantEntry("anthropic", "claude-x"), assistantEntry("openai", "gpt-x", "error")]),
+            { cancel: true },
+            "error/aborted tail entries do not mask the carrying route",
+        );
+
+        // (F) Fresh session (nothing answered yet): degrades to the env
+        // fallback — no candidate without env; old behavior holds with env set.
+        assert.equal(await run(noProxyEnv, virtualCtx([])), undefined, "no responses and no env → native compaction proceeds");
+        assert.deepEqual(await run({ BILLION_CONTEXT_PROXY: knownProxy.origin, BILI_PROVIDER_REWRITES: undefined }, virtualCtx([])), { cancel: true }, "env fallback still arms when env is set");
+
+        // (G) Local-stamp fast path is reachable for virtual sessions too:
+        // before_provider_headers resolves the same way, stamps the sid, and
+        // ownership then needs no status round-trip.
+        const stampedProxy = await startFakeProxy({ statusOk: false });
+        try {
+            await withEnv(noProxyEnv, async () => {
+                const pi = makeFakePi();
+                createBiliPlugin("pi")(pi as never);
+                const ctx = virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: wrappedRegistry(stampedProxy.origin) });
+                await pi.events.get("session_start")!({}, ctx);
+                await waitForTools(pi, 2);
+                const headers: Record<string, string> = {};
+                await pi.events.get("before_provider_headers")!({ headers }, ctx);
+                assert.equal(headers["x-bili-plugin-conversation"], "sess-virtual", "virtual session stamps its conversation id without env");
+                const handler = pi.events.get("session_before_compact")!;
+                assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "locally stamped virtual session is carried by construction");
+            });
+        } finally {
+            await stampedProxy.close();
+        }
+
+        // (H) Non-virtual selections are untouched by the new path.
+        const emptyPhysical = {
+            sessionManager: { getSessionId: () => "sess-phys" },
+            model: { contextWindow: 1000000, baseUrl: "" },
+            cwd: "/tmp",
+        };
+        assert.equal(await run(noProxyEnv, emptyPhysical), undefined, "physical model with empty baseUrl keeps today's behavior (no env → no proxy)");
+        const biliPhysical = { ...emptyPhysical, model: { contextWindow: 1000000, baseUrl: `${knownProxy.origin}/bili/https://api.example.com/v1` } };
+        assert.deepEqual(await run(noProxyEnv, biliPhysical), { cancel: true }, "/bili/-wrapped physical baseUrl still cancels");
+
+        // (I) Kill switch wins over every virtual-model candidate.
+        assert.equal(
+            await run({ BILLION_CONTEXT_PLUGIN: "0", BILLION_CONTEXT_PROXY: undefined, BILI_PROVIDER_REWRITES: undefined }, virtualCtx([assistantEntry("anthropic", "claude-x")], { modelRegistry: wrappedRegistry(knownProxy.origin) }), [assistantEntry("anthropic", "claude-x")]),
+            undefined,
+            "BILLION_CONTEXT_PLUGIN=0 disables ownership even for virtual routes",
+        );
+    } finally {
+        await unknownProxy.close();
+        await knownProxy.close();
+    }
+});
+
 test("pi extension registers manifest tools and stamps headers when proxied", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -572,7 +705,9 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         const out = await pi.tools[0]!.execute("call-1", { content: [] }, undefined, undefined, fakeCtx(proxy));
         assert.equal(out.content[0]!.text, "[Compressed m00001-m00002 -> b1]");
         assert.equal(out.isError, undefined);
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] } }]);
+        // #2072: the pi host stamps its session-manager id as a confirmed
+        // native caller — the captured wire body carries the flag.
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
@@ -778,12 +913,12 @@ test("before_provider_headers stays silent when the manifest fetch keeps failing
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        await pi.events.get("session_start")!({}, fakeCtx(origin));
+        await pi.events.get("session_start")!({}, fakeCtx(origin as unknown as FakeProxy));
         await flush();
         await flush();
         assert.equal(pi.tools.length, 0);
         const headers: Record<string, string> = {};
-        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin as unknown as FakeProxy));
         assert.deepEqual(headers, {});
     } finally {
         server.close();
@@ -2160,7 +2295,7 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
         const out = await handler(pi, payload) as Record<string, unknown>;
         assert.equal(out.prompt_cache_key, sid, "chat payload stamped with the omp session id");
         assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
-        assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
+        assert.equal((payload as Record<string, unknown>).prompt_cache_key, undefined, "original payload not mutated");
     }
     // real-world chat-completions payload carries max_tokens (omp's openai-compat
     // providers use maxTokensField:"max_tokens") → stamped (#268)

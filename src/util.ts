@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 
 // #920: stamped per request by the opencode thin plugin for LEGACY
 // opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
@@ -47,6 +48,22 @@ export function safeJsonParse(s: string): unknown {
     }
 }
 
+/**
+ * #1954 safety signal. bili's Responses adapter replays `input` as the FULL
+ * conversation and strips `previous_response_id`, so it CANNOT materialize the
+ * history a native-chaining continuation references. When we strip a non-empty
+ * id, this returns an operator-facing warning: the request still succeeds with
+ * HTTP 200, so without it the context loss is silent. Keys off the id ALONE —
+ * not off `store` — because Responses stores responses by default, so an omitted
+ * `store` still leaves the referenced response resolvable upstream; judging on
+ * explicit `store:true` would miss the common case. Returns null when there is
+ * nothing to warn about (absent / empty / non-string id).
+ */
+export function strippedResponseIdWarning(prevId: unknown): string | null {
+    if (typeof prevId !== "string" || prevId.length === 0) return null;
+    return `responses previous_response_id=${prevId} stripped without rebuilding referenced history (#1954): bili replays input as full history, so a Responses native-chaining (delta) continuation loses prior turns upstream yet still returns 200. Send full input/output history, or set ACP_KEEP_RESPONSE_ID=1 to preserve the id.`;
+}
+
 /** True if a socket remote address is loopback. Covers the IPv4 127.0.0.0/8
  *  block and IPv6 ::1, including the IPv4-mapped ::ffff:127.x.x.x form Node
  *  reports for dual-stack sockets. Shared by the admin-endpoint gate
@@ -54,6 +71,37 @@ export function safeJsonParse(s: string): unknown {
  *  the two security checks cannot drift apart. */
 export function isLoopbackAddress(addr: string | undefined): boolean {
     return !!addr && (addr.startsWith("127.") || addr === "::1" || addr.startsWith("::ffff:127."));
+}
+
+/** #1933: reduce an upstream URL/origin to a comparable route key
+ *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
+ *  from the forward path, full URLs with paths from resolveUpstream — and the
+ *  baseline-provenance / calibration checks compare keys, so both must land on
+ *  the same form. Unparseable input falls back to its trimmed raw value. */
+export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
+    if (!u) return undefined;
+    try {
+        return new URL(u).origin;
+    } catch {
+        const t = u.trim();
+        return t || undefined;
+    }
+}
+
+/** #1933 F1: apply the session's learned estimator scale k̂ to a raw local
+ *  text estimate. The chars/4 estimator is a proxy whose ratio to real billing
+ *  varies per upstream, so it may only decide on the route where k̂ was
+ *  learned: both origins known and equal → scaled; either unknown or the
+ *  routes differ → raw estimate unchanged (legacy behavior). */
+export function applyEstimateCalibration(raw: number, k: number | undefined, kOrigin: string | undefined, origin: string | undefined): number {
+    // Invalid factors (null/0/NaN/±Infinity — e.g. a corrupted persisted
+    // session.stats field) must degrade to no-correction, never zero or
+    // poison the reading: raw×0 would blind the estimate arm entirely.
+    if (k === undefined || !Number.isFinite(k) || k <= 0 || raw <= 0) return raw;
+    const a = normalizeUpstreamOrigin(origin);
+    const b = normalizeUpstreamOrigin(kOrigin);
+    if (a === undefined || b === undefined || a !== b) return raw;
+    return raw * k;
 }
 
 export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
@@ -317,12 +365,15 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * (#377). Keeping the summary mid-stream at its anchor (instead of hoisting it
  * to the head) also keeps the head system message — the prefix-cache anchor —
  * byte-stable across compress turns, so a new block does not invalidate the
- * whole-conversation prefix. In plugin/launcher mode the summary carrier is the
- * `compress` tool call (in the agent's own re-sent history), so the kernel's
- * acp_summary is stripped by stripKernelSummaries and this is a no-op there.
- * A summary is a stand-in for the folded history; re-voicing it as a user turn
- * is the accepted trade-off for SGLang compatibility + cache stability. No-op
- * (same array) when there is no system/developer message to convert.
+ * whole-conversation prefix. In plugin/launcher mode the summary carrier is
+ * usually the `compress` tool call in the agent's own re-sent history:
+ * stripKernelSummaries removes the kernel's acp_summary anchor when that pair
+ * rides inbound history, making this a no-op; when the pair does NOT ride
+ * (pruned or line-form echo) the anchor survives, and this re-voicing is what
+ * keeps strict backends legal then (#1999). A summary is a stand-in for the
+ * folded history; re-voicing it as a user turn is the accepted trade-off for
+ * SGLang compatibility + cache stability.
+ * No-op (same array) when there is no system/developer message to convert.
  */
 export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
     let hasSys = false;
@@ -335,6 +386,38 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
             ? ({ ...m, role: "user" } as T)
             : m
     );
+}
+
+/** #1999 residual (non-streaming Responses JSON loop): that loop rebuilds its
+ * re-request input from the RAW client body (plus its own pushed visibility
+ * markers / retrieval injections as `developer` items), so the two projection
+ * chokepoints that run `systemToUser` before the codec never see those items —
+ * a mid-history system/developer item still reaches strict single-system
+ * backends (Qwen3-family "system-first" templates behind developer→system
+ * mapping engines) and 400s the re-request. Unlike `systemToUser` above, this
+ * variant preserves the LEADING system/developer PREFIX verbatim: on this path
+ * the head carrier comes from the client's own raw input (its developer head /
+ * system message), and flattening it to user would change the request's voice;
+ * only items AFTER the first non-system/developer item are re-voiced (with
+ * output_text parts normalized to input_text, the user-side convention). No-op
+ * (same array) when nothing after the prefix needs converting. */
+export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
+    const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
+    let head = 0;
+    while (head < items.length && isSysDev(items[head]!)) head++;
+    let touched = false;
+    const out = items.map((it, i) => {
+        if (i < head || !isSysDev(it)) return it;
+        touched = true;
+        const content = Array.isArray(it.content)
+            ? it.content.map((part) =>
+                part && typeof part === "object" && (part as { type?: string }).type === "output_text"
+                    ? { ...(part as object), type: "input_text" }
+                    : part)
+            : it.content;
+        return { ...it, role: "user", content } as T;
+    });
+    return touched ? out : items;
 }
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
@@ -354,6 +437,34 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
         if (c === null || c === undefined) return { ...m, content: "" } as T;
         return m;
     });
+}
+
+// #1876: rebuild the outbound Anthropic `system` by APPENDING bili's added
+// text (the compress prompt) instead of merging it into one block. The kernel's
+// buildSystem(flattenedText, original) collapses a client's N-block system into
+// a single joined block and relocates the first client cache_control onto it —
+// which breaks downstream gateways that identify Claude Code traffic by system
+// BLOCK SHAPE (sub2api's systemHasBillingAttributionBlock requires some block's
+// text to startsWith the billing-attribution prefix — true pre-merge only when
+// the billing block happened to lead) and shifts byte-prefix/sticky-hash
+// anchors (#1754/#1631). Original blocks therefore ride out byte-exact, in
+// order, with their cache_control in place; the added text becomes ONE fresh
+// trailing text block with no mark (the "---" separator is redundant once the
+// prompt stands alone as its own block). String/absent/empty originals have no
+// block shape to preserve: the legacy flat join (base + "\n\n---\n\n" + added)
+// stays byte-identical. REPLACEMENT semantics (#1085 anchor rollback, where the
+// frozen text is NOT an extension of the current client text) stay on kernel
+// buildSystem — this helper is for appends only.
+export function appendSystemText(
+    added: string,
+    original: AnthropicRequestBody["system"],
+): string | AnthropicRequestBody["system"] {
+    if (Array.isArray(original) && original.length > 0) {
+        return added ? [...original, { type: "text", text: added }] : [...original];
+    }
+    const base = typeof original === "string" ? original : "";
+    if (!added) return base;
+    return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
 /**

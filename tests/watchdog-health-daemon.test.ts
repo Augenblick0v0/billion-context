@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import type { ProxyOptions } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #1322 counterpart of watchdog-health.test.ts: a proxy started WITHOUT
@@ -58,7 +59,7 @@ test("health exposes an unarmed watchdog on a daemon proxy; registration stays r
     ]);
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const opts = {
+    const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1:1",
@@ -74,7 +75,14 @@ test("health exposes an unarmed watchdog on a daemon proxy; registration stays r
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

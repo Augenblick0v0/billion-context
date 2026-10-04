@@ -11,7 +11,7 @@
 // learned) is documented alongside; AGENTS.md "Wire-constraint ledger" is the
 // institutional rule: the ledger only grows — every new upstream rejection or
 // documented constraint becomes an entry here + a validator clause inside the
-// fixing PR. Size-budget rules that need the model's window (WC-014) activate
+// fixing PR. Size-budget rules that need the model's window (WC-015) activate
 // only when the harness declares it via startFakeUpstream({ window }).
 
 import http from "node:http";
@@ -28,6 +28,12 @@ export interface WireRule {
 }
 
 export const WIRE_RULES: readonly WireRule[] = [
+    {
+        id: "WC-013",
+        wire: "responses",
+        summary: "Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields",
+        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim.",
+    },
     {
         id: "WC-012",
         wire: "responses",
@@ -125,6 +131,14 @@ export const WIRE_RULES: readonly WireRule[] = [
     },
     {
         id: "WC-014",
+        wire: "responses",
+        summary:
+            "strict Jinja-template backends (Qwen family served by vLLM/SGLang) reject any role:\"system\" message that is not the first chat-producing item — or any second system — raising \"System message must be at the beginning.\" from chat_template.jinja; bili never emits such items itself (front block/anchors ride as developer, nudges/separators as user, top-level instructions stripped), so offenders are client-origin mid-history system items forwarded verbatim by the plugin-mode position-preserving pass-through (#1638); repair = learn-on-failure placement entry (src/compat-roles.ts hasOffHeadSystem → single system→user rewrite hop, remembered per session)",
+        provenance:
+            "bili #1996 production 400 (vLLM /v1/responses serving a Qwen model: artifact:chat_template.jinja Jinja Exception \"System message must be at the beginning.\", code invalid_prompt, every post-compression request of two OMP plugin-mode sessions, 2026-10-03); vLLM Responses→chat passes role-bearing items verbatim (vllm/entrypoints/openai/responses/utils.py _construct_message_from_response_item)",
+    },
+    {
+        id: "WC-015",
         wire: "anthropic",
         summary:
             "input tokens + max_tokens must fit the model's context window — Anthropic counts output against the window and 400s 'Prompt is too long' on overflow; bili caps outgoing max_tokens to window − input − margin (#453 clamp, wired into prepareAnthropic by #1908)",
@@ -144,11 +158,11 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 /** Per-harness context for size-budget rules that need model metadata. */
 export interface WireValidateCtx {
-    /** Model's context window in tokens; enables WC-014. */
+    /** Model's context window in tokens; enables WC-015. */
     window?: number;
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-014 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007, WC-010, WC-015 on an Anthropic /v1/messages body. Returns violation strings. */
 export function validateAnthropicBody(body: unknown, ctx?: WireValidateCtx): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -168,7 +182,7 @@ export function validateAnthropicBody(body: unknown, ctx?: WireValidateCtx): str
         }
     if (breakpoints > 4)
         out.push(`WC-010 ${breakpoints} cache_control breakpoints (system + tools + messages combined) — Anthropic allows at most 4`);
-    // WC-014 (#1908): runs before the tools early-return — the overflow check
+    // WC-015 (#1908): runs before the tools early-return — the overflow check
     // applies to bodies without tools too. Counting mirrors bili's own estimate
     // (chars/4); the #453 clamp leaves >= min-margin slack, so a correctly
     // clamped request cannot trip this.
@@ -188,7 +202,7 @@ export function validateAnthropicBody(body: unknown, ctx?: WireValidateCtx): str
             }
         const est = defaultCountTokens(sysText) + defaultCountTokens(msgText) + defaultCountTokens(JSON.stringify(body.tools ?? []));
         if (est + body.max_tokens > ctx.window)
-            out.push(`WC-014 input~${est} + max_tokens ${body.max_tokens} exceeds window ${ctx.window} — Anthropic 400s 'Prompt is too long' (#1908)`);
+            out.push(`WC-015 input~${est} + max_tokens ${body.max_tokens} exceeds window ${ctx.window} — Anthropic 400s 'Prompt is too long' (#1908)`);
     }
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
@@ -258,6 +272,7 @@ function validateGeminiSchema(schema: unknown, path: string, out: string[]): voi
 export function validateResponsesBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (body.type === "response.create") out.push(...validateResponsesWsCreate(body));
     // WC-011 (#1733): runs before the tools early-return — the adjacency ban
     // applies to any array input, tools or not.
     if (Array.isArray(body.input)) {
@@ -277,6 +292,35 @@ export function validateResponsesBody(body: unknown): string[] {
     // exists on bodies without tools.
     if (isPlainObject(body.reasoning) && "summary" in body.reasoning)
         out.push('WC-013 reasoning.summary is not part of the OpenAI Responses API — strict-schema upstreams 400 (json: unknown field "summary"); drop it via compat.dropFields (#1757)');
+    // WC-014 (#1996): runs before the tools early-return — strict Jinja
+    // templates raise on any system message that is not the first
+    // chat-producing item, or on a duplicate system. Mirrors
+    // src/compat-roles.ts hasOffHeadSystem eligibility exactly; a non-empty
+    // top-level instructions becomes a leading system upstream.
+    if (Array.isArray(body.input)) {
+        const wc14RoleProducing = new Set([
+            "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning",
+        ]);
+        const hasInstructions = typeof body.instructions === "string" && body.instructions.length > 0;
+        let systems = 0;
+        let firstSlotIdx = -1;
+        let firstSystemIdx = -1;
+        body.input.forEach((item, i) => {
+            if (!isPlainObject(item)) return;
+            const t = item.type;
+            const isMessage = t === undefined || t === "message";
+            if (!isMessage && !wc14RoleProducing.has(t as string)) return;
+            if (firstSlotIdx < 0) firstSlotIdx = i;
+            if (isMessage && item.role === "system") {
+                systems++;
+                if (firstSystemIdx < 0) firstSystemIdx = i;
+            }
+        });
+        if (systems > 1)
+            out.push(`WC-014 ${systems} system messages — strict Jinja templates: system messages must be at the beginning, exactly one (#1996)`);
+        else if (systems === 1 && (hasInstructions || firstSystemIdx !== firstSlotIdx))
+            out.push(`WC-014 input[${firstSystemIdx}]: system message must be at the beginning (strict Jinja templates reject off-head system roles, #1996)`);
+    }
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
@@ -326,6 +370,11 @@ export function validateResponsesBody(body: unknown): string[] {
         closeRun(body.input.length - 1);
     }
     return out;
+}
+
+export function validateResponsesWsCreate(body: unknown): string[] {
+    if (!isPlainObject(body) || body.type !== "response.create") return ["WC-013: expected response.create WebSocket event"];
+    return ["stream", "stream_options", "background"].filter(key => key in body).map(key => `WC-013: HTTP-only ${key} must not reach WebSocket response.create`);
 }
 
 /** WC-006 on a Gemini generateContent/streamGenerateContent body. */

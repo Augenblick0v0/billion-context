@@ -37,6 +37,10 @@ export interface ContinuationRetryOpts {
     log: (level: string, msg: string) => void;
     /** Log prefix, normally the session id. */
     label: string;
+    /** #1884: re-sign the retry body before it hits the wire (armed re-sign
+     *  lane only; undefined on unsigned traffic). The retry body carries an
+     *  injected continuation nudge, so the previous signature is stale. */
+    resign?: (headers: Record<string, string>, body: string | Buffer) => void;
 }
 
 /** Build the re-request used when a turn ends with no visible output. Returns a
@@ -69,6 +73,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             return null;
         }
         try {
+            opts.resign?.(opts.reqHeaders, retryBody);
             const r = await fetchWithTimeout(
                 opts.upstreamUrl,
                 {

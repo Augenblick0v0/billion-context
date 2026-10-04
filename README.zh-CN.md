@@ -105,7 +105,7 @@ QQ群:
 
 | 客户端 | 用这个 |
 |---|---|
-| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#pipidev-coding-agent) |
 | **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](CLIENTS.zh-CN.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
@@ -295,9 +295,17 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 所有日志**默认同时写入文件**:`~/.local/state/billion-context/bili.log`(XDG state 目录),同时仍打印到 stderr。覆盖用配置的 `"logFile"` 或 `ACP_LOG_FILE`(`off` 关闭文件)。超过 10 MB 自动轮转(`bili.log.old`)。每个请求的缓存命中统计以 `[acp-usage] round N input=X cached=Y (cache hit Z%)` 打印,可直接从日志衡量前缀缓存健康度。
 
+### 连接生命周期调优（#1982）
+
+客户端侧连接在最终响应结束后优雅关闭:代理主动发起关闭(`Connection: close`)时,最多等待 `BILI_POST_RESPONSE_LINGER_MS`(默认 `5000`)毫秒的对端关闭信号才释放套接字,池化客户端因此看到的是干净的 EOF,而非字节竞态可能产生的 RST。相关旋钮:`BILI_KEEP_ALIVE_TIMEOUT_MS`(空闲回收预算,默认 `5000`)与 `BILI_CLIENT_ERROR_BACKSTOP_MS`(错误排空路径终局兜底,默认 `30000`)——完整语义见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+
 ### 自动更新
 
 代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
+
+**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp` —— 当磁盘安装领先于运行进程时,状态面板现在会追加一行过期警告(运行版本 vs 已安装版本)。
+
+当安装反复失败(目录不可写或受宿主托管、网络错误等)时,自动更新不再每个 3 分钟周期都重复下载并重试。连续失败三次后,它按指数退避(5 分钟 → 10 → 20 …,上限 6 小时),打印一次性的可操作提示(修复权限 / npm prefix、以用户级重装,或用 `"autoUpdate": false` / `ACP_AUTO_UPDATE=0` 禁用),并在冷却期间不再为这次失败输出日志(不下载、不打重试行);一旦故障消除或目标版本变化即恢复(#1603)。
 
 ### 严重缺陷公告(强制更新)
 
@@ -313,6 +321,28 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
 见 **[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)**。
+
+### 配置文件
+
+一份 JSON 文档:`~/.config/billion-context/billion-context.json`
+(`$XDG_CONFIG_HOME/billion-context/`;用 `BILI_CONFIG_FILE` 可改路径)。
+同一开关有多个来源时的优先级:**CLI 参数(如有)> 环境变量 > 配置文件 > 内置默认值** —— 每个环境变量都继续作为覆盖层可用。
+
+里面有什么(细节见 CONFIGURATION.zh-CN.md):
+
+- `providers` —— 按 provider 的路由表:上游覆盖、模型上下文窗口、按 provider/模型的压缩调参、wire 协议声明、compaction opt-in。
+- `compress` —— 三级压缩调参(全局 → provider → 模型):阈值、nudge 节奏、保留规则、prompts、tiers。
+- 服务端级配置块 —— 进程级行为,含 #2030 新增:`network`(超时 / 重试 / keep-alive / preflight 节奏)、`persist`(会话持久化格式 + tail)、`sessions`(上限 + GC 策略)、`update`(registry 镜像 + 检查间隔)、`diagnostics`(dump、render-tag 模式、注入开关)、`fakeCompletion`,以及标量 `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` 和扩展项 `mitm.handshakeTimeoutMs`、`compat.noCacheControl`、`compat.keepResponseId`。
+
+最小示例:
+
+```json
+{
+  "network": { "upstreamTimeoutMs": 900000 },
+  "persist": { "zstd": true },
+  "sessions": { "gc": { "enabled": true, "maxAgeDays": 14 } }
+}
+```
 
 两个最常找的开关:
 

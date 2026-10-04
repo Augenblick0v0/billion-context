@@ -169,6 +169,7 @@ function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptio
         autoUpdate: false,
         logFile: "off",
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
         ...overrides,
     };
 }

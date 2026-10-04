@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { appendSystemText } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -252,9 +253,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // (coreToAnthropic) — a marker present on the trigger turn must be
             // present here too or the byte prefix breaks at that element.
             const messages = coreToAnthropic(coreMessages, cacheMarks);
-            const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
-            const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
-            const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
+            // #1876: same append-not-merge rebuild as the steady path's
+            // injectSystem — both must emit byte-identical system (F2 seam).
+            const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
             const withNotes = notes && notes.length > 0
                 ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
@@ -272,11 +273,18 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let usageYielded = false;
             const indexMap = new Map<number, number>();
             const thinkingIndexes = new Set<number>();
-            // #206: strip model-imitated render tags from text deltas before
-            // they reach the client (and before coreText accumulates them for
+            // #1960: a redacted_thinking block arrives whole in content_block_start
+            // (no deltas) — capture its opaque payload so the rebuilt tail replays it
+            // byte-exact in position.
+            const redactedPayloads = new Map<number, string>();
+            // #206: strip model-imitated render tags from PROSE deltas before
+            // they reach the client (and before the loop accumulates them for
             // re-request rounds). Flush at the owning block's stop so held-back
-            // fragments still emit while the block is open.
-            const tagFilter = composeStreamFilters(
+            // fragments still emit while the block is open. #1881: one instance
+            // per prose field — text and thinking deltas interleave across one
+            // stream, so a shared instance would hold a tag-shaped tail against
+            // the wrong field's bytes.
+            const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
                         loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -289,12 +297,17 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
+            const tagFilter = makeFilter();
             let lastTextIndex: number | null = null;
+            let lastThinkingIndex: number | null = null;
             let sawThinking = false;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
                 if (degenerateWarned) return;
+                // #1881: the gate reads the TEXT channel only — thinking
+                // presence reaches it via sawThinking, and counting thinking
+                // chars as visible output would silence a tag-echo-only turn.
                 const msg = degenerateTurnWarning({ reason, terminalReason: "end_turn", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking, wire: "anthropic" });
                 if (msg) {
                     degenerateWarned = true;
@@ -364,6 +377,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         if (block.type === "thinking" || block.type === "redacted_thinking") {
                             thinkingIndexes.add(upstreamIndex);
                             sawThinking = true;
+                            if (block.type === "redacted_thinking" && typeof block.data === "string") {
+                                redactedPayloads.set(upstreamIndex, block.data);
+                            }
                         }
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
@@ -386,7 +402,18 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
                         }
                     } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
+                        // #1960: thinking is a SIGNED payload — Anthropic verifies it
+                        // byte-for-byte when the latest assistant message is replayed
+                        // ("thinking blocks ... cannot be modified"), and Gemini's
+                        // thoughtSignature has the same contract. Any filtering here —
+                        // of the bytes forwarded to the client OR of the text the loop
+                        // accumulates for the re-request rebuild — desynchronizes the
+                        // text from its signature and bricks the session (the client
+                        // persists the filtered bytes and re-sends them forever). So the
+                        // #1881/#1882 prose filters NEVER touch thinking; cosmetic
+                        // tag/marker echoes inside a thinking pane are accepted.
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        lastThinkingIndex = ci;
                         yield {
                             kind: "reasoning",
                             delta: delta.thinking,
@@ -420,10 +447,19 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
+                        // #1960: a redacted block has no captured reasoning — replay its
+                        // opaque payload instead of sealing an empty segment.
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         removeOpenBlock(ci);
+                        lastThinkingIndex = null;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: false } as ParsedStreamEvent;
-                        yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
+                        const redactedData = redactedPayloads.get(upstreamIndex);
+                        if (redactedData !== undefined) {
+                            redactedPayloads.delete(upstreamIndex);
+                            yield { kind: "redacted_thinking", data: redactedData } as ParsedStreamEvent;
+                        } else {
+                            yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
+                        }
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         removeOpenBlock(ci);
@@ -492,6 +528,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         }
                         lastTextIndex = null;
                     }
+                    lastThinkingIndex = null;
                     const stopExtras = terminalExtrasOf(data, MESSAGE_STOP_KNOWN_KEYS);
                     if (!usageYielded) {
                         usageYielded = true;

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
@@ -55,6 +56,15 @@ test("isSideRequest: host-declared side-request agent outranks the token-budget 
     // An unknown persona id is inert — falls back to the token-budget heuristic.
     assert.equal(isSideRequest({}, "unknown-persona"), false, "unknown persona does not grant side status");
     assert.equal(isSideRequest({ max_tokens: 100 }, "unknown-persona"), true, "unknown persona still honors a tiny budget");
+});
+
+test("isSideRequest: explicit main intent vetoes side heuristics", () => {
+    for (const body of [{ max_tokens: 100 }, { max_completion_tokens: 100 }, { max_output_tokens: 100 }, { generationConfig: { maxOutputTokens: 100 } }]) {
+        assert.equal(isSideRequest(body, "main"), false, "main intent outranks a tiny budget even without tools");
+        assert.equal(isSideRequest(body, "title"), true, "title intent remains side");
+        assert.equal(isSideRequest(body, "other"), true, "unknown intent keeps the budget heuristic");
+        assert.equal(isSideRequest(body), true, "missing intent keeps the budget heuristic");
+    }
 });
 
 const noopLog = (): void => {};
@@ -270,35 +280,35 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
     const est = estimateRawBodyTokens(body);
     assert.ok(est > 0);
-    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, 1).blocked, false, "unknown window → forward as before");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1).blocked, false, "fits");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
-    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
-    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
+    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1).blocked, false, "fits");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.15), undefined, undefined, 1).blocked, true, "boundary: estimate == limit x 1.15 blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
+    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
     // OpenAI wire: the output budget counts against the window → headroom reserved.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
     const oaEst = estimateRawBodyTokens(oa);
     const oaLimit = Math.floor(oaEst / 1.15);
-    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, 1);
+    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
     assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
-    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, 1).blocked, false);
+    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, undefined, 1).blocked, false);
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
         { type: "text", text: "z".repeat(4000) },
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
     const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
-    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, 1).blocked, true, "image cost included at boundary");
+    assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, undefined, 1).blocked, true, "image cost included at boundary");
     // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
     // so a CJK-heavy payload estimated at ~110% of the window must forward —
     // the upstream's real overflow 400 arms the evidence that blocks re-sends.
     const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
     const cjkEst = estimateRawBodyTokens(cjkBody);
     assert.ok(cjkEst >= 4000, "CJK counted per-char");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
-    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
+    assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
 });
 
 function okSse(inputTokens: number): string {
@@ -369,7 +379,7 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port as number;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(opts?.store ?? new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -388,10 +398,17 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port as number;
+    const proxyPort = (proxy.address() as { port: number }).port;
     rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = proxyPort; rig.upstreamPort = upstreamPort;
     return rig;
 }
@@ -467,7 +484,7 @@ test("e2e: side request response still gets render-tag stripping (#460 contract)
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "Generate a short title." }] }) });
         assert.equal(r2.status, 200);
         let raw = "";
-        for await (const chunk of r2.body) raw += Buffer.from(chunk).toString("utf8");
+        for await (const chunk of r2.body!) raw += Buffer.from(chunk).toString("utf8");
         assert.equal(raw.includes(OPEN_MARK), false, "side-request stream leaked a render open tag");
         assert.equal(raw.includes(CLOSE_MARK), false, "side-request stream leaked a render close tag");
         assert.equal(JSON.stringify(getSession(SESSION).state), stateAfterMain, "tag-strip pipe must not touch kernel state (session stays off)");

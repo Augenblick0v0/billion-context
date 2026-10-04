@@ -213,19 +213,19 @@ test("setup(route): header stamping applies to the REPLACED request, tools regis
         session: {
             hook: (name, cb) => {
                 hooks.push({ name, cb });
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
         tool: {
             transform: (add) => {
                 add({ add: (t) => tools.push(t.name) });
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
     };
     const setup = createOpencodeV2Setup({ route: createNativeRoute(state, { probe: async () => true }) });
     const cleanup = await setup(ctx);
-    assert.deepEqual(hooks.map((h) => h.name), ["http.request"]);
+    assert.deepEqual(hooks.map((h) => h.name), ["http.request", "experimental.ws.handshake"]);
     assert.deepEqual(tools.sort(), [...EXPECTED_TOOLS].sort());
     const e: V2HttpRequestEvent = {
         sessionID: "ses_abc",
@@ -248,7 +248,7 @@ test("setup(route): kill switch keeps the hook fully inert", async () => {
         session: {
             hook: (_name, cb) => {
                 hooks.push(cb);
-                return { dispose() {} };
+                return Promise.resolve({ dispose() {} });
             },
         },
     };

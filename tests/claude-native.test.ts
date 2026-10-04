@@ -589,6 +589,29 @@ test("resolveClaudeCli: bare names resolve via where.exe on Windows, untouched e
         resolveClaudeCli("claude", where("C:\\tools\\nodejs\\claude.cmd\r\nC:\\other\\claude.exe\n")),
         "C:\\tools\\nodejs\\claude.cmd",
     );
+    // #1902: npm's global dir lists the extensionless POSIX shim FIRST — Node
+    // cannot spawn it (ENOENT), so the .cmd must win over list position.
+    assert.equal(
+        resolveClaudeCli(
+            "claude",
+            where("C:\\Users\\u\\AppData\\Roaming\\npm\\claude\r\nC:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd\r\nC:\\Users\\u\\AppData\\Roaming\\npm\\claude.ps1\n"),
+        ),
+        "C:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd",
+    );
+    // Within one directory PATHEXT order decides: a real .exe outranks the shim.
+    assert.equal(
+        resolveClaudeCli("claude", where("C:\\bin\\claude\r\nC:\\bin\\claude.cmd\r\nC:\\bin\\claude.exe\n")),
+        "C:\\bin\\claude.exe",
+    );
+    // PATH order still beats extension: an earlier dir's .cmd wins over a later dir's .exe.
+    assert.equal(
+        resolveClaudeCli("claude", where("C:\\first\\claude.cmd\r\nC:\\second\\claude.exe\n")),
+        "C:\\first\\claude.cmd",
+    );
+    // Nothing carries a PATHEXT extension → old first-hit behavior stands.
+    assert.equal(resolveClaudeCli("claude", where("C:\\x\\claude\r\nC:\\y\\claude.ps1\n")), "C:\\x\\claude");
+    // Injectable PATHEXT for exotic environments/tests.
+    assert.equal(resolveClaudeCli("claude", where("C:\\x\\claude\r\nC:\\x\\claude.ps1\n"), ".PS1;.CMD"), "C:\\x\\claude.ps1");
     assert.equal(resolveClaudeCli("claude", where("\r\n   \n")), "claude");
     assert.equal(resolveClaudeCli("claude", where(null)), "claude");
     assert.equal(resolveClaudeCli("claude", () => { throw new Error("where.exe ETIMEDOUT"); }), "claude");
@@ -613,6 +636,14 @@ test("installer round-trip: managed block + MCP face, then removal restores", ()
         assert.equal(after.env?.ANTHROPIC_BASE_URL, baseUrlForPort(ZONE_PORT_BASE));
         assert.equal(after.env?.DISABLE_AUTO_COMPACT, "1");
         assert.equal(claudeNativeInstalled(), true);
+        // #1902: the emitted hook must carry a bare `node` head — parseable by
+        // whichever shell Claude Code runs hooks through (cmd on 2.1.284,
+        // PowerShell on 2.1.282), never a spaced absolute node path.
+        const hookEntries = (after.hooks as { SessionStart?: Array<{ hooks: Array<{ type: string; command: string }> }> })?.SessionStart ?? [];
+        assert.equal(hookEntries.length, 1);
+        const hookCmd = hookEntries[0].hooks[0].command;
+        assert.ok(hookCmd.startsWith("node "), hookCmd);
+        assert.ok(hookCmd.endsWith("claude-native-bootstrap.js"), hookCmd);
         // #1660: install no longer persists claude.nativePort — the hook
         // resolves the same zone preference, and its repin pass follows any
         // drift. The bili config may not even exist.
@@ -778,7 +809,7 @@ test("repinClaudeManagedBaseUrl: follows a drifted origin, preserves the relay, 
             "utf8",
         );
         const notes = repinClaudeManagedBaseUrl("http://127.0.0.1:18788");
-        const after = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string>; hooks?: unknown };
+        const after = JSON.parse(fs.readFileSync(box.settings, "utf8")) as { env?: Record<string, string>; hooks?: { SessionStart?: unknown } };
         // The relay survives the repin; only the origin moves.
         assert.equal(after.env?.ANTHROPIC_BASE_URL, "http://127.0.0.1:18788/bili/https://relay.example");
         assert.ok(Array.isArray(after.hooks?.SessionStart), "the hook is upserted alongside");
@@ -907,6 +938,36 @@ async function waitForInstanceFile(file: string, ms: number): Promise<string> {
             await new Promise((r) => setTimeout(r, 50));
         }
     }
+}
+
+// #1903: TCP accept alone is NOT readiness for the hook's attach machinery —
+// the proxy publishes its identity record (proxy-origin file) inside its
+// 'listening' callback, which lags kernel accept by an event-loop-dependent
+// margin (waitForInstanceFile above documents the same window, #1031). Gate
+// the squatter on BOTH the health endpoint and the published record so the
+// hook's one-shot discovery can never race the daemon's publication (CI flake
+// on PR #1896: the hook probed between accept and publication, took the SPAWN
+// path, and its strict-port child died on EADDRINUSE).
+async function waitForProxyVisible(port: number, instanceFile: string, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        let healthy = false;
+        try {
+            const res = await fetch(`http://127.0.0.1:${port}/__bili/health`, { signal: AbortSignal.timeout(2_000) });
+            if (res.ok) {
+                const body = (await res.json()) as { ok?: boolean };
+                healthy = body.ok === true;
+            }
+        } catch {}
+        if (healthy) {
+            try {
+                JSON.parse(fs.readFileSync(instanceFile, "utf8"));
+                return true;
+            } catch {}
+        }
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
 }
 
 function runHook(distScript: string, port: number, xdg: Record<string, string>): Promise<{ code: number | null; stderr: string }> {
@@ -1309,6 +1370,7 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
     const port = await freePort();
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1322,6 +1384,10 @@ test("hook e2e: manual `bili start` on the pinned port is attached, not refused 
     let claudePid = 0;
     try {
         assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
+        assert.ok(
+            await waitForProxyVisible(port, instanceFile, 60_000),
+            "squatter fully visible to the attach machinery (health + identity record, #1903)",
+        );
         // Fake claude reproducing the live SessionStart shape: node-shebang
         // binary (npm install form: argv [node, <path>/claude]), launches the
         // hook through /bin/sh -c, captures hook stderr to a file, then

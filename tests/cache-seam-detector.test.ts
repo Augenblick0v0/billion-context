@@ -120,7 +120,10 @@ test("seam events are bounded (ring keeps the last 8)", () => {
     }
     const led = getCacheLedger(s);
     assert.equal(led.seamEvents?.length, 8, "bounded ring");
-    assert.equal(led.agg.seamSuspects, 12, "aggregate counts all");
+    // #2059: the first transition (["a"] -> ["a","v0"]) is a pure tail append and is
+    // now attributed provider-side; the remaining 11 mutate slot 1 (mid-history breaks).
+    assert.equal(led.agg.seamSuspects, 11, "aggregate counts all seam-suspects");
+    assert.equal(led.agg.providerSideMisses, 1, "the single append is provider-side");
 });
 
 test("seam detector: client rewind (fewer messages) attributes to HISTORY REWOUND, not a seam", () => {
@@ -151,6 +154,79 @@ test("seam detector: byte-stable resend attributes to PROVIDER-SIDE MISS, not a 
     assert.ok(led.agg.providerSideMissed > 0);
     assert.equal(led.agg.seamSuspects, 0, "stable wire must not cry seam");
     assert.match(handleAcpCache(s), /PROVIDER-SIDE MISS/);
+});
+
+test("seam detector: tail-append turn attributes to PROVIDER-SIDE MISS, not a seam (#2059)", () => {
+    const s = makeSession();
+    noteForwardedBody(s, body(["a", "b"]));
+    settle(s, T0, 100_000, 99_000);
+    // Next turn APPENDS one message; the previous list is a byte-identical prefix,
+    // upstream gave no cache. The whole-body LCP test can't see this (the body grew),
+    // so pre-fix it falsely cried seam.
+    noteForwardedBody(s, body(["a", "b", "c"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.providerSideMisses, 1, "tail-append miss is provider-side");
+    assert.ok(led.agg.providerSideMissed > 0);
+    assert.equal(led.agg.seamSuspects, 0, "tail-append must not cry seam");
+    assert.notEqual(led.lines[led.lines.length - 1]!.seam, 1);
+    const text = handleAcpCache(s);
+    assert.match(text, /PROVIDER-SIDE MISS/);
+    assert.ok(!/CACHE SEAM \(/.test(text), "no seam section for a pure tail-append miss");
+});
+
+test("seam detector: multi-message tail append also attributes to PROVIDER-SIDE MISS (#2059)", () => {
+    const s = makeSession();
+    noteForwardedBody(s, body(["a", "b"]));
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, body(["a", "b", "c", "d"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.providerSideMisses, 1);
+    assert.equal(led.agg.seamSuspects, 0, "appending several messages is still a pure tail growth");
+});
+
+test("seam detector: a REAL mid-history break (0 < msgIndex < prevMsgs) stays a seam-suspect (#2059)", () => {
+    const s = makeSession();
+    noteForwardedBody(s, body(["a", "b", "c"]));
+    settle(s, T0, 100_000, 99_000);
+    // Diverges at messages[1]: a genuine mid-history rewrite, NOT a tail append —
+    // the #2059 reclassification must not swallow it.
+    noteForwardedBody(s, body(["a", "B2", "c"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.seamSuspects, 1, "mid-history break stays a seam-suspect");
+    assert.equal(led.agg.providerSideMisses, 0, "must not be swallowed into provider-side");
+    assert.equal(led.lines[led.lines.length - 1]!.seam, 1);
+    assert.equal(led.seamEvents?.[0]?.msgIndex, 1);
+});
+
+test("seam detector: a head break (msgIndex == 0) stays a seam-suspect (#2059)", () => {
+    const s = makeSession();
+    noteForwardedBody(s, body(["a", "b"]));
+    settle(s, T0, 100_000, 99_000);
+    // The very first message diverges — not a tail append, must stay flagged.
+    noteForwardedBody(s, body(["A", "b"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.seamSuspects, 1, "head break stays a seam-suspect");
+    assert.equal(led.agg.providerSideMisses, 0);
+    assert.equal(led.lines[led.lines.length - 1]!.seam, 1);
+    assert.equal(led.seamEvents?.[0]?.msgIndex, 0);
+});
+
+test("seam detector: an over-cap prior body keeps an append miss a seam-suspect, never a false provider-side (#2059)", () => {
+    const s = makeSession();
+    // Over-cap prior body is stored truncated → parses to zero messages, so the
+    // message-level forensics are untrustworthy; the guard must keep it out of the
+    // provider-side reclassification.
+    noteForwardedBody(s, JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(600 * 1024) }] }));
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, body(["q", "r"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.seamSuspects, 1, "truncated-pair miss stays a seam-suspect");
+    assert.equal(led.agg.providerSideMisses, 0, "truncated bodies must not be read as provider-side");
 });
 
 test("seam detector: abort correlation marks missed samples near a client abort", () => {

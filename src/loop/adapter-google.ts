@@ -285,9 +285,16 @@ export function createGoogleAdapter(
             const pending = new Map<number, FunctionCallBuffer>();
             const rawCallChunks: { json: string; parsed: Record<string, unknown>; callIndexes: number[] }[] = [];
             // #206/#717: strip model-imitated render tags and forged ACP
-            // confirmation markers from text parts; both filters may hold back a
+            // confirmation markers from prose parts; filters may hold back a
             // short tail, flushed on finish (and at stream end).
-            const tagFilter = composeStreamFilters(
+            // #1960: there is deliberately NO filter instance for thought parts —
+            // thought text is signed (thoughtSignature is verified byte-for-byte
+            // on replay, the same fatality class as Anthropic thinking), so any
+            // filtering of the forwarded or accumulated bytes desynchronizes
+            // text from signature and bricks the session. Thought echoes are
+            // forwarded verbatim; cosmetic leaks inside a thought pane are
+            // accepted (#1960 verdict).
+            const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
                         loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -300,6 +307,7 @@ export function createGoogleAdapter(
                     loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
+            const tagFilter = makeFilter();
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
@@ -316,6 +324,9 @@ export function createGoogleAdapter(
             let sawRealToolCall = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
                 if (degenerateWarned) return;
+                // #1881: the gate reads the TEXT channel only — thought
+                // presence reaches it via sawReasoning, and counting thought
+                // chars as visible output would silence a tag-echo-only turn.
                 const msg = degenerateTurnWarning({
                     reason,
                     terminalReason: "STOP",
@@ -345,6 +356,17 @@ export function createGoogleAdapter(
                 }
                 pending.clear();
             };
+            // #1881: a call chunk's prose parts. Such a chunk was withheld from
+            // immediate forwarding on the assumption it would be replayed whole
+            // at settle; when settle decides nothing replays, the prose still
+            // has to reach the client (master lost even UNEDITED sibling text
+            // in all-proxy chunks through this same path).
+            const prosePartsOf = (obj: Record<string, unknown>): GooglePart[] => {
+                const cands = obj.candidates as Array<Record<string, unknown>> | undefined;
+                const ps = (cands?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
+                if (!Array.isArray(ps)) return [];
+                return ps.filter((p): p is GooglePart => !!p && typeof p === "object" && p.functionCall === undefined && typeof p.text === "string" && p.text.length > 0);
+            };
             // Decide proxy-vs-real from the buffered calls and emit events: real
             // calls → raw part replay (verbatim parts, original signatures/ids)
             // + passthrough-flagged structured events so the loop counts them;
@@ -360,6 +382,10 @@ export function createGoogleAdapter(
                 sawRealToolCall = realIndexes.size > 0;
                 if (!sawRealToolCall) {
                     yield* flushPendingAsStructured();
+                    for (const { parsed } of rawCallChunks) {
+                        const prose = prosePartsOf(parsed);
+                        if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
+                    }
                     return;
                 }
                 for (const [idx, tc] of pending) {
@@ -381,6 +407,11 @@ export function createGoogleAdapter(
                         yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
                         yield { kind: "meta", chunk: sseFrame(filtered) } as ParsedStreamEvent;
+                    } else {
+                        // #1881: proxy-only chunk — its frame is dropped, but
+                        // its withheld prose still has to reach the client.
+                        const prose = prosePartsOf(parsed);
+                        if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
                     }
                 }
                 for (const [idx, tc] of pending) {
@@ -444,6 +475,12 @@ export function createGoogleAdapter(
                 // even when settle drops the chunk).
                 const hasCallPart = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
                 let emitted = false;
+                // #1881: cleaned copies of the prose parts this chunk carried.
+                // When a call chunk's sibling prose was filtered, the settle-time
+                // replay must carry the CLEANED bytes (the stored entry is
+                // rebuilt from this), and the filtered part is NOT forwarded
+                // ahead of settle (no double-send, no original-bytes leak).
+                let editedParts: GooglePart[] | null = null;
                 for (let i = 0; i < parts.length; i++) {
                     const part = parts[i];
                     if (!part || typeof part !== "object") continue;
@@ -463,12 +500,18 @@ export function createGoogleAdapter(
                     if (typeof part.text !== "string" || part.text.length === 0) continue;
                     if (part.thought === true) {
                         sawReasoning = true;
+                        // #1960: thought parts replay VERBATIM — never filtered
+                        // (thoughtSignature is verified byte-for-byte; see the
+                        // makeFilter note above).
                         emitted = true;
-                        const reasoningRaw = !hasCallPart ? (finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf) : undefined;
+                        let raw: Buffer | undefined;
+                        // A chunk that also carries functionCall parts is replayed
+                        // whole at settle, so its text must not be forwarded twice.
+                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                         yield {
                             kind: "reasoning",
                             delta: part.text,
-                            ...(reasoningRaw ? { raw: reasoningRaw } : {}),
+                            ...(raw ? { raw } : {}),
                             ...(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0
                                 ? { signature: part.thoughtSignature }
                                 : {}),
@@ -484,16 +527,22 @@ export function createGoogleAdapter(
                         // whole at settle, so its text must not be forwarded twice.
                         if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                     } else {
-                        raw = sseFrame(cloneChunk(parsed, {
-                            parts: parts
-                                .map((p, j) => (j === i ? { ...p, text: clean } : p))
-                                .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
-                            dropFinishReason: true,
-                        }));
+                        editedParts = (editedParts ?? [...parts]).map((p, j) => (j === i ? { ...p, text: clean } : p));
+                        if (!hasCallPart) {
+                            raw = sseFrame(cloneChunk(parsed, {
+                                parts: parts
+                                    .map((p, j) => (j === i ? { ...p, text: clean } : p))
+                                    .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
+                                dropFinishReason: true,
+                            }));
+                        }
                     }
                     yield { kind: "text", delta: clean, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
                 }
-                if (callIndexes.length > 0) rawCallChunks.push({ json, parsed, callIndexes });
+                if (callIndexes.length > 0) {
+                    const storedParsed = editedParts ? cloneChunk(parsed, { parts: editedParts }) : parsed;
+                    rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
+                }
                 if (!emitted && callIndexes.length === 0 && !finishReason && parts.length === 0) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
@@ -512,9 +561,14 @@ export function createGoogleAdapter(
                         // A finish chunk that also carried the functionCall was
                         // already replayed by settleToolCalls; re-sending it
                         // verbatim would duplicate the call on the wire.
-                        const finishChunk = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined)
-                            ? sseFrame(cloneChunk(parsed, { parts: [] }))
-                            : rawBuf;
+                        // #1881: settle already delivered this chunk's parts in
+                        // every classification ("keep" replays the stored/cleaned
+                        // json, a filtered rewrite keeps the non-call parts, and
+                        // a dropped proxy-only chunk delivers its withheld prose),
+                        // so the stub carries NO parts — resending them duplicates
+                        // the prose on the wire.
+                        const finishHasCall = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
+                        const finishChunk = finishHasCall ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
                         yield { kind: "meta", chunk: finishChunk } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     } else {

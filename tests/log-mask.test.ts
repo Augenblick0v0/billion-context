@@ -219,7 +219,14 @@ test("proxy debug logs: no credentials, no non-public host in ANY log line (#255
             debug: true,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -296,7 +303,14 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
             debug: false,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -356,7 +370,14 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
             debug: false,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: true, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: true, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -415,7 +436,14 @@ test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
             debug: false,
             passthrough: false,
             autoUpdate: false,
-            mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            updateTag: "latest",
+mitm: { enabled: false, domains: [] },
         };
         proxy = await startServer(opts);
         await once(proxy, "listening");
@@ -522,6 +550,6 @@ test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async (
     } finally {
         configureLogger(undefined);
         setLogCapture(null);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

@@ -104,13 +104,15 @@ function makeFakeCtx() {
     const addedCommands: FakeAddedCommand[] = [];
     const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
+    let wsHandshakeCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
 
     const ctx = {
         session: {
             hook: async (name: string, cb: (e: Record<string, unknown>) => void | Promise<void>) => {
-                assert.equal(name, "http.request");
-                modelRequestCb = cb;
+                if (name === "http.request") modelRequestCb = cb;
+                else if (name === "experimental.ws.handshake") wsHandshakeCb = cb;
+                else assert.fail(`unexpected hook ${name}`);
                 return { dispose: () => { disposed.push(1); } };
             },
             synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
@@ -157,7 +159,7 @@ function makeFakeCtx() {
 
     return {
         ctx,
-        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown }) => {
+        fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown; headers?: Record<string, string> }) => {
             const store: Record<string, string> = {};
             await modelRequestCb!({
                 sessionID: opts.sessionID,
@@ -170,6 +172,10 @@ function makeFakeCtx() {
             return { headers: store };
         },
         pushEvent: (evt: { type?: unknown; data?: Record<string, unknown> }) => { eventQueue.push(evt); wake?.(); },
+        fireWsHandshake: async (event: Record<string, unknown>) => {
+            await wsHandshakeCb!(event);
+            return event;
+        },
         get addedTools() { return addedTools; },
         get addedCommands() { return addedCommands; },
         get syntheticCalls() { return syntheticCalls; },
@@ -569,7 +575,8 @@ test("v2 setup: /acp-cache registered and renders the cache report via synthetic
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
                 assert.match(fake.syntheticCalls[0].text, /not an instruction/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
-                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {} }]);
+                // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
+                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {}, nativeCaller: true }]);
             } finally {
                 cleanup();
             }
@@ -590,7 +597,7 @@ test("v2 /acp-cache: full flag maps to detail=full; long reports keep the leadin
                 await cache.execute({ sessionID: "ses_cache_full", arguments: "full" });
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
-                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" } });
+                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" }, nativeCaller: true });
 
                 await cache.execute({ sessionID: "ses_cache_long" });
                 await until(() => fake.syntheticCalls.length === 2);

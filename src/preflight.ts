@@ -13,10 +13,12 @@ import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
+import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
+import { applyEstimateCalibration } from "./util.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -51,7 +53,7 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // retries the span's only draw against a flaky summarizer kills the whole
 // preflight (one content_filter blip bricked an entire turn; the identical
 // payload summarized fine ~90s later on the user's manual retry). Retries
-// count against MAX_SUMMARY_CALLS_PER_PREFLIGHT like any other call.
+// count against the per-invocation summary budget like any other call.
 const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
 // Per-protection-regime cap on wasted transient retries so a SYSTEMIC
 // (persistent) empty-summary failure degrades to today's behavior after a
@@ -68,9 +70,10 @@ const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
 // halving worklist can spend several calls on one range without completing a
 // fold. Beyond the bound the loop still exits cleanly — the fail-fast reports
 // the post-fold size and the remaining compressible-range count, so an
-// operator sees exactly how far the budget ran out. 16 is tuned to the
-// incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
-// not scaled to the overshoot — scaling it is a separate design question.
+// operator sees exactly how far the budget ran out. #1933 made the depth
+// dynamic: base 16 covers payloads up to ~1.4x the window (one ideal fold
+// removes CHUNK_FRACTION x window); larger entry overshoots scale both
+// budgets proportionally, capped at 2x the base (see preflightCompress).
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
@@ -89,8 +92,8 @@ export interface PreflightDeps {
     proxyUrl?: string;
     signal?: AbortSignal;
     log: (level: string, msg: string) => void;
-    /** Constant floor on the forwarded-payload size for this request (image bytes, #488). Folding only ever removes images, so adding this to every text estimate keeps the fit decision sound for multimodal payloads. */
-    imageFloor?: number;
+    /** #1843: the image reserve for this request — the billed cost of the images riding the payload verbatim (#488). Folding never removes them, so every TEXT-channel decision compares the text estimate against `limit − reserve` instead of adding the reserve to each total; an image-estimate error can no longer move a fold decision. Kernel-facing quantities keep the total view (reserve added back), which is the conservative direction. */
+    imageReserve?: number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
     /** #553: the caller knows this session's input size is unmeasured AND its
@@ -101,6 +104,8 @@ export interface PreflightDeps {
      *  optimistic chars/4 estimator, which undercounts code/JSON replays by up
      *  to ~4x and would let an over-window payload slip through uncompressed. */
     unknownBaseline?: boolean;
+    /** #1933 F1: origin of the upstream this request routes to. When it matches the route that learned the session's estimate-calibration factor k̂, every per-round text estimate is scaled by k̂ so gate, per-round exit and final fit judge one payload on the same scale as the trigger that started this invocation; absent or mismatched → raw estimates (legacy behavior). */
+    upstreamOrigin?: string;
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -706,15 +711,29 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
-const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"]);
+// In-loop retry set — parity with the main model-request path's fail-fast
+// kinds (#1263/#1453 isFailFastUpstreamKind): a summary call must not die
+// faster than the request it protects. TLS trust failures stay OUT on purpose:
+// a bad CA does not self-heal within the backoff window (the main path agrees).
+const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "ECONNABORTED"]);
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
-    ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "ENOTFOUND", "UND_ERR_ABORTED", "UND_ERR_CONNECT_TIMEOUT",
+    ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+// Certificate-TRUST codes: the failure is "this CA chain is not trusted here"
+// (corporate interception / MITM), not "the upstream is broken" — the
+// client-facing error must say so and name the remedy (#1987).
+const TLS_TRUST_HINT_CODES = new Set([
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
 ]);
 
 class SummaryTransportError extends Error {
     readonly retryable: boolean;
+    readonly aborted: boolean;
+    readonly code?: string;
     constructor(stage: "request" | "response body", error: unknown, attempts: number) {
         let code: string | undefined;
         let aborted = false;
@@ -729,6 +748,8 @@ class SummaryTransportError extends Error {
         super(`summary ${stage} failed (${name}${code ? `, code=${code}` : ""}; ${attempts} attempt${attempts === 1 ? "" : "s"})`);
         this.name = "SummaryTransportError";
         this.retryable = !aborted && code !== undefined && TRANSIENT_SUMMARY_CODES.has(code);
+        this.aborted = aborted;
+        this.code = code;
     }
 }
 
@@ -758,7 +779,12 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
             const retryable = failure instanceof UpstreamHttpError
                 ? isTransientUpstreamError(failure.status, failure.body)
                 : failure.retryable;
-            if (!retryable || attempt >= maxAttempts) throw failure;
+            if (!retryable || attempt >= maxAttempts) {
+                if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
+                    dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
+                }
+                throw failure;
+            }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
         } finally {
             clearTimer?.();
@@ -832,8 +858,23 @@ function noEmergencyTruncate(config: Config): Config {
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
-    let target = Math.min(limit, deps.compressionTarget ?? limit);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
+    // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
+    // text estimate vs `target − imageReserve`. Algebraically the same firing
+    // set as the old total-view check (max(B, T+R) >= C  <=>  max(max(0,B−R), T)
+    // >= max(0,C−R)), but an image-estimate error can no longer start or stop
+    // folding. Images ride the payload verbatim through every round, so the
+    // reserve is constant for this invocation. Kernel-facing quantities below
+    // keep the total view (reserve added back): conservative direction, and the
+    // kernel's own truncation/absorb behavior stays byte-identical.
+    const imageReserve = deps.imageReserve ?? 0;
+    const wireOverhead = deps.wireOverhead ?? 0;
+    // #1933 F1: capture k̂ once — it only mutates on usage settlement (outside
+    // this invocation), while every fit judgment in this loop must stay on
+    // one consistent scale with the gate that started it.
+    const kFactor = deps.session.stats.calibratedEstimate;
+    const kOrigin = deps.session.stats.calibratedEstimateOrigin;
+    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -851,6 +892,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const baselineKnown = deps.unknownBaseline !== true;
     const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
     let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    let decisionTokens = 0;
     let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
@@ -879,7 +921,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
     let rangesRemaining = 0;
-    for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
+    // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
+    // note atop the file). A raised budget is only a ceiling — well-behaved
+    // payloads exit early exactly as before; only genuinely huge payloads burn
+    // toward it before the fail-fast reports how far it ran out.
+    const entryLocal = (baselineKnown ? estimateCoreMessages(messages) : estimateCoreMessagesUpper(messages)) + imageReserve + wireOverhead;
+    const entryTokens = Math.max(baselineKnown ? deps.session.stats.lastInputTokens : 0, entryLocal);
+    const overshootRatio = limit > 0 && entryTokens > 0 ? entryTokens / limit : 1;
+    const summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
+    const roundBudget = Math.min(MAX_PREFLIGHT_ROUNDS * 2, Math.max(MAX_PREFLIGHT_ROUNDS, Math.ceil(MAX_PREFLIGHT_ROUNDS * overshootRatio)));
+    if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+        deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
+    }
+    for (let round = 0; round < roundBudget; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
             break;
@@ -916,19 +970,29 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const baselineFloor = messages.length > 0
             ? ((deps.session.stats.lastInputTokensSource === "usage" || deps.session.stats.lastInputTokensSource === "overflow-arm") ? deps.session.stats.lastInputTokens : 0)
             : deps.session.stats.lastInputTokens;
-        currentTokens = Math.max(baselineFloor, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
+        const rawRoundText = estimateCoreMessages(turn.messages) + wireOverhead;
+        // #1933 F1: same calibrated caliber as the gate's trigger/fit checks —
+        // per-round exit and final fit must judge this payload identically to
+        // the trigger that started the invocation (no mid-loop scale drift).
+        const roundText = applyEstimateCalibration(rawRoundText, kFactor, kOrigin, deps.upstreamOrigin);
+        currentTokens = Math.max(baselineFloor, roundText + imageReserve);
+        // #1843: the TEXT-channel judgment quantity — the usage-grade baseline
+        // bills images too, so project it onto the text channel by subtracting
+        // the reserve (floored at zero).
+        decisionTokens = Math.max(Math.max(0, baselineFloor - imageReserve), roundText);
         if (!baselineKnown) {
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove
             // (#470/#488 postdate this PR's fork point).
-            finalUpper = estimateCoreMessagesUpper(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
+            finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
+            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
-        result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
+        result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (currentTokens < target) break;
+        if (decisionTokens < textTarget) break;
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
@@ -954,7 +1018,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
-                target = limit;
+                textTarget = Math.max(0, limit - imageReserve);
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -973,7 +1037,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
         for (const range of ordered) {
-            if (currentTokens < target) break;
+            if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
                 break;
@@ -1007,7 +1071,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // exactly those cases. Bounded by the per-regime call budget below.
             const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
             while (spans.length > 0) {
-                if (currentTokens < target) break;
+                if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
                     break;
@@ -1099,7 +1163,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const parts: string[] = [];
                     const chunks = splitSummaryContent(content, budget, countText);
                     for (const chunk of chunks) {
-                        if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+                        if (summaryCalls >= summaryBudget) {
                             budgetHit = true;
                             break;
                         }
@@ -1110,7 +1174,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             "unusable" in part && part.transient &&
                             transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
                             transientRetryBudget > 0 &&
-                            summaryCalls < MAX_SUMMARY_CALLS_PER_PREFLIGHT &&
+                            summaryCalls < summaryBudget &&
                             !deps.signal?.aborted
                         ) {
                             transientTries += 1;
@@ -1140,20 +1204,52 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
+                        // #1993: the rejection body is the only evidence for WHY the
+                        // upstream said no — log it the way the main paths already do
+                        // and carry a bounded snippet into the client-visible detail.
+                        const transient = isTransientUpstreamError(err.status, err.body);
+                        const bodySnippet = safePrefix(err.body.trim(), 200);
                         failure = {
                             kind: "upstream",
                             status: err.status,
-                            retryable: isTransientUpstreamError(err.status, err.body),
+                            retryable: transient,
                             detail: err.status === 429
                                 ? `the summarization call was rate-limited by the upstream (HTTP 429)`
-                                : `the summarization call was rejected by the upstream (HTTP ${err.status})`,
+                                : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
                         };
-                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)`);
+                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);
+                        // #1993: a hard (non-transient) size-plausible rejection gets the
+                        // same halving recovery as an unusable HTTP-200 summary — the
+                        // whole request was refused, so it is at least as likely to be
+                        // size-driven as an empty 200. Transient 4xx (risk-control
+                        // markers) keep the replay-retry semantics; other 4xx (auth /
+                        // routing) fail fast instead of burning the call budget;
+                        // unsplittable spans fall through to the give-up below. The
+                        // cascade is bounded by the per-invocation summary budget
+                        // (summaryBudget, #1933) via the while-top budgetHit check.
+                        const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                        if ((err.status === 400 || err.status === 413) && !transient
+                            && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
+                            lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
+                            deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
+                            const mid = Math.floor((cs + ce) / 2);
+                            spans.push([mid + 1, ce]);
+                            spans.push([cs, mid]);
+                            continue;
+                        }
                     } else if (deps.signal?.aborted) {
                         failure = ABORTED_FAILURE;
                         deps.log("warn", `[preflight] summarization aborted: client disconnected`);
                     } else if (err instanceof SummaryTransportError) {
-                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}`, ...(err.retryable ? { retryable: true } : {}) };
+                        // #1987: a transport-class death carries NO upstream verdict about the
+                        // content — the call simply did not complete — so it stays retryable for
+                        // the client regardless of which code surfaced (a cert problem is not more
+                        // terminal than a gzip corruption). Only an abort (client gone / idle budget)
+                        // is not worth retrying; keep that case's field omitted as before.
+                        const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
+                            ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
+                            : "";
+                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                         deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                     } else {
                         failure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
@@ -1192,6 +1288,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
+                // #1993: a fold succeeded after an earlier rejection in this walk — the
+                // payload shrank, so the stale failure no longer describes the end
+                // state; clear it so a later exhaustion reports its own reason (and a
+                // fitting result reports none at all).
+                failure = undefined;
                 // The summary itself re-enters the payload; net its cost against
                 // both the folded size and the session's input baseline. Without a
                 // baseline currentTokens is char-based, so net the folded span's
@@ -1230,7 +1331,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
         const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
         if (budgetHit) {
-            failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
+            failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
         } else if (relaxed && result.compressedRanges > 0) {
             failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
         } else if (result.compressedRanges === 0) {
@@ -1241,20 +1342,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 ? `no viable range could be compressed: ${cause}${unusableNote}`
                 : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
         } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}${skipNote}` };
-        }
-    }
-    if (result.compressedRanges > 0) {
-        // #857: never persist the IMAGE FLOOR into the usage baseline — images
-        // are billed by the upstream and every fit/clamp gate adds their
-        // estimate separately, so the baseline must stay usage-semantics
-        // (text + overhead only). A bytes-mode floor (b64/4) overestimates
-        // pixel-billing upstreams ~100× and would poison the upward window
-        // self-heal and close the #496 escape hatch permanently.
-        const textBaseline = result.payloadEstimate - (deps.imageFloor ?? 0);
-        if (textBaseline > deps.session.stats.lastInputTokens) {
-            deps.session.stats.lastInputTokens = textBaseline;
-            deps.session.stats.lastInputTokensSource = "estimate";
+            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${roundBudget} rounds${unusableNote}${skipNote}` };
         }
     }
     result.rangesRemaining = rangesRemaining;

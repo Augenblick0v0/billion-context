@@ -142,7 +142,7 @@ function makeFixture(version: string, entry: string | null = "npm:billion-contex
     fs.mkdirSync(installDir, { recursive: true });
     fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version }));
     const file = path.join(piHome, "settings.json");
-    const setEntry = (e: string | null): void => {
+    const setEntry = (e: string | null | undefined): void => {
         fs.writeFileSync(file, JSON.stringify(e === null ? {} : { packages: [e] }));
     };
     setEntry(entry);

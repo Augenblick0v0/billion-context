@@ -4,6 +4,14 @@ import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
+import {
+    persistEnabled as knobPersistEnabled,
+    persistZstdEnabled as knobPersistZstdEnabled,
+    persistDebounceMs as knobPersistDebounceMs,
+    persistTailTokens as knobPersistTailTokens,
+    persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
+    persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
+} from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
@@ -11,6 +19,7 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
+import { currentContextObservation } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -154,6 +163,8 @@ interface PersistedSession {
      *  absent on records written before #401, whose `messages` held the raw
      *  history and must still be pruned at export time. */
     messagesFolded?: boolean;
+    pluginSnapshot?: CoreMessage[];
+    forkContentStore?: MessageContentStore;
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
@@ -170,6 +181,10 @@ function mergeState(parsed: CompressionState): CompressionState {
         nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
         nextRunId: parsed.nextRunId ?? fresh.nextRunId,
         tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
+        lastPassIds: parsed.lastPassIds ?? fresh.lastPassIds,
+        hiddenOrphanRefs: parsed.hiddenOrphanRefs ?? fresh.hiddenOrphanRefs,
+        terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
+        nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
         // Without this, a restart re-exposes absorbed tool outputs: state
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
@@ -669,14 +684,33 @@ export class SessionStore {
 
 function buildRecord(session: Session): PersistedSession {
     const snapshot = boundedFoldedSnapshot(session);
+    const observation = currentContextObservation(session);
+    if (session.pluginSnapshot && session.contentStore) {
+        const previous = session.metadata.publicSnapshotStoredRefs;
+        session.metadata.publicSnapshotStoredRefs = [...new Set([
+            ...(Array.isArray(previous) ? previous : []),
+            ...session.pluginSnapshot.flatMap((m) => {
+                const ref = session.state.messageRefs.byRaw[m.id];
+                return ref && session.contentStore!.byRef[ref] ? [ref] : [];
+            }),
+        ])];
+    }
     return {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         id: session.id,
         meta: { ...session.meta },
-        stats: { ...session.stats },
+        // Credits are one-shot and are not restored; persist the effective view instead.
+        stats: { ...session.stats, ...(observation ? { contextTokens: observation.tokens, contextTokensSource: observation.source } : {}) },
         messages: snapshot,
         messagesFolded: snapshot ? true : undefined,
+        // #2077: the raw snapshot is persisted lazily — only once it becomes an
+        // external contract (a fork receipt exists on this session, or a fork
+        // was cut from this one and set the sticky retained flag). Non-forking
+        // sessions pay no disk cost; the in-memory copy self-heals on the next
+        // model request because plugin agents resend their full history.
+        pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
+        forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
@@ -777,6 +811,8 @@ function buildSession(parsed: PersistedSession): Session {
         blockContents,
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,
+        pluginSnapshot: Array.isArray(parsed.pluginSnapshot) ? parsed.pluginSnapshot : undefined,
+        contentStore: parsed.forkContentStore,
         inFlight: 0,
         persisted: true,
         pendingRetrievals: [],
@@ -805,27 +841,19 @@ function defaultDir(): string {
 }
 
 function defaultDebounce(): number {
-    const env = process.env.BILI_PERSIST_DEBOUNCE_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 500;
+    return knobPersistDebounceMs();
 }
 
 function persistEnabled(): boolean {
-    const env = process.env.BILI_PERSIST;
-    if (env === "0" || env === "false") return false;
-    return true;
+    return knobPersistEnabled();
 }
 
 /** #1080 (owner decision): session files stay plain JSON by default —
  *  recoverability (jq/grep-debuggable, no downgrade tail risk) beats silent
- *  disk savings. Only BILI_PERSIST_ZSTD=1/true opts into zstd (BILIZSTD1);
- *  anything else (0/false/unset) keeps plain JSON. */
+ *  disk savings. Only persist.enabled=false / BILI_PERSIST_ZSTD=1/true opts
+ *  into zstd (BILIZSTD1); anything else keeps plain JSON. */
 function persistZstdEnabled(): boolean {
-    const env = process.env.BILI_PERSIST_ZSTD;
-    return env === "1" || env === "true";
+    return knobPersistZstdEnabled();
 }
 
 /** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
@@ -854,12 +882,7 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
  *  OLDEST messages are dropped until the view fits. 0 disables message
  *  persistence entirely (block summaries + blockContents survive). */
 function persistTailTokens(): number {
-    const env = process.env.BILI_PERSIST_TAIL_TOKENS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 16384;
+    return knobPersistTailTokens();
 }
 
 /** Bounded folded-view snapshot for the on-disk record (#401). See
@@ -890,21 +913,11 @@ function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
 }
 
 function epermAlertThreshold(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_THRESHOLD;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n > 0) return n;
-    }
-    return 5;
+    return knobPersistEpermAlertThreshold();
 }
 
 function epermAlertRepeatMs(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_REPEAT_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 0;
+    return knobPersistEpermAlertRepeatMs();
 }
 
 function defaultLogger(level: string, m: string): void {

@@ -19,17 +19,16 @@ export const WEB_CLIENT = `(function () {
     function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, (c) => c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === \'"\' ? "&quot;" : "&#39;");
     }
-    // #1206 ledger detail carries per-event identity (client/entry/source); the
-    // banner used to show counts only and force users into acp_status — surface
-    // the named entries here instead.
+    // #1206 ledger detail carries per-event identity (client/entry/source);
+    // #2045: render it in FULL — keep the source path and list EVERY distinct
+    // entry, no truncation — so the alert is accurate and complete without
+    // forcing users into acp_status to find out what/where.
     function shortConflictDetail(e) {
         if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") return "";
         let s = e.detail;
         const suspected = s.indexOf("[suspected]") >= 0;
         const si = s.lastIndexOf("[suspected]");
         if (si >= 0) s = s.slice(0, si);
-        const pi = s.lastIndexOf(" (");
-        if (pi > 0) s = s.slice(0, pi);
         return s.trim() + (suspected ? " [suspected]" : "");
     }
     function bili_conflictLine(c) {
@@ -44,8 +43,7 @@ export const WEB_CLIENT = `(function () {
         }
         let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
         if (items.length > 0) {
-            const shown = items.slice(0, 4).map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : ""));
-            line += " — " + shown.join(" · ") + (items.length > 4 ? " …+" + (items.length - 4) : "");
+            line += " — " + items.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
         }
         return line;
     }
@@ -679,9 +677,14 @@ export const WEB_CLIENT = `(function () {
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
         const blocks = [];
         let cur = null;
+        // #2065: only known roles open a block — an in-body Markdown heading
+        // ("### 7.1 …" inside a user's rules blob) is content, not a divider.
+        const KNOWN_ROLE = { user: 1, assistant: 1, tool: 1 };
         for (let i = start; i < lines.length; i++) {
             const l = lines[i];
-            if (l.indexOf("### ") === 0) { cur = { role: l.slice(4).trim(), lines: [] }; blocks.push(cur); continue; }
+            let divider = null;
+            if (l.indexOf("### ") === 0) { const r = l.slice(4).trim(); if (KNOWN_ROLE[r]) divider = r; }
+            if (divider) { cur = { role: divider, lines: [] }; blocks.push(cur); continue; }
             if (cur) cur.lines.push(l);
         }
         const html = [];
@@ -707,6 +710,7 @@ export const WEB_CLIENT = `(function () {
         }
         return html.join("");
     }
+    window.bili_renderHandoffMd = renderHandoffMd;
     function buildDetailHtml(d) {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
@@ -1185,7 +1189,7 @@ export const WEB_CLIENT = `(function () {
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
-            ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
@@ -1331,7 +1335,8 @@ export const WEB_CLIENT = `(function () {
         ptInp.parentElement.appendChild(ptWarn);
         ptInp.addEventListener("change", () => commit((d) => {
             const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
-            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+            if (!compressOf(d)) d.compress = {};
+            if (list.length === 0) delete d.compress.protectedTools; else d.compress.protectedTools = list;
         }));
         const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
         prm.type = "number";

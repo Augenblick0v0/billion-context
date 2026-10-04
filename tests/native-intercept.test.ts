@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -25,7 +25,7 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
 });
 
 function fakeFetch(sink: string[]) {
-    return (async (input: RequestInfo | URL, _init?: RequestInit) => {
+    return (async (input: string | URL | Request, _init?: RequestInit) => {
         sink.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
         return new Response("{}", { status: 200 });
     }) as typeof fetch;
@@ -38,7 +38,7 @@ interface RecordedCall {
 }
 
 function fakeFetchRecordingHeaders(sink: RecordedCall[]) {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    return (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
         const headers: Record<string, string> = {};
@@ -272,7 +272,7 @@ test("install: TypeError triggers one respawn + retry", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
     let failNext = true;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (failNext) {
@@ -334,7 +334,7 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
     let failNext = true;
     let respawns = 0;
     let giveUps = 0;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (failNext) {
@@ -424,7 +424,7 @@ test("install: headersFor stamps an already-routed /bili/ request without rewrit
     const saved = globalThis.fetch;
     _resetForTest();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const headers: Record<string, string> = {};
         if (init?.headers instanceof Headers) {
@@ -460,7 +460,7 @@ test("install: attach mode rewrites to the attach origin and stamps (#809 + #941
     const saved = globalThis.fetch;
     _resetForTest();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         const headers: Record<string, string> = {};
         const h = init?.headers;
@@ -519,7 +519,7 @@ test("install: spawn mode stamps headers on the rewritten request (#941)", async
     const saved = globalThis.fetch;
     _resetForTest();
     let headerDump = "";
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         headerDump = h.get("x-bili-plugin") ?? "";
         return new Response("{}", { status: 200 });
@@ -562,7 +562,7 @@ test("#1117 takeoverGate: unattributed /bili/-routed URL is marked x-bili-passth
     _resetForTest();
     let passthrough = "";
     let pluginHeader = "";
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         passthrough = h.get("x-bili-passthrough") ?? "";
         pluginHeader = h.get("x-bili-plugin") ?? "";
@@ -591,7 +591,7 @@ test("#1117 takeoverGate: attributed /bili/-routed URL keeps plugin headers (no 
     _resetForTest();
     let passthrough = "";
     let pluginHeader = "";
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
         const h = new Headers(init?.headers);
         passthrough = h.get("x-bili-passthrough") ?? "";
         pluginHeader = h.get("x-bili-plugin") ?? "";
@@ -638,7 +638,7 @@ test("install: routed /bili/ request against a dead attach origin recovers and r
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
@@ -686,7 +686,7 @@ test("install: routed /bili/ request with no respawn degrades to a direct send (
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
@@ -723,7 +723,7 @@ test("install: routed /bili/ request whose recovery also fails degrades to direc
     const dispatches: string[] = [];
     const saved = globalThis.fetch;
     _resetForTest();
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
         calls.push(url);
         if (url.startsWith("http://127.0.0.1:40001/")) throw new TypeError("fetch failed");
@@ -847,4 +847,165 @@ test("#1365 observeRoutedOrigin: pre-set evidence skips the window; expiry clean
         if (saved === undefined) delete process.env.BILI_ATTACH_EVIDENCE_GRACE_MS;
         else process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = saved;
     }
+});
+
+// — #1957: a health verdict describes a PROCESS GENERATION, not a URL —
+// A respawn puts a new process behind the same origin (lane port memory,
+// #1723). Verdicts obtained before that boundary — cached or still in flight
+// — must not steer routing for the replacement.
+
+test("#1957 same-origin respawn: replacement is probed for real (stale negative verdict discarded)", async (t) => {
+    let now = 100_000;
+    t.mock.method(Date, "now", () => now);
+    const origin = "http://127.0.0.1:18787";
+    let online = true;
+    let probes = 0;
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        origin,
+        ready: Promise.resolve(origin),
+        respawn: async () => {
+            respawnCalls += 1;
+            online = true;
+            state.origin = origin;
+            return origin;
+        },
+    };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async () => { probes += 1; return online; },
+        probeTtlMs: 2_000,
+    });
+    assert.equal(await resolve(), origin, "healthy hold fast-paths through the cached verdict");
+    now += 2_001;
+    online = false;
+    const recovered = await resolve();
+    assert.equal(respawnCalls, 1, "one respawn on death");
+    assert.equal(recovered, origin, "post-recovery request must route to the respawned proxy");
+    assert.equal(probes, 3, "replacement must be probed for real, not served from the stale negative cache");
+    assert.equal(state.origin, origin);
+});
+
+test("#1957 new-origin respawn lands on the replacement's own origin", async (t) => {
+    t.mock.method(Date, "now", () => 100_000);
+    const dead = "http://127.0.0.1:1";
+    const fresh = "http://127.0.0.1:2";
+    const state: NativeInterceptState = {
+        origin: dead,
+        ready: Promise.resolve(dead),
+        respawn: async () => { state.origin = fresh; return fresh; },
+    };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async (o: string) => o === fresh,
+        probeTtlMs: 2_000,
+    });
+    assert.equal(await resolve(), fresh, "respawn lands on a different origin and passes its real probe");
+    assert.equal(state.origin, fresh);
+    assert.equal(await resolve(), fresh, "subsequent requests reuse the landed origin");
+});
+
+test("#1957 a replacement that fails its real probe degrades — the respawn URL is never trusted blindly", async (t) => {
+    t.mock.method(Date, "now", () => 100_000);
+    const origin = "http://127.0.0.1:18787";
+    let giveUps = 0;
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        origin,
+        ready: Promise.resolve(origin),
+        onGiveUp: () => { giveUps += 1; },
+        respawn: async () => { respawnCalls += 1; state.origin = origin; return origin; },
+    };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async () => false,
+        probeTtlMs: 2_000,
+    });
+    assert.equal(await resolve(), undefined, "an unhealthy replacement must not be routed to");
+    assert.equal(respawnCalls, 1);
+    assert.equal(giveUps, 1, "onGiveUp fires so the host can surface the loss");
+});
+
+test("#1957 failed respawn: cooldown suppresses re-fire within the window", async (t) => {
+    let now = 100_000;
+    t.mock.method(Date, "now", () => now);
+    const origin = "http://127.0.0.1:18787";
+    let giveUps = 0;
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        origin,
+        ready: Promise.resolve(origin),
+        onGiveUp: () => { giveUps += 1; },
+        respawn: async () => { respawnCalls += 1; return undefined; },
+    };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async () => false,
+        probeTtlMs: 2_000,
+    });
+    assert.equal(await resolve(), undefined);
+    assert.equal(respawnCalls, 1);
+    now += 5_000;
+    assert.equal(await resolve(), undefined, "still degraded inside the cooldown");
+    assert.equal(respawnCalls, 1, "cooldown bounds attempts to one per interval");
+    assert.equal(giveUps, 1, "loss is reported once per observed loss, not per degraded request");
+    now += 15_001;
+    assert.equal(await resolve(), undefined, "replacement still absent after the cooldown");
+    assert.equal(respawnCalls, 2, "cooldown elapsed → retry bootstrap");
+});
+
+test("#1957 steady-state verdict reuse survives the fix (#928)", async (t) => {
+    let now = 100_000;
+    t.mock.method(Date, "now", () => now);
+    const origin = "http://127.0.0.1:18787";
+    let probes = 0;
+    const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async () => { probes += 1; return true; },
+        probeTtlMs: 2_000,
+    });
+    for (let i = 0; i < 3; i++) assert.equal(await resolve(), origin);
+    assert.equal(probes, 1, "steady-state requests ride the cached positive verdict");
+    now += 2_001;
+    assert.equal(await resolve(), origin, "after the TTL lapses a fresh probe confirms and routes");
+    assert.equal(probes, 2);
+});
+
+test("#1957 a stale in-flight verdict cannot clobber a healthy same-origin replacement", async (t) => {
+    t.mock.method(Date, "now", () => 100_000);
+    const origin = "http://127.0.0.1:18787";
+    let respawnCalls = 0;
+    const gates: Array<(ok: boolean) => void> = [];
+    const state: NativeInterceptState = {
+        origin,
+        ready: Promise.resolve(origin),
+        respawn: async () => {
+            respawnCalls += 1;
+            state.origin = origin;   // replacement binds the SAME origin
+            return origin;
+        },
+    };
+    const resolve = createLiveOriginResolver(state, {
+        probe: async () => new Promise<boolean>((res) => { gates.push(res); }),
+        probeTtlMs: 2_000,
+    });
+    const tick = (): Promise<void> => new Promise((r) => { setTimeout(r, 0); });
+
+    const first = resolve();
+    const second = resolve();   // both hold the pre-respawn origin while probing
+    assert.equal(gates.length, 2, "two concurrent in-flight probes");
+
+    gates[0](false);   // caller 1 sees the OLD process dead
+    await tick();      // → respawn fires, replacement lands on the same origin,
+                       //   caller 1 starts its post-ready verification probe
+    assert.equal(respawnCalls, 1);
+    assert.equal(gates.length, 3, "caller 1 verifies the replacement for real");
+
+    gates[1](false);   // caller 2's verdict arrives AFTER the boundary — stale
+    await tick();      // it must be discarded, not acted on
+    assert.equal(state.origin, origin, "stale verdict must not wipe the healthy replacement");
+    assert.equal(respawnCalls, 1, "stale verdict must not trigger a redundant respawn");
+    assert.ok(gates.length >= 4, "caller 2 must verify the current origin for real");
+
+    gates[2](true);    // caller 1's verification: replacement is alive
+    await tick();
+    gates[3](true);    // caller 2's own verification of the current origin
+    assert.equal(await first, origin);
+    assert.equal(await second, origin, "caller 2 recovers through the shared ready");
 });

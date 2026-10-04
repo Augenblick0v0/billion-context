@@ -4,6 +4,8 @@ import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
+export type { CompressSettings } from "./config.js";
+
 /** Host-side policy default for `compress.stripImagesKeepRecent` (#617): how
  *  many of the most recent messages keep their image payloads when stripping
  *  is enabled. The strip mechanism itself lives in acp-kernel's wire layer
@@ -98,6 +100,7 @@ stripImages: pick("stripImages"),
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
+        reconcile: pick("reconcile"),
         promptPack: pick("promptPack"),
     };
 }

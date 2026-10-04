@@ -21,13 +21,14 @@
  * cycle automatically.
  */
 import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
 import * as tar from "tar";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { safeSuffix } from "./text-safe.js";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
@@ -35,6 +36,7 @@ import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-chann
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
+import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs } from "./knobs.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -45,7 +47,7 @@ export function normalizeRegistryBase(raw: string | undefined): string {
     if (!v) return "https://registry.npmjs.org";
     return v.replace(/\/+$/, "");
 }
-const REGISTRY_BASE = normalizeRegistryBase(process.env.BILI_UPDATE_REGISTRY);
+const REGISTRY_BASE = normalizeRegistryBase(knobUpdateRegistryBase());
 
 /** Normalize a configured dist-tag channel: absent/blank → "latest". */
 export function normalizeUpdateTag(tag: string | undefined): string {
@@ -56,15 +58,11 @@ export function normalizeUpdateTag(tag: string | undefined): string {
 export function registryUrlFor(packageName: string, tag: string): string {
     return `${REGISTRY_BASE}/${packageName}/${encodeURIComponent(tag)}`;
 }
-const DEFAULT_CHECK_INTERVAL_MS = 3 * 60 * 1000;
-
-// BILI_UPDATE_CHECK_INTERVAL_MS overrides the check period in ms (must be > 0)
-// so the hermetic e2e suite need not wait 3 minutes (#1153). Unset = default.
-function checkIntervalMs(): number {
-    const raw = Number(process.env.BILI_UPDATE_CHECK_INTERVAL_MS?.trim());
-    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHECK_INTERVAL_MS;
-}
-export const CHECK_INTERVAL_MS = checkIntervalMs();
+// update.checkIntervalMs / BILI_UPDATE_CHECK_INTERVAL_MS override the check
+// period in ms (must be > 0) so the hermetic e2e suite need not wait 3 minutes
+// (#1153). Unset = default. Resolved once at import: the updater's own cadence
+// is process-lifetime, and the e2e suites set it in the child process env.
+export const CHECK_INTERVAL_MS = knobUpdateCheckIntervalMs();
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
@@ -114,6 +112,88 @@ function warnAdvisoryOnce(advisoryId: string, message: string): void {
     if (advisoryRefusalWarnKeys.has(key)) return;
     advisoryRefusalWarnKeys.add(key);
     loggerLog("warn", message);
+}
+
+// #1603: bounded retry for persistent install failures. Pre-fix, a failing
+// install (unwritable dir, host-managed lane) re-downloaded and re-failed every
+// 3-min cycle for days (124× over 12 days in the field) with no backoff or
+// remediation. Keyed on (installDir, targetVersion): consecutive failures grow
+// an exponential cooldown during which the check skips the download silently;
+// a success or a different key resets it. Backoff (not hard self-disable) keeps
+// the path self-healing if the dir becomes writable later.
+const BACKOFF_THRESHOLD = 3;
+const BACKOFF_BASE_MS = 5 * 60 * 1000;
+const BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
+
+interface InstallBackoff {
+    key: string;
+    count: number;
+    nextRetryAt: number;
+}
+let installBackoff: InstallBackoff | undefined;
+const installBackoffRemediatedKeys = new Set<string>();
+
+export function _resetInstallBackoffForTest(): void {
+    installBackoff = undefined;
+    installBackoffRemediatedKeys.clear();
+}
+
+function backoffKey(installDir: string | undefined, version: string): string {
+    return `${installDir ?? "<unknown-install-dir>"}\u0000${version}`;
+}
+
+export function backoffMs(count: number): number {
+    const exp = Math.max(0, count - BACKOFF_THRESHOLD);
+    return Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** exp);
+}
+
+function remediationHint(error: string): string {
+    if (/not writable/i.test(error)) {
+        return "the install dir is not writable by this user. Fix its ownership/permissions, point npm at a user-writable prefix and reinstall (npm install -g billion-context), or disable auto-update (config autoUpdate:false / env ACP_AUTO_UPDATE=0)";
+    }
+    if (/git working tree/i.test(error)) {
+        return "this copy runs from a source checkout. Install globally instead (npm install -g billion-context) so auto-update has a writable target";
+    }
+    if (/managed by/i.test(error)) {
+        return "this copy is managed by its host. Update it through the host's own channel rather than in place";
+    }
+    return "review the error above. Auto-update keeps retrying with an increasing delay";
+}
+
+// Names the literal-vs-real mismatch when the resolved install dir is a symlink
+// to somewhere else (#1603: the updater can target a path whose real location
+// differs, invisible without this). Empty when they match.
+function installDirNote(installDir: string | undefined): string {
+    if (!installDir) return "";
+    try {
+        const real = realpathSync(installDir);
+        return real === installDir ? "" : ` (target ${installDir} resolves via symlink to ${real})`;
+    } catch {
+        return "";
+    }
+}
+
+function recordInstallFailure(key: string, error: string, installDir: string | undefined): void {
+    const now = Date.now();
+    if (installBackoff?.key !== key) {
+        installBackoff = { key, count: 1, nextRetryAt: now };
+    } else {
+        installBackoff.count += 1;
+    }
+    const b = installBackoff;
+    const note = installDirNote(installDir);
+    if (b.count < BACKOFF_THRESHOLD) {
+        loggerLog("warn", `[update] install failed: ${error}${note}. Will retry next cycle.`);
+        return;
+    }
+    b.nextRetryAt = now + backoffMs(b.count);
+    const waitMin = Math.round(backoffMs(b.count) / 60_000);
+    if (!installBackoffRemediatedKeys.has(key)) {
+        installBackoffRemediatedKeys.add(key);
+        loggerLog("warn", `[update] install keeps failing (${b.count}\u00d7 in a row): ${error}${note}. ${remediationHint(error)}. Backing off \u2014 next attempt in ~${waitMin}m.`);
+        return;
+    }
+    loggerLog("warn", `[update] install failed: ${error}${note}. Still failing \u2014 next attempt in ~${waitMin}m.`);
 }
 
 // --- Version comparison (ported from opencode-acp lib/update.ts) ---
@@ -220,24 +300,96 @@ export async function lastUpdateCheckTime(): Promise<number | undefined> {
     return ts > 0 ? ts : undefined;
 }
 
-/**
- * Walk up from this module's location until we find the directory whose
- * package.json `name` matches `packageName`. This is the install directory.
- * Exported for the pre-re-exec gate (#811).
- */
-export async function findInstallDir(packageName: string): Promise<string | undefined> {
-    let dir = path.dirname(fileURLToPath(import.meta.url));
+/** #1628: pure walk-up form of the install-dir resolution. From `startDir`,
+ *  the nearest self-or-ancestor whose package.json `name` matches `packageName`.
+ *  Two invariants pin the resolution-error class (#580/#1628): there is NO
+ *  global/npm-root fallback — walking past the filesystem root without a match
+ *  yields undefined (loud failure beats silently targeting another install) —
+ *  and crossing into a DIFFERENT named package before matching means the
+ *  running copy's own root is missing/corrupt, so the foreign ancestor is
+ *  refused instead of adopted. Exported for tests. */
+export async function findPackageRoot(startDir: string, packageName: string): Promise<string | undefined> {
+    let dir = startDir;
     for (;;) {
         try {
             const pkg = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8"));
-            if (pkg.name === packageName) return dir;
+            const name = typeof pkg.name === "string" ? pkg.name : undefined;
+            if (name === packageName) return dir;
+            if (name !== undefined) return undefined;
         } catch {
-            // not a package.json or doesn't match — keep walking
+            // not a package.json — keep walking
         }
         const parent = path.dirname(dir);
         if (parent === dir) return undefined;
         dir = parent;
     }
+}
+
+/**
+ * Walk up from this module's location until we find the directory whose
+ * package.json `name` matches `packageName`. This is the install directory.
+ * The running module's own path is the single source of truth — the copy
+ * serving traffic is the copy that gets updated, and no global-prefix
+ * fallback exists by design (#1628). Exported for the pre-re-exec gate (#811).
+ */
+export async function findInstallDir(packageName: string): Promise<string | undefined> {
+    return findPackageRoot(path.dirname(fileURLToPath(import.meta.url)), packageName);
+}
+
+/** #1628: both sides of an install failure as one log fragment so the log
+ *  alone answers "which copy is this process?": the resolved update target
+ *  (plus its realpath when different — a symlink hop) and the running
+ *  module's real path. Returns space-joined key=value pairs like
+ *  `target=X real=Y running=Z`; `target=<unresolved>` when the walk found
+ *  nothing. Exported for tests. */
+export function describeInstallLocation(installDir: string | undefined, runningModule: string | undefined): string {
+    const parts: string[] = [];
+    if (installDir) {
+        parts.push(`target=${installDir}`);
+        try {
+            const real = realpathSync(installDir);
+            if (real !== installDir) parts.push(`real=${real}`);
+        } catch {
+            // vanished mid-flight — the literal path is already named
+        }
+    } else {
+        parts.push("target=<unresolved>");
+    }
+    if (runningModule) {
+        let real = runningModule;
+        try {
+            real = realpathSync(runningModule);
+        } catch {
+            // keep the literal path
+        }
+        parts.push(`running=${real}`);
+    }
+    return parts.join(" ");
+}
+
+let installLocationLogged = false;
+
+/** Test hook: re-arm the once-per-process install-location diagnostic. */
+export function _resetInstallLocationForTest(): void {
+    installLocationLogged = false;
+}
+
+/** #1628: on this process's FIRST install failure, name the resolved target
+ *  and the running module's real path. A persistent failure (e.g. a zombie of
+ *  a root-owned global install while the host loads a different lane) then
+ *  diagnoses itself from one log line — no filesystem archaeology (#1603
+ *  defect 2 took 12 days of identical lines to attribute). At most once per
+ *  process; the every-cycle retry line stays unchanged. */
+export function logInstallLocationOnce(installDir: string | undefined, packageName: string, log: Logger = loggerLog): void {
+    if (installLocationLogged) return;
+    installLocationLogged = true;
+    let running: string | undefined;
+    try {
+        running = fileURLToPath(import.meta.url);
+    } catch {
+        running = undefined;
+    }
+    log("warn", `[update] install location: ${describeInstallLocation(installDir, running)} — this process updates only the copy it runs from; if your host loads ${packageName} from a different location, that copy is not being updated here`);
 }
 
 /** True when `dir` is a git working tree: `.git` present as a directory
@@ -691,9 +843,9 @@ export async function refreshDshDesktopCopy(
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
             return;
         }
-        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env);
+        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env, { bootSmoke: true });
         if (result.ok) {
-            log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it`);
+            log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it (the running app keeps the old code in memory; across the handoff bili tools may fail once until dsh restarts, #2082)`);
         } else {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed: ${result.error}; retrying next cycle`);
         }
@@ -954,6 +1106,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
+        const bkey = backoffKey(installDir, latest);
+        if (!force && installBackoff && installBackoff.key === bkey && Date.now() < installBackoff.nextRetryAt) {
+            return;
+        }
+
         loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
 
         // Acquire lock to prevent concurrent updates across processes.
@@ -965,6 +1122,8 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         try {
             const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
+                installBackoff = undefined;
+                installBackoffRemediatedKeys.clear();
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -974,7 +1133,8 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
                 notifyStaleInstall(opts, latest);
             } else {
-                loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+                recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
+                logInstallLocationOnce(installDir, opts.packageName, loggerLog);
             }
         } finally {
             await lock.release();
@@ -1018,6 +1178,63 @@ export function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?:
  *  over the install directory. `dispatcher` (optional) routes the download
  *  through a proxy (#609); omitted = direct connection. */
 
+const BOOT_SMOKE_TIMEOUT_MS = 20_000;
+
+/** #2082: run the freshly installed copy's CLI entry with --version in a
+ *  clean child process. Loading the module graph and exiting 0 is the smoke;
+ *  any non-zero exit, timeout, or spawn failure returns a short reason (with
+ *  the last stderr lines) for the caller to log before rolling back.
+ *  Env scrub: the child must not inherit the parent's BILLION_CONTEXT_* /
+ *  BILI_* knobs (a preset proxy origin would make --version spin up lanes)
+ *  nor NODE_OPTIONS / NODE_TEST_CONTEXT interference. */
+async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+    let entry: string | undefined;
+    try {
+        const pkg = JSON.parse(await readFile(path.join(installDir, "package.json"), "utf8")) as { main?: string };
+        if (typeof pkg.main === "string" && pkg.main.length > 0) entry = pkg.main;
+    } catch (err) {
+        return `package.json unreadable: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (entry === undefined) return "package.json declares no main entry to smoke";
+    const childEnv: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) continue;
+        if (key.startsWith("BILI_") || key.startsWith("BILLION_CONTEXT_") || key.startsWith("ACP_")) continue;
+        if (key === "NODE_OPTIONS" || key === "NODE_TEST_CONTEXT" || key === "NODE_ENV") continue;
+        childEnv[key] = value;
+    }
+    return await new Promise<string | null>((resolve) => {
+        const child = spawn(process.execPath, [path.join(installDir, entry!), "--version"], {
+            cwd: installDir,
+            env: childEnv,
+            stdio: ["ignore", "ignore", "pipe"],
+        });
+        let stderr = "";
+        child.stderr?.on("data", (chunk: Buffer) => {
+            stderr += chunk.toString();
+            if (stderr.length > 8192) stderr = safeSuffix(stderr, 8192);
+        });
+        const timer = setTimeout(() => {
+            child.kill();
+            resolve(`boot smoke timed out after ${BOOT_SMOKE_TIMEOUT_MS}ms`);
+        }, BOOT_SMOKE_TIMEOUT_MS);
+        child.on("error", (err) => {
+            clearTimeout(timer);
+            resolve(`boot smoke could not spawn ${process.execPath}: ${err.message}`);
+        });
+        child.on("close", (code, signal) => {
+            clearTimeout(timer);
+            if (code === 0) {
+                resolve(null);
+                return;
+            }
+            const lines = stderr.split("\n").filter((l) => l.trim().length > 0 && !l.trim().startsWith("at ") && !/^Node\.js v/.test(l.trim()));
+            const tail = lines.length > 0 ? `: ${safeSuffix(lines.join(" | "), 600)}` : "";
+            resolve(`boot smoke exited ${code ?? signal}${tail}`);
+        });
+    });
+}
+
 export async function installViaTarball(
     version: string,
     tarballUrl: string,
@@ -1026,6 +1243,7 @@ export async function installViaTarball(
     shasum?: string,
     dispatcher?: object,
     env: NodeJS.ProcessEnv = process.env,
+    opts: { bootSmoke?: boolean } = {},
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -1235,6 +1453,23 @@ export async function installViaTarball(
     if (postEntryErr) {
         const rb = await restoreFromBackup();
         return { ok: false, error: rb ?? postEntryErr };
+    }
+
+    // #2082: optional boot smoke. verifyEntries proves the declared entries
+    // PARSE; it cannot prove the artifact BOOTS (a top-level throw, a broken
+    // import graph, a runtime dependency the flattened copy no longer
+    // resolves — all syntactically valid). The desktop lane swaps this copy
+    // in place under a RUNNING dsh whose plugin respawns from it on the next
+    // proxy death; an unbootable copy turns that respawn into an infinite
+    // give-up loop and the bili tools vanish until dsh restarts. Run the new
+    // copy's CLI entry with --version once — the module graph loads and exits
+    // immediately. Any failure rolls the working copy back to the backup.
+    if (opts.bootSmoke) {
+        const smokeErr = await bootSmoke(installDir, env);
+        if (smokeErr !== null) {
+            const rb = await restoreFromBackup();
+            return { ok: false, error: rb ?? `boot smoke failed (rolled back to the previous copy): ${smokeErr}` };
+        }
     }
 
     // Success: the backup is no longer needed, and neither is the displaced

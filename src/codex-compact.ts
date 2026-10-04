@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { CompressionBlock } from "acp-kernel";
 import type { Session } from "./session.js";
+import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
 export const CODEX_COMPACT_SENTINEL = "bili:acp:";
@@ -10,10 +11,9 @@ const CODEX_UA_PREFIXES = ["codex_cli_rs/", "codex_exec/", "codex desktop/"];
 export type CodexCompactMode = "intercept" | "pass";
 
 // Read per-request (not cached at startup) so a running proxy can flip the
-// kill-switch without a restart.
+// kill-switch without a restart (env BILI_CODEX_COMPACT or config codexCompact).
 export function codexCompactMode(): CodexCompactMode {
-    const v = process.env.BILI_CODEX_COMPACT?.trim().toLowerCase();
-    return v === "pass" ? "pass" : "intercept";
+    return knobCodexCompactMode();
 }
 
 // The `originator` header is only sent for non-default thread originators, so

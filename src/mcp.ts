@@ -11,6 +11,16 @@
 // which overrides the default binding for that one call only. No registration
 // is issued for per-call ids — the proxy resolves them directly and flips the
 // target session to plugin mode on successful execution.
+// #2024: a fifth channel for hosts that stamp per-call MACHINE metadata —
+// Codex ≥0.160 puts the real thread id on every tools/call at _meta.threadId
+// (codex-rs core/src/mcp_tool_call.rs with_mcp_tool_call_ids_meta; its
+// sessionId is a transient run id and is deliberately NOT consumed). A valid
+// non-empty native id overrides BOTH the model-transcribed conversation_id
+// and any stale env/default binding for that one call only, is flagged to the
+// proxy as host-stamped (body field nativeCaller), and is NEVER written back
+// to this shim's global conversationId — main/sub-agent threads sharing one
+// MCP process must not clobber each other's binding. Absent or malformed
+// metadata leaves the legacy channels untouched.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -113,15 +123,21 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined): Promise<string> {
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<string> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
         try {
+            const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args };
+            // #2024: flag host-stamped per-call identity (Codex _meta.threadId) so
+            // the proxy ranks it above a content-based witness. Static env/meta
+            // bindings and model-transcribed ids are NOT flagged — their
+            // precedence stays exactly as #1685 wrote it.
+            if (nativeCaller && effectiveConversationId) body.nativeCaller = true;
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId: effectiveConversationId, tool, args }),
+                body: JSON.stringify(body),
                 signal: AbortSignal.timeout(timeoutMs),
             });
         } catch (err) {
@@ -174,7 +190,7 @@ async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string } };
+        _meta?: { ui?: { sessionId?: string }; threadId?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -226,6 +242,12 @@ async function handleMessage(msg: {
                 sendError(id, -32002, "server not initialized");
                 return;
             }
+            if (degradedReason !== undefined) {
+                // #1892: idle shim — advertise nothing rather than blocking on
+                // (or erroring against) an origin that is not there.
+                sendResult(id, { tools: [] });
+                return;
+            }
             try {
                 await ensureManifest();
                 sendResult(id, { tools: manifestTools });
@@ -239,6 +261,10 @@ async function handleMessage(msg: {
             const rawArgs: Record<string, unknown> = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
             if (!tool) {
                 sendError(id, ERR_TOOL, "params.name is required");
+                return;
+            }
+            if (degradedReason !== undefined) {
+                sendResult(id, { content: [{ type: "text", text: `bili is idle: ${degradedReason}` }], isError: true });
                 return;
             }
             // #760: per-call conversation_id — the model copies the id the
@@ -255,16 +281,30 @@ async function handleMessage(msg: {
             // stripped, exactly as before.
             const perCallRaw = rawArgs.conversation_id;
             const perCall = typeof perCallRaw === "string" ? perCallRaw.trim() : "";
-            const keepForSearch = tool === "search_context" && perCall.length > 0 && typeof conversationId === "string" && conversationId.length > 0;
+            // #2024: Codex stamps the real thread id on every tools/call via
+            // _meta.threadId (see file header). Validated strictly — anything
+            // that is not a non-empty string after trim is treated as ABSENT
+            // so malformed metadata can never shadow the legacy channels.
+            // Per-call only: this value never touches the global
+            // `conversationId` below. _meta.sessionId (transient run id) is
+            // deliberately not consumed.
+            const metaThreadId = params._meta?.threadId;
+            const nativeThreadId = typeof metaThreadId === "string" && metaThreadId.trim().length > 0 ? metaThreadId.trim() : undefined;
+            // A native caller counts as "bound" for the search-target
+            // exception (#841 extended by #2024): the call routes to the
+            // native thread while args.conversation_id stays the read-only
+            // target — even when no env/default binding exists (previously
+            // the target would have been mistaken for the caller).
+            const keepForSearch = tool === "search_context" && perCall.length > 0 && (nativeThreadId !== undefined || (typeof conversationId === "string" && conversationId.length > 0));
             const args = { ...rawArgs };
             if (!keepForSearch) delete args.conversation_id;
-            const routeOverride = keepForSearch ? undefined : perCall || undefined;
+            const routeOverride = nativeThreadId ?? (keepForSearch ? undefined : perCall || undefined);
             // #1685: with no binding and no per-call id, forward anyway — the
             // proxy routes the id-less POST itself (outbound tool_use witness,
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride);
+                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeThreadId !== undefined);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC
@@ -305,8 +345,16 @@ async function mcpMain(): Promise<void> {
     process.stdin.on("end", () => process.exit(0));
 }
 
+/** Set when this shim serves WITHOUT a live proxy behind it (#1892,
+ *  zcode mcp-entry): tools/list answers an empty list instead of timing out
+ *  against a dead origin, and tools/call returns a loud isError explaining
+ *  why. The process stays a valid MCP server so the host handshake completes
+ *  instead of seeing the child die pre-initialize. */
+let degradedReason: string | undefined;
+
 /** CLI entry (`bili mcp`): the stdio loop keeps the process alive. */
-export function runMcpStdio(): void {
+export function runMcpStdio(opts: { degraded?: string } = {}): void {
+    degradedReason = opts.degraded;
     void mcpMain();
 }
 

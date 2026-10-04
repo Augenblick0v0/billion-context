@@ -19,6 +19,7 @@ import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalI
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
+import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -27,9 +28,7 @@ type TrackedTempFile = { path: string; mtimeMs: number };
 const trackedTempFiles: TrackedTempFile[] = [];
 
 function getDecompressTmpCap(): number {
-    const raw = process.env.BILI_DECOMPRESS_TMP_CAP;
-    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+    return knobDecompressTmpCap();
 }
 
 function reapTempFiles(): void {

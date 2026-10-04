@@ -234,6 +234,46 @@ before trusting it. As a backstop, the proxy strips any marker-shaped line the
 model emits on its own and logs a `[marker-echo]` warning, and both the nudge
 and the injected prompt state explicitly that markers are proxy-emitted only.
 
+## Responses native chaining is not supported — history must be replayed (#1954)
+
+The Responses-wire adapter (`prepareResponses` in `src/server.ts`, `buildRequest`
+in `src/loop/adapter-responses.ts`) is a **stateless replay compressor**: it
+treats `parsed.input` as the *complete* conversation, compresses that, and then
+drops `previous_response_id` unless `ACP_KEEP_RESPONSE_ID=1`. It keeps no
+response-lineage store, so it **cannot materialize the history a native-chaining
+continuation references**.
+
+OpenAI's native chaining (`store:true` + `previous_response_id`, server-held
+history) and bili's client-replayed model are mutually exclusive paradigms. A
+delta-only continuation (just the new turn + `previous_response_id`, no full
+replay) therefore reaches the upstream with **neither the reference nor the
+referenced turns** — prior context is silently lost upstream while the request
+still returns 200. That is the mechanism behind #1954.
+
+**What ships here (approach A — visibility only).** When a non-empty
+`previous_response_id` is stripped, both paths now emit a `warn` naming the id
+and stating the consequence. The trigger keys off the id **alone**, not off
+explicit `store:true`, because Responses stores responses by default — an omitted
+`store` still leaves the referenced response resolvable upstream, so judging on
+`store` would miss the common case. Approach A changes no forwarded byte and
+closes nothing: the delta request still loses its history and still returns 200.
+It only stops the loss from being silent.
+
+**Observation, not proof.** Current builds/tests show codex sends `store:false`
+and never sets `previous_response_id`, so this is a no-op for codex *today*. That
+is an observation from the existing E2E + traffic, not proof that no client ever
+chains — the E2E does not cover the delta-chaining shape. codex is OpenAI's own
+CLI against a Responses API that natively supports chaining, so a future version
+switching to native continuation to save tokens is a reasonable evolution; until
+then this stays a latent high-severity gap.
+
+**Safe options for a chaining client today:** resend the full input/output
+history (bili then compresses/forwards normally), or set `ACP_KEEP_RESPONSE_ID=1`
+to preserve the id — but under KEEP the referenced history lives server-side and
+bili's compression/prefix-cache accounting cannot see it. The real fix
+(materialize lineage before compression) is tracked as feature #1973. Official
+migration guide: https://developers.openai.com/api/docs/guides/migrate-to-responses
+
 ## Single-writer: who owns which copy (#991)
 
 Every bili presence on a machine has exactly **one writer** — the thing

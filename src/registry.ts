@@ -21,7 +21,7 @@ type RegistryShape = Record<string, ModelEntry>;
 // providers.<host>.models.<id>.cost ($/Mtok). Only rows with a usable input
 // price are stored — without an input anchor there is nothing to normalize
 // against, and half-inventing a profile would misprice every fold.
-type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
+export type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
 type CostsShape = Record<string, CostRow>;
 type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 
@@ -30,6 +30,14 @@ let costCache: CostsShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
 const warnedConflicts = new Set<string>();
 const warnedPriceConflicts = new Set<string>();
+// Case-folded key indexes for the roster maps (#2074): models.dev keys are
+// mixed-case ("minimax/MiniMax-M3", "google/gemma-4-E2B-it") while relay ids
+// often arrive lowercased — exact-key hits and suffix scans were case-
+// sensitive on both sides, so any case drift silently fell back to the
+// built-in table / default window. One slot per source object; identity-
+// checked, so loadRegistry / _setForTest swaps invalidate automatically.
+let regLowerIdx: { reg: RegistryShape; idx: LowerKeyIndex<ModelEntry> } | null = null;
+let costLowerIdx: { costs: CostsShape; idx: LowerKeyIndex<CostRow> } | null = null;
 
 /** Full models.dev snapshot committed at src/registry-snapshot.json
  *  (refresh with `npm run registry:snapshot`) and inlined into dist at build
@@ -361,20 +369,23 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
             if (!names.includes(variant)) names.push(variant);
         }
     }
+    const idx = costLowerIndex(costs);
     for (const name of names) {
         const candidates = provider ? [`${provider}/${name}`, name] : [name];
         for (const key of candidates) {
-            const profile = priceProfileFromRow(costs[key]);
+            let row: CostRow | undefined = costs[key];
+            if (!row) row = idx.byLower.get(key.toLowerCase())?.value;
+            const profile = priceProfileFromRow(row);
             if (profile) return profile;
         }
         if (provider === undefined) {
-            const suffix = `/${name}`;
+            const suffix = `/${name.toLowerCase()}`;
             let chosen: PriceProfile | undefined;
             const seen = new Set<string>();
             const parts: string[] = [];
-            for (const key of Object.keys(costs)) {
-                if (!key.endsWith(suffix)) continue;
-                const profile = priceProfileFromRow(costs[key]);
+            for (const { lower, key, value: row } of idx.entries) {
+                if (!lower.endsWith(suffix)) continue;
+                const profile = priceProfileFromRow(row);
                 if (!profile) continue;
                 const sig = `${profile.w}|${profile.r}|${profile.q}`;
                 if (!seen.has(sig)) {
@@ -462,6 +473,37 @@ export function modelVariants(name: string): string[] {
     return variants;
 }
 
+// byLower keeps only the FIRST original key per lowercased form (case-only
+// collisions in one roster are degenerate); entries keeps every key so the
+// relay scan still sees all providers.
+type LowerKeyIndex<T> = {
+    byLower: Map<string, { key: string; value: T }>;
+    entries: Array<{ lower: string; key: string; value: T }>;
+};
+
+function buildLowerKeyIndex<T>(obj: Record<string, T>): LowerKeyIndex<T> {
+    const byLower = new Map<string, { key: string; value: T }>();
+    const entries: Array<{ lower: string; key: string; value: T }> = [];
+    for (const [key, value] of Object.entries(obj)) {
+        const lower = key.toLowerCase();
+        if (!byLower.has(lower)) byLower.set(lower, { key, value });
+        entries.push({ lower, key, value });
+    }
+    return { byLower, entries };
+}
+
+function registryLowerIndex(reg: RegistryShape): LowerKeyIndex<ModelEntry> {
+    if (regLowerIdx && regLowerIdx.reg === reg) return regLowerIdx.idx;
+    regLowerIdx = { reg, idx: buildLowerKeyIndex(reg) };
+    return regLowerIdx.idx;
+}
+
+function costLowerIndex(costs: CostsShape): LowerKeyIndex<CostRow> {
+    if (costLowerIdx && costLowerIdx.costs === costs) return costLowerIdx.idx;
+    costLowerIdx = { costs, idx: buildLowerKeyIndex(costs) };
+    return costLowerIdx.idx;
+}
+
 function registryLookup(reg: RegistryShape | null, model: string, host: string | undefined, field: "context" | "output"): number | undefined;
 function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined;
 function registryLookup(reg: RegistryShape | null, model: string, host?: string, field: "context" | "output" = "context"): number | undefined {
@@ -483,10 +525,14 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string,
             if (!names.includes(variant)) names.push(variant);
         }
     }
+    const idx = registryLowerIndex(reg);
     for (const name of names) {
         const candidates = provider ? [`${provider}/${name}`, name] : [name];
         for (const key of candidates) {
-            const entry = reg[key];
+            // Byte-exact key first, case-folded second (#2074): roster keys
+            // are mixed-case while relay ids often arrive lowercased.
+            let entry: ModelEntry | undefined = reg[key];
+            if (!entry) entry = idx.byLower.get(key.toLowerCase())?.value;
             const value = entry?.limit?.[field];
             if (typeof value === "number" && value > 0) return value;
         }
@@ -502,13 +548,13 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string,
         // model is genuinely unlisted for that provider (its stripped
         // variants still get their exact-key chance above).
         if (provider === undefined) {
-            const suffix = `/${name}`;
+            const suffix = `/${name.toLowerCase()}`;
             let max: number | undefined;
             const distinct = new Set<number>();
             const parts: string[] = [];
-            for (const key of Object.keys(reg)) {
-                if (!key.endsWith(suffix)) continue;
-                const value = reg[key].limit?.[field];
+            for (const { lower, key, value: entry } of idx.entries) {
+                if (!lower.endsWith(suffix)) continue;
+                const value = entry.limit?.[field];
                 if (typeof value !== "number" || value <= 0) continue;
                 if (max === undefined || value > max) max = value;
                 distinct.add(value);
@@ -530,6 +576,8 @@ export function _resetForTest(): void {
     cache = null;
     costCache = null;
     loading = null;
+    regLowerIdx = null;
+    costLowerIdx = null;
     warnedConflicts.clear();
     warnedPriceConflicts.clear();
 }

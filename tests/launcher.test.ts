@@ -80,10 +80,14 @@ import {
     findFreePort,
     ensureProxyRunning,
     resolveNodeRuntime,
+    probeNodeWrapperTarget,
     stopProxy,
     stopProxyGuarded,
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
+    codexRunModePinned,
+    codexSupportsNoDaemon,
+    buildWindowsCommandLine,
     resolveClaudeBudgetEnv,
     resolveQoderBudgetEnv,
     buildQoderEnv,
@@ -432,7 +436,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
             clientArgsSeen.push([...args]);
             // runClient resolves on "exit" — fire it on next tick.
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -541,7 +545,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (cmd === fakePi) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -612,7 +616,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         if (cmd === process.env.BILI_CLIENT_BIN) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -694,7 +698,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
         if (cmd === fakeHermes) {
             childEnv = options.env;
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -812,7 +816,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         if (cmd === fakeOmp) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -996,7 +1000,7 @@ test("runLaunch: client exit spares the shared proxy when other watchers remain 
     const spawnImpl: SpawnFn = (cmd, _args, options) => {
         if (cmd === fakeBin) {
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -1053,6 +1057,29 @@ function makeFakeChild(pid: number): SpawnChild {
     };
 }
 
+// #679/#1867 test seam: inverse of planClientSpawn's comspec wrapping — splits
+// the single `comspec /d /s /c "<line>"` arg back into tokens (quote-aware;
+// quoteWinToken only quotes whitespace-bearing tokens, so this round-trips it).
+function splitWindowsCommandLine(line: string): string[] {
+    const tokens: string[] = [];
+    let cur = "";
+    let quoted = false;
+    for (const ch of line) {
+        if (ch === '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && /\s/.test(ch)) {
+            if (cur !== "") tokens.push(cur);
+            cur = "";
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur !== "") tokens.push(cur);
+    return tokens;
+}
+
 test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
@@ -1088,9 +1115,9 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     );
     assert.equal(handle.child?.pid, 42421);
     assert.ok(spawnedArgs !== null);
-    assert.ok(spawnedArgs.includes("start"));
-    assert.ok(spawnedArgs.includes("--host"));
-    const portIdx = spawnedArgs.indexOf("--port");
+    assert.ok((spawnedArgs as string[]).includes("start"));
+    assert.ok((spawnedArgs as string[]).includes("--host"));
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.ok(portIdx >= 0, "spawn args include --port");
     assert.equal(spawnedArgs[portIdx + 1], String(handle.port));
     assert.ok(healthProbes >= 2, "fallback polls health until the child answers");
@@ -1165,6 +1192,83 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
         ...over,
     };
 }
+
+// #1903: post-exit re-discovery. A spawned child dying before healthy PROVES
+// the port it wanted is held; when the holder's identity record published
+// AFTER our one-shot discovery snapshot (manual `bili start`: TCP accept
+// precedes the 'listening' callback that writes proxy-origin), the launcher
+// must attach on a bounded retry instead of failing from a stale view — and
+// throw the original error when nothing republishes within the budget.
+function makeFastExitChild(code: number): SpawnChild {
+    const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
+    return {
+        pid: 42423,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on(event, listener) {
+            const list = handlers.get(event) ?? [];
+            list.push(listener);
+            handlers.set(event, list);
+            // synchronous emit: the death lands before the spawn poll loop's
+            // first tick, so the failure path is reached without burning SPAWN_WAIT_MS
+            if (event === "exit") listener(code, null);
+        },
+    };
+}
+
+test("ensureProxyRunning: attaches a late-publishing instance after the spawned child dies (#1903)", async () => {
+    const PORT = 38991;
+    const late = recordedInstance({ origin: `http://127.0.0.1:${PORT}`, port: PORT });
+    let reads = 0;
+    const registrations: Array<[string, number]> = [];
+    let t = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: PORT, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+        {
+            spawnImpl: () => makeFastExitChild(1),
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async (origin) => origin === late.origin ? { ok: true, instanceId: late.instanceId, pid: late.pid } : undefined,
+            readInstanceFile: () => (++reads > 1 ? late : undefined),
+            now: () => t,
+            sleep: async (ms) => { t += ms; },
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "refused"; },
+            attachDiag: () => {},
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(handle.attached, true, "attached to the late publisher instead of failing");
+    assert.equal(handle.origin, late.origin);
+    assert.equal(handle.refusedWatcher, true, "manual daemon refuses watchers — #1322 flag carried through the retry path");
+    assert.deepEqual(registrations, [[late.origin, process.pid]]);
+    assert.equal(reads, 2, "initial snapshot missed it; the FIRST re-discovery tick caught it");
+});
+
+test("ensureProxyRunning: throws the original child-death error when nothing republishes within the budget (#1903)", async () => {
+    let reads = 0;
+    let t = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 38992, passthrough: false, debug: false, strictPort: true, lane: "claude" },
+            {
+                spawnImpl: () => makeFastExitChild(1),
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
+                readInstanceFile: () => { reads++; return undefined; },
+                now: () => t,
+                sleep: async (ms) => { t += ms; },
+                registerWatcher: async () => "failed",
+                attachDiag: () => {},
+                scriptPath: FP_SCRIPT,
+            },
+        ),
+        /exited before becoming healthy \(code 1\)/,
+    );
+    // exactly one initial discovery + POST_EXIT_REDISCOVERY_MS / HEALTH_POLL_INTERVAL_MS
+    // re-discovery ticks — the budget is bounded and honored under the injected clock
+    assert.equal(reads, 1 + Math.round(3000 / 200));
+});
 
 test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
     let spawnCalls = 0;
@@ -1407,7 +1511,7 @@ test("ensureProxyRunning: a lane'd launch with port 0 binds the zone preference 
     );
     assert.deepEqual(preferred, ["zcode"], "the lane's zone preference resolves the spawn port");
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.equal(spawnedArgs[portIdx + 1], "18787", "zone base is the spawn port, not an OS ephemeral");
     assert.equal(handle.port, 18787);
     assert.deepEqual(settled, [["zcode", 18787]], "the settled port is recorded sticky for later launches");
@@ -1434,7 +1538,7 @@ test("ensureProxyRunning: an unlane'd launch keeps the OS ephemeral default — 
         },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     const childPort = Number(spawnedArgs[portIdx + 1]);
     assert.ok(Number.isInteger(childPort) && childPort > 0, `ephemeral port assigned, got ${childPort}`);
     assert.equal(handle.port, childPort);
@@ -2075,7 +2179,7 @@ test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned e
         { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.ok(portIdx >= 0, "spawn args include --port");
     const childPort = Number(spawnedArgs[portIdx + 1]);
     assert.ok(Number.isInteger(childPort) && childPort >= 1024 && childPort <= 65535, `ephemeral port assigned, got ${childPort}`);
@@ -2094,7 +2198,7 @@ test("ensureProxyRunning: explicit port is honored verbatim (no ephemeral reassi
         { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
-    const portIdx = spawnedArgs.indexOf("--port");
+    const portIdx = (spawnedArgs as string[]).indexOf("--port");
     assert.equal(spawnedArgs[portIdx + 1], "8787");
     assert.equal(handle.port, 8787);
 });
@@ -2174,7 +2278,7 @@ test("stopProxy: POSIX kills the owned child, win32 defers to the parent-gone wa
             return true;
         },
     };
-    stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, reused: false, child });
+    stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, child });
     if (process.platform === "win32") {
         assert.equal(killed, false, "win32 child.kill is TerminateProcess (no flush) — shutdown belongs to BILI_PARENT_PID watcher");
     } else {
@@ -2478,7 +2582,7 @@ test("resolveNonHttpProviders: providers-table compactionOptIn ∪ env list, ded
         assert.deepEqual(resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "claude-bridge,z" }), ["claude-bridge", "https://api.anthropic.com", "z"]);
     } finally {
         if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2523,10 +2627,10 @@ test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => 
         "  default: sglang-responses/qwen3.8-27b:high",
     ].join("\n");
     const cfg = parseOmpYaml(yml);
-    assert.equal(cfg.providers["sglang-responses"].baseUrl, "http://127.0.0.1:8199/v1");
-    assert.equal(cfg.providers["zhipuai"].baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
-    assert.equal(cfg.providers["ollama-chat"].baseUrl, "http://127.0.0.1:11435/v1");
-    assert.equal(Object.keys(cfg.providers).length, 3);
+    assert.equal(cfg.providers?.["sglang-responses"]?.baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers?.["zhipuai"]?.baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
+    assert.equal(cfg.providers?.["ollama-chat"]?.baseUrl, "http://127.0.0.1:11435/v1");
+    assert.equal(Object.keys(cfg.providers ?? {}).length, 3);
 });
 
 test("parseOmpYaml: no providers key → {}", () => {
@@ -2539,7 +2643,7 @@ test("readOmpConfig: reads models.yml from omp home", () => {
     try {
         fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: http://x:1/v1\n");
         const cfg = readOmpConfig(home);
-        assert.equal(cfg.providers.a.baseUrl, "http://x:1/v1");
+        assert.equal(cfg.providers?.a?.baseUrl, "http://x:1/v1");
     } finally {
         rmrf(home);
     }
@@ -2590,10 +2694,10 @@ test("readOpencodeConfig: reads provider baseURLs from opencode.json", () => {
             }),
         );
         const cfg = readOpencodeConfig(cfgFile);
-        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
-        assert.deepEqual(cfg.providers["remote"], { baseURL: "https://api.example.com/v1" });
-        assert.equal(cfg.providers["noUrl"], undefined);
-        assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers["local"], undefined);
+        assert.deepEqual(cfg.providers?.["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+        assert.deepEqual(cfg.providers?.["remote"], { baseURL: "https://api.example.com/v1" });
+        assert.equal(cfg.providers?.["noUrl"], undefined);
+        assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers?.["local"], undefined);
     } finally {
         rmrf(dir);
     }
@@ -2633,7 +2737,7 @@ test("readOpencodeConfig: parses JSONC (comments + trailing commas)", () => {
             ].join("\n"),
         );
         const cfg = readOpencodeConfig(cfgFile);
-        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+        assert.deepEqual(cfg.providers?.["local"], { baseURL: "http://127.0.0.1:18081/v1" });
     } finally {
         rmrf(dir);
     }
@@ -2834,8 +2938,8 @@ test("prepareOpencodeHttpRewrite: re-anchors relative local plugin specs against
         ]);
         // original file untouched and the caller's merged root stays pristine
         assert.equal(fs.readFileSync(path.join(cfgDir, "opencode.json"), "utf8"), original);
-        assert.equal((root.plugin as unknown[])[0], "./ntfy.js");
-        assert.equal(((root.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
+        assert.equal((root!.plugin as unknown[])[0], "./ntfy.js");
+        assert.equal(((root!.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
         rmrf(path.dirname(tmpFile));
     } finally {
         rmrf(dir);
@@ -3152,9 +3256,9 @@ test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", (
         assert.ok(file);
         const txt = fs.readFileSync(file, "utf8");
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: billion-context$/m);
-        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+        rmrf(`${dir}-bili`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3209,7 +3313,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // No shim at all: the same fallback.
-        fs.rmSync(shimDir, { recursive: true, force: true });
+        rmrf(shimDir);
         assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
 
         // Missing dist bundles: nothing written, existing content untouched.
@@ -3219,7 +3323,7 @@ test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare 
         assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
         assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3238,7 +3342,7 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         const repoPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
         assert.equal(shimPkg.version, repoPkg.version);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -3428,9 +3532,13 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     // overlay home — loopback rewrites are pending here, so the overlay
     // exists). Keeps the bare-entry assertion deterministic on trees without
     // a build: runLaunch's own writeDshClientShim only overwrites the fixture
-    // with real dist symlinks when bili's dist bundles exist.
-    const hostFixture = path.join(home, "host-bundle.js");
-    const clientFixture = path.join(home, "client-bundle.js");
+    // with real dist symlinks when bili's dist bundles exist. The fixture
+    // files MUST be named agent/dsh-native.js / -client.js: dshPluginEntry's
+    // identity check requires the resolved root's realpath to end with
+    // agent/dsh-native.js — mere resolvability is not enough (#1889).
+    const hostFixture = path.join(home, "agent", "dsh-native.js");
+    const clientFixture = path.join(home, "agent", "dsh-native-client.js");
+    fs.mkdirSync(path.dirname(hostFixture), { recursive: true });
     fs.writeFileSync(hostFixture, "// host\n");
     fs.writeFileSync(clientFixture, "// client\n");
     assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169"), true);
@@ -3448,7 +3556,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
             if (options?.env) envSeen.push(options.env);
             argsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -3558,7 +3666,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
         if (cmd === fakeDsh) {
             if (options?.env) envSeen.push(options.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -3691,6 +3799,92 @@ test("resolveNodeRuntime: non-Electron host still throws when no Node resolves (
     );
 });
 
+test("resolveNodeRuntime: win32 PATH node that re-execs into a wrapper resolves to the real Node (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const real = "C:/Users/x/scoop/apps/nodejs-lts/current/node.exe";
+    const probed: string[] = [];
+    const probe = (c: string): string | undefined => { probed.push(c); return real; };
+    const exists = (p: string): boolean => p === shim || p === real;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        real,
+    );
+    // the discovered candidate is consulted exactly once, on the wrapper itself
+    assert.deepEqual(probed, [shim]);
+});
+
+test("resolveNodeRuntime: win32 wrapper probe failure falls back to the shim unchanged (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => undefined;
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 wrapper resolving to a missing target falls back to the shim (#1887)", () => {
+    const shim = "C:/Users/x/AppData/Local/mise/shims/node.exe";
+    const probe = (): string | undefined => "C:/gone/node.exe";
+    const exists = (p: string): boolean => p === shim;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Users/x/AppData/Local/mise/shims" }, "win32", exists, undefined, probe),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: win32 real node whose probe reports itself is left unchanged (#1887)", () => {
+    const node = "C:/Program Files/nodejs/node.exe";
+    const probe = (c: string): string | undefined => c;
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/Program Files/nodejs" }, "win32", exists, undefined, probe),
+        node,
+    );
+});
+
+test("resolveNodeRuntime: posix never consults the wrapper probe (#1887)", () => {
+    const node = "/opt/host/bin/node";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "/elsewhere/node"; };
+    const exists = (p: string): boolean => p === node;
+    assert.equal(
+        resolveNodeRuntime("/snap/opencode/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", exists, undefined, probe),
+        node,
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: a live Node executable is returned without probing (#1887)", () => {
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    assert.equal(
+        resolveNodeRuntime("C:/nodejs/node.exe", { PATH: "C:/whatever" }, "win32", () => false, undefined, probe),
+        "C:/nodejs/node.exe",
+    );
+    assert.equal(calls, 0);
+});
+
+test("resolveNodeRuntime: an explicit BILLION_CONTEXT_NODE override is honored verbatim, not probed (#1887)", () => {
+    const override = "C:/pinned/node.exe";
+    let calls = 0;
+    const probe = (): string | undefined => { calls++; return "x"; };
+    const exists = (p: string): boolean => p === override || p === "C:/shim/node.exe";
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { BILLION_CONTEXT_NODE: override, PATH: "C:/shim" }, "win32", exists, undefined, probe),
+        override,
+    );
+    assert.equal(calls, 0);
+});
+
+test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", () => {
+    const out = probeNodeWrapperTarget(process.execPath, { ...process.env });
+    assert.ok(typeof out === "string" && out.length > 0, "expected a non-empty path");
+    assert.ok(fs.existsSync(out), `expected an existing path, got ${out}`);
+    const lower = out.toLowerCase();
+    assert.ok(lower.endsWith("node") || lower.endsWith("node.exe"), `expected a node path, got ${out}`);
+});
+
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
     let spawnedCmd: string | null = null;
     const spawnImpl: SpawnFn = (cmd) => {
@@ -3743,7 +3937,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
     const spawnImpl: SpawnFn = (cmd, args, opts) => {
         if (cmd === fakeOmp) {
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -3970,7 +4164,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         if (cmd === fakeCodex) {
             clientArgsSeen.push([...args]);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4032,6 +4226,230 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
     }
 });
 
+test("codexRunModePinned: detects user-pinned run mode (#1867)", () => {
+    assert.equal(codexRunModePinned([]), false);
+    assert.equal(codexRunModePinned(["-c", "model_context_window=400000"]), false);
+    assert.equal(codexRunModePinned(["resume", "abc"]), false);
+    assert.equal(codexRunModePinned(["--no-daemon"]), true);
+    assert.equal(codexRunModePinned(["--remote", "ws://127.0.0.1:9"]), true);
+    assert.equal(codexRunModePinned(["--remote=ws://127.0.0.1:9"]), true);
+});
+
+test("splitWindowsCommandLine: round-trips buildWindowsCommandLine quoting (#679/#1867)", () => {
+    // helper contract: the inner line, i.e. the comspec arg minus its outer quote pair
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\temp\\fake-codex.cmd", ["--no-daemon", "-c", "model_context_window=400000"]).slice(1, -1)),
+        ["C:\\temp\\fake-codex.cmd", "--no-daemon", "-c", "model_context_window=400000"],
+    );
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\Users\\Some User\\temp\\fake-codex.cmd", ["--remote", "ws://127.0.0.1:9"]).slice(1, -1)),
+        ["C:\\Users\\Some User\\temp\\fake-codex.cmd", "--remote", "ws://127.0.0.1:9"],
+    );
+});
+
+test("codexSupportsNoDaemon: probes --help output, fails soft (#1867)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-"));
+    const isWin = process.platform === "win32";
+    const helpWithFlag = isWin
+        ? "@echo Options:\r\n@echo   --no-daemon\r\n@echo       Run without the shared background server\r\n"
+        : "#!/bin/sh\necho \"Options:\"\necho \"  --no-daemon\"\necho \"      Run without the shared background server\"\n";
+    const helpWithoutFlag = isWin
+        ? "@echo Options:\r\n@echo   --profile <NAME>\r\n"
+        : "#!/bin/sh\necho \"Options:\"\necho \"  --profile <NAME>\"\n";
+    const mk = (name: string, body: string): string => {
+        const p = path.join(dir, name + (isWin ? ".cmd" : ""));
+        fs.writeFileSync(p, body);
+        if (!isWin) fs.chmodSync(p, 0o755);
+        return p;
+    };
+    try {
+        assert.equal(codexSupportsNoDaemon(mk("new-codex", helpWithFlag), []), true);
+        assert.equal(codexSupportsNoDaemon(mk("old-codex", helpWithoutFlag), []), false);
+        assert.equal(codexSupportsNoDaemon(mk("dead-codex", isWin ? "@exit /b 3\r\n" : "#!/bin/sh\nexit 3\n"), []), false);
+        assert.equal(codexSupportsNoDaemon(path.join(dir, "missing-codex" + (isWin ? ".cmd" : "")), []), false);
+        // cached per command path
+        const again = mk("new-codex-2", helpWithFlag);
+        assert.equal(codexSupportsNoDaemon(again, []), true);
+        fs.writeFileSync(again, helpWithoutFlag);
+        if (!isWin) fs.chmodSync(again, 0o755);
+        assert.equal(codexSupportsNoDaemon(again, []), true);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("runLaunch codex: --no-daemon pinned when supported, escape hatches honored (#1867)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-run-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const isWin = process.platform === "win32";
+    const fakeCodex = path.join(home, isWin ? "fake-codex.cmd" : "fake-codex");
+    fs.writeFileSync(fakeCodex, isWin ? "@echo Options:\r\n@echo   --no-daemon\r\n@echo       Run without the shared background server\r\n" : "#!/bin/sh\necho \"Options:\"\necho \"  --no-daemon\"\necho \"      Run without the shared background server\"\n");
+    if (!isWin) fs.chmodSync(fakeCodex, 0o755);
+    process.env.BILI_CLIENT_BIN = fakeCodex;
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\n');
+
+    const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    const launch = (clientArgs: string[]) =>
+        runLaunch(
+            { client: "codex", clientArgs, overrides: {} },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+
+    try {
+        // fresh launch → #321 budget args AND explicit embedded pin
+        await launch([]);
+        assert.equal(clientArgsSeen.length, 1);
+        let args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(args.includes("model_context_window=400000") && args.includes("model_auto_compact_token_limit=400000"), JSON.stringify(args));
+
+        // user self-aligned window (no budget injection) → still pinned: without this
+        // the session would silently attach to an external daemon and bypass bili
+        fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\nmodel_context_window = 1000000\n');
+        clientArgsSeen.length = 0;
+        await launch([]);
+        args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(!args.some((a) => a.startsWith("model_context_window=")), JSON.stringify(args));
+
+        // unresolvable model (no budget injection) → still pinned
+        fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "totally-unknown-model"\n');
+        clientArgsSeen.length = 0;
+        await launch([]);
+        args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+
+        // user already passed --no-daemon → not duplicated
+        clientArgsSeen.length = 0;
+        await launch(["--no-daemon"]);
+        args = clientArgsSeen[0];
+        assert.equal(args.filter((a) => a === "--no-daemon").length, 1, JSON.stringify(args));
+
+        // user passed --remote → no injection (codex hard-errors the combo)
+        clientArgsSeen.length = 0;
+        await launch(["--remote", "ws://127.0.0.1:9"]);
+        args = clientArgsSeen[0];
+        assert.ok(!args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(args.includes("--remote"), JSON.stringify(args));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
+test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-old-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const isWin = process.platform === "win32";
+    const fakeCodex = path.join(home, isWin ? "old-codex.cmd" : "old-codex");
+    fs.writeFileSync(fakeCodex, isWin ? "@echo Options:\r\n@echo   --profile <NAME>\r\n" : "#!/bin/sh\necho \"Options:\"\necho \"  --profile <NAME>\"\n");
+    if (!isWin) fs.chmodSync(fakeCodex, 0o755);
+    process.env.BILI_CLIENT_BIN = fakeCodex;
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "");
+
+    const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "codex", clientArgs: [], overrides: {} },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("--no-daemon"), JSON.stringify(clientArgsSeen[0]));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
 test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table window)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-budget-"));
     const prevHome = process.env.HOME;
@@ -4055,7 +4473,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         if (cmd === fakeClaude) {
             clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4380,7 +4798,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
         if (cmd === fakeCodebuddy) {
             clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -4615,7 +5033,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         if (cmd === fakeQoder) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5022,7 +5440,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         if (cmd === fakeTrae) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5112,7 +5530,7 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
         if (cmd === fakeBin) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5235,7 +5653,7 @@ async function runAiderLaunch(
         if (cmd === fakeAider) {
             clientEnv = env;
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5472,7 +5890,7 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         if (cmd === fakeKimi) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5697,7 +6115,7 @@ test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA
         if (cmd === fakeMcode) {
             clientEnvs.push(env);
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);
@@ -5910,7 +6328,7 @@ test("runLaunch goose: custom provider rides the regenerated GOOSE_PATH_ROOT ove
             clientEnvs.push(env);
             fs.writeFileSync(path.join(String(env!.GOOSE_PATH_ROOT), "config", "config.toml"), 'active_provider = "mine"\nsome_new_key = 1\n');
             const child = makeFakeChild(0);
-            const orig = child.on.bind(child);
+            const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
                 orig(event, listener);
                 if (event === "exit") setTimeout(() => listener(0, null), 0);

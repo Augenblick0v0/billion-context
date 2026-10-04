@@ -331,7 +331,39 @@ proxy never strands a dead URL, and the shell simply attaches to whatever is
 alive. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
-(#760).
+(#760). Codex ≥0.160 additionally stamps the real thread id on every
+`tools/call` via `_meta.threadId`; the shell consumes it per call (strictly
+validated, never written back into the spawn-time binding) and it outranks
+both a stale `BILI_CONVERSATION_ID` residue and the model-transcribed
+`conversation_id` (#2024).
+
+**Responses native chaining (a caveat).** bili compresses by replaying the full
+`input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a
+delta-only continuation would lose its earlier turns upstream while still
+returning 200. Today this is a non-issue for codex — observed builds send
+`store:false` and never set `previous_response_id` (an observation, not a proof;
+the E2E does not cover that shape). If you point a native-chaining Responses
+client through bili, either resend the full input/output history or set
+`ACP_KEEP_RESPONSE_ID=1`; when bili strips a non-empty `previous_response_id` it
+now logs a `warn` (#1954). Full chaining support is tracked as #1973. See the
+[official migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
+
+### Run mode: `bili codex` pins embedded (#1867)
+
+Since ~0.156 Codex can attach to (or auto-start) a machine-wide shared
+background server whose model traffic uses the environment that was present
+**when the daemon started**, not when a session starts. The launcher's proxy is
+session-scoped (its port dies with the process), so a long-lived daemon cannot
+route through it safely: if codex starts first without bili's env, later
+`bili codex` sessions silently attach to it and bypass compression entirely;
+if bili starts first, the surviving daemon keeps pointing at a dead port. The
+launcher therefore passes `--no-daemon` explicitly — after probing
+`codex --help` for the flag (older binaries launch unchanged) and only when the
+user has not already pinned a mode (`--no-daemon` or `--remote`). Result:
+deterministic embedded runs, no per-launch fallback warning, no silent bypass.
+The #321 budget `-c` args are kept verbatim (embedded mode honors them
+identically). If you want the shared background server, run native `codex`
+directly — no compression, but tools still work via `bili plugin install codex`.
 
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
@@ -367,6 +399,54 @@ None of the three has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit
 that surface). Launcher-only by design.
 
+## Pi (pi.dev coding agent)
+
+Pi has a full native mode (`bili plugin install pi`, README quickstart
+option 1); this section covers what the one-line table can't — **which model
+transports the native intercept actually covers**. Pi is the only host that
+brings WebSocket model traffic into the loop.
+
+**How routing works.** The pi extension bootstraps (or attaches to) its own
+proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
+is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the
+`x-bili-plugin*` headers through pi's `before_provider_headers` event. Every
+HTTP-based provider (Anthropic, OpenAI chat/completions/responses, Gemini,
+Mistral, OpenRouter, Azure, custom relays…) rides this path as a named
+plugin-mode session.
+
+**The WebSocket gap (#2073).** A WebSocket connection never goes through
+`globalThis.fetch`, so pi's WebSocket model transports bypass the native
+intercept entirely whenever the handshake succeeds:
+
+| Provider / transport | Status |
+|---|---|
+| All HTTP providers | ✅ covered — named plugin-mode session |
+| `openai-codex-responses` (ChatGPT backend-api), `transport: "sse"` | ✅ covered — identical to any HTTP provider |
+| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ❌ bypasses the proxy while the WebSocket succeeds — the ACP tools are still registered and their calls still reach the proxy, but no model request from that session ever arrives, so no conversation state exists. Tool calls fail at the routing stage (`unknown plugin conversation` + `NO MODEL REQUESTS`, #1158 diagnostic). Until #2072 ships the failure is worse than loud: a stale outbound witness from a *sibling* subagent session can silently answer with that other session's state (#2063) — treat status panels from such sessions as untrustworthy until you check bili.log |
+| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (tracked under #2073) |
+
+**Workaround for the codex provider.** Force the SSE lane in pi's settings
+(`~/.pi/agent/settings.json`; project `.pi/settings.json` overrides):
+
+```json
+{ "transport": "sse" }
+```
+
+The default `"auto"` tries WebSocket first and falls back to SSE only when
+the handshake fails; the legacy boolean key `"websockets": false` migrates
+automatically. The key is global but only multi-transport providers (today:
+the codex provider) consume it — HTTP-only providers ignore it. Verified on
+Windows + Pi 1.0.2 (#2063 owner repro): explicit `sse` enters bili with the
+correct session id.
+
+The tracked fix (client-side `globalThis.WebSocket` interception, owner-gated
+per #2073) is viable rather than speculative: pi sends the same `session-id`
+header on its WebSocket upgrades as on SSE (value = the pi session id),
+Node's built-in WebSocket forwards constructor `headers` (verified on Node
+22), and the proxy side already speaks the wire — the WS bridge admits the
+prefix shape `/bili/<upstream>/responses` keyed on exactly that header
+(`src/ws-bridge.ts`, `src/responses-ws.ts` `codexResponsesCodec`).
+
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 
 Some clients (VS Code-based IDEs: CodeBuddy, Cursor, Windsurf, …) only offer an HTTP **proxy** setting (`http.proxy`, `codingcopilot.httpProxyURL`, …) — no model base-URL to rewrite. Such clients send `CONNECT <model-host>:443` through the proxy instead of plain `/bili/…` requests. That path is only decrypted when the model host is on bili's **MITM whitelist**; otherwise bili blind-tunnels the TLS bytes (opaque relay) and can never see — or compress — the model requests (#897).
@@ -381,7 +461,7 @@ To actually compress such a client: add its model domain to `"mitm".domains` in 
 
 ## An unrecognized endpoint goes direct and nothing compresses (#1290)
 
-bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**. There is no config seam to declare an arbitrary new wire today; adding one is a separate feature, not a switch you can flip.
+bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**.
 
 That outcome is now loud instead of silent (#1290):
 
@@ -389,7 +469,20 @@ That outcome is now loud instead of silent (#1290):
 - `unrecognizedPaths` (per-path counts) in `curl -s http://localhost:8787/__bili/stats` (loopback-only);
 - an `UNRECOGNIZED PATHS (instance-level)` section in `acp_status` output while such requests exist.
 
-If you expected compression at such an endpoint, use the provider's standard protocol endpoint instead (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress); a genuinely custom wire needs its own support.
+Two seams now cover the "custom path, standard wire" case — an endpoint whose path is nonstandard but whose request/response shape is one of the four known protocols:
+
+1. **Client-side, per client** — set the client's model base URL to the protocol-segment form of the `/bili/` tunnel:
+
+   ```text
+   http://127.0.0.1:8787/bili/<protocol>/<upstream-base-url>
+   # e.g. http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+   ```
+
+   `<protocol>` is one of `anthropic`, `openai`, `responses`, `google`. It forces the wire protocol regardless of the path — it **outranks** every server-side signal. Use it when you control the client's base URL but the endpoint path is nonstandard.
+
+2. **Server-side, per lane (#1909)** — declare `"protocol"` on the provider key that already routes the host/path (see [CONFIGURATION.md → `protocol`](CONFIGURATION.md#protocol)). Use it when the client's base URL cannot be changed (hardcoded endpoints, MITM-intercepted hosts).
+
+Either way the declaration only *identifies* the wire — a body that does not parse as that protocol still relays verbatim (#1284). A genuinely custom wire (own request/response shape, e.g. Command Code's `/alpha/generate`) still needs its own support; the fix for that is to use the provider's standard protocol endpoint (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress).
 
 ## OpenCode
 
@@ -406,6 +499,8 @@ on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
 | Launcher (easiest) | `bili opencode` | one command brings up proxy + client; real config untouched |
 | Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
 | Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
+
+These paths are **mutually exclusive** — each one owns routing of the same requests, so exactly one may be active per host instance. A hand-written `/bili/` provider baseURL is the pure-proxy path's marker; writing it while the native plugin is installed is a **conflicting configuration** (#1958): the runtime warns once per session (deduplicated per origin) with a fix-it guide — remove the prefix or remove the plugin — and the requests stay on the plain-proxy path they encode (no plugin session markers). The supported exception is an explicit pin of the **same** origin — `BILLION_CONTEXT_PROXY` pointing at the proxy the URLs already ride — which stays silent.
 
 ### Launcher — `bili opencode`
 
@@ -467,6 +562,26 @@ healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
 
+### OpenAI Responses WebSockets (V2)
+
+The V2 plugin also intercepts OpenAI `experimental.ws.handshake` requests.
+Both legs use WebSocket: OpenCode → bili → the Responses upstream. This
+includes API-key OpenAI and ChatGPT Pro/Plus browser/headless OAuth; the login
+method does not select the transport. No OpenCode configuration rewrite or
+new bili setting is required. The socket must originate locally and carry
+the cooperative plugin identity; generic or unclaimed upgrades retain 426.
+
+ACP processing, native tools and usage accounting stay active. Client deltas
+are expanded before compression. Upstream deltas are used only when the
+processed history exactly extends the previous response; a fold starts a new
+chain with full compressed input on the same socket. Ref tagging or other
+history edits can also require full input, so connection reuse does not imply
+every turn is incremental. Older hosts without the experimental hook must
+use OpenCode's existing `providers.openai.settings.transport: "http"` setting.
+Realtime, multiplexed concurrent responses, and remote WS clients are outside
+this integration's scope. Verification: real OpenCode V2.0.20 with a local
+Responses WS upstream, not live OpenAI/ChatGPT credentials.
+
 ### Pure proxy (no plugin)
 
 Point the provider baseURL at the proxy like any other client:
@@ -487,6 +602,9 @@ Point the provider baseURL at the proxy like any other client:
 
 Note: 2.0 AI-SDK providers require an `apiKey` field even for local
 endpoints that never check it — set any non-empty value.
+
+This path means **no plugin**: if the native plugin is also installed, the
+runtime warns once per session — pick one path per provider (#1958).
 
 ### Status: `/acp` and `acp_status`
 

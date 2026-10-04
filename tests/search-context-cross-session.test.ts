@@ -16,7 +16,8 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0,         rangeRestores: 0 },
+        pendingRetrievals: [],
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -49,7 +50,7 @@ function compressInto(session: Session) {
 
 type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; parameters?: Record<string, unknown> } };
 
-function searchEntry(arr: unknown[], shape: "flat" | "openai"): FlatTool | undefined {
+function searchEntry(arr: readonly unknown[], shape: "flat" | "openai"): FlatTool | undefined {
     return arr.find((t) => {
         const e = t as FlatTool;
         return shape === "openai" ? e.function?.name === SEARCH_CONTEXT_TOOL_NAME : e.name === SEARCH_CONTEXT_TOOL_NAME;
@@ -61,7 +62,7 @@ function paramsOf(entry: FlatTool): Record<string, unknown> {
 }
 
 test("#841 schema: BILI arrays no longer add conversation_id to search_context (#1685); #1179 range args stay on decompress", () => {
-    const cases: [unknown[], unknown[], "flat" | "openai"][] = [
+    const cases: [readonly unknown[], readonly unknown[], "flat" | "openai"][] = [
         [BILI_ACP_TOOLS_ANTHROPIC, ACP_TOOLS_ANTHROPIC, "flat"],
         [BILI_ACP_TOOLS_OPENAI, ACP_TOOLS_OPENAI, "openai"],
         [BILI_ACP_TOOLS_RESPONSES, ACP_TOOLS_RESPONSES, "flat"],

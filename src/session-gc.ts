@@ -6,6 +6,7 @@ import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
 import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
+import { gcSettings as knobGcSettings } from "./knobs.js";
 
 /**
  * Session-file garbage collection (#1082). OPT-IN: disabled unless
@@ -71,31 +72,15 @@ export interface GcConfig {
     intervalMs: number;
 }
 
-const DEFAULT_MAX_AGE_DAYS = 7;
 // Owner decision (#1082): aggressive by design — a cold rebuild (client re-sends
 // full history, proxy folds via preflight) is acceptable even for large idle
-// sessions, so the size gate rarely bites; the age gate does the work.
-const DEFAULT_MAX_TOKENS = 1_000_000;
-const DEFAULT_INTERVAL_MS = 3_600_000;
+// sessions, so the size gate rarely bites; the age gate does the work. Defaults
+// live in knobs.gcSettings (config `sessions.gc.*`, env BILI_SESSION_GC* win).
 const DAY_MS = 86_400_000;
 
+/** Opt-in only (owner requirement #1082): unset means disabled. */
 export function gcConfigFromEnv(): GcConfig {
-    // Opt-in only (owner requirement #1082): unset means disabled.
-    const env = process.env.BILI_SESSION_GC?.toLowerCase();
-    const enabled = env === "1" || env === "true" || env === "on";
-    return {
-        enabled,
-        maxAgeMs: intEnv("BILI_SESSION_GC_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS) * DAY_MS,
-        maxTokens: intEnv("BILI_SESSION_GC_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        intervalMs: intEnv("BILI_SESSION_GC_INTERVAL_MS", DEFAULT_INTERVAL_MS),
-    };
-}
-
-function intEnv(name: string, fallback: number): number {
-    const v = process.env[name];
-    if (!v) return fallback;
-    const n = Number.parseInt(v, 10);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
+    return knobGcSettings();
 }
 
 interface FileView {

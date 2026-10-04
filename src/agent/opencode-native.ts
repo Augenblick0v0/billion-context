@@ -108,12 +108,43 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
     const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
+    // #1958: conflicting pre-routed config is exposed once per (session, origin).
+    const conflictWarned = new Set<string>();
     return async (e, s) => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
         // #1365: routed URLs are skipped by isModelApiUrl by design — record
         // the pinned model channel before that gate so attach recovery can see it.
-        if (routedBiliModelUrl(url) !== undefined) noteRoutedOrigin(state, url);
+        if (routedBiliModelUrl(url) !== undefined) {
+            noteRoutedOrigin(state, url);
+            // #1958: a hand-written /bili/ prefix while the native plugin is
+            // active means two access paths claiming routing ownership of the
+            // same request — a conflicting configuration, not something the
+            // plugin should silently absorb. Expose it loudly, once per
+            // session+origin, with a fix-it guide, and leave the request on
+            // the plain-proxy path it already encodes: no rewrite, no plugin
+            // stamping. An explicit pin of THIS origin (BILLION_CONTEXT_PROXY
+            // pointing at the proxy the URLs already ride) is the supported
+            // attach posture — silent. Compared against the env, NOT
+            // state.origin: attach arming does not freeze state.origin
+            // synchronously, so early requests would false-warn against a
+            // benign pin.
+            const baked = new URL(url).origin;
+            const declaredRaw = process.env.BILLION_CONTEXT_PROXY;
+            let declared: string | undefined;
+            try {
+                declared = declaredRaw !== undefined && declaredRaw !== "" ? new URL(declaredRaw).origin : undefined;
+            } catch {
+                declared = undefined;
+            }
+            if (declared !== baked) {
+                const key = `${String(e.sessionID ?? "_")}\u0000${baked}`;
+                if (!conflictWarned.has(key)) {
+                    conflictWarned.add(key);
+                    console.error(`bili-native-opencode: conflicting configuration — model requests already carry a /bili/ prefix (origin ${baked}) while the native plugin is active. The plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path. Pick ONE: (1) remove the /bili/ prefix from your opencode provider baseURL(s) so the plugin routes them, or (2) run \`bili plugin remove opencode\` and keep the pre-routed URLs. Until resolved, these requests continue to ${baked} in plain proxy mode WITHOUT the plugin session markers.`);
+                }
+            }
+        }
         if (!isModelApiUrl(url)) return;
 
         const target = await resolveLive();
@@ -299,7 +330,7 @@ export function _resetNativeStateForTest(): void {
 
 // ———— OpenCode 1.x native surface (V1 `.server()`) ————————————————————
 
-type ZodLike = typeof import("zod");
+export type ZodLike = typeof import("zod");
 
 interface V1ToolContext {
     sessionID: string;
@@ -470,7 +501,7 @@ export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown) => Promise<string>;
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<string>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -632,7 +663,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             }
             maybeReportDerived(base, input.sessionID);
         };
-        const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
+        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true)));
         if (legacy !== undefined) {
             // Tool slots carry acp's DCP schemas (kernel-parseable object form)
             // for BOTH lanes; executors route per session. acp_context_recap
@@ -650,7 +681,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        return forward(base, v1ctx.sessionID, name, args);
+                        return forward(base, v1ctx.sessionID, name, args, true);
                     },
                 };
             }
@@ -666,7 +697,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            return forward(base, v1ctx.sessionID, fn.name, args);
+                            return forward(base, v1ctx.sessionID, fn.name, args, true);
                         },
                     };
                 }

@@ -161,7 +161,7 @@ test("CCR v2 range decompress: store-first per-ref beats an arrival placeholder 
     // non-empty; per-ref store-first must restore the stored original.
     const pre = storeOriginal(createContentStore(), { ref: "m00003", rawId: "h_2", text: "ARRIVAL-WINS FULL ORIGINAL", kind: "shell output", toolName: "bash", tokens: 40, head: "ARRIVAL-WINS HEAD" });
     const f = fold({ ccr: true, preStore: pre });
-    const msgs = f.msgs.map((m) => (m.id === "h_2" ? { ...m, contentType: "text", toolName: undefined, text: buildStoredPlaceholder({ ref: "m00003", kind: "shell output", tokens: 40, head: "ARRIVAL-WINS HEAD", retrieveToolName: "acp_retrieve" }) } : m));
+    const msgs: CoreMessage[] = f.msgs.map((m) => (m.id === "h_2" ? { ...m, contentType: "text", toolName: undefined, text: buildStoredPlaceholder({ ref: "m00003", kind: "shell output", tokens: 40, head: "ARRIVAL-WINS HEAD", retrieveToolName: "acp_retrieve" }) } : m));
     const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, { core: f.core, config: f.config, messages: msgs, session: f.session, log: () => {} });
     assert.match(ack, /restored 3 item\(s\)/);
     const injs = drainPendingRetrievals(f.session);
@@ -318,7 +318,14 @@ async function startV2Proxy(captured: string[], noCcr?: boolean): Promise<{ prox
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: noCcr ? { injectTool: true, minCompressRangeChars: 1000 } : { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compress: noCcr ? { injectTool: true, injectNudge: false, minCompressRangeChars: 1000 } : { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -436,7 +443,14 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

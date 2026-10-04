@@ -2,6 +2,7 @@ import { createInitialState, defaultConfig, resetImageFullState, type Compressio
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
+import { maxSessions as knobMaxSessions } from "./knobs.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -20,9 +21,13 @@ export type BlockContent = {
 
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
- *  context rewrite that preceded it. `shrinkRatio` is the fraction of the
- *  pre-compress context removed by this compress; `foldPoint` is the start ref
- *  of the earliest folded range (where the prefix structure rewrites). */
+ *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
+ *  the CURRENT request's live context removed by this compress — counted with
+ *  the kernel's own per-message counter over the folded view (capped at 1),
+ *  never derived from the billed usage baseline, which can be stale-netted,
+ *  clobbered by concurrent streams, or absent after an aborted turn;
+ *  `foldPoint` is the start ref of the earliest folded range (where the prefix
+ *  structure rewrites). */
 export type LastCompressInfo = {
     at: number;
     shrinkRatio: number;
@@ -164,6 +169,54 @@ export type Session = {
          *  other baseline stats at native-compaction boundaries. Absent on
          *  legacy session files → legacy path. */
         lastUsageGradeTokens?: number;
+        /** #1933 F2: upstream origin (scheme://host[:port]) that measured
+         *  lastInputTokens — written by settleUsageReport alongside "usage".
+         *  The gate demotes a usage-grade baseline to untrusted when the
+         *  CURRENT request routes elsewhere: a billing scale learned on one
+         *  provider says nothing about whether another accepts the payload.
+         *  Absent on legacy session files → baseline keeps legacy behavior. */
+        lastInputTokensOrigin?: string;
+         /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
+          *  consistent same-route samples of (upstream-billed input ÷ local
+          *  text estimate), clamped to [0.25, 1] — one-way by design: the
+          *  correction can only deflate the estimate (never fire earlier
+          *  than the raw proxy); routes billing above the local estimate
+          *  publish k̂=1 (legacy behavior, overflow arm covers them). A
+          *  sample is only admitted
+          *  when it falls in the plausibility band [0.2, 5] — outside it the
+          *  report and the payload clearly don't correspond (placeholder
+          *  billing, relay echo, mock upstreams) and must not teach anything.
+          *  k̂ is published only once ≥2 admitted samples agree within ×2;
+          *  disagreement clears it again (fall back to the conservative raw
+          *  estimate). The chars/4 estimator is a proxy, not a measurement —
+          *  its ratio to real billing varies per upstream (observed 1.3–2.5×
+          *  on one relay, ~1.0× on another), and max()ing it against the
+          *  usage baseline let the systematically-high proxy fire preflight
+          *  while the provider billed 59–63% of the window. Applied ONLY
+          *  where the raw estimate currently decides (trigger, zero-range
+          *  fast-forward fit, folder exit, post-fold fit); absent or
+          *  route-mismatched → raw estimate (today's behavior). */
+         calibratedEstimate?: number;
+         /** #1933 F1: route the calibratedEstimate was learned on. A sample
+          *  from a different origin starts a fresh ring instead of blending
+          *  two providers' scales. */
+         calibratedEstimateOrigin?: string;
+         /** #1933 F1: evidence ring behind calibratedEstimate — the recent
+          *  admitted raw samples for ONE origin (max 3). Persisted so a
+          *  restart doesn't re-arm the warmup delay; reset at native-
+          *  compaction boundaries with the rest of the baseline stats. */
+         calibrationRing?: { origin: string; values: number[] };
+        /** #1933 F1: pending pairing input — local estimate of the LAST
+         *  prepared outbound in BILLED caliber (estimateCoreMessages +
+         *  system/tools overhead + image reserve, defaultCountTokens rate),
+         *  recorded in prepare*. settleUsageReport pairs it with the NEXT
+         *  usage report's billed total (same request) to sample k̂, then
+         *  overwrites it with the current turn's value. In-memory only — a
+         *  restart simply loses one pending pair. */
+        lastLocalTextEstimate?: number;
+        /** #1933 F1: route of the pending lastLocalTextEstimate; the pair is
+         *  only consumed when the settling report came from the same route. */
+        lastLocalTextEstimateOrigin?: string;
         /** #1097 content store: total acp_retrieve calls issued this session. */
         retrieveCalls: number;
         /** #1097: acp_retrieve calls that resolved to stored content. */
@@ -235,6 +288,15 @@ export type Session = {
      *  the state ranges). Cleared by snapshotMessages on the next live
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
+    pluginSnapshot?: CoreMessage[];
+    /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
+     *  bumped by markDirty after every mutation. Keys the fork-revision cache
+     *  below so status polling skips re-hashing the whole history (#2017). */
+    revisionEpoch?: number;
+    /** In-memory only (NOT persisted): cached fork parentRevision valid for
+     *  the current revisionEpoch — forkSnapshot() is a pure function of the
+     *  session content, so same epoch ⇒ same hash. */
+    pluginRevisionCache?: { epoch: number; revision: string };
     /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
     *  owned and mutated only by kernel processTurn (ccr-store node) via
     *  adoptContentStore. Lazily loaded from the session's content-store.json;
@@ -298,6 +360,29 @@ export type Session = {
      *  critical section onto the previous one so they run strictly in order. */
     lockChain?: Promise<unknown>;
 };
+
+/** Server-stamped anonymous-prefix-affinity record (#1115/#1486 lane, written
+ *  in src/server.ts when an anonymous request resolves onto a pfa-* chain or
+ *  mints a fresh one). Typed here so readers don't cast the Record bag. */
+export type AnonymousPrefixAffinityStamp = {
+    depth: number;
+    tailHash: string;
+    via: "prefix" | "new";
+    lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+};
+
+export function peekAnonymousPrefixAffinity(session: Session): AnonymousPrefixAffinityStamp | undefined {
+    const v = session.metadata.anonymousPrefixAffinity;
+    if (!v || typeof v !== "object") return undefined;
+    return v as AnonymousPrefixAffinityStamp;
+}
+
+/** Per-request-resolved context limit stamped by the server (src/server.ts) —
+ *  the window actually in force for this session's traffic. */
+export function peekEffectiveContextLimit(session: Session): number | undefined {
+    const v = session.metadata.effectiveContextLimit;
+    return typeof v === "number" ? v : undefined;
+}
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
 // model compress settings + self-heal + output headroom), while the plugin
@@ -383,8 +468,7 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
 
 const sessions = new Map<string, Session>();
 
-// `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
-let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256);
+let MAX_SESSIONS = knobMaxSessions();
 
 let initialized = false;
 
@@ -412,6 +496,12 @@ export async function initSessions(): Promise<void> {
     } else {
         for (const [id, s] of loaded) sessions.set(id, s);
     }
+}
+
+/** Zero-valued stats for a fresh session (#1991) — exported so test fixtures
+ *  can build sessions without retyping every field. */
+export function zeroStats(): Session["stats"] {
+    return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
 }
 
 export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
@@ -453,10 +543,16 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
         }
     }
-    const session: Session = {
+    const session = createSession(id, meta);
+    sessions.set(id, session);
+    return session;
+}
+
+export function createSession(id: string, meta?: Session["meta"]): Session {
+    return {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: zeroStats(),
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -466,8 +562,14 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         persisted: false,
         pendingRetrievals: [],
     };
-    sessions.set(id, session);
-    return session;
+}
+
+export function publishForkSession(session: Session): void {
+    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.size >= MAX_SESSIONS && !evictOldest()) throw new Error("session pool exhausted");
+    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
+    session.persisted = getStore().enabled;
+    sessions.set(session.id, session);
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.
@@ -607,6 +709,7 @@ export function snapshotMessages(session: Session, messages: CoreMessage[]): voi
 /** Mark a session's state as changed so it is persisted on the next debounce.
  *  Call this after any mutation (processTurn, compress, decompress, orphan GC). */
 export function markDirty(session: Session): void {
+    session.revisionEpoch = (session.revisionEpoch ?? 0) + 1;
     getStore().scheduleSave(session);
 }
 
@@ -653,6 +756,15 @@ export function resetSessionCompression(session: Session): void {
     // #1569: pre-compaction billing evidence describes a payload lineage that
     // no longer exists — fall back to legacy sizing until a fresh report lands.
     delete session.stats.lastUsageGradeTokens;
+    // #1933: same rationale for the calibration pair and its provenance — k̂ was
+    // learned against the pre-compaction content class, and the baseline's
+    // measuring route no longer bounds this rebuilt session.
+    delete session.stats.lastInputTokensOrigin;
+    delete session.stats.calibratedEstimate;
+    delete session.stats.calibratedEstimateOrigin;
+    delete session.stats.calibrationRing;
+    delete session.stats.lastLocalTextEstimate;
+    delete session.stats.lastLocalTextEstimateOrigin;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
     session.metadata.nativeCompactionAt = Date.now();

@@ -89,7 +89,32 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 | `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
 | 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
 
-安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。
+安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
+
+## Pi(pi.dev coding agent)
+
+Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
+
+**路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
+
+**WebSocket 缺口(#2073)。** WebSocket 连接从不经过 `globalThis.fetch`,所以 pi 的 WS 模型传输在握手成功时整体绕过原生拦截:
+
+| Provider / 传输 | 状态 |
+|---|---|
+| 全部 HTTP provider | ✅ 覆盖 —— 具名 plugin-mode 会话 |
+| `openai-codex-responses`(ChatGPT backend-api),`transport: "sse"` | ✅ 覆盖 —— 与任何 HTTP provider 无异 |
+| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ❌ WS 成功期间绕过代理 —— ACP 工具照常注册、调用照常到达代理,但该会话没有任何模型请求到过代理,会话状态不存在。工具调用在路由阶段失败(`unknown plugin conversation` + `NO MODEL REQUESTS`,#1158 诊断)。#2072 落地前失败形态比「大声」更糟:*兄弟*子代理会话的过期 outbound witness 可能静默用别人的会话状态应答(#2063)—— 此类会话的状态面板在核对 bili.log 之前不可信 |
+| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(归入 #2073 跟踪) |
+
+**Codex provider 的绕行办法。** 在 pi 配置里强制 SSE 车道(`~/.pi/agent/settings.json`;项目 `.pi/settings.json` 可覆盖):
+
+```json
+{ "transport": "sse" }
+```
+
+默认值 `"auto"` 先试 WS、握手失败才回退 SSE;旧布尔键 `"websockets": false` 会自动迁移。该键全局生效,但只有支持多传输的 provider(目前是 codex provider)消费它,纯 HTTP provider 不受影响。Windows + Pi 1.0.2 实机验证(#2063 owner 复现):显式 `sse` 携带正确会话 ID 进入 bili。
+
+已立项的修法(客户端侧 `globalThis.WebSocket` 拦截,#2073 中 owner-gated)是可行而非推测:pi 在 WS 升级握手上发送与 SSE 相同的 `session-id` 头(值 = pi 会话 ID),Node 内置 WebSocket 会转发构造器 `headers`(Node 22 实测),且代理侧已经会讲这条线 —— WS 桥按 `/bili/<upstream>/responses` 前缀形状准入、恰好以该 header 键控(`src/ws-bridge.ts`、`src/responses-ws.ts` `codexResponsesCodec`)。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
@@ -125,6 +150,8 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 | 原生(免启动器) | `bili plugin install opencode` | 自拉起插件写进真实配置;照常启动 `opencode` |
 | 纯代理(兜底) | baseURL 加 `/bili/` 前缀 | 无插件 —— wire 级工具注入 |
 
+这三条路径**互斥**——每条都拥有同一批请求的路由权,每个宿主实例只能激活其中一条。手写的 `/bili/` provider baseURL 是纯代理路径的标记;在原生插件已装的情况下写它就是**矛盾配置**(#1958):运行时会每会话警告一次(按 origin 去重)并附修复指引——去掉前缀或卸掉插件——请求则留在其编码的纯代理路径上(无插件会话标记)。受支持的例外是对**同一** origin 的显式钉住——`BILLION_CONTEXT_PROXY` 指向 URL 已经在走的那个代理——保持静默。
+
 ### 启动器 —— `bili opencode`
 
 HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC 注释照单接受,合并方式与 opencode 自身一致;相对本地插件路径在副本里重新锚定为绝对路径 —— opencode 按声明所在配置文件目录解析,#826)。宿主代次用 `--version` 探测(探测失败默认按 1.x):**2.x** 宿主注入内置 V2 插件(`dist/agent/opencode.js`),以临时包装目录形式给出(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径);**1.x** 宿主直接给裸文件路径。
@@ -138,6 +165,23 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**本 bili 自身的安装来源**:**npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)**git checkout / 开发构建**回退到本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 该 checkout 的 `dist/agent/opencode-native.js`)—— 按构造即机器本地;之后改用 npm 安装再跑一次 install 会把条目迁回裸包名。
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
+
+### OpenAI Responses WebSocket(V2)
+
+V2 插件也接管 OpenAI 的 `experimental.ws.handshake` 请求，两端均使用
+WebSocket：OpenCode → bili → Responses 上游。支持 OpenAI API Key 及
+ChatGPT Pro/Plus browser/headless OAuth；登录方式不决定传输方式。
+无需改写 OpenCode 配置或增加 bili 设置。首版只接受本机发起、携带原生
+插件身份的连接；普通或未接管的 WebSocket 升级仍立即返回 426。
+
+ACP 处理、原生工具和用量统计保持生效。客户端增量先还原再压缩；只有
+处理后的历史确实延续上次响应时，上游才使用增量。压缩后在同一连接上
+发送完整压缩上下文，开始新的响应链。引用标签或其它历史变化也可能要求
+完整输入，因此复用连接不代表每轮都只发增量。不支持实验钩子的旧宿主
+需要使用 OpenCode 已有的 `providers.openai.settings.transport: "http"`。
+Realtime、同一连接的并发多路响应及远程 WS 客户端不在本次范围。
+验证使用真实 OpenCode V2.0.20 与本地 Responses WS 上游，未使用真实
+OpenAI/ChatGPT 凭据。
 
 ### 纯代理(无插件)
 
@@ -158,6 +202,8 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 ```
 
 注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
+
+这条路径意味着**无插件**:若同时装了原生插件,运行时每会话警告一次——每个 provider 只选一条路径(#1958)。
 
 ### 状态:`/acp` 与 `acp_status`
 

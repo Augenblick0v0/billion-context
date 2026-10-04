@@ -9,7 +9,8 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_PREFLIGHT_HOLD_MS = "300";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { EXIT_CONCERNS, WIRE_EXITS, type ExitConcernId } from "../src/exit-matrix.ts";
@@ -122,7 +123,7 @@ function startUpstream(mode: UpstreamMode): Promise<{ server: http.Server; port:
     });
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
-            resolve({ server, port: server.address().port, socketsClosed: () => closed, requests: () => requests });
+            resolve({ server, port: (server.address() as { port: number }).port, socketsClosed: () => closed, requests: () => requests });
         });
     });
 }
@@ -144,7 +145,14 @@ function startProxy(upstreamPort: number): Promise<http.Server> {
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 

@@ -1,5 +1,12 @@
 import { Agent } from "undici";
+import { currentFetchTransport } from "./fetch-transport.js";
 import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import {
+    upstreamTimeoutMs as knobUpstreamTimeoutMs,
+    replayMaxAttempts as knobReplayMaxAttempts,
+    replayBaseDelayMs as knobReplayBaseDelayMs,
+    maxShrinkPerCompress as knobMaxShrinkPerCompress,
+} from "./knobs.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -60,8 +67,7 @@ export function _resetIdleTimerSeamsForTest(): void {
  *  phases, long prefills), so any finite sub-budget false-positived healthy
  *  turns into truncations. Do not re-add a shorter timer here. */
 export function upstreamTimeoutMs(): number {
-    const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
-    return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
+    return knobUpstreamTimeoutMs();
 }
 
 // Direct (non-proxied) requests go through Node's hidden global agent, whose
@@ -186,7 +192,10 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const raw = await fetch(url, finalOpts as RequestInit) as Response;
+        const transport = currentFetchTransport();
+        const raw = transport
+            ? await transport(url, finalOpts)
+            : await fetch(url, finalOpts as RequestInit) as Response;
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
@@ -279,15 +288,14 @@ export const REPLAY_MAX_ATTEMPTS = 3;
  *  (1 = legacy fail-fast behavior, no retry). Read on each call so tests can
  *  tune it live. */
 export function replayMaxAttempts(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_MAX);
-    return Number.isInteger(raw) && raw >= 1 ? raw : REPLAY_MAX_ATTEMPTS;
+    return knobReplayMaxAttempts();
 }
 
-/** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
- *  (0 disables the delay). Read on each call so tests can tune it live. */
+/** Default base backoff delay in ms; override tiers in knobs.replayBaseDelayMs. */
+export const REPLAY_BASE_DELAY_MS = 1500;
+
 export function replayBaseDelayMs(): number {
-    const raw = Number(process.env.BILI_REPLAY_RETRY_BASE_MS);
-    return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+    return knobReplayBaseDelayMs();
 }
 
 /** Max shrink FRACTION (0,1] a single compress may remove before the proxy
@@ -297,8 +305,7 @@ export function replayBaseDelayMs(): number {
  *  transition gentle and the prefix cache alive. Unset (or out of range) =
  *  no steering (legacy behavior). Read on each call so tests can tune it live. */
 export function maxShrinkPerCompress(): number | undefined {
-    const raw = Number(process.env.BILI_MAX_SHRINK_PER_COMPRESS);
-    return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : undefined;
+    return knobMaxShrinkPerCompress();
 }
 
 /** Exponential backoff for the given 1-based attempt: base * 2^(attempt-1). */

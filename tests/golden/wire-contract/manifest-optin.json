@@ -797,5 +797,12 @@
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
-  "runtimeInfoEndpoint": "/__bili/plugin/runtime-info"
+  "runtimeInfoEndpoint": "/__bili/plugin/runtime-info",
+  "capabilities": {
+    "fork": {
+      "protocolVersion": 1,
+      "endpoint": "/__bili/plugin/fork",
+      "snapshotEndpoint": "/__bili/plugin/snapshot"
+    }
+  }
 }
