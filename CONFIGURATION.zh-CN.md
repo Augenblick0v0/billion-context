@@ -326,6 +326,14 @@
 - **状态：** ACTIVE
 - **说明：** 为这条 lane 声明 wire 协议（#1909），适用于端点路径不在内置后缀表（`/chat/completions`、`/messages`、`/responses`、Google 路径）里的上游。两种粒度：裸 host 键（`"https://relay.example.com": { "protocol": "openai" }`）覆盖该 host 下所有带 body 的 POST；路径键（`"https://relay.example.com/my/custom/complete": { "protocol": "openai" }`）只覆盖该子树。它是客户端侧 `/bili/<protocol>/<origin>` 逃生门的**服务端对应物** —— 覆盖那些改不了 base URL 的客户端（自定义端点路径的中转站、MITM 拦截的 host）。优先级：`/bili/<protocol>/` 显式标记 **高于** 声明，声明高于内置后缀表。声明只负责**识别**请求，不放松任何安全网：body 无法按声明协议解析时原样转发（#1284），无 body 的 GET 永远不会被声明接管。
 
+  **客户端侧对应物 —— `/bili/<protocol>/<origin>` 逃生门：** 当你*能*改客户端的 base URL 但端点路径非标准时，可以完全不动配置，直接把协议写进 URL：
+
+  ```text
+  http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+  ```
+
+  `<protocol>` ∈ `anthropic` | `openai` | `responses` | `google`。无论路径是什么，它都强制该 wire 协议，且**高于**一切服务端声明（也高于内置后缀表）。不带协议段的普通形式（`/bili/<absolute-url>`）不变：协议仍从路径推断。URL 形式按客户端生效；当 base URL 改不了（硬编码端点、MITM 拦截的 host）时，用这个 `providers.protocol` 字段按 lane 生效。
+
   **非遮蔽（#1909）：** `protocol` 独立于其他 provider 字段解析 —— 所有匹配的键按最长前缀优先扫描，**显式声明了** `protocol` 的最深键胜出。因此只写 `{ "protocol": "openai" }` 的路径键仍继承 host 键的 `compressProtocol`/`compress`/`models`/…；host 键的声明也继续作用于沉默的路径键。（*其他*字段维持既有的单条目最长键语义。）不声明 `protocol` 的路径键仍只是路由配置；`mitm://` 键遵循与其他字段相同的 scheme 划分。非法值在配置加载时响亮报错（web 保存得到 400）。
 
 ### `compress`

@@ -392,7 +392,7 @@ To actually compress such a client: add its model domain to `"mitm".domains` in 
 
 ## An unrecognized endpoint goes direct and nothing compresses (#1290)
 
-bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**. There is no config seam to declare an arbitrary new wire today; adding one is a separate feature, not a switch you can flip.
+bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**.
 
 That outcome is now loud instead of silent (#1290):
 
@@ -400,7 +400,20 @@ That outcome is now loud instead of silent (#1290):
 - `unrecognizedPaths` (per-path counts) in `curl -s http://localhost:8787/__bili/stats` (loopback-only);
 - an `UNRECOGNIZED PATHS (instance-level)` section in `acp_status` output while such requests exist.
 
-If you expected compression at such an endpoint, use the provider's standard protocol endpoint instead (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress); a genuinely custom wire needs its own support.
+Two seams now cover the "custom path, standard wire" case — an endpoint whose path is nonstandard but whose request/response shape is one of the four known protocols:
+
+1. **Client-side, per client** — set the client's model base URL to the protocol-segment form of the `/bili/` tunnel:
+
+   ```text
+   http://127.0.0.1:8787/bili/<protocol>/<upstream-base-url>
+   # e.g. http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+   ```
+
+   `<protocol>` is one of `anthropic`, `openai`, `responses`, `google`. It forces the wire protocol regardless of the path — it **outranks** every server-side signal. Use it when you control the client's base URL but the endpoint path is nonstandard.
+
+2. **Server-side, per lane (#1909)** — declare `"protocol"` on the provider key that already routes the host/path (see [CONFIGURATION.md → `protocol`](CONFIGURATION.md#protocol)). Use it when the client's base URL cannot be changed (hardcoded endpoints, MITM-intercepted hosts).
+
+Either way the declaration only *identifies* the wire — a body that does not parse as that protocol still relays verbatim (#1284). A genuinely custom wire (own request/response shape, e.g. Command Code's `/alpha/generate`) still needs its own support; the fix for that is to use the provider's standard protocol endpoint (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress).
 
 ## OpenCode
 

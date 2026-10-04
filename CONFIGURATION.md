@@ -328,6 +328,14 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 - **Status:** ACTIVE
 - **Description:** Declares the wire protocol for this lane (#1909), for endpoints whose path does not match the built-in suffix table (`/chat/completions`, `/messages`, `/responses`, Google paths). Two granularities: a bare host key (`"https://relay.example.com": { "protocol": "openai" }`) covers every POST-with-body under that host; a path key (`"https://relay.example.com/my/custom/complete": { "protocol": "openai" }`) covers only that subtree. This is the server-side counterpart of the client-side `/bili/<protocol>/<origin>` escape hatch — it covers clients whose base URL you cannot change (relays with custom endpoint paths, MITM-intercepted hosts). Priority: `/bili/<protocol>/` explicit marker **outranks** the declaration, which outranks the built-in suffix table. The declaration only ever *identifies* a request — it does not relax the safety nets: a body that does not parse as the declared protocol is relayed verbatim (#1284), and a GET without a body never becomes a declared protocol.
 
+  **Client-side counterpart — the `/bili/<protocol>/<origin>` escape hatch:** when you *do* control the client's base URL but the endpoint path is nonstandard, skip config entirely and put the protocol in the URL itself:
+
+  ```text
+  http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+  ```
+
+  `<protocol>` ∈ `anthropic` | `openai` | `responses` | `google`. It forces the wire protocol regardless of the path and **outranks** every server-side declaration (and the built-in suffix table). The plain form without a protocol segment (`/bili/<absolute-url>`) is unchanged: protocol still inferred from the path. Use the URL form per client; use this `providers.protocol` field per lane when the base URL cannot be changed (hardcoded endpoints, MITM-intercepted hosts).
+
   **Non-shadowing (#1909):** `protocol` resolves independently of the other provider fields — all matching keys are scanned longest-prefix-first and the deepest key that *explicitly declares* `protocol` wins. So a path key carrying only `{ "protocol": "openai" }` inherits the host key's `compressProtocol`/`compress`/`models`/… untouched, and a host-key declaration keeps applying under a silent path key. (The *other* fields keep their existing single-entry longest-key semantics.) A path key **without** `protocol` in it is still just routing config; `mitm://` keys follow the same scheme split as every other field. Invalid values fail config load loudly (web saves get a 400).
 
 ### `compress`
