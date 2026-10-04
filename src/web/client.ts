@@ -161,6 +161,14 @@ export const WEB_CLIENT = `(function () {
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
     let latestAlerts = [];
 
+    let cfgSavedSnap = null;
+    function refreshDirtyFlag() {
+        const el = $("cfg-file-edit");
+        const dirty = Boolean(el && cfgSavedSnap !== null && el.value !== cfgSavedSnap);
+        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+    }
+
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
         // shown underneath so rows stay identifiable. Disk-restored pool entries read as history,
@@ -1221,7 +1229,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
+            if (fe) cfgSavedSnap = fe.value;
             hydrateQuickConfig(cfg);
+            refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
             ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
@@ -1309,6 +1319,7 @@ export const WEB_CLIENT = `(function () {
             if (fe) fe.value = JSON.stringify(draft, null, 2);
             quickBroken(false);
             syncAll();
+            refreshDirtyFlag();
         }
         function row(id, label) {
             const w = document.createElement("div");
@@ -1500,7 +1511,7 @@ export const WEB_CLIENT = `(function () {
         moreA.style.cssText = "font-size:12px;color:#0969da";
         moreA.textContent = t("cfg.q_more");
         box.appendChild(moreA);
-        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); refreshDirtyFlag(); });
         syncAll();
     }
     async function loadUpstream(cfg) {
