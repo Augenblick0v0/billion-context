@@ -17,7 +17,7 @@ is loaded every session. The split is deliberate and load-bearing:
 |------|-------|------------------|
 | [architecture.md](architecture.md) | The file-by-file `src/` module map + orientation cheat-sheet | Adding/removing a module, or needing to find where a concern lives. Regenerate the map when it drifts. |
 | [testing.md](testing.md) | Build commands, local install, E2E codex + image-billing + hermetic-registry (+ advisory-rollback) suites (env vars, phases, CI trigger list) | Running build/test/e2e or wiring a test. |
-| [release.md](release.md) | Release process steps (incl. release-notes entry), one-click workflow internals, cross-repo acp-kernel ordering, auto-update testing, no-op validation protocol | Preparing or reviewing a release. |
+| [release.md](release.md) | Release process steps (incl. release-notes entry), one-click workflow internals, bugfix carve-out channel, cross-repo acp-kernel ordering, auto-update testing, no-op validation protocol | Preparing or reviewing a release, or cutting an emergency hotfix. |
 | [git-pr.md](git-pr.md) | "Open a PR without `gh`" REST recipe; external-contributor PR mechanics; post-merge supplements | Opening a PR or handling a contributor's PR. |
 
 > If you add a new reference file, add a row above and a pointer from the relevant
