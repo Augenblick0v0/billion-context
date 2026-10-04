@@ -12,9 +12,13 @@
 // bootstrap variable, or host-side posture read in a foreign process — and
 // the read site must say so in a comment.
 //
-// Resolution happens on every call (deliberately uncached): the config file
-// is small, hot-reloadable (web-UI Apply rewrites it), and tests mutate both
-// process.env and the file between calls.
+// Resolution happens on every call: the ENV tier is read live (deployments and
+// test seams set these after import), while the FILE tier goes through
+// loadConfigFile()'s content-keyed parse cache (#2078 — the old
+// deliberately-uncached readFileSync+JSON.parse per call cost ~5-10 parses per
+// request). The raw file text is the invalidation key, so any rewrite is
+// visible on the next call — hot-reload (web-UI Apply) and file-mutating test
+// seams keep working unchanged.
 
 import path from "node:path";
 import { stateDir } from "./paths.js";

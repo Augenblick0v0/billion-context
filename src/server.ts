@@ -5575,19 +5575,40 @@ function outboundPayloadBreakdown(
     return { textEstimate, overheadEstimate, imageTokens, payloadEstimate: textEstimate + overheadEstimate + imageTokens, armEstimate };
 }
 
-function outboundContextEstimate(prepared: Prepared, wireBody: string, opts: ProxyOptions, upstream: string): number {
+/** #2078: `parsed` carries the caller's pre-parsed send body so forward() does
+ *  not pay a second full JSON.parse of the largest payload in flight per
+ *  request. Three states: undefined = parse here (legacy callers), object =
+ *  project from it (numbers identical to re-parsing the same string), null =
+ *  caller already tried and failed → keep the prepared projection and skip the
+ *  doomed re-parses inside the helpers (they return 0 on unparseable input). */
+export function outboundContextEstimate(
+    prepared: Prepared,
+    wireBody: string,
+    opts: ProxyOptions,
+    upstream: string,
+    parsed?: Record<string, unknown> | null,
+): number {
     let msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
-    try {
-        const parsed = JSON.parse(wireBody);
+    const project = (value: unknown): void => {
         switch (prepared.protocol) {
-            case "anthropic": msgs = anthropicToCore(parsed as AnthropicRequestBody).msgs; break;
-            case "openai": msgs = openaiToCore(parsed as OpenAIRequestBody).msgs; break;
-            case "responses": msgs = responsesToCore(parsed as ResponsesRequestBody).msgs; break;
-            case "google": msgs = googleToCore(parsed as GoogleRequestBody).msgs; break;
+            case "anthropic": msgs = anthropicToCore(value as AnthropicRequestBody).msgs; break;
+            case "openai": msgs = openaiToCore(value as OpenAIRequestBody).msgs; break;
+            case "responses": msgs = responsesToCore(value as ResponsesRequestBody).msgs; break;
+            case "google": msgs = googleToCore(value as GoogleRequestBody).msgs; break;
         }
-    } catch { /* Preserve the prepared projection if the wire codec cannot project a provider extension. */ }
-    return estimateCoreMessagesUpper(msgs) + estimateWireOverhead(prepared.protocol, wireBody)
-        + imageReserveFor(prepared.session, prepared.protocol, wireBody, opts, upstream);
+    };
+    let raw: string | Record<string, unknown>;
+    if (parsed === undefined) {
+        try { project(JSON.parse(wireBody)); } catch { /* Preserve the prepared projection if the wire codec cannot project a provider extension. */ }
+        raw = wireBody;
+    } else if (parsed !== null) {
+        try { project(parsed); } catch { /* Preserve the prepared projection if the wire codec cannot project a provider extension. */ }
+        raw = parsed;
+    } else {
+        raw = "";
+    }
+    return estimateCoreMessagesUpper(msgs) + estimateWireOverhead(prepared.protocol, raw)
+        + imageReserveFor(prepared.session, prepared.protocol, raw, opts, upstream);
 }
 
 async function preflightCompressIfNeeded(
@@ -6305,8 +6326,18 @@ async function forward(
     // not clobber the slot.
     if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
+        // #2078: ONE parse of the outbound body for the whole seam block — the
+        // estimate's projection, its wire-overhead term, and the image reserve
+        // each used to re-parse this same string independently.
+        let sentParsed: Record<string, unknown> | null;
+        try {
+            const p = JSON.parse(sentBody);
+            sentParsed = p && typeof p === "object" && !Array.isArray(p) ? (p as Record<string, unknown>) : null;
+        } catch {
+            sentParsed = null;
+        }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
-        const estimate = outboundContextEstimate(prepared, sentBody, opts, upstreamUrl);
+        const estimate = outboundContextEstimate(prepared, sentBody, opts, upstreamUrl, sentParsed);
         prepared.session.stats.localInputEstimate = estimate;
         prepared.session.stats.contextTokens = estimate;
         prepared.session.stats.contextTokensSource = "estimate";

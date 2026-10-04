@@ -1488,17 +1488,48 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] ignoring unknown top-level config key(s): ${unknown.join(", ")}${hint}`);
 }
 
-/** Read the JSON config file fresh on every call (no cache): the file is small,
- *  hot-reloadable (web-UI Apply rewrites it), and test seams mutate it between
- *  calls. Exported so src/knobs.ts can resolve the file tier of every knob
- *  through this single reader (#2030). */
+// #2078: parse-once cache for loadConfigFile(). Every knob resolves its file
+// tier through this reader per call (~5-10 calls per request once #2030
+// landed), and each call used to do a full readFileSync + JSON.parse. The raw
+// file TEXT is the invalidation key, deliberately NOT (mtime, size): back-to-
+// back rewrites can land on the same sub-ms mtime on common filesystems
+// (measured), so a stat-keyed cache serves stale values right after a web-UI
+// Apply or a test-seam write. Re-reading the text per call is a page-cache hit
+// (~µs); JSON.parse is the expensive half and now runs only when content
+// actually changed. Hot-reload stays exact: any external rewrite is visible on
+// the next call; a missing file is never cached (reappearing files show up
+// immediately). Callers treat the returned object as READ-ONLY (shared across
+// calls until the content changes) — audited: all current consumers only read
+// fields.
+let configFileCache: { raw: string; value: FileConfig } | null = null;
+
 export function loadConfigFile(): FileConfig {
-    const parsed = safeReadJson(configFile());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
-        return parsed as FileConfig;
+    const path = configFile();
+    let raw: string | undefined;
+    let value: FileConfig | undefined;
+    try {
+        raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
+        const cached = configFileCache;
+        if (cached && cached.raw === raw) return cached.value;
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
+            value = parsed as FileConfig;
+        } else {
+            value = {};
+        }
+    } catch (e) {
+        // Same surface as safeReadJson: silent on ENOENT, loud otherwise.
+        // Corrupt-but-present content IS cached (as {}) so one bad save does
+        // not re-log and re-fail-parse on every knob call until it is fixed.
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+            loggerLog("error", `[acp-config] failed to parse ${path}: ${String(e)}`);
+        }
+        if (raw !== undefined) value = {};
     }
-    return {};
+    if (raw === undefined || value === undefined) return {};
+    configFileCache = { raw, value };
+    return value;
 }
 
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
