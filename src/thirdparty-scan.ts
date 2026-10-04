@@ -46,12 +46,19 @@ export interface ScanResult {
     sourcesScanned: number;
 }
 
-/** #920: opencode-acp co-resident with bili's OWN opencode native/launcher
- *  mode is absorbed by design (legacy sessions keep their compression
- *  carrier) — it is NOT a conflict there. Everywhere else (wire mode, other
- *  clients) the same entry warns like any known conflict. */
-export function isDesignAbsorbed(finding: ThirdPartyFinding, pluginAgent: string | undefined): boolean {
-    return finding.client === "opencode" && finding.knownId === "opencode-acp" && pluginAgent === "opencode";
+/** #920/#2045: a finding naming one of bili's OWN sibling compressors is
+ *  benign by design when bili's own entry for THAT client drives the session —
+ *  the sibling either is absorbed into bili's pipeline (opencode-acp, #920) or
+ *  stands down because bili owns the process/traffic (billion-context-pi via
+ *  BILLION_CONTEXT_NATIVE / BILLION_CONTEXT_PROXY). No double-compression can
+ *  happen there, so no conflict alert (#2045: these auto-disable — no web
+ *  popup needed). Everywhere else (wire/plain-proxy mode, other clients) the
+ *  same entry IS a real conflict and still warns like any known finding. */
+export function isDesignBenign(finding: ThirdPartyFinding, pluginAgent: string | undefined): boolean {
+    if (finding.match !== "known") return false;
+    if (finding.client === "opencode" && finding.knownId === "opencode-acp") return pluginAgent === "opencode";
+    if (finding.client === "pi" && finding.knownId === "billion-context-pi") return pluginAgent === "pi";
+    return false;
 }
 
 export const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;

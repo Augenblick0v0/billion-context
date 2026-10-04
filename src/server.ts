@@ -83,7 +83,7 @@ import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, im
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
-import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
+import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext } from "./logger.js";
@@ -2511,7 +2511,7 @@ async function handle(
                 if (client !== undefined) {
                     const res = scanClientPlugins(client, { env: process.env, cwd: process.cwd() });
                     for (const f of res.findings) {
-                        if (isDesignAbsorbed(f, pluginAgent)) continue;
+                        if (isDesignBenign(f, pluginAgent)) continue;
                         const risk = f.match === "known"
                             ? "it is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs"
                             : "its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs";

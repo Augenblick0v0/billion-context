@@ -19,17 +19,16 @@ export const WEB_CLIENT = `(function () {
     function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, (c) => c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === \'"\' ? "&quot;" : "&#39;");
     }
-    // #1206 ledger detail carries per-event identity (client/entry/source); the
-    // banner used to show counts only and force users into acp_status — surface
-    // the named entries here instead.
+    // #1206 ledger detail carries per-event identity (client/entry/source);
+    // #2045: render it in FULL — keep the source path and list EVERY distinct
+    // entry, no truncation — so the alert is accurate and complete without
+    // forcing users into acp_status to find out what/where.
     function shortConflictDetail(e) {
         if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") return "";
         let s = e.detail;
         const suspected = s.indexOf("[suspected]") >= 0;
         const si = s.lastIndexOf("[suspected]");
         if (si >= 0) s = s.slice(0, si);
-        const pi = s.lastIndexOf(" (");
-        if (pi > 0) s = s.slice(0, pi);
         return s.trim() + (suspected ? " [suspected]" : "");
     }
     function bili_conflictLine(c) {
@@ -44,8 +43,7 @@ export const WEB_CLIENT = `(function () {
         }
         let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
         if (items.length > 0) {
-            const shown = items.slice(0, 4).map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : ""));
-            line += " — " + shown.join(" · ") + (items.length > 4 ? " …+" + (items.length - 4) : "");
+            line += " — " + items.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
         }
         return line;
     }
