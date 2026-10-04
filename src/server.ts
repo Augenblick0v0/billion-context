@@ -84,7 +84,7 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
-import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
+import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
@@ -1425,6 +1425,9 @@ async function handle(
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
+    // #2102: wipe the diagnostic conflict ledgers (global, or one session via
+    // ?session=<id>). Loopback + trusted-origin gated like every /__bili/ path.
+    if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -7436,6 +7439,23 @@ function reapOrphansLogged(session: Session, msgs: CoreMessage[], log: (level: s
     if (reaped.length === 0) return;
     log("warn", `[${sessionId}] orphan-gc deactivated ${reaped.length} block(s) whose source messages left the client history (${reaped.join(", ")}) — the client or another compression plugin deleted summarized content; those summaries can no longer be decompressed (#1206)`);
     recordConflict(session, "orphan-reap", `${reaped.length} block(s) deactivated: ${reaped.join(", ")}`);
+}
+
+// #2102: wipe diagnostic conflict ledgers — global, or one session via ?session=<id>.
+// Gated by the /__bili/* admin gate above (loopback + trusted origin only);
+// wiping loses no conversation data, only the evidence notes (#1206 design).
+function handleConflictsClear(url: string, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
+    const sessionId = new URL(url, "http://localhost").searchParams.get("session");
+    const sessions = listSessions();
+    if (sessionId !== null && sessionId !== "" && !sessions.some((s) => s.id === sessionId)) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${sessionId}` }, null, 2));
+        return;
+    }
+    const cleared = clearConflictEvents(sessions, sessionId || undefined);
+    log("info", `[conflict] ledger cleared via web UI: ${cleared.events} event(s) across ${cleared.sessions} session(s)${sessionId ? ` (session ${sessionId})` : ""}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cleared }, null, 2));
 }
 
 function sendStats(res: http.ServerResponse): void {

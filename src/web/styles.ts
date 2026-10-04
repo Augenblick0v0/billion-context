@@ -90,8 +90,8 @@ body {
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
-.banner .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
-.banner .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.banner .alert-row, .card .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.banner .alert-row > span, .card .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
