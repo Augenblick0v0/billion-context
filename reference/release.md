@@ -128,6 +128,47 @@ commit. The standard branch/PR flow above remains the canonical path for anythin
 non-trivial (updater changes, cross-repo bumps, or whenever a human wants the review
 gate).
 
+## Bugfix carve-out channel (release-bugfix.yml)
+
+Emergency hotfix path (#2011, first used for v0.1.182): publish a version cut from
+a **non-master ref** — typically a released tag plus a single fix commit — STRICTLY
+excluding the unreleased work that has since accumulated on master.
+
+`release.yml` cannot do this: it builds the post-merge MASTER tree on push-to-master,
+so it can never exclude commits already on master. This channel checks out and
+publishes the pushed/dispatched REF itself — the artifact is exactly that ref's tree,
+nothing else.
+
+**Process:**
+
+1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
+   plus the version bump and the release-notes entry (step 4 above), then push:
+   ```bash
+   git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
+   ```
+   The `bugfix-release/` name prefix is the trigger (`push`, or manual dispatch
+   against such a ref); concurrency group `bugfix-release`, no cancel-in-progress.
+2. The run reads the target version from the ref's `package.json` (before any gate)
+   and enforces fail-closed guards:
+   - strictly newer than npm latest (base-semver compare — never holds or downgrades
+     `latest`; conservative edge: a stable `X` is refused while npm latest is `X-dev`);
+   - not already published (`npm view billion-context@$VER`);
+   - no sub-0.1.0 lines (#1385);
+   - stable versions need a release-notes entry ON THE REF (#1870; prereleases exempt).
+3. Full pre-flight gate before publish: `npm ci` + typecheck + test + build
+   (`ACP_TEST_CLAUDE_NATIVE=1`, #1248).
+4. Publishes `--tag latest` (`dev` for prereleases), pushes tag `v{VERSION}`, creates
+   the GitHub Release with notes generated from `git log` between the nearest ancestor
+   tag other than the one just made and HEAD — for a tag+one-fix carve-out that list
+   is exactly the fix (deliberately NOT `generate_release_notes:true`, which would span
+   into unreleased master work).
+
+**Master stays out:** no merge, no push to master, no interaction with the standard
+flow. The tag points at the hotfix ref; master keeps its own (older) version and
+advances independently on its next normal release, which MUST be higher than the
+carve-out version (after v0.1.182 was cut off v0.1.181, master stayed 0.1.181 → next
+normal release ≥ 0.1.183).
+
 ## CI publish mechanism (what release.yml does)
 
 - **Trigger**: push to `master` where the merge commit or branch name matches
