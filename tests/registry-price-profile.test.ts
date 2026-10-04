@@ -95,6 +95,20 @@ test("unlisted model yields undefined (stamp site then keeps kernel defaults)", 
     assert.equal(peekRegistryPriceProfile("totally-unlisted-model-xyz"), undefined);
 });
 
+test("price lookup is case-insensitive like the window lookup (same mechanism, #2074)", () => {
+    _resetForTest();
+    _setForTest({}, {
+        "minimax/MiniMax-M3": { input: 3, output: 12 },
+        "tencent/HY3": { input: 0.4, output: 1.6 },
+    });
+    // Exact-key branch (known-provider host): probe case differs from the roster key.
+    assert.deepEqual(peekRegistryPriceProfile("minimax-m3", "api.minimax.chat"), { w: 3, r: 0.3, q: 12 });
+    // Relay scan branch: same folding.
+    assert.deepEqual(peekRegistryPriceProfile("hy3"), { w: 0.4, r: 0.04, q: 1.6 });
+    // Byte-exact keys still resolve identically (no precedence shift).
+    assert.deepEqual(peekRegistryPriceProfile("MiniMax-M3", "api.minimax.chat"), { w: 3, r: 0.3, q: 12 });
+});
+
 test("bundled snapshot ships cost rows so the offline floor exercises pricing", () => {
     const snap = bundledSnapshot as { count?: unknown; models?: Record<string, unknown>; costs?: Record<string, { input?: unknown; output?: unknown }> };
     assert.ok(snap.costs && Object.keys(snap.costs).length > 0, "snapshot carries a costs map");

@@ -193,3 +193,22 @@ test("dashscope/comfly hosts reach listed Qwen windows from the bundled snapshot
     assert.equal(bundledSnapshotLookup("qwen3-coder-plus", "coding.dashscope.aliyuncs.com"), 1_048_576);
     assert.equal(bundledSnapshotLookup("qwen3-coder-plus", "ai.comfly.org"), 1_048_576);
 });
+
+test("roster lookup is case-insensitive on exact keys and the relay scan (#2074)", () => {
+    _setForTest({
+        "minimax/MiniMax-M3": { limit: { context: 1_048_576 } },
+        "google/gemma-4-E2B-it": { limit: { context: 131_072 } },
+        "tencent/hy3": { limit: { context: 256_000 } },
+    });
+    // Exact-key branch (known-provider host): probe case differs from the roster key.
+    assert.equal(peekRegistryContext("minimax-m3", "api.minimax.chat"), 1_048_576);
+    assert.equal(peekRegistryContext("MINIMAX/MINIMAX-M3", "api.minimax.chat"), 1_048_576);
+    // Relay suffix-scan branch: same folding.
+    assert.equal(peekRegistryContext("HY3", "relay.example"), 256_000);
+    assert.equal(peekRegistryContext("gemma-4-e2b-it", "relay.example"), 131_072);
+    assert.equal(peekRegistryContext("minimax-m3"), 1_048_576);
+    // Byte-exact keys still resolve identically (no precedence shift).
+    assert.equal(peekRegistryContext("MiniMax-M3", "api.minimax.chat"), 1_048_576);
+    // Genuinely absent models still miss.
+    assert.equal(peekRegistryContext("nope-xyz", "relay.example"), undefined);
+});
