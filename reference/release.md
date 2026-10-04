@@ -32,9 +32,11 @@ The Agent does steps 1–6, the human does step 7 (merge).
    -    "version": "0.1.16",
    +    "version": "0.1.17",
    ```
-4. **Add the release-notes entry (#1870)** — in the SAME release PR, as its
-   own commit (never bundled into the release commit): prepend an entry to
-   the `releases` array in `release-notes/package.json`:
+4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
+   since 2026-10-04)** — ordinary releases skip this step entirely and ship
+   with NO entry. When a release IS severe, add the entry in the SAME release
+   PR, as its own commit (never bundled into the release commit): prepend an
+   entry to the `releases` array in `release-notes/package.json`:
    ```json
    {
      "version": "0.1.17",
@@ -52,8 +54,10 @@ The Agent does steps 1–6, the human does step 7 (merge).
    - The summary is model-written, ≤400 chars, newest-first order, cap 20
      entries. NEVER hand-edit the companion package's own `"version"` field —
      CI bumps it on publish.
-   - Full rules: `release-notes/README.md`. Enforcement: `release.yml` fails
-     the publish if the version being released has no entry.
+   - Full rules: `release-notes/README.md`. Enforcement: the gates in
+     `release.yml` / `release-manual.yml` / `release-bugfix.yml` pass with a
+     notice when the entry is absent (silent release, the default) and
+     validate it when present.
 5. **Local pre-flight** — run the same checks CI runs:
    ```bash
    npm run typecheck
@@ -84,18 +88,18 @@ For routine patch releases, skip the branch/PR dance: **Actions → "Release
 input is optional — blank means auto next-patch over the npm latest; type a full
 semver for minor/major/prerelease bumps.
 
-**Prerequisite (#1870):** the version being released must ALREADY have a
-release-notes entry merged to master (`release-notes/package.json`, same
-shape as step 4 above) — the workflow checks this at dispatch time and aborts
-with a pointer to `release-notes/README.md` if the entry is missing. So for
-one-click releases the agent adds the entry in a tiny docs PR (or the owner
-commits it) BEFORE dispatching. Prereleases (dev channel) are exempt.
+**Severe-release prerequisite (#1870):** if the version being released is
+severe, its release-notes entry must ALREADY be merged to master
+(`release-notes/package.json`, same shape as step 4 above) — the workflow
+checks at dispatch time and logs the entry when found. Ordinary releases
+need NO entry: a missing entry is a notice, not an abort. Prereleases (dev
+channel) are exempt.
 The workflow then:
 
 1. **Drift guard**: master's `package.json` version must equal the npm latest, else it
    aborts (never release off a drifted tree). It also rejects a target version that is
-   already published. A separate dispatch-time step then verifies the
-   release-notes entry exists for the target version (#1870) — see the
+   already published. A separate dispatch-time step then logs the
+   release-notes entry for the target version when present (#1870) — see the
    prerequisite above.
 2. Bumps ONLY `package.json` + `package-lock.json` and commits `release v{VERSION}` —
    the same one-version-one-commit discipline as `AGENTS.md` Version Bumps.
@@ -142,7 +146,8 @@ nothing else.
 **Process:**
 
 1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
-   plus the version bump and the release-notes entry (step 4 above), then push:
+   plus the version bump (plus the release-notes entry ONLY if the hotfix is
+   severe — step 4 above), then push:
    ```bash
    git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
    ```
@@ -154,7 +159,8 @@ nothing else.
      `latest`; conservative edge: a stable `X` is refused while npm latest is `X-dev`);
    - not already published (`npm view billion-context@$VER`);
    - no sub-0.1.0 lines (#1385);
-   - stable versions need a release-notes entry ON THE REF (#1870; prereleases exempt).
+   - severe stable versions need a release-notes entry ON THE REF (#1870;
+     ordinary releases ship with none; prereleases exempt).
 3. Full pre-flight gate before publish: `npm ci` + typecheck + test + build
    (`ACP_TEST_CLAUDE_NATIVE=1`, #1248).
 4. Publishes `--tag latest` (`dev` for prereleases), pushes tag `v{VERSION}`, creates
