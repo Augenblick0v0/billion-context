@@ -119,3 +119,30 @@ jobs:
             exit 1
           fi
           echo "✓ kernel version discipline OK"
+
+  # #2107 drift guard A: the config docs are generated from
+  # website/config-reference/*.yaml (single source). Regenerate and fail when
+  # the committed artifacts differ — a schema edit without re-running the
+  # generator goes red here. Zero-dep script: no npm install needed.
+  docs-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/gen-config-docs.mjs generate
+      - name: Fail on artifact drift
+        run: git diff --exit-code -- CONFIGURATION.md CONFIGURATION.zh-CN.md website/main.js website/docs/index.html
+
+  # #2107 drift guard B: every BILI_*/ACP_* env var read in src/ and every
+  # FileConfig top-level key must have a seed entry — an undocumented param
+  # added to src goes red here with the missing names listed.
+  docs-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/gen-config-docs.mjs check-coverage

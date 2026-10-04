@@ -59,6 +59,286 @@
 
 状态说明：**ACTIVE（启用）** = 当前生效 | **DEPRECATED（已弃用）** = 接受但无效果 | **EXPERIMENTAL（实验性）** = 可能变更
 
+<!-- bili:gen param-ref -->
+以下索引由 `website/config-reference/*.yaml` 生成——改种子后运行 `node tools/gen-config-docs.mjs generate`，不要手改本区块。
+
+**服务与核心**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `port` | number | 8787 | ACP_PORT, PORT | 代理监听端口（用户区；车道派生代理使用 BILI_ZONE_PORT，互不干扰）。 |
+| `host` | string | 127.0.0.1 | ACP_HOST | 绑定地址。127.0.0.1 仅本机回环；:: 双栈；0.0.0.0 对外暴露（无鉴权，仅限可信网络）。 |
+| `sessionHeader` | string | x-acp-session | ACP_SESSION_HEADER | 携带会话 id 的请求头；相同取值的请求共享压缩状态。 |
+| `log` | boolean | true | ACP_LOG | 逐请求日志总开关。 |
+| `logFile` | string | XDG state path (off disables the file, keeps stderr) | ACP_LOG_FILE | bili.log 的显式路径；10 MB 自动轮转。 |
+| `debug` | boolean | false | ACP_DEBUG | 逐请求详细日志。 |
+| `dumpSse` | string | unset (directory) | ACP_DUMP_SSE | 原始 SSE 帧转储目录（排障用），含循环内发起的上游响应。 |
+| `passthrough` | boolean | false | ACP_PASSTHROUGH | 全局裸转发开关：所有请求不做压缩、工具注入或提醒直接转发。 |
+
+**上游与计费**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `upstream` | string | https://api.anthropic.com | ACP_UPSTREAM | 请求未命中任何路由时的兜底上游基础地址。 |
+| `proxy` | string | unset (direct) | BILI_UPSTREAM_PROXY | 代理自身出站的全局代理。解析顺序：按路由 → BILI_UPSTREAM_PROXY → Web UI → 本值 → HTTP(S)_PROXY 环境变量 → Windows 系统代理 → 直连。空字符串 = 显式直连；不支持 SOCKS5。 |
+| `upstreamProxy` | string | unset | — | Web 面板手动设置的代理层级（由仪表盘代理编辑器写入）；解析顺序中位于 BILI_UPSTREAM_PROXY 之下。 |
+| `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | 全局代理来源策略：auto（环境变量/系统发现）、manual（仅 Web 面板值）、direct（从不使用代理）。 |
+| `providers` | record url-prefix → route entry | {} | — | 路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。 |
+| `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | 旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。 |
+| `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
+| `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
+
+**行为开关**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
+| `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
+| `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
+| `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | 以新会话 id 恢复的已识别客户端继承父会话的引用编号与完整存在的压缩块。 |
+| `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
+| `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | 在出口消息上打模型可见的 <bili-chain/> 链完整性标记（默认关：模型会把它当幽灵输入而消耗 token）。 |
+| `stableSystemAnchor` | boolean | false | BILI_STABLE_SYSTEM_ANCHOR | 线路层尽力而为的前缀缓存锚点：客户端改动头部 system 时仍重发首次见到的字节（仅纯代理通道）。 |
+| `compat` | { roles?, dropFields?, streamErrorShape?, noCacheControl?, keepResponseId? } | {} (disabled) | — | 全局线上兼容块：角色映射、严格 schema 字段剔除、流式错误形态、缓存控制处理。 |
+| `compat.roles` | record role → role | {} | — | 把消息角色映射为上游接受的名字（如 developer→system）；仅精确匹配角色，逐 provider 条目按键级胜出。 |
+| `compat.dropFields` | string[] (dot paths) | [] | — | 从每个转发请求体中剔除的点路径字段，面向对未知字段返回 400 的严格 schema 网关；全局与逐 provider 列表加法并集。 |
+| `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | 200 已提交后上游流失败的呈现方式：协议原生错误帧（默认）或旧版合成完成形态。 |
+| `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | 完全停止 Anthropic 通道的 cache_control 断点打标（面向拒收该字段或有自有断点策略的上游/中继的逃生门）。 |
+| `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | 在内核重建的 Responses 请求上保留 previous_response_id（默认剔除，使重建请求体永不引用上游从未签发过的响应 id）。 |
+| `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
+| `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
+| `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
+| `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
+
+**MITM 通道**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `providersPath` | string | unset | ACP_PROVIDERS | 外部 providers.json 路径（遗留/共享路由文件）；优先于内联 providers 与配置文件位置。 |
+| `mitm.enabled` | boolean | true | BILI_MITM | 面向写死 HTTPS 上游的登录客户端的拦截开关；域名首次发现即加入白名单。 |
+| `mitm.domains` | string[] | [] | BILI_MITM_DOMAINS | 显式 MITM 白名单域名（与首次发现的自动白名单取并集）。 |
+| `mitm.handshakeTimeoutMs` | number | 10000 | BILI_MITM_HANDSHAKE_TIMEOUT_MS | 被拦截连接的 TLS 握手超时。 |
+
+**进程级配置块**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `network` | object | {} (all defaults) | — | 上游调用的传输超时、看门狗与重放策略。 |
+| `network.upstreamTimeoutMs` | number | 720000 | BILI_UPSTREAM_TIMEOUT_MS | 单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。 |
+| `network.requestWatchdogMs` | number | 2× upstreamTimeoutMs | BILI_REQUEST_WATCHDOG_MS | 绝对看门狗：即使按调用计时器从未挂上，也强制中止卡死的上游套接字。 |
+| `network.keepAliveTimeoutMs` | number | 5000 | BILI_KEEP_ALIVE_TIMEOUT_MS | 连接池内上游套接字的空闲保活超时。 |
+| `network.clientErrorBackstopMs` | number | 30000 | BILI_CLIENT_ERROR_BACKSTOP_MS | 中止停止读取已提交响应的客户端连接的兜底超时。 |
+| `network.exposureLogIntervalMs` | number | 3600000 (0 disables the log) | BILI_EXPOSURE_LOG_INTERVAL_MS | 绑定地址暴露警告在日志中的重复间隔；0 完全禁用。 |
+| `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | 模型块之间的下游流保活心跳间隔；0 禁用心跳。 |
+| `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | preflight 失败后，允许请求未校准放行的持有时长。 |
+| `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
+| `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
+| `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
+| `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
+| `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
+| `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
+| `persist` | object | {} (all defaults) | — | 会话落盘持久化（XDG state 目录之下）。 |
+| `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
+| `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | zstd 压缩持久化会话文件（1/true 启用）。 |
+| `persist.debounceMs` | number | 500 | BILI_PERSIST_DEBOUNCE_MS | 会话文件写入的去抖窗口。 |
+| `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
+| `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
+| `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
+| `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
+| `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
+| `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
+| `plugin.snapshotCapBytes` | number | 16777216 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
+
+**更新与公告**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | 自动 npm 版本检查（约每 3 分钟）；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭。 |
+| `autoRestartOnUpdate` | boolean | false | ACP_AUTO_RESTART_ON_UPDATE | 新版本装好后自动重启守护进程。 |
+| `updateTag` | string | latest | ACP_UPDATE_TAG | 自更新的 npm dist-tag 通道：latest（默认）、dev 或 pr。 |
+| `update` | object | {} (all defaults) | — | 自更新通道设置。 |
+| `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | 自更新用的自定义 npm registry 基础地址（私有镜像）。 |
+| `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | npm registry 版本检查间隔。 |
+| `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。 |
+| `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | 公告源覆盖地址。 |
+| `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Web 面板里的发布说明源（只抓取缓存、从不安装任何东西）。 |
+| `releaseNotesUrl` | string | unset (built-in feed) | BILI_RELEASE_NOTES_URL | 发布说明源覆盖地址。 |
+
+**诊断与调优**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `diagnostics` | object | {} (all defaults) | — | 本地排障旋钮（转储、渲染/注入开关、count-tokens 透传）。 |
+| `diagnostics.dumpBody` | boolean | false | ACP_DUMP_BODY | 把完整请求/响应体转储到日志用于排障。 |
+| `diagnostics.dumpReq` | boolean | true | ACP_DUMP_REQ | 逐次调用记录发往上游的请求元数据。 |
+| `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | 原始线路转储目录。 |
+| `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | 把上游 4xx 响应落盘以便事后检查。 |
+| `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | 单个 4xx 转储文件的大小上限。 |
+| `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | 禁用所有 ACP 标签渲染（原始线路研究模式）。 |
+| `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | 停止向请求注入 acp_compress 工具定义。 |
+| `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | 停止向系统提示词附加压缩教条文本。 |
+| `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | 把 /v1/messages/count_tokens 转发给上游，而不是本地应答。 |
+| `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | 压缩的 ACP 注入面：原生工具（默认）或旧版提示词标记。 |
+| `fakeCompletion` | object | {} (all defaults) | — | 末块被截断时重新发起请求的重试环。 |
+| `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
+| `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
+| `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。 |
+| `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
+| `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
+
+**压缩（全局层级）**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。 |
+| `compress.maxContextLimit` | number \| "N%" | "75%" | — | 强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。 |
+| `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
+| `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
+| `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
+| `compress.preserveRecentMessages` | number | kernel ≈5 | — | 最近的消息软保护、免于折叠。 |
+| `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
+| `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
+| `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
+| `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
+| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留。 |
+| `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
+| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。 |
+| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。 |
+| `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
+| `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
+| `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
+| `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
+| `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。 |
+| `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
+| `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
+| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
+| `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库。 |
+| `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
+| `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
+| `compress.imageCompression` | object | opt-in (disabled) | — | 可选有损缩放（依赖可选 sharp）后再发送；image_full 取回原图；仅限代理模式。 |
+| `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | 覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。 |
+| `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
+| `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
+| `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。 |
+| `compress.acknowledgePromptsRisk` | boolean | false | — | 必须先置 true，自定义 prompts 才会生效。 |
+| `compress.absorb.enabled` | boolean | false | — | 启用 absorb 蒸馏块。 |
+| `compress.absorb.minToolTokens` | number | 1000 | — | 可被吸收的工具结果的最小估算 token 大小。 |
+| `compress.absorb.contextThresholdPct` | number \| % | unset | — | 仅当上下文使用率超过窗口该占比时才吸收。 |
+| `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
+| `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
+| `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
+| `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
+| `compress.ccr.excludeTools` | string[] | [] | — | 排除出 CCR 存储的工具名。 |
+| `compress.ccr.toolName` | string | "acp_retrieve" | — | 回取工具的注册名。 |
+| `compress.ccr.maxHeadChars` | number | 96 | — | 存储指针处内联首段摘录的最大长度。 |
+| `compress.imageCompression.enabled` | boolean | false | — | 启用有损图片缩放（需要可选依赖 sharp）。 |
+| `compress.imageCompression.minTokens` | number | 512 | — | 只对计得 token 超过该值的图片做缩放。 |
+| `compress.imageCompression.maxDimension` | number | 1280 | — | 缩放后的最大输出边长。 |
+| `compress.imageCompression.quality` | number | 80 | — | 编码质量（1–100）。 |
+| `compress.imageCompression.format` | string | "webp" | — | 输出图片格式。 |
+| `compress.prompts.compressPhilosophy` | string | unset (kernel text) | — | 覆盖压缩哲学教条文段。 |
+| `compress.prompts.howToCompressRules` | string | unset (kernel text) | — | 覆盖压缩操作规则。 |
+| `compress.prompts.tier2DistillRules` | string | unset (kernel text) | — | 覆盖二级蒸馏规则。 |
+| `compress.prompts.tier3CondenseRules` | string | unset (kernel text) | — | 覆盖三级浓缩规则。 |
+| `compress.reasoningGuard.enabled` | boolean | false | — | 启用推理格自动修复。 |
+| `compress.reasoningGuard.maxContinue` | number | 3 | — | 单次截断的最多继续提示轮数。 |
+| `compress.reasoningGuard.maxTierN` | number | (built-in) | — | 修复后格层索引的上限。 |
+| `compress.reasoningGuard.markerText` | string | "Continue thinking..." | — | 标识被截断推理格的标记文本。 |
+| `compress.reasoningGuard.base` | number | (built-in) | — | 修复格的基础偏移参数。 |
+| `compress.reasoningGuard.offset` | number | (built-in) | — | 修复格的偏移步长参数。 |
+| `compress.reasoningGuard.debugLog` | boolean | false | — | 修复环的详细日志。 |
+| `compress.outputSteering.enabled` | boolean | false | — | 启用附加在系统提示词尾部的简洁度指令。 |
+| `compress.outputSteering.verbosityLevel` | number (0–4) | 2 | — | 指令的目标详细程度级别。 |
+| `compress.outputSteering.effortRouting` | boolean | (built-in) | — | 随指令一起路由 effort 提示。 |
+| `compress.priceProfile.w` | number | unset (registry) | — | 写入价相对输入价的比率。 |
+| `compress.priceProfile.r` | number | unset (registry) | — | 缓存读价相对输入价的比率。 |
+| `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
+| `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
+| `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
+| `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
+
+**路由表字段**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `models` | record name → { context?, output?, compress?, benefit? } | {} | — | 逐模型声明：上下文窗口、输出上限、逐模型压缩覆盖；不是流量过滤器。 |
+| `models.context` | number | unset (model registry) | — | 为该模型名声明的上下文窗口 token 数。 |
+| `models.output` | number | unset | — | 为该模型名声明的输出 token 上限。 |
+| `models.compress` | object | unset | — | 该模型的第 3 级压缩覆盖（全局→provider→模型合并中最深）。 |
+| `models.benefit` | boolean | false | — | 在经济学账本中标记该模型为免费额度计费。 |
+| `proxy` | string ("" = explicit direct) | unset | — | 本路由出站代理地址。 |
+| `compressProtocol` | "tools" (default) \| "marker" | "tools" | — | 本通道的 ACP 注入面。 |
+| `protocol` | "anthropic" \| "openai" \| "responses" \| "google" | inferred from the URL marker | — | 声明本通道的线上协议；客户端侧 /bili/<protocol>/ URL 标记优先级更高。 |
+| `compress` | object (level 2) | unset | — | 任意 compress 字段可在此覆盖——全局→provider→模型三级合并的第 2 级。 |
+| `compat` | { roles?, dropFields? } | {} | — | 逐路由线上兼容覆盖；provider 条目按键级覆盖全局；dropFields 加法并集。 |
+| `direct` | boolean | false | — | 客户端侧豁免：该上游流量完全不指向 bili。 |
+| `passthrough` | boolean | false | — | 路由级逐字节透传、无会话状态——面向反作弊上游。 |
+| `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (→ pixels) | — | 本路由图片 token 计费口径；bytes 为字节中继的显式指定。 |
+| `imageTokenCap` | number | unset (uncapped) | — | 本路由单张图片 token 成本上限。 |
+| `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | 按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。 |
+| `bind` | string (named entries only) | unset | — | 把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。 |
+| `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
+
+**仅环境变量（无配置文件键）**
+
+| Key | Type | Default | Env | Description |
+|-----|------|---------|-----|-------------|
+| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
+| `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
+| `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
+| `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM 隧道车道的主机白名单。 |
+| `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | 进程退出时回收全局 fetch 补丁的开关。 |
+| `BILI_CONFLICT_SCAN` | boolean-ish | off | — | 启用安装车道冲突扫描探针。 |
+| `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | number | (built-in) | — | 链检查点时间戳未来偏移的容忍度。 |
+| `BILI_CHAIN_RECENT_WINDOW_MS` | number | (built-in) | — | 链检查点校验的近期窗口大小。 |
+| `BILI_ZONE_PORT` | number | 18787 base (derived per lane) | — | 车道派生代理端口区的基础端口（端口重定位）。 |
+| `BILI_ZCODE_ROUTE` | string | unset | — | zcode 车道的路由选择。 |
+| `BILI_ZCODE_PORT` | number | unset | — | zcode 车道的端口钉死。 |
+| `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 凭据车道的固定签名模式。 |
+| `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
+| `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
+| `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
+| `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
+| `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
+| `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
+| `BILI_STRICT_PORT` | number | unset | — | 派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。 |
+| `BILI_OPENCODE_ACP_SPEC` | string | unset | — | 派生通道：opencode 原生车道的 ACP 规格标记。 |
+| `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | 启动器通道：传入被派生客户端的模型窗口覆盖。 |
+| `BILI_LAUNCHER_LANE` | string | unset | — | 启动器通道：派生方 bili 进程的车道身份。 |
+| `BILI_LAUNCHER_PLUGIN` | string | unset | — | 启动器通道：插件模式交接标记。 |
+| `BILI_LAUNCHER_DIRECT` | boolean-ish | off | — | 启动器通道：本次启动绕过注入的代理。 |
+| `BILI_INHERITED_HTTP_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 http_proxy 继承值。 |
+| `BILI_INHERITED_HTTPS_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 https_proxy 继承值。 |
+| `BILI_INHERITED_ALL_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 all_proxy 继承值。 |
+| `BILI_INHERITED_NO_PROXY` | string | unset | — | 启动器通道：跨派生边界保留的 no_proxy 继承值。 |
+| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | 宿主姿态：标记 claude 原生插件进程。 |
+| `BILI_NATIVE_DSH` | boolean-ish | off | — | 宿主姿态：标记 dsh 原生插件进程。 |
+| `BILI_NATIVE_KIMI` | boolean-ish | off | — | 宿主姿态：标记 kimi 原生插件进程。 |
+| `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |
+| `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | 宿主姿态：标记 opencode 原生插件进程。 |
+| `BILI_NATIVE_PI` | boolean-ish | off | — | 宿主姿态：标记 pi 原生插件进程。 |
+| `BILI_NATIVE_ZCODE` | boolean-ish | off | — | 宿主姿态：标记 zcode 原生插件进程。 |
+| `BILI_PI_BIN` | string | pi (PATH lookup) | — | 宿主姿态：pi 客户端二进制的显式路径。 |
+| `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | 宿主姿态：dsh 客户端二进制的显式路径。 |
+| `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | 测试钩子：模型信息查询的重试间隔。 |
+| `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道操作的重试间隔。 |
+| `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | 测试钩子：dsh 车道恢复清扫间隔。 |
+| `ACP_DUMP_DIR` | string | unset | — | 线路转储输出基础目录覆盖（路径重定位）。 |
+| `BILI_STREAM_STALL_MS` | number | (built-in) | — | 已提交上游流的停滞检测超时（无字节静默多久后中止）。 |
+| `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | 被启动客户端二进制的显式覆盖（在 PATH 上解析）。 |
+| `BILI_CONVERSATION_ID` | string | unset (per-spawn UUID written by bili) | — | 传给 MCP 子进程的逐派生会话 UUID（宿主不传会话 id 时用于无头自注册）。 |
+| `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` | string (JSON id→maxOutput map) | unset | — | 启动器通道：传给被派生代理的逐模型最大输出映射，用于输出预留。 |
+| `BILI_LAUNCH_TOKEN` | string | unset (generated per launch) | — | 启动令牌，鉴权启动器与其派生代理之间的车道内部端点（机密）。 |
+| `BILI_MCP_DEFAULT_ORIGIN` | string | http://127.0.0.1:8787 | — | MCP 入口的兜底代理 origin 候选。 |
+| `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | 多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。 |
+| `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
+| `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
+
+<!-- /bili:gen -->
+
 ---
 
 ## 服务端设置
@@ -1104,53 +1384,99 @@
 
 文件键仅在对应环境变量未设置时生效。括号内为内置默认值。
 
-| 环境变量 | 配置键 | 默认值 |
-|---------|--------|--------|
-| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | `720000` |
-| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | 上游超时 ×2 |
-| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | `3` |
-| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | `1500` |
-| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | 未设置（不引导） |
-| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | `5000` |
-| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | `30000` |
-| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | `3600000` |
-| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | `15000` |
-| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
-| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
-| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
-| `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | `5000` |
-| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
-| `BILI_PERSIST` | `persist.enabled` | `true` |
-| `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
-| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | `500` |
-| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | `16384` |
-| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | `5` |
-| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | `0` |
-| `BILI_MAX_SESSIONS` | `sessions.max` | `256` |
-| `BILI_SESSION_GC` | `sessions.gc.enabled` | `false` |
-| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
-| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
-| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | `16777216` |
-| `BILI_UPDATE_REGISTRY` | `update.registry` | npm 公共 registry |
-| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
-| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
-| `BILI_CODEX_COMPACT` | `codexCompact` | `"intercept"` |
-| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | `50` |
-| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | `false` |
-| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | `true` |
-| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | `<state dir>/raw` |
-| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | `false` |
-| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | `2097152` |
-| `ACP_RENDER_NONE` | `diagnostics.renderNone` | `false` |
-| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | `false` |
-| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | `false` |
-| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | `false` |
-| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | `"tools"` |
-| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | `false` |
-| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | `false` |
-| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | `0` |
-| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | `16777216` |
+<!-- bili:gen env-map -->
+| 环境变量 | 配置文件键 | 默认值 |
+|---------|------------|--------|
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false |
+| `ACP_AUTO_UPDATE` | `autoUpdate` | true |
+| `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
+| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |
+| `ACP_COMPRESS_TOOL` | `compress.injectTool` | true |
+| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | false |
+| `ACP_DEBUG` | `debug` | false |
+| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | false |
+| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | true |
+| `ACP_DUMP_SSE` | `dumpSse` | unset (directory) |
+| `ACP_HOST` | `host` | 127.0.0.1 |
+| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | false |
+| `ACP_LOG` | `log` | true |
+| `ACP_LOG_FILE` | `logFile` | XDG state path (off disables the file, keeps stderr) |
+| `ACP_MODEL_CONTEXT_LIMIT` | `modelContextLimit` | 200000 |
+| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | false |
+| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | false |
+| `ACP_PASSTHROUGH` | `passthrough` | false |
+| `ACP_PORT` | `port` | 8787 |
+| `ACP_PROMPT_CACHE_ROUTING` | `promptCache.routing` | auto |
+| `ACP_PROVIDERS` | `providersPath` | unset |
+| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | <state dir>/raw |
+| `ACP_RENDER_NONE` | `diagnostics.renderNone` | false |
+| `ACP_SESSION_HEADER` | `sessionHeader` | x-acp-session |
+| `ACP_UPDATE_TAG` | `updateTag` | latest |
+| `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
+| `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
+| `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
+| `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
+| `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
+| `BILI_CLAUDE_NATIVE_PORT` | `claude.nativePort` | unset (lane sticky zone port) |
+| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
+| `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
+| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
+| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
+| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
+| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
+| `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
+| `BILI_FORK_ADOPTION` | `forkAdoption` | false |
+| `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
+| `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
+| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
+| `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
+| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
+| `BILI_MITM` | `mitm.enabled` | true |
+| `BILI_MITM_DOMAINS` | `mitm.domains` | [] |
+| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | 10000 |
+| `BILI_NATIVE_ATTACH_EXTERNAL` | `native.attachExternal` | false |
+| `BILI_NON_HTTP_PROVIDERS` | `compactionOptIn` | false |
+| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | false |
+| `BILI_PERSIST` | `persist.enabled` | true |
+| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | 500 |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | 0 (no repeats) |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
+| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
+| `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
+| `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
+| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
+| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
+| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 16777216 (0 disables snapshots) |
+| `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
+| `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
+| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | 1500 (0 disables the delay) |
+| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | 3 (1 disables replays) |
+| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | 2× upstreamTimeoutMs |
+| `BILI_RESIGN` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESIGN_BENEFIT` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
+| `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
+| `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
+| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
+| `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
+| `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
+| `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
+| `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
+| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PORT` | `port` | 8787 |
+<!-- /bili:gen -->
 
 | 变量 | 效果 |
 |------|------|
