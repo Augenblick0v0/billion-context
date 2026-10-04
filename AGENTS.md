@@ -36,7 +36,7 @@ The full file-by-file map lives in [reference/architecture.md](reference/archite
 
 1. **acp-kernel is bundled inline** — tsup does NOT list it in `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
 2. **Tags use XML format** — messages carry ACP tags like `<acp tokens="2" type="text">m00001</acp>` (an opening element with `tokens=`/`type=` attributes wrapping a ref id, closed by its end element). In **source files** these angle brackets MUST be written as hex escapes (`\x3c`, `\x3e`) to avoid tooling that strips well-formed tags.
-3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`); first check per process ignores throttle.
+3. **Auto-update**: checks npm registry every 3 min by default (`CHECK_INTERVAL_MS = 3*60*1000`, overridable via `update.checkIntervalMs` / `BILI_UPDATE_CHECK_INTERVAL_MS`, #2030); first check per process ignores throttle.
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
 5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
@@ -70,7 +70,7 @@ The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a se
 
 - Host code must NOT prune/repack `session.state.messageRefs` in ways that let a freed number be re-issued (kernel `assignRefsNode` computes its cursor as `highestUsedIndex(map)+1`, so shrinking the map can drop the cursor and re-issue numbers).
 - Known residual: `applyCompactionArchive` (#421, `src/session.ts`) prunes `byRaw/byRef` to live raw ids on native-compaction boundaries. In practice the highest-numbered (newest) messages stay resident so the cursor does not drop, but this is a theoretical re-issue window — drop the map-prune once the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
-- master pins acp-kernel 0.0.100 (the old "do not bump past 0.0.47" guard is obsolete).
+- master pins acp-kernel 0.0.101 (the old "do not bump past 0.0.47" guard is obsolete).
 
 ## 3. Development Standards
 
@@ -93,12 +93,13 @@ The suites below cover the full context lifecycle plus the hermetic billing/advi
 - `tests/e2e/e2e-codex.test.ts` — real `codex` CLI through a Responses-compatible upstream (warmup → growth → ACP compress → purity → native-compact). Skips by default behind `ACP_TEST_E2E=1`; **never remove the gate**.
 - `tests/e2e/e2e-image-billing.test.ts` (`npm run test:e2e:image`) — hermetic real-image billing lane (#1843/#1857): deterministic image corpus driven through the real billing pipeline against a mock upstream; ungated, ~1s, always runs in CI (`.github/workflows/ci-image.yml`).
 - `tests/e2e/e2e-registry.test.ts` — hermetic local verdaccio exercising the real self-update chain; `tests/e2e/e2e-advisory-rollback.test.ts` shares its gate and fixture infra, asserting the #1588 rollback-form advisory contract end-to-end. Gated by `ACP_TEST_REGISTRY=1`.
+- Newer hermetic lanes each carry their own skip gate (read the test header for the exact env var): release-canary (`ACP_TEST_CANARY=1`), OpenCode V2 Responses-over-WebSocket (`ACP_TEST_E2E_OC_WS=1`, needs a real OpenCode V2 binary), plus real-client native suites under `tests/e2e/` (dsh/opencode/pi/codex-fake/subagent-sessions).
 
 Rules: run the codex suite (at least the 4-phase core) before merging changes to the request pipeline (`src/server.ts`, `src/loop/**`, adapters, preflight/compact paths); run the registry suite before changing `src/update.ts`, `src/advisory.ts`, or `src/plugin-install.ts`. Exact env vars, phases, and the CI trigger file-list: [reference/testing.md](reference/testing.md).
 
 ### Configuration Surface Discipline (owner-gated)
 
-The config surface — every field of `~/.config/billion-context/config.json`, every `BILI_*` env var, every CLI flag, mirrored across CONFIGURATION.md en/zh — is **owner-design territory**. Hard rules:
+The config surface — every field of `~/.config/billion-context/billion-context.json`, every `BILI_*` env var, every CLI flag, mirrored across CONFIGURATION.md en/zh — is **owner-design territory**. Hard rules:
 
 1. **Any change that adds, renames, or re-semantics a config field MUST report it explicitly** in the PR under a "config surface" heading: what is added/changed, why the existing surface cannot express it, which existing mechanisms were considered (providers table + its key species, the three-level `compress` hierarchy, env-var conventions, launcher↔extension channels), and the compat/migration story. A PR touching config without this section is incomplete by definition.
 2. **Agents do NOT invent new config shapes on their own initiative.** A new section/field proposed merely because locally convenient — without mapping it onto the existing system — is rejected on principle: **don't even build it**. File the proposal (issue, with the mapping above) and wait.
@@ -108,25 +109,7 @@ Canonical cautionary case (#1437 → #1469): a one-off `plugin.nonHttpProviders`
 
 ### Environment Variable Discipline (#2030)
 
-Env vars are a **scarce surface**: every `BILI_*`/`ACP_*` variable is a permanent knob a user must discover, document (CONFIGURATION.md en + zh), and keep in sync. The default answer to "should this be an env var?" is **no** — the config file exists precisely so knobs don't bloat the environment.
-
-**Where a knob lives:**
-
-| Category | Home | Examples |
-|----------|------|----------|
-| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*`, `fakeCompletion.*` |
-| Secrets / credentials | env only (never written to disk) | `BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY` |
-| Per-process channels (written by another bili component at spawn) | env only + comment at the read site naming the writer | `BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*` |
-| Host-side posture (read inside a third-party host process at bootstrap) | env only + comment at the read site | `BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH` |
-| Path relocation (test/container isolation) | env only via `src/paths.ts` | `BILI_CONFIG_FILE`, `BILI_SESSIONS_DIR`, `ACP_DUMP_DIR`, `XDG_*` |
-| Third-party conventions (not ours to rename) | as-is | `CLAUDE_CODE_SESSION_ID`, `CODEX_HOME`, `https_proxy` |
-
-Hard rules:
-
-1. **New env var = new discussion.** A PR introducing a new `process.env.X` read that fits none of the env-only categories above is incomplete: the knob lands as a config-file key resolved through `src/knobs.ts` (env > file > default), or it carries explicit owner sign-off for the env-only category in the PR thread.
-2. **One resolver per knob.** Tiered resolution lives ONLY in `src/knobs.ts`; leaf modules delegate and never parse `process.env` themselves. The env tier preserves each variable's historical parsing quirks byte-exact (backward compat); the file tier takes strict typed values. A set-but-garbage env value resolves exactly as it did pre-migration — it never leaks into, nor is shadowed by, the file tier.
-3. **Env wins over file, always.** Test seams set env live after import; inverting the precedence breaks them.
-4. **Document or don't ship.** Every user-facing knob (either tier) is documented in CONFIGURATION.md (en + zh) with its default and env-var name.
+Env vars are a **scarce surface**: by default a new behavior knob becomes a config-file key resolved through `src/knobs.ts` (**env > file > default**) — not a new `process.env` read. Env-only is reserved for six categories (secrets, per-process spawn channels, host-side posture, path relocation, third-party conventions); every env var must be documented in CONFIGURATION.md en+zh ("document or don't ship"). Full category table, hard rules, and rationale: [reference/env-vars.md](reference/env-vars.md).
 
 ### Code Quality
 
@@ -178,6 +161,7 @@ Releases are fully automated via CI (`.github/workflows/release.yml`): the Agent
 
 - **Branch** `YYYY-MM-DD_release-v{VERSION}`; commit `release v{VERSION}` changing ONLY `version`. The Agent does steps 1–6 (sync master → branch → bump → **release-notes entry (#1870)** → pre-flight typecheck+test+build → commit/push/open PR); HUMAN merges step 7; CI publishes step 8.
 - **Release-notes entry (#1870):** every released version needs an entry in `release-notes/package.json` — standard flow adds it as its own commit in the SAME release PR; the one-click fast path requires it already merged to master (dispatch-time check; prereleases exempt). `release.yml` fails the publish without it. Full rules: [reference/release.md](reference/release.md) + `release-notes/README.md`.
+- **Bugfix carve-out channel (#2011):** emergency hotfixes ship through `.github/workflows/release-bugfix.yml` (dispatch-triggered, no release branch) — mechanics and constraints: [reference/release.md](reference/release.md).
 - **NEVER run `npm publish` manually** — CI does it (§4).
 - **Cross-repo: acp-kernel MUST ship first.** When bumping the acp-kernel pin: release acp-kernel, confirm it's live on npm (`npm view acp-kernel version`), THEN bump here — else CI's `npm ci` fails at install.
 - **Changing `src/update.ts` (the updater itself) requires a NO-OP validation release FIRST** — a pure version bump proves the *existing* upgrade path is healthy end-to-end before the change ships. A broken updater bricks every future upgrade. Full protocol + rationale: [reference/release.md](reference/release.md).
