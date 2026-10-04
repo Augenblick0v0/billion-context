@@ -25,7 +25,10 @@ Companion package mechanics mirror `advisories/` (#1481):
 | tier     | yes      | `routine` (default) / `recommended` (restart soon, record-only) / `critical` (see below) |
 | summary  | yes      | One user-meaningful line, ≤400 chars, model-written|
 
-Rules: newest-first, ≤20 entries, no duplicates. Tier discipline (#1977):
+Rules: newest-first, ≤20 entries, no duplicates. **Entries are opt-in since
+2026-10-04**: only severe releases get one; ordinary releases ship with NO
+entry (the workflow gates pass with a notice when the entry is absent and
+validate it when present). Tier discipline (#1977):
 
 - `routine` — default. The overwhelming majority of releases.
 - `recommended` — "worth restarting soon" (correctness/cache fixes,

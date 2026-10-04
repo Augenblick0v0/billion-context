@@ -83,6 +83,10 @@ jobs:
           ' "$VER" "$LATEST"
 
       - name: Verify release-notes entry (#1870)
+        # Policy (2026-10-04 revision of #1870): entries are OPT-IN severity
+        # declarations — only severe releases need one; ordinary releases ship
+        # silently with NO entry. Missing entry => notice + pass; present
+        # entry => validated and logged.
         run: |
           VER="${{ steps.version.outputs.version }}"
           case "$VER" in
@@ -92,8 +96,8 @@ jobs:
             const notes = require('./release-notes/package.json').billionContextReleaseNotes;
             const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
             if (!entry) {
-              console.error('::error::release ' + process.argv[1] + ' has no release-notes entry (tier + model-written summary). Add it to release-notes/package.json BEFORE dispatching — see release-notes/README.md (#1870).');
-              process.exit(1);
+              console.log('::notice::release ' + process.argv[1] + ' has no release-notes entry — shipping silently (entries are opt-in; only severe releases need one). See release-notes/README.md (#1870).');
+              process.exit(0);
             }
             console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
           " "$VER"
