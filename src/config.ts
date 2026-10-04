@@ -5,7 +5,7 @@ import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
-import { resolveOutputHeadroomCap } from "./util.js";
+import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
 import { parseCompatDropFields } from "./compat-drop.js";
@@ -47,6 +47,20 @@ export type ProviderRoute = {
      *  (for upstreams that cannot coexist with a declared tools field).
      *  Default / "tools" = native function tools. */
     compressProtocol?: "tools" | "marker";
+    /** #1909: declared wire protocol for this key's requests — forces the
+     *  pipeline to treat matching POSTs as this protocol regardless of the
+     *  built-in path-suffix table (relays that hang model endpoints off
+     *  custom paths; MITM'd clients that cannot carry a /bili/ explicit
+     *  marker). Resolved independently of every other field: ALL matching
+     *  keys are scanned longest-prefix-first and the deepest key that
+     *  EXPLICITLY declares `protocol` wins, so a host-level declaration keeps
+     *  applying under a silent path-scoped key without duplication. The OTHER
+     *  fields keep findRoute's single-entry longest-key semantics — a
+     *  protocol-only path key still becomes the winning entry under its
+     *  subtree for them. The /bili/<protocol>/ URL marker still outranks it; the
+     *  body must still parse as the declared protocol or it relays verbatim
+     *  (#1284). Invalid values reject the config load loudly. */
+    protocol?: WireProtocol;
     /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
     compress?: CompressSettings;
     /** Per-provider wire-compat overrides. `roles` maps message roles to the
@@ -595,6 +609,31 @@ export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: str
     return findRoute(routes, upstreamUrl)?.compressProtocol;
 }
 
+/** #1909: the user-declared wire protocol for this destination — scans ALL
+ *  matching keys longest-prefix-first and returns the deepest key that
+ *  explicitly declares `protocol`. Unlike findRoute (single longest entry,
+ *  every field from it), this one field resolves through the prefix hierarchy:
+ *  a host-level declaration inherits down onto path-scoped keys that stay
+ *  silent, and a path-scoped declaration needs no duplication of the host
+ *  entry to take effect. The other fields keep findRoute's single-entry
+ *  semantics — a protocol-only path key still wins for them under its subtree.
+ *  undefined = no
+ *  declaration anywhere → callers fall back to the built-in path-suffix
+ *  inference. The query string is ignored (same as the built-in table). */
+export function resolveDeclaredProtocol(routes: ProviderRoutes, url: string | undefined): WireProtocol | undefined {
+    if (!url) return undefined;
+    const path = url.split("?", 2)[0];
+    let best: WireProtocol | undefined;
+    let bestLen = -1;
+    for (const key of Object.keys(routes)) {
+        if (routes[key].protocol === undefined) continue;
+        if (path === key || path.startsWith(key + "/")) {
+            if (key.length > bestLen) { bestLen = key.length; best = routes[key].protocol; }
+        }
+    }
+    return best;
+}
+
 export type ProxyOptions = {
     port: number;
     host: string;
@@ -743,7 +782,7 @@ export type ProxyOptions = {
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
  *  WITHOUT `bind` they are inert (longest-prefix matching never hits a name),
  *  so loadRoutes warns loudly instead of letting them sit dead (#1469). */
-const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "compat", "imageBilling", "imageTokenCap"] as const;
+const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
 // the same named-provider warning (same pattern as the absorb warnings below).
@@ -1536,10 +1575,12 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
+        const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
+        if (declaredProtocol !== undefined) route.protocol = declaredProtocol;
         if (obj.compress) route.compress = obj.compress;
         const compat: ProviderRoute["compat"] = {};
         const compatRoles = parseCompatRoles(obj.compat?.roles);
@@ -1562,6 +1603,16 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
 
 export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
+}
+
+/** Strict #1909 validation: an invalid providers.protocol value THROWS
+ *  (config-load failure / web 400) instead of being silently dropped — a
+ *  dropped declaration would leave the user staring at "unrecognized path"
+ *  passthrough logs with no signal about why their config had no effect. */
+function parseDeclaredWireProtocol(v: unknown): WireProtocol | undefined {
+    if (v === undefined) return undefined;
+    if (v === "anthropic" || v === "openai" || v === "responses" || v === "google") return v;
+    throw new Error(`[acp-config] providers.protocol must be one of: anthropic, openai, responses, google (got ${JSON.stringify(v)})`);
 }
 
 /** #1843 L3: per-image token ceiling — positive integer only (lenient like
