@@ -1363,6 +1363,8 @@ type FileConfig = {
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
         proxyKeepAliveMaxMs?: number;
+        /** Post-response close linger budget (#1982; was env-only BILI_POST_RESPONSE_LINGER_MS; default 5000). */
+        postResponseLingerMs?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

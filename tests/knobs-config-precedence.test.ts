@@ -55,6 +55,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.preflightHoldGraceMs(), 30_000);
     assert.equal(knobs.preflightDeadEndCooldownMs(), 5 * 60_000);
     assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
+    assert.equal(knobs.postResponseLingerMs(), 5_000);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 10_000);
     assert.equal(knobs.persistEnabled(), true);
     assert.equal(knobs.persistZstdEnabled(), false);
@@ -97,6 +98,7 @@ test("file tier: every migrated block resolves from the config file", () => {
             clientErrorBackstopMs: 45000, exposureLogIntervalMs: 0, streamKeepAliveMs: 20000,
             preflightHoldMs: 40000, preflightDeadEndCooldownMs: 60000, replayRetryMax: 5,
             replayRetryBaseMs: 250, maxShrinkPerCompress: 0.4, proxyKeepAliveMaxMs: 60000,
+            postResponseLingerMs: 12345,
         },
         persist: { enabled: false, zstd: true, debounceMs: 900, tailTokens: 4096, epermAlertThreshold: 9, epermAlertRepeatMs: 1200 },
         sessions: { max: 64, gc: { enabled: true, maxAgeDays: 3, maxTokens: 2000000, intervalMs: 60000 } },
@@ -127,6 +129,7 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.replayBaseDelayMs(), 250);
     assert.equal(knobs.maxShrinkPerCompress(), 0.4);
     assert.equal(knobs.proxyKeepAliveMaxMs(), 60000);
+    assert.equal(knobs.postResponseLingerMs(), 12345);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 1234);
     assert.equal(knobs.persistEnabled(), false);
     assert.equal(knobs.persistZstdEnabled(), true);
@@ -162,16 +165,18 @@ test("file tier: every migrated block resolves from the config file", () => {
 });
 
 test("env tier always wins over the file (live test seams)", () => {
-    setConfig({ network: { upstreamTimeoutMs: 60000, replayRetryMax: 5 }, persist: { enabled: false }, diagnostics: { renderNone: true, compressProtocol: "text" } });
+    setConfig({ network: { upstreamTimeoutMs: 60000, replayRetryMax: 5, postResponseLingerMs: 12345 }, persist: { enabled: false }, diagnostics: { renderNone: true, compressProtocol: "text" } });
     withEnv({
         BILI_UPSTREAM_TIMEOUT_MS: "999",
         BILI_REPLAY_RETRY_MAX: "2",
+        BILI_POST_RESPONSE_LINGER_MS: "777",
         BILI_PERSIST: "1",
         ACP_RENDER_NONE: "",
         ACP_COMPRESS_PROTOCOL: "tools",
     }, () => {
         assert.equal(knobs.upstreamTimeoutMs(), 999);
         assert.equal(knobs.replayMaxAttempts(), 2);
+        assert.equal(knobs.postResponseLingerMs(), 777);
         // persistEnabled env tier: only "0"/"false" disable; "1" forces on over file false
         assert.equal(knobs.persistEnabled(), true);
         // a SET (even empty) env var owns the knob: historical truthy check
@@ -213,6 +218,18 @@ test("set env owns the knob: garbage env resolves exactly as pre-migration", () 
     setConfig({ network: { requestWatchdogMs: 90000 } });
     withEnv({ BILI_REQUEST_WATCHDOG_MS: "" }, () => {
         assert.equal(knobs.requestWatchdogBudgetMs(), 90000);
+    });
+});
+
+test("post-response linger: strict parseInt tier — set-but-empty/garbage env never consults the file (#1982)", () => {
+    setConfig({ network: { postResponseLingerMs: 12345 } });
+    withEnv({ BILI_POST_RESPONSE_LINGER_MS: "junk" }, () => {
+        assert.equal(knobs.postResponseLingerMs(), 5_000);
+    });
+    // pre-migration parser was Number.parseInt(env ?? ""): an EMPTY export parsed
+    // to NaN → default, unlike the tIntLoose family where empty means unset
+    withEnv({ BILI_POST_RESPONSE_LINGER_MS: "" }, () => {
+        assert.equal(knobs.postResponseLingerMs(), 5_000);
     });
 });
 
