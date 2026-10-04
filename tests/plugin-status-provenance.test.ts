@@ -76,7 +76,7 @@ async function harness() {
     const tool = (name: string, args: Record<string, unknown>) => request<{ result: string }>("/__bili/plugin/tool", { conversationId: "provenance", tool: name, args });
     const compressArgs = { content: [{ startId: "m00001", endId: "m00002", summary: "The prefix preserves the first user request and second assistant response. Original content remains available for decompression using stable references." }] };
     await send();
-    return { status, send, tool, messages, compressArgs, setUsage: (value: typeof usage) => { usage = value; }, holdNext: () => {
+    return { status, send, tool, messages, compressArgs, origin, setUsage: (value: typeof usage) => { usage = value; }, holdNext: () => {
         let entered!: () => void;
         let release!: () => void;
         const waiting = new Promise<void>((resolve) => { entered = resolve; });
@@ -242,5 +242,24 @@ test("HTTP CCR range decompress accounts for queued restored content without cha
         assert.notEqual(current.contextGeneration, folded.contextGeneration);
         assert.equal(session.stats.lastUsageGradeTokens, baseline);
         assert.deepEqual([current.inputTokens, current.cachedTokens], [folded.inputTokens, folded.cachedTokens]);
+    } finally { await h.close(); }
+});
+test("HTTP status sessionRevision is cache-stable while unchanged and moves after a mutation (#2017 item E)", async () => {
+    const h = await harness();
+    try {
+        await h.send();
+        const first = await h.status();
+        assert.ok(first.sessionRevision, "snapshot available in this harness");
+        const again = await h.status();
+        assert.equal(again.sessionRevision, first.sessionRevision, "unchanged session: repeated polls return the identical revision (epoch-keyed cache)");
+        await h.send([...h.messages, { role: "assistant", content: "an intervening answer" }, { role: "user", content: "next original turn" }]);
+        const moved = await h.status();
+        assert.notEqual(moved.sessionRevision, first.sessionRevision, "a real mutation invalidates the cached revision");
+        // The cached value is exactly what expectedRevision accepts under the
+        // session lock (sessionRevisionOf is the check's data source).
+        const ok = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: "provenance", tool: "acp_status", args: {}, expectedRevision: moved.sessionRevision }) });
+        assert.equal(ok.status, 200);
+        const stale = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: "provenance", tool: "acp_status", args: {}, expectedRevision: first.sessionRevision }) });
+        assert.equal(stale.status, 409, "stale cached revision must fail closed");
     } finally { await h.close(); }
 });

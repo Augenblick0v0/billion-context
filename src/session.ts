@@ -288,6 +288,14 @@ export type Session = {
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
+     *  bumped by markDirty after every mutation. Keys the fork-revision cache
+     *  below so status polling skips re-hashing the whole history (#2017). */
+    revisionEpoch?: number;
+    /** In-memory only (NOT persisted): cached fork parentRevision valid for
+     *  the current revisionEpoch — forkSnapshot() is a pure function of the
+     *  session content, so same epoch ⇒ same hash. */
+    pluginRevisionCache?: { epoch: number; revision: string };
     /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
     *  owned and mutated only by kernel processTurn (ccr-store node) via
     *  adoptContentStore. Lazily loaded from the session's content-store.json;
@@ -701,6 +709,7 @@ export function snapshotMessages(session: Session, messages: CoreMessage[]): voi
 /** Mark a session's state as changed so it is persisted on the next debounce.
  *  Call this after any mutation (processTurn, compress, decompress, orphan GC). */
 export function markDirty(session: Session): void {
+    session.revisionEpoch = (session.revisionEpoch ?? 0) + 1;
     getStore().scheduleSave(session);
 }
 

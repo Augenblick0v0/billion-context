@@ -796,6 +796,21 @@ export function publicForkInputMatches(session: Session, protocol: WireProtocol,
     }
 }
 
+/** Cheap, cache-backed read of the fork parentRevision. forkSnapshot() is a
+ *  pure function of the session content and status polling would otherwise
+ *  re-hash the entire history (plus the CCR store, payload by payload) on
+ *  every call (#2017 review item E); revisionEpoch — bumped by markDirty on
+ *  every mutation — keys the cache, so an unchanged session costs O(1).
+ *  Same fail-closed errors as forkSnapshot itself propagate to the caller. */
+function sessionRevisionOf(session: Session): string {
+    const epoch = session.revisionEpoch ?? 0;
+    const cache = session.pluginRevisionCache;
+    if (cache && cache.epoch === epoch) return cache.revision;
+    const revision = forkSnapshot(session).parentRevision;
+    session.pluginRevisionCache = { epoch, revision };
+    return revision;
+}
+
 function forkSnapshot(session: Session) {
     const messages = session.pluginSnapshot;
     if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
@@ -1085,7 +1100,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const contextTokensSource = observation?.source ?? "unavailable";
     const contextTokens = observation?.tokens ?? null;
     let sessionRevision: string | null = null;
-    try { sessionRevision = forkSnapshot(session).parentRevision; } catch {}
+    try { sessionRevision = sessionRevisionOf(session); } catch {}
     const mem = remembered.get(session.id);
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     // #387: the remembered nudge is a prepare-time snapshot. A compress tool
@@ -1352,7 +1367,7 @@ export async function handlePluginTool(
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
                 try {
-                    if (forkSnapshot(session).parentRevision !== parsed.expectedRevision) {
+                    if (sessionRevisionOf(session) !== parsed.expectedRevision) {
                         forkReply(res, 409, { ok: false, code: "PARENT_REVISION_CONFLICT", error: "session revision changed" });
                         return undefined;
                     }
