@@ -116,7 +116,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
             <tr><td class="mono">dsh</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">--patch plugin · DSH_HOME overlay</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili dsh">bili dsh</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install dsh">bili plugin install dsh</button></td></tr>
             <tr><td class="mono">kimi</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">KIMI_CODE_HOME / managed OAuth</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili kimi">bili kimi</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install kimi">bili plugin install kimi</button></td></tr>
             <tr><td class="mono">hermes</td><td><span class="mbadge">plugin</span><span class="mbadge">launcher</span></td><td class="mech">HTTPS_PROXY + MITM CA</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili hermes">bili hermes</button> <button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install hermes">bili plugin install hermes</button></td></tr>
-            <tr><td class="mono">zcode</td><td><span class="mbadge">plugin</span></td><td class="mech">plugin lane only</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install zcode">bili plugin install zcode</button></td></tr>
+            <tr><td class="mono">zcode</td><td><span class="mbadge">plugin</span></td><td class="mech">native plugin · /bili/ prefix · GUI cert-MITM</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili plugin install zcode">bili plugin install zcode</button></td></tr>
             <tr><td class="mono">jcode</td><td><span class="mbadge">launcher</span></td><td class="mech">HTTPS_PROXY + CA (api.z.ai)</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili jcode">bili jcode</button></td></tr>
             <tr><td class="mono">gemini</td><td><span class="mbadge">launcher</span></td><td class="mech">GOOGLE_GEMINI_BASE_URL</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili gemini">bili gemini</button></td></tr>
             <tr><td class="mono">iflow</td><td><span class="mbadge">launcher</span></td><td class="mech">IFLOW_BASE_URL</td><td><button class="chip-cmd copy-btn" type="button" data-copy="bili iflow">bili iflow</button></td></tr>
@@ -195,18 +195,18 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
             <tr><td class="mono">reasoning</td><td class="mech">{ drop?, threshold? }</td><td data-i18n="ct.rz">·</td></tr>
           </tbody>
         </table>
-        <ul class="obj-list">          <li data-i18n-html="co.absorb"><code>absorb</code> — <span class="mech">enabled, minToolTokens, contextThresholdPct, excludeTools, toolName</span>。</li>
-          <li data-i18n-html="co.ccr"><code>ccr</code> — <span class="mech">enabled, minToolTokens, excludeTools, toolName, maxHeadChars</span>。</li>
-          <li data-i18n-html="co.search"><code>search.planAware</code> — <span class="mech">planAware</span>。</li>
-          <li data-i18n-html="co.img"><code>imageCompression</code> — <span class="mech">enabled, minTokens, maxDimension, quality, format (webp/jpeg/png)</span>。</li>
-          <li data-i18n-html="co.prompts"><code>prompts</code> — <span class="mech">compressPhilosophy, howToCompressRules, tier2DistillRules, tier3CondenseRules</span>。</li>
-          <li data-i18n-html="co.rg"><code>reasoningGuard</code> — <span class="mech">enabled, maxContinue, maxTierN, markerText, base, offset, debugLog</span>。</li>
-          <li data-i18n-html="co.os"><code>outputSteering</code> — <span class="mech">(free-form object)</span>。</li>
-          <li data-i18n-html="co.pp"><code>priceProfile</code> — <span class="mech">w, r, q — relative unit-price weights</span>。</li>
-          <li data-i18n-html="co.apr"><code>acknowledgePromptsRisk</code> — <span class="mech">bool</span>。</li>
+        <ul class="obj-list">          <li data-i18n-html="co.absorb"><code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName "absorb"</span>).</li>
+          <li data-i18n-html="co.ccr"><code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName "acp_retrieve", maxHeadChars</span>).</li>
+          <li data-i18n-html="co.search"><code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results.</li>
+          <li data-i18n-html="co.img"><code>imageCompression</code> — opt-in lossy downscale via optional sharp before sending (<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format "webp"</span>); <code>image_full</code> restores originals; proxy mode only.</li>
+          <li data-i18n-html="co.prompts"><code>prompts</code> — override the kernel doctrine texts (<span class='mech'>compressPhilosophy, howToCompressRules, tier2DistillRules, tier3CondenseRules</span>); load-bearing for quality — gated behind acknowledgePromptsRisk.</li>
+          <li data-i18n-html="co.rg"><code>reasoningGuard</code> — auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (≤3 continue-nudge rounds, marker "Continue thinking...") (<span class='mech'>enabled, maxContinue, maxTierN, markerText, base, offset, debugLog</span>).</li>
+          <li data-i18n-html="co.os"><code>outputSteering</code> — <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>: appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests.</li>
+          <li data-i18n-html="co.pp"><code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire.</li>
+          <li data-i18n-html="co.apr"><code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect.</li>
         </ul>
         <h3 data-i18n="d.cf.t_routes">providers — route table fields</h3>
-        <p class="hint" data-i18n-html="d.cf.routes_intro">Keys are upstream URL prefixes — longest match wins, boundary-safe. https:// keys match /bili/ traffic; mitm:// keys match login-client traffic.</p>
+        <p class="hint" data-i18n-html="d.cf.routes_intro">Keys are upstream URL prefixes — longest match wins, boundary-safe. <code>https://</code> keys match /bili/ traffic; <code>mitm://</code> keys match login-client traffic on the MITM lane. An entry with no fields is still an ordinary compressed lane.</p>
         <table class="client-table param-table">
           <thead><tr><th data-i18n="d.cf.th_param">Field</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
           <tbody>
@@ -222,6 +222,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
             <tr><td class="mono">imageTokenCap</td><td class="mech">number</td><td data-i18n="cr.itc">·</td></tr>
             <tr><td class="mono">resign</td><td class="mech">scheme → {enabled?, passthrough?, credentialRef?}</td><td data-i18n="cr.resign">·</td></tr>
             <tr><td class="mono">bind</td><td class="mech">string (named entries only)</td><td data-i18n="cr.bind">·</td></tr>
+            <tr><td class="mono">compactionOptIn</td><td class="mech">bool</td><td data-i18n="cr.optin">·</td></tr>
           </tbody>
         </table>
         <h3 data-i18n="d.cf.t_top">Other top-level fields</h3>
@@ -274,7 +275,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li data-i18n-html="ttl.tmp"></li>
           <li data-i18n-html="tt.nat"></li>
         </ul>
-        <p data-i18n="d.cf.env">Environment overrides (win over the file):</p>
+        <p data-i18n="d.cf.env">Environment variables win over the config file — precedence: env &gt; file &gt; built-in default, and a set variable owns the knob even if its value looks invalid. Common ones:</p>
         <div class="codebox">
           <div class="codebox-head"><span class="mono">env</span><button class="copy-btn" type="button" data-copy="ACP_PORT=8787&#10;ACP_HOST=127.0.0.1&#10;ACP_UPSTREAM=https://api.anthropic.com&#10;ACP_PASSTHROUGH=1&#10;ACP_PROVIDERS=/path/to/routes.json&#10;BILI_CONFIG_FILE=~/.config/billion-context/billion-context.json&#10;BILI_SESSIONS_DIR=~/.local/share/billion-context/sessions&#10;BILI_UPSTREAM_PROXY=http://host:port&#10;ACP_MODEL_CONTEXT_LIMIT=200000&#10;BILI_MITM_DOMAINS=api.foo.com&#10;BILI_REPLAY_RETRY_MAX=3&#10;BILI_SESSION_GC=1&#10;BILI_IMAGE_TOKEN_CAP=8192&#10;BILI_SUBAGENT_SPLIT=0&#10;BILI_FORK_ADOPTION=1&#10;ACP_LOG_FILE=/path/to/bili.log&#10;ACP_COMPRESS_TOOL=0&#10;ACP_COMPRESS_NUDGE=0" data-i18n="common.copy">Copy</button></div>
           <pre class="mono env-pre"><code>ACP_PORT=8787                    # listen port
@@ -327,7 +328,7 @@ ACP_COMPRESS_NUDGE=0             # disable growth nudges</code></pre>
         <details class="faq-item"><summary data-i18n="fa.win.q">Does it work on Windows?</summary><p data-i18n="fa.win.a">Recommended: WSL2. Inside WSL everything uses 127.0.0.1 as usual; a Windows-side client should reach the proxy via the WSL host IP, or simply run the client inside WSL too.</p></details>
         <details class="faq-item"><summary data-i18n="fa.cost.q">Do I pay for the proxy itself?</summary><p data-i18n="fa.cost.a">No — it's free and open source (MIT plus an attribution clause). Token savings come from smaller contexts and your provider's prompt caching; the economics panel shows the real per-session numbers.</p></details>
         <details class="faq-item"><summary data-i18n="fa.up.q">How do I upgrade?</summary><p data-i18n-html="fa.up.a">Run <code>bili update</code> (or reinstall via npm). Use <code>bili doctor</code> before and after to audit every install lane.</p></details>
-        <details class="faq-item"><summary data-i18n="fa.panel.q">I can’t reach the dashboard?</summary><p data-i18n-html="fa.panel.a">Check the daemon is running (<code>bili doctor</code>) and the port isn’t changed (default 8787). The dashboard binds <code>127.0.0.1</code> only — from another machine or phone you need an SSH port-forward or an explicit ACP_HOST setting.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.panel.q">I can't reach the dashboard?</summary><p data-i18n-html="fa.panel.a">Check the daemon is running (<code>bili doctor</code>) and the port isn't changed (default 8787). The dashboard binds <code>127.0.0.1</code> only — from another machine or phone you need an SSH port-forward or an explicit ACP_HOST setting.</p></details>
 
         <h2 id="resources" data-i18n="d.toc_links">Resources</h2>
         <ul class="res-list">
