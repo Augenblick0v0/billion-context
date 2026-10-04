@@ -97,7 +97,12 @@ test("#1387: stop signal suppressed when a tier-distillation nudge is active", (
         preserveRecentTokens: 0,
         tiers: { enabled: true, tier2Trigger: 2, tier3Trigger: 3 },
     }));
+    // #2029: this contract is about a REAL over-limit reading — stamp the
+    // provenance so the shared status baseline keeps the value verbatim
+    // instead of relying on legacy-shape luck (unflagged values now fall back
+    // to the usage anchor / unknown).
     ctx.session.stats.lastInputTokens = 200000;
+    ctx.session.stats.lastInputTokensSource = "usage";
     const spans: [string, string][] = [["m00001", "m00004"], ["m00005", "m00008"], ["m00009", "m00012"]];
     let out = "";
     for (let i = 0; i < spans.length; i++) {
@@ -107,6 +112,35 @@ test("#1387: stop signal suppressed when a tier-distillation nudge is active", (
     assert.equal(ctx.session.state.blocks.filter((b) => b.active).length, 3, "three active tier-1 blocks");
     assert.ok(!out.includes(RANGES_HEADER), "no raw ranges remain after the final fold:\n" + out);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must be suppressed while T2 distillation is actionable:\n" + out);
+});
+
+test("#2029: estimate-grade baseline must not suppress the stop signal via phantom pressure", () => {
+    // Same shape as the tier-suppression case above, but the session baseline
+    // is estimate-grade: a failure arm / preflight write-back raised
+    // lastInputTokens past the window while the retained real anchor stays
+    // well inside it. The shared status baseline feeds the ANCHOR to the nudge
+    // recompute, so there is no confirmed pressure and T2 distillation is not
+    // yet actionable on the growth cadence — the stop signal fires instead of
+    // the phantom-pressure silence (behavioral evidence in issue #2029).
+    const msgs = Array.from({ length: 12 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const big = "y".repeat(10000);
+    const ctx = withRefs(makeCtx(msgs, {
+        preserveRecentMessages: 0,
+        preserveRecentTokens: 0,
+        tiers: { enabled: true, tier2Trigger: 2, tier3Trigger: 3 },
+    }));
+    ctx.session.stats.lastInputTokens = 174000;
+    ctx.session.stats.lastInputTokensSource = "estimate";
+    ctx.session.stats.lastUsageGradeTokens = 60000;
+    const spans: [string, string][] = [["m00001", "m00004"], ["m00005", "m00008"], ["m00009", "m00012"]];
+    let out = "";
+    for (let i = 0; i < spans.length; i++) {
+        out = runApply(ctx, { content: [{ startId: spans[i][0], endId: spans[i][1], summary: big }] });
+        assert.ok(out.startsWith("[Compressed"), `call ${i + 1} expected success, got: ${out.slice(0, 120)}`);
+    }
+    assert.equal(ctx.session.state.blocks.filter((b) => b.active).length, 3, "three active tier-1 blocks");
+    assert.ok(!out.includes(RANGES_HEADER), "no raw ranges remain after the final fold:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must fire: an estimate-grade reading must not manufacture tier pressure:\n" + out);
 });
 
 test("#1387: partial failure (some ranges rejected) keeps the old silent tail", () => {

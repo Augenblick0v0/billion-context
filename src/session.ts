@@ -401,6 +401,35 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     return fallback;
 }
 
+/** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
+ *  recompute, plugin live nudge + panel, post-compress tail. Shared by every
+ *  status surface so none of them can present an estimate-grade reading as a
+ *  measurement.
+ *
+ * The main request path already refuses estimate-grade failure baselines
+ * (#1839/#1846, effectiveTokenCount), but the status readers kept passing raw
+ * stats.lastInputTokens into processTurn: a no-usage failure or preflight
+ * write-back could raise it to an estimate-grade phantom and the status
+ * surfaces reported false emergency pressure while the request path stayed
+ * anchored on real usage (#2029 repro: 60k real / 174k estimate → 116% in the
+ * panel for a 150k window).
+ *
+ * Contract (mirrors effectiveTokenCount's provenance priority): source
+ * "usage" or bounded "overflow-arm" → lastInputTokens verbatim, including 0
+ * after credit adjustments drained it; otherwise (estimate-grade, or legacy
+ * sessions restored without a source flag) → the retained real usage anchor
+ * (lastUsageGradeTokens, #1569); no positive anchor → 0, the kernel's unknown
+ * sentinel. Never clamps: a REAL over-window usage report must still read
+ * >100%. The JSON observation contract (contextTokens/contextTokensSource,
+ * #2017) is deliberately separate — it expresses unknown explicitly rather
+ * than as 0. */
+export function statusInputBaseline(session: Session): number {
+    const stats = session.stats;
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 /** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
  *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
  *  The per-request config stamped by storeEffectiveConfig is the same object
