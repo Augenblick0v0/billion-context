@@ -128,6 +128,23 @@ import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSyst
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "./compat-drop.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
+import {
+    clientErrorBackstopMs as knobClientErrorBackstopMs,
+    countTokensPassthrough as knobCountTokensPassthrough,
+    dumpReqAllowed as knobDumpReqAllowed,
+    exposureLogIntervalMs as knobExposureLogIntervalMs,
+    forceTextProtocol as knobForceTextProtocol,
+    keepAliveTimeoutMs as knobKeepAliveTimeoutMs,
+    keepResponseId as knobKeepResponseId,
+    noCompressPrompt as knobNoCompressPrompt,
+    noInjectTool as knobNoInjectTool,
+    preflightDeadEndCooldownMs as knobPreflightDeadEndCooldownMs,
+    preflightHoldGraceMs as knobPreflightHoldGraceMs,
+    rawDumpDir as knobRawDumpDir,
+    renderNone as knobRenderNone,
+    requestWatchdogBudgetMs as knobRequestWatchdogBudgetMs,
+    streamKeepAliveMs as knobStreamKeepAliveMs,
+} from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
@@ -297,10 +314,7 @@ function registerRequestAbort(res: http.ServerResponse, ac: AbortController): vo
 }
 
 export function requestWatchdogBudgetMs(): number {
-    const raw = process.env.BILI_REQUEST_WATCHDOG_MS;
-    if (!raw) return 2 * upstreamTimeoutMs();
-    const v = Number(raw);
-    return Number.isFinite(v) ? Math.floor(v) : 2 * upstreamTimeoutMs();
+    return knobRequestWatchdogBudgetMs();
 }
 
 function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
@@ -495,8 +509,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // 5000ms; the default here matches it exactly (zero behavior change), but
     // the knob exists so pooled clients can deliberately extend or shorten the
     // reuse window instead of guessing at Node internals.
-    const katRaw = Number(process.env.BILI_KEEP_ALIVE_TIMEOUT_MS);
-    const keepAliveTimeoutMs = Number.isInteger(katRaw) && katRaw > 0 ? katRaw : 5000;
+    const keepAliveTimeoutMs = knobKeepAliveTimeoutMs();
     server.keepAliveTimeout = keepAliveTimeoutMs;
     // #1529: terminal backstop for the clientError drain path. After the bail
     // end(), a peer that never sends FIN holds the socket half-open on our
@@ -505,8 +518,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // silence instead. Safe against the #1452 RST signature: resume() has
     // drained the recv buffer for the whole window, so no unread residual
     // bytes ride the destroy. 0 restores hold-until-peer-death (status quo).
-    const backstopRaw = Number(process.env.BILI_CLIENT_ERROR_BACKSTOP_MS);
-    const clientErrorBackstopMs = Number.isInteger(backstopRaw) && backstopRaw >= 0 ? backstopRaw : 30_000;
+    const clientErrorBackstopMs = knobClientErrorBackstopMs();
     log("info", `[conn] keepAliveTimeout=${keepAliveTimeoutMs}ms clientErrorBackstop=${clientErrorBackstopMs}ms`);
     // #1714: BILI_STREAM_STALL_MS is retired (#1706 incident: a stale 400ms
     // export turned every thinking-phase silence into a false truncation).
@@ -763,8 +775,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // inside one 36.7h process while fresh processes stayed clean under
     // higher load; fd/connection-table drift was unfalsifiable without
     // periodic ground truth. One info line per interval, zero payload.
-    const exposureRaw = Number(process.env.BILI_EXPOSURE_LOG_INTERVAL_MS);
-    const exposureIntervalMs = Number.isInteger(exposureRaw) ? Math.max(0, exposureRaw) : 3_600_000;
+    const exposureIntervalMs = knobExposureLogIntervalMs();
     if (exposureIntervalMs > 0) {
         const exposureStartedAt = Date.now();
         const exposureTimer = setInterval(() => {
@@ -2650,7 +2661,7 @@ async function handle(
         // ACP_NO_INJECT_TOOL disables all injection on that wire — both would
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
-            (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
+            (!knobNoInjectTool() && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
         // [#1345/#1273] Plugin mode: the static manifest (handlePluginManifest
         // sees opts.compress.ccr, never the route/model-scoped merge) is the ONLY
         // declaration of the retrieve surface, so the executed policy must be the
@@ -3131,7 +3142,7 @@ async function handle(
                 // so the incoming side adds no attribution signal.
                 if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
                     try {
-                        const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
+                        const rawDir = knobRawDumpDir();
                         try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
                         const hdrs = maskHeadersForLog(
                             Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
@@ -3793,7 +3804,7 @@ async function prepareAnthropic(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -3936,7 +3947,7 @@ async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 async function prepareOpenai(
@@ -4038,7 +4049,7 @@ async function prepareOpenai(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -4103,7 +4114,7 @@ async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
-        else if (!isTitleGen && !process.env.ACP_RENDER_NONE) {
+        else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
             if (tagsOnly) sysParts.push(tagsOnly);
@@ -4202,7 +4213,7 @@ async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
@@ -4535,7 +4546,7 @@ async function prepareResponses(
     // first-wins and would silently ignore the new relay's route settings).
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
-    const renderTags: "text-only" | "none" = process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only";
+    const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
     try {
         // [#1638] Plugin mode: position-preserve mid-history system/developer
@@ -4589,7 +4600,7 @@ async function prepareResponses(
         }
         const { msgs } = projection;
         originalMessages = msgs;
-        if (process.env.ACP_DEBUG) {
+        if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
@@ -4655,10 +4666,10 @@ async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnlyPrompt = !shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT && !process.env.ACP_RENDER_NONE
+        const tagsOnlyPrompt = !shouldInject && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
             : "";
-        if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
+        if (shouldInject && !isCompactionTrigger && !knobNoCompressPrompt()) {
             const prompt = withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers);
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
@@ -4666,7 +4677,7 @@ async function prepareResponses(
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
-            if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
+            if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
                 const ccrOn = ccrEnabled(session);
@@ -4787,14 +4798,14 @@ async function prepareResponses(
     // duplicate history for clients that use store:true + chaining). Empirically
     // codex sends store:false and never sets previous_response_id, so this is a
     // no-op for codex — kept defensively for any client that does chain. Set
-    // ACP_KEEP_RESPONSE_ID=1 to preserve it (diagnostic only). `instructions`
+    // ACP_KEEP_RESPONSE_ID=1 / compat.keepResponseId=true to preserve it (diagnostic only). `instructions`
     // was already lifted into the developer message at input[1]; forwarding it
     // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
     // #1954: stripping is only lossless when input already holds the full
     // conversation. Warn when we strip a non-empty id so a native-chaining
     // (delta) continuation that loses its history is visible, not silent 200s.
-    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+    if (!knobKeepResponseId()) {
         const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;
@@ -4807,13 +4818,13 @@ async function prepareResponses(
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
     // namespace items (type:namespace/custom).
-    if (process.env.ACP_DEBUG) {
+    if (opts.debug) {
         const fwdTools = (Array.isArray(toolsOut) ? toolsOut : []).map((t) => {
             const r = t as Record<string, unknown>;
             const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
             return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
         });
-        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${knobNoInjectTool()} NO_COMPRESS_PROMPT=${knobNoCompressPrompt()}`);
     }
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
@@ -4866,7 +4877,7 @@ export function isCountTokensRequest(method: string, urlPath: string, hasBody: b
     return (
         method === "POST" &&
         hasBody &&
-        process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
+        !knobCountTokensPassthrough() &&
         (urlPath.endsWith("/messages/count_tokens") || googlePathKind(urlPath) === "count-tokens")
     );
 }
@@ -4882,7 +4893,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         // Read-only preview: same policy as the google twin above.
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
@@ -4964,7 +4975,7 @@ function prepareResponsesCompact(
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).
         const compactConfig = ccrLoopConfig(session, { ...config, absorb: undefined });
-        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         transformOk = true;
@@ -5073,7 +5084,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers));
-    else if (!process.env.ACP_RENDER_NONE) {
+    else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
         if (tagsOnly) parts.push(tagsOnly);
@@ -5143,7 +5154,7 @@ function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: strin
  *  server-side tools are disabled the moment any `tools` entry is declared.
  *  In text mode we keep `tools` untouched (undefined) so code_mode stays
  *  active, and detect the trigger in the output_text stream instead. */
-const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
+const FORCE_TEXT_PROTOCOL = knobForceTextProtocol();
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
@@ -5313,25 +5324,16 @@ function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is 
 // client is held with periodic keep-alive bytes until the real response exists.
 // 30s protects every client whose header deadline exceeds 30s (undici's 300s
 // default included); shorter preflights keep full status-code fidelity.
-const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
 
 function preflightHoldGraceMs(): number {
-    const raw = process.env.BILI_PREFLIGHT_HOLD_MS;
-    if (!raw) return PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
+    return knobPreflightHoldGraceMs();
 }
 
 // Cache exhausted walks and non-transient HTTP rejections only for the same
 // forwarded body. Transport failures do not establish a content dead end.
-const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
-
 function preflightDeadEndCooldownMs(): number {
-    const raw = process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS;
-    if (!raw) return PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
+    return knobPreflightDeadEndCooldownMs();
 }
 
 /** #568: commit the response early so a long preflight cannot lose the client
@@ -5390,13 +5392,8 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
 // so no stop() needs threading through the pipe branches below. Safe under any
 // framing: content-length is a hop header stripped from respHeaders, so the
 // response is always chunked downstream.
-const STREAM_KEEPALIVE_DEFAULT_MS = 15_000;
-
 function streamKeepaliveMs(): number {
-    const raw = process.env.BILI_STREAM_KEEPALIVE_MS;
-    if (!raw) return STREAM_KEEPALIVE_DEFAULT_MS;
-    const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : STREAM_KEEPALIVE_DEFAULT_MS;
+    return knobStreamKeepAliveMs();
 }
 
 export function beginStreamKeepalive(res: http.ServerResponse, sid: string, log: (level: string, msg: string) => void): void {
@@ -6079,7 +6076,7 @@ async function forward(
     log("info", currentFetchTransport()
         ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
         : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
-    if (process.env.ACP_DEBUG && prepared) {
+    if (opts.debug && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
         log("info", `[${sid}] client headers: ${hdrKeys.join(",")}`);
@@ -6106,7 +6103,7 @@ async function forward(
                 });
                 log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
             }
-            if (bodyDumpEnabled() && process.env.ACP_DUMP_REQ !== "0") {
+            if (bodyDumpEnabled() && knobDumpReqAllowed()) {
                 const dumpDir = dumpsDir();
                 try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
                 const sid = prepared?.session.id ?? "unknown";
@@ -6140,7 +6137,7 @@ async function forward(
         bodyDumpEnabled()
             ? (() => {
                   try {
-                      const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
+                      const rawDir = knobRawDumpDir();
                       fs.mkdirSync(rawDir, { recursive: true });
                       return path.join(rawDir, `${Date.now()}-${safeSessionId(prepared?.session.id)}`);
                   } catch {

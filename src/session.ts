@@ -2,6 +2,7 @@ import { createInitialState, defaultConfig, resetImageFullState, type Compressio
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
+import { maxSessions as knobMaxSessions } from "./knobs.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -458,8 +459,7 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
 
 const sessions = new Map<string, Session>();
 
-// `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
-let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256);
+let MAX_SESSIONS = knobMaxSessions();
 
 let initialized = false;
 

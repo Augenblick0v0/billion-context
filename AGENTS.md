@@ -106,6 +106,28 @@ The config surface — every field of `~/.config/billion-context/config.json`, e
 
 Canonical cautionary case (#1437 → #1469): a one-off `plugin.nonHttpProviders` section drafted alongside the existing `providers` table collided with the table's design and had to be reworked into `providers[<name>].compactionOptIn`. The first shape should never have existed.
 
+### Environment Variable Discipline (#2030)
+
+Env vars are a **scarce surface**: every `BILI_*`/`ACP_*` variable is a permanent knob a user must discover, document (CONFIGURATION.md en + zh), and keep in sync. The default answer to "should this be an env var?" is **no** — the config file exists precisely so knobs don't bloat the environment.
+
+**Where a knob lives:**
+
+| Category | Home | Examples |
+|----------|------|----------|
+| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*`, `fakeCompletion.*` |
+| Secrets / credentials | env only (never written to disk) | `BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY` |
+| Per-process channels (written by another bili component at spawn) | env only + comment at the read site naming the writer | `BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*` |
+| Host-side posture (read inside a third-party host process at bootstrap) | env only + comment at the read site | `BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH` |
+| Path relocation (test/container isolation) | env only via `src/paths.ts` | `BILI_CONFIG_FILE`, `BILI_SESSIONS_DIR`, `ACP_DUMP_DIR`, `XDG_*` |
+| Third-party conventions (not ours to rename) | as-is | `CLAUDE_CODE_SESSION_ID`, `CODEX_HOME`, `https_proxy` |
+
+Hard rules:
+
+1. **New env var = new discussion.** A PR introducing a new `process.env.X` read that fits none of the env-only categories above is incomplete: the knob lands as a config-file key resolved through `src/knobs.ts` (env > file > default), or it carries explicit owner sign-off for the env-only category in the PR thread.
+2. **One resolver per knob.** Tiered resolution lives ONLY in `src/knobs.ts`; leaf modules delegate and never parse `process.env` themselves. The env tier preserves each variable's historical parsing quirks byte-exact (backward compat); the file tier takes strict typed values. A set-but-garbage env value resolves exactly as it did pre-migration — it never leaks into, nor is shadowed by, the file tier.
+3. **Env wins over file, always.** Test seams set env live after import; inverting the precedence breaks them.
+4. **Document or don't ship.** Every user-facing knob (either tier) is documented in CONFIGURATION.md (en + zh) with its default and env-var name.
+
 ### Code Quality
 
 - **No `as any`**, **No `@ts-ignore`**

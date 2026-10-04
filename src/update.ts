@@ -35,6 +35,7 @@ import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-chann
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
+import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs } from "./knobs.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -45,7 +46,7 @@ export function normalizeRegistryBase(raw: string | undefined): string {
     if (!v) return "https://registry.npmjs.org";
     return v.replace(/\/+$/, "");
 }
-const REGISTRY_BASE = normalizeRegistryBase(process.env.BILI_UPDATE_REGISTRY);
+const REGISTRY_BASE = normalizeRegistryBase(knobUpdateRegistryBase());
 
 /** Normalize a configured dist-tag channel: absent/blank → "latest". */
 export function normalizeUpdateTag(tag: string | undefined): string {
@@ -56,15 +57,11 @@ export function normalizeUpdateTag(tag: string | undefined): string {
 export function registryUrlFor(packageName: string, tag: string): string {
     return `${REGISTRY_BASE}/${packageName}/${encodeURIComponent(tag)}`;
 }
-const DEFAULT_CHECK_INTERVAL_MS = 3 * 60 * 1000;
-
-// BILI_UPDATE_CHECK_INTERVAL_MS overrides the check period in ms (must be > 0)
-// so the hermetic e2e suite need not wait 3 minutes (#1153). Unset = default.
-function checkIntervalMs(): number {
-    const raw = Number(process.env.BILI_UPDATE_CHECK_INTERVAL_MS?.trim());
-    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHECK_INTERVAL_MS;
-}
-export const CHECK_INTERVAL_MS = checkIntervalMs();
+// update.checkIntervalMs / BILI_UPDATE_CHECK_INTERVAL_MS override the check
+// period in ms (must be > 0) so the hermetic e2e suite need not wait 3 minutes
+// (#1153). Unset = default. Resolved once at import: the updater's own cadence
+// is process-lifetime, and the e2e suites set it in the child process env.
+export const CHECK_INTERVAL_MS = knobUpdateCheckIntervalMs();
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;

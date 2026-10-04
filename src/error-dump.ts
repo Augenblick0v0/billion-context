@@ -2,13 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { dumpsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { dump4xxEnabled as knobDump4xxEnabled, dump4xxMaxBytes as knobDump4xxMaxBytes } from "./knobs.js";
 
 // #762: when the upstream rejects the forwarded body (4xx), persist the exact
 // bytes that were sent so the rejection can be explained byte-for-byte. The
 // standing body dump (ACP_DUMP_BODY=1) must be armed BEFORE the incident; this
 // one fires on the failure itself. Still off by default — conversation bodies
-// leak to disk (#276) — enable with BILI_DUMP_4XX=1.
-const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+// leak to disk (#276) — enable with BILI_DUMP_4XX=1 or diagnostics.dump4xx.
 
 let failCount = 0;
 let lastFailLog = 0;
@@ -26,11 +26,11 @@ function warnDumpFailure(err: unknown): void {
 /** Write the rejected forwarded body to `<dumpDir>/err-<ts>-<sid>-<status>.json`
  *  when BILI_DUMP_4XX=1. Returns the file path, or null when disabled/skipped/failed. */
 export function dumpRejectedBody(status: number, sessionId: string, body: string | Buffer): string | null {
-    if (process.env.BILI_DUMP_4XX !== "1") return null;
+    if (!knobDump4xxEnabled()) return null;
     const raw = typeof body === "string" ? body : body.toString("utf8");
     if (!raw) return null;
     try {
-        const cap = Math.max(1024, Number(process.env.BILI_DUMP_4XX_MAX_BYTES) || DEFAULT_MAX_BYTES);
+        const cap = knobDump4xxMaxBytes();
         let text: string;
         let marker = "";
         if (raw.length > cap) {
@@ -66,10 +66,10 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
 // other. Sides are embedded as strings so the envelope stays valid JSON even
 // when a side is not itself JSON.
 export function dumpSummaryRejection(status: number, sessionId: string, request: string, response: string): string | null {
-    if (process.env.BILI_DUMP_4XX !== "1") return null;
+    if (!knobDump4xxEnabled()) return null;
     if (!request && !response) return null;
     try {
-        const cap = Math.max(1024, Number(process.env.BILI_DUMP_4XX_MAX_BYTES) || DEFAULT_MAX_BYTES);
+        const cap = knobDump4xxMaxBytes();
         const side = (raw: string): string => {
             const bounded = raw.length > cap ? `${raw.slice(0, cap)}\n[truncated: ${raw.length - cap} more character(s)]` : raw;
             try { return JSON.stringify(JSON.parse(bounded)); } catch { return bounded; }

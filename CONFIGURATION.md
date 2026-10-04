@@ -797,6 +797,58 @@ For a request to `https://api.anthropic.com/v1/messages` with model `claude-sonn
 
 Environment variables take precedence over the config file. They are useful for environment-specific overrides (CI, containers) without editing the file.
 
+**Precedence model (#2030).** Every behavior knob resolves as **env var > config file > built-in default**. Since #2030 each pure-behavior knob ALSO has a config-file key, so a deployment can live entirely in `billion-context.json`; the env var remains the override tier. A *set* env var owns its knob even when its value is garbage — it parses exactly as it did before #2030 (falling back to the default) and neither leaks into nor gets shadowed by the file tier. Env-only variables are reserved for what cannot live in the file: secrets (`BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY`), per-process channels written by another bili component at spawn (`BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*`), host-side posture read inside third-party host processes (`BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH`), path relocation (`BILI_CONFIG_FILE`, `BILI_SESSIONS_DIR`, `ACP_DUMP_DIR`, `XDG_*`), and third-party conventions (`CLAUDE_CODE_SESSION_ID`, `CODEX_HOME`, `https_proxy`). New knobs follow the rules in AGENTS.md "Environment Variable Discipline".
+
+### Config-file keys for environment knobs (#2030)
+
+File keys resolve only when the matching env var is unset. Defaults in parentheses are the built-ins.
+
+| Env var | Config key | Default |
+|---------|------------|---------|
+| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | `720000` |
+| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | `2×` upstream timeout |
+| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | `3` |
+| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | `1500` |
+| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset (no steering) |
+| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | `5000` |
+| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | `30000` |
+| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | `3600000` |
+| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | `15000` |
+| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
+| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
+| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
+| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
+| `BILI_PERSIST` | `persist.enabled` | `true` |
+| `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
+| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | `500` |
+| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | `16384` |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | `5` |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | `0` |
+| `BILI_MAX_SESSIONS` | `sessions.max` | `256` |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | `false` |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
+| `BILI_UPDATE_REGISTRY` | `update.registry` | npm public registry |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
+| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
+| `BILI_CODEX_COMPACT` | `codexCompact` | `"intercept"` |
+| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | `50` |
+| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | `false` |
+| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | `true` |
+| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | `<state dir>/raw` |
+| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | `false` |
+| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | `2097152` |
+| `ACP_RENDER_NONE` | `diagnostics.renderNone` | `false` |
+| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | `false` |
+| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | `false` |
+| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | `false` |
+| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | `"tools"` |
+| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | `false` |
+| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | `false` |
+| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | `0` |
+| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | `16777216` |
+
 | Variable | Effect |
 |----------|--------|
 | `ACP_DEBUG` | Set to `1` for verbose logging (same as `"debug": true`). |

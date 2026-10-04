@@ -6,6 +6,7 @@ import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
 import { maskHostForLog, maskHostInText, maskHostPortForLog } from "./log-mask.js";
+import { mitmHandshakeTimeoutMs as knobMitmHandshakeTimeoutMs } from "./knobs.js";
 
 // Domains we transparently MITM. These are ONLY the model-inference endpoints
 // hardcoded in client BINARIES with no config file to discover from
@@ -96,10 +97,8 @@ export function _resetBlindTunnelStatsForTest(): void {
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
  *  opens the tunnel but never sends/trickle-feeds its ClientHello).
  *  Env-overridable so tests can exercise the timeout path quickly. */
-const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 function mitmHandshakeTimeoutMs(): number {
-    const v = Number.parseInt(process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+    return knobMitmHandshakeTimeoutMs();
 }
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a

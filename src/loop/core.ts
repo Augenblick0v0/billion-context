@@ -28,6 +28,7 @@ import { classifyUpstreamFailure, type UpstreamFailureKind } from "../upstream-f
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
@@ -1052,7 +1053,7 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
 
             let newBody = withStrictEchoRepair(adapter.buildRequest(coreMessages, systemPrompt, requestBody));
-            if (process.env.ACP_DUMP_BODY === "1") {
+            if (knobBodyDumpEnabled()) {
                 try {
                     const fs = await import("node:fs");
                     const path = await import("node:path");

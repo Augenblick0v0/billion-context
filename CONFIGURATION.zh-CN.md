@@ -802,6 +802,58 @@
 
 环境变量优先于配置文件。在不修改文件的情况下，它们适用于环境特定的覆盖（CI、容器）。
 
+**优先级模型（#2030）。** 每个行为开关的解析顺序为 **环境变量 > 配置文件 > 内置默认值**。自 #2030 起，每个纯行为开关同时拥有配置文件键，部署可以完全放在 `billion-context.json` 里；环境变量保留为覆盖层。**已设置**的环境变量独占其开关——即使值是垃圾值，也按 #2030 之前的原样解析（回落到默认值），既不会泄漏到文件层、也不会被文件层遮蔽。纯环境变量仅保留给无法放进文件的东西：密钥（`BILI_LAUNCH_TOKEN`、`BILI_ENCRYPTION_KEY`）、由另一个 bili 组件在 spawn 时写入的进程间通道（`BILI_MCP_PROXY`、`BILI_PARENT_PID`、`BILI_STRICT_PORT`、`BILI_OPENCODE_ACP_SPEC`、`BILI_LAUNCHER_MODEL_*`）、在第三方宿主进程内读取的宿主侧姿态（`BILLION_CONTEXT_PLUGIN*`、`BILI_NATIVE_*`、`BILI_RECLAIM_FETCH_PATCH`）、路径重定位（`BILI_CONFIG_FILE`、`BILI_SESSIONS_DIR`、`ACP_DUMP_DIR`、`XDG_*`）以及第三方约定（`CLAUDE_CODE_SESSION_ID`、`CODEX_HOME`、`https_proxy`）。新开关的准入规则见 AGENTS.md「Environment Variable Discipline」。
+
+### 环境变量的配置键对照（#2030）
+
+文件键仅在对应环境变量未设置时生效。括号内为内置默认值。
+
+| 环境变量 | 配置键 | 默认值 |
+|---------|--------|--------|
+| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | `720000` |
+| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | 上游超时 ×2 |
+| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | `3` |
+| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | `1500` |
+| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | 未设置（不引导） |
+| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | `5000` |
+| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | `30000` |
+| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | `3600000` |
+| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | `15000` |
+| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
+| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
+| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
+| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
+| `BILI_PERSIST` | `persist.enabled` | `true` |
+| `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
+| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | `500` |
+| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | `16384` |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | `5` |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | `0` |
+| `BILI_MAX_SESSIONS` | `sessions.max` | `256` |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | `false` |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
+| `BILI_UPDATE_REGISTRY` | `update.registry` | npm 公共 registry |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
+| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
+| `BILI_CODEX_COMPACT` | `codexCompact` | `"intercept"` |
+| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | `50` |
+| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | `false` |
+| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | `true` |
+| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | `<state dir>/raw` |
+| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | `false` |
+| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | `2097152` |
+| `ACP_RENDER_NONE` | `diagnostics.renderNone` | `false` |
+| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | `false` |
+| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | `false` |
+| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | `false` |
+| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | `"tools"` |
+| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | `false` |
+| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | `false` |
+| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | `0` |
+| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | `16777216` |
+
 | 变量 | 效果 |
 |------|------|
 | `ACP_DEBUG` | 设为 `1` 开启详细日志（等同 `"debug": true`）。 |

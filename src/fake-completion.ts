@@ -1,6 +1,7 @@
 import type { WireProtocol } from "./util.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { appendTrailingUserText } from "./wire-body.js";
+import { fakeCompletionRetries as knobFakeCompletionRetries, fakeBufCapBytes as knobFakeBufCapBytes } from "./knobs.js";
 
 // #371 (root-cause follow-up to #361): a small model can WRITE a tool call as
 // plain text (echoing the tool-call XML template from the context) instead of
@@ -21,17 +22,16 @@ export const FAKE_COMPLETION_HINT =
 // the client sees it (a fake completion is only knowable at end-of-stream),
 // which defeats incremental streaming. That cost is only worth paying for the
 // low-frequency fake-completion case (small models via gateways), so it is
-// opt-in: set BILI_FAKE_COMPLETION_RETRIES=2 to enable. 0 = pre-#371 passthrough.
+// opt-in: set BILI_FAKE_COMPLETION_RETRIES=2 / fakeCompletion.retries=2 to
+// enable. 0 = pre-#371 passthrough.
 export function maxFakeCompletionRetries(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_COMPLETION_RETRIES ?? "0", 10);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
+    return knobFakeCompletionRetries();
 }
 
 // OOM guard for a pathological upstream; LLM responses are bounded by max_tokens
 // and normally well under 1 MiB.
 export function fakeBufCap(): number {
-    const n = Number.parseInt(process.env.BILI_FAKE_BUF_CAP ?? String(16 * 1024 * 1024), 10);
-    return Number.isFinite(n) && n > 0 ? n : 16 * 1024 * 1024;
+    return knobFakeBufCapBytes();
 }
 
 // "Does this raw response (full SSE stream or JSON body) carry a REAL tool
