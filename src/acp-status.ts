@@ -12,7 +12,7 @@ import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
-import { preCompactionArchiveOf, type Session } from "./session.js";
+import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION } from "./version.js";
@@ -60,7 +60,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             messages: ctx.messages,
             state: ctx.session.state,
             config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: ctx.session.stats.lastInputTokens,
+            tokenCount: statusInputBaseline(ctx.session),
             renderTags: "none",
             contentStore: contentStoreOf(ctx.session),
         });

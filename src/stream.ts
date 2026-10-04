@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -261,7 +261,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
             messages: ctx.messages,
             state: ctx.session.state,
             config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
-            tokenCount: ctx.session.stats.lastInputTokens,
+            tokenCount: statusInputBaseline(ctx.session),
             renderTags: "none",
             contentStore: contentStoreOf(ctx.session),
         });
