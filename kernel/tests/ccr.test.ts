@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import {
   createContentStore,
   hashContent,
@@ -963,7 +964,7 @@ test("applyRetrieve exports large originals to a file; small ones inline", () =>
     assert.ok(hit.export, "originals >= the inline limit must be exported");
     assert.equal(
       hit.export?.path,
-      "/state/billion-context/retrieve/m00004.txt",
+      path.join("/state/billion-context/retrieve", "m00004.txt"),
     );
     assert.equal(hit.export?.text, bigText());
     assert.ok(hit.toolResultText.includes('<acp-retrieved-file ref="m00004"'));

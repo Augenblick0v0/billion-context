@@ -68,7 +68,12 @@ test("applySectionOverrides ignores malformed (non-string, non-null) values", ()
 
 test("default builders are byte-stable against checked-in fixtures", () => {
   const fixture = (name: string) =>
-    readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+    // normalize EOL: Windows checkouts materialize fixtures as CRLF while the
+    // generated prompts are LF-canonical
+    readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
   assert.equal(
     buildCompressSystemPrompt(),
     fixture("prompt-function-default.txt"),
