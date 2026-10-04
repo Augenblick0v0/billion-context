@@ -272,7 +272,17 @@ test("codex WS: rejection names the offending transport option in the frame and 
         assert.equal(error.type, "error");
         assert.equal((error.error as { code: string }).code, "invalid_request");
         assert.match(String((error.error as Item).message), /background/);
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.match(log, /client rejected reason=invalid_request detail=.*background/);
+        // Poll, don't one-shot-read: the logger's file stream is async/buffered
+        // (#1971) and readFileSync right after the error frame raced loaded CI runners.
+        const want = /client rejected reason=invalid_request detail=.*background/;
+        const deadline = Date.now() + 5000;
+        let log = "";
+        for (;;) {
+            try { log = fs.readFileSync(f.logPath, "utf8"); } catch { /* open still in flight */ }
+            if (want.test(log)) break;
+            if (Date.now() >= deadline) break;
+            await new Promise(r => setTimeout(r, 20));
+        }
+        assert.match(log, want);
     } finally { await f.close(); }
 });
