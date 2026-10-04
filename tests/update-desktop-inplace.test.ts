@@ -41,11 +41,17 @@ function makePnpmLink(target: string, linkPath: string): void {
 test("desktop profile copy: link displaced, real dir laid down, .pnpm store untouched (#1575)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-"));
     const prevDshHome = process.env.DSH_HOME;
+    // Isolate the updater's cache dir too (#2106): without it these tests
+    // wrote their update temps into the host's real ~/.cache/billion-context,
+    // racing every other concurrent test file.
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     const originalFetch = globalThis.fetch;
     t.after(() => {
         globalThis.fetch = originalFetch;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
         rmrf(root);
     });
     try {
@@ -57,6 +63,7 @@ test("desktop profile copy: link displaced, real dir laid down, .pnpm store unto
         mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
         makePnpmLink(storeCopy, flat);
         process.env.DSH_HOME = dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
 
         const src = path.join(root, "pkg", "package");
         writePkg(src, "2.0.0");
@@ -134,16 +141,20 @@ function captureLog(): { lines: string[]; log: CaptureLog } {
 test("refreshDshDesktopCopy: stale junction displaced in place through the full drive path (#1575)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-drive-"));
     const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     const originalFetch = globalThis.fetch;
     t.after(() => {
         globalThis.fetch = originalFetch;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
         rmrf(root);
     });
     try {
         const fx = buildDesktopFixture(root, "1.2.3", "2.0.0");
         process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz));
         const { lines, log } = captureLog();
         await refreshDshDesktopCopy("2.0.0", log, process.env);

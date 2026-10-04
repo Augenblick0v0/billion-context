@@ -80,16 +80,23 @@ function captureLog(): { lines: string[]; log: CaptureLog } {
 test("installViaTarball bootSmoke: an entry that throws at boot fails the install and rolls the copy back (#2082)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-2082-smoke-bad-"));
     const prevDshHome = process.env.DSH_HOME;
+    // Isolate the updater's cache dir too (#2106): without it these tests
+    // wrote their update temps into the host's real ~/.cache/billion-context,
+    // racing every other concurrent test file.
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     const originalFetch = globalThis.fetch;
     t.after(() => {
         globalThis.fetch = originalFetch;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
         rmrf(root);
     });
     try {
         const fx = buildFixture(root, "1.2.3", "2.0.0", BOOT_BROKEN_ENTRY);
         process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz));
 
         const r = await installViaTarball("2.0.0", "https://registry.test/bc-2.0.0.tgz", fx.flat, integrityField(fx.tgz), undefined, undefined, process.env, { bootSmoke: true });
@@ -116,16 +123,20 @@ test("installViaTarball bootSmoke: an entry that throws at boot fails the instal
 test("installViaTarball bootSmoke: a loadable entry passes and the copy lands (#2082)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-2082-smoke-ok-"));
     const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     const originalFetch = globalThis.fetch;
     t.after(() => {
         globalThis.fetch = originalFetch;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
         rmrf(root);
     });
     try {
         const fx = buildFixture(root, "1.2.3", "2.0.0", GOOD_ENTRY);
         process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz));
 
         const r = await installViaTarball("2.0.0", "https://registry.test/bc-2.0.0.tgz", fx.flat, integrityField(fx.tgz), undefined, undefined, process.env, { bootSmoke: true });
@@ -144,16 +155,20 @@ test("installViaTarball bootSmoke: a loadable entry passes and the copy lands (#
 test("refreshDshDesktopCopy: a boot-broken registry tarball keeps the working copy and warns loudly (#2082)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-2082-drive-"));
     const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
     const originalFetch = globalThis.fetch;
     t.after(() => {
         globalThis.fetch = originalFetch;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
         rmrf(root);
     });
     try {
         const fx = buildFixture(root, "1.2.3", "2.0.0", BOOT_BROKEN_ENTRY);
         process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz));
         const { lines, log } = captureLog();
         await refreshDshDesktopCopy("2.0.0", log, process.env);
