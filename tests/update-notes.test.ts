@@ -226,28 +226,28 @@ test("#1977 acp_status: CRITICAL UPDATE READY section lists the span; clean + no
     try {
         const ctx = makeCtx12();
         const clean = handleAcpStatus({}, ctx);
-        assert.ok(!clean.includes("UPDATE READY") && !clean.includes("UPDATE AVAILABLE"), "no section on a clean install");
+        assert.ok(!clean.text.includes("UPDATE READY") && !clean.text.includes("UPDATE AVAILABLE"), "no section on a clean install");
 
         // #1977: a newer disk version with a routine/recommended-only span
         // must NOT surface either — silence is the default.
         _setReleaseNotesStateForTest({ entries: [SURFACE_ENTRIES[0]], diskVersion: NEXT2 });
         const quiet = handleAcpStatus({}, ctx);
-        assert.ok(!quiet.includes("UPDATE READY") && !quiet.includes("UPDATE AVAILABLE"), "#1977: pending restart without a critical entry stays silent");
+        assert.ok(!quiet.text.includes("UPDATE READY") && !quiet.text.includes("UPDATE AVAILABLE"), "#1977: pending restart without a critical entry stays silent");
 
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const out = handleAcpStatus({}, ctx);
-        assert.ok(out.includes(`CRITICAL UPDATE READY (instance-level): ${NEXT2} downloaded — restart this agent's proxy to finish`), "actionable headline names the disk version");
-        assert.ok(out.includes(`(running ${VERSION})`), "names the running version for contrast");
-        assert.ok(out.includes(`· ${NEXT} [critical] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
-        assert.ok(out.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
-        assert.ok(out.includes("GET /__bili/status → update"), "points at the live-state field");
+        assert.ok(out.text.includes(`CRITICAL UPDATE READY (instance-level): ${NEXT2} downloaded — restart this agent's proxy to finish`), "actionable headline names the disk version");
+        assert.ok(out.text.includes(`(running ${VERSION})`), "names the running version for contrast");
+        assert.ok(out.text.includes(`· ${NEXT} [critical] OpenCode WebSocket traffic intercepted again (#1844)`), "span renders versions below disk but above running, tier-first");
+        assert.ok(out.text.includes(`· ${NEXT2} [routine] docs and log polish`), "span renders up to the disk version the restart will finish");
+        assert.ok(out.text.includes("GET /__bili/status → update"), "points at the live-state field");
 
         // No disk info (auto-update off): AVAILABLE wording + manual command.
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES });
         const avail = handleAcpStatus({}, ctx);
-        assert.ok(avail.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
-        assert.ok(avail.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
-        assert.ok(!avail.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
+        assert.ok(avail.text.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "available headline when nothing is pending");
+        assert.ok(avail.text.includes(`npm install -g billion-context@${NEXT2}`), "manual update command present");
+        assert.ok(!avail.text.includes("UPDATE READY"), "ready wording reserved for the pending-restart case");
     } finally {
         _resetReleaseNotesWatcherForTest();
     }

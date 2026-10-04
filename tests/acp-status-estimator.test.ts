@@ -44,7 +44,7 @@ function cjkToolSession(): { session: Session; messages: CoreMessage[] } {
 test("acp_status reports CJK at 1:1 scale (defaultCountTokens, not chars/4) (#386)", () => {
     const { session, messages } = cjkToolSession();
     const ctx = { core: createCore(), config: defaultConfig(200000), messages, session, log: (_msg: string) => {} };
-    const out = executeProxyTool("acp_status", {}, ctx);
+    const out = executeProxyTool("acp_status", {}, ctx).text;
     const line = out.split("\n").find((l) => l.includes(" tool (") && l.includes(" text ("));
     assert.ok(line, `no breakdown line in:\n${out}`);
     assert.ok(line.includes("6.0K tool"), `tool bucket should be ~6000 CJK tokens (1:1), not chars/4: ${line}`);
@@ -55,7 +55,7 @@ test("acp_status reports CJK at 1:1 scale (defaultCountTokens, not chars/4) (#38
 test("acp_status attributes CJK tool-results to their calling tools (#386)", () => {
     const { session, messages } = cjkToolSession();
     const ctx = { core: createCore(), config: defaultConfig(200000), messages, session, log: (_msg: string) => {} };
-    const out = executeProxyTool("acp_status", {}, ctx);
+    const out = executeProxyTool("acp_status", {}, ctx).text;
     const top = out.split("\n").find((l) => l.startsWith("  Top tools:"));
     assert.ok(top, `no Top tools line in:\n${out}`);
     assert.ok(top.includes("bash"), `bash missing: ${top}`);

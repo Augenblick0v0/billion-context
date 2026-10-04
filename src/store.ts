@@ -20,6 +20,7 @@ import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
 import type { PendingRetrieval, Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
 
@@ -151,19 +152,19 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
  *  inline threshold are exported to <stateDir>/retrieve/<ref>.txt and the
  *  tool result carries a file pointer the model reads with its file tool.
  *  A hallucinated ref costs one tool call by design. */
-export function executeRetrieve(args: Record<string, unknown>, session: Session): string {
+export function executeRetrieve(args: Record<string, unknown>, session: Session): ProxyToolResult {
     session.stats.retrieveCalls = (session.stats.retrieveCalls ?? 0) + 1;
     const rawRef = args.ref;
     const ref = typeof rawRef === "string" ? rawRef.trim() : "";
     if (!ref) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
-        return `[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`;
+        return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
     const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
-        return result.toolResultText;
+        return toolFail(result.toolResultText);
     }
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
@@ -171,14 +172,14 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     if (result.export !== undefined && !writeRetrievalExport(result.export)) {
         // The pointer names a file we could not write — degrade to a bounded
         // head preview instead of handing the model a dead path.
-        return `[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`;
+        return toolFail(`[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`);
     }
     // Delivery is the tool result itself (the #1343 queued-injection
     // lifecycle is retired for CCR): the hit is delivered the moment this
     // returns, so it counts as delivered now — nothing left to queue.
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
-    return result.toolResultText;
+    return toolOk(result.toolResultText);
 }
 
 /** Host side of the kernel RetrievalExport effect: exports land under

@@ -113,7 +113,7 @@ test("#1494 A: a parse-dropped entry is surfaced in the SUCCESS receipt and logg
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: "valid fold" },
         { startId: "m00003" },
-    ] }), ctx);
+    ] }), ctx).text;
     assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), out);
     assert.ok(out.includes("entry 1: missing range bounds"), out);
@@ -133,7 +133,7 @@ test("#1494 A: a parse-dropped entry is surfaced in the FAILED receipt too (0-bl
     const out = applyRanges(parseCompressInput({ content: [
         { startId: "m00001", endId: "m00002", summary: "valid but too small" },
         { startId: "m00003" },
-    ] }), ctx);
+    ] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), out.split("\n")[0]);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), out);
     assert.ok(out.includes("entry 1: missing range bounds"), out);
@@ -144,7 +144,7 @@ test("#1494 A+B: single-object content folds end-to-end through applyRanges", ()
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
-    const out = applyRanges(parseCompressInput({ content: { startId: "m00001", endId: "m00002", summary: "solo fold via normalized content" } }), ctx);
+    const out = applyRanges(parseCompressInput({ content: { startId: "m00001", endId: "m00002", summary: "solo fold via normalized content" } }), ctx).text;
     assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
     assert.ok(!out.includes("REJECTED"), out);
 });

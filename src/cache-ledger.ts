@@ -13,6 +13,7 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -967,7 +968,7 @@ export function readModelSwitchStats(session: Session): { count: number; missedT
     };
 }
 
-export function handleAcpCache(session: Session, args?: Record<string, unknown>): string {
+export function handleAcpCache(session: Session, args?: Record<string, unknown>): ProxyToolResult {
     try {
         const detail = args?.detail === "full" ? "full" : "summary";
         const report = buildSessionCacheReport(session);
@@ -978,12 +979,12 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
+            return toolOk(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : ""));
         }
-        return formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
+        return toolOk(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : ""));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
-        return `[acp_cache FAILED: ${String(err)}]`;
+        return toolFail(`[acp_cache FAILED: ${String(err)}]`);
     }
 }
 

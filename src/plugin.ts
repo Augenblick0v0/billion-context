@@ -14,6 +14,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
+import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
@@ -1469,7 +1470,7 @@ export async function handlePluginTool(
     delete args.conversation_id;
     const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
-    let result: string | undefined;
+    let result: ProxyToolResult | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -1505,10 +1506,10 @@ export async function handlePluginTool(
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
-            const restored = tool === "decompress" && (/^\[Block [^\n]+ content /.test(toolResult) || /^\[decompress [^\n]+: restored \d+ item\(s\)/.test(toolResult));
+            const restored = tool === "decompress" && (/^\[Block [^\n]+ content /.test(toolResult.text) || /^\[decompress [^\n]+: restored \d+ item\(s\)/.test(toolResult.text));
             if (before && (creditDelta !== 0 || session.lastCompress !== compressBefore || restored)) {
                 // Credit was already applied to lastInputTokens by the tool; do not net it twice.
-                const restoredTokens = restored ? countMessageTokens({ text: toolResult }) + restoredInjections.reduce((sum, p) => sum + countMessageTokens(p.injection), 0) : 0;
+                const restoredTokens = restored ? countMessageTokens({ text: toolResult.text }) + restoredInjections.reduce((sum, p) => sum + countMessageTokens(p.injection), 0) : 0;
                 recordContextObservation(session, Math.max(0, before.tokens - creditDelta) + restoredTokens, "estimate");
             }
             return toolResult;
@@ -1531,18 +1532,25 @@ export async function handlePluginTool(
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
-    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.length} chars)`);
+    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"})`);
     // Same deep link on the /acp-cache display surfaces: clients wrap this text in
     // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
     // (src/acp-panel.ts). The MCP acp_cache path shares this endpoint — one extra line
     // is harmless context and lets the model tell the user the link, too.
-    let sentResult = result;
+    let sentResult = result.text;
     if (tool === "acp_cache") {
         const wu = webSessionUrl(deps.webOrigin, session.id);
-        if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result}`;
+        if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result.text}`;
     }
+    // #1875: ok stays the transport/execution signal (200 = the tool ran); the
+    // business effect rides additive fields so clients can distinguish an
+    // accepted fold from a kernel refusal without parsing the receipt text.
+    const body: Record<string, unknown> = { ok: true, tool, conversationId };
+    if (result.outcome !== undefined) body.outcome = result.outcome;
+    if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
+    body.result = sentResult;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, tool, conversationId, result: sentResult }));
+    res.end(JSON.stringify(body));
 }
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):

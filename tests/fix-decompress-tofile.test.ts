@@ -52,7 +52,7 @@ test("#1691 whole-block toFile: a small restore (would be inline) writes to the 
     try {
         const { ctx, session, blockId } = foldBlock("s", 4);
         const target = path.join(scratch, "nested", "small-restore.txt");
-        const out = resolveDecompress({ blockId, toFile: target }, ctx);
+        const out = resolveDecompress({ blockId, toFile: target }, ctx).text;
         assert.ok(fs.existsSync(target), "file created at the exact requested path (nested dirs created)");
         assert.match(out, /written to: /);
         assert.ok(out.includes(target), "ack references the caller path");
@@ -73,7 +73,7 @@ test("#1691 whole-block toFile: a large restore targets the caller path, not os.
     try {
         const { ctx, blockId } = foldBlock("l", 8);
         const target = path.join(scratch, "large-restore.txt");
-        const out = resolveDecompress({ blockId, toFile: target }, ctx);
+        const out = resolveDecompress({ blockId, toFile: target }, ctx).text;
         assert.ok(fs.existsSync(target), "file created at the caller path");
         assert.ok(out.includes(target), "ack points at the caller path");
         assert.doesNotMatch(out, /acp-decompress-/, "not the auto tmpdir spill name");
@@ -91,7 +91,7 @@ test("#1691 default unchanged: no toFile leaves a small restore inline (no file)
     process.env.TMPDIR = scratch;
     try {
         const { ctx, blockId } = foldBlock("n", 4);
-        const out = resolveDecompress({ blockId }, ctx);
+        const out = resolveDecompress({ blockId }, ctx).text;
         assert.doesNotMatch(out, /written to:/, "small body inlines, no file");
         assert.match(out, /Historical detail 0\./, "inline body present");
         const files = fs.readdirSync(scratch).filter((f) => f.startsWith("acp-decompress-"));
@@ -106,7 +106,7 @@ test("#1691 default unchanged: no toFile leaves a small restore inline (no file)
 test("#1691 malformed toFile (non-string) warns once and falls back to the default output", () => {
     const logs: string[] = [];
     const { ctx, blockId } = foldBlock("m", 4, (msg) => logs.push(msg));
-    const out = resolveDecompress({ blockId, toFile: 12345 }, ctx);
+    const out = resolveDecompress({ blockId, toFile: 12345 }, ctx).text;
     assert.match(out, /Historical detail 0\./, "fell back to inline (small body)");
     assert.doesNotMatch(out, /written to:/);
     assert.ok(logs.some((l) => l.includes("toFile must be a string")), `expected a warning, got: ${JSON.stringify(logs)}`);
@@ -118,7 +118,7 @@ test("#1691 relative toFile resolves against the proxy cwd", () => {
     try {
         process.chdir(scratch);
         const { ctx, blockId } = foldBlock("r", 4);
-        const out = resolveDecompress({ blockId, toFile: "rel-restore.txt" }, ctx);
+        const out = resolveDecompress({ blockId, toFile: "rel-restore.txt" }, ctx).text;
         const resolved = path.join(scratch, "rel-restore.txt");
         assert.ok(fs.existsSync(resolved), "relative path created under cwd");
         assert.ok(out.includes(resolved), "ack reports the resolved absolute path");
@@ -161,7 +161,7 @@ test("#1691 range toFile: writes the span to the caller path and queues only a l
         const f = foldCcr();
         const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
         const target = path.join(scratch, "span.txt");
-        const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004", toFile: target }, ctx);
+        const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004", toFile: target }, ctx).text;
         assert.match(ack, /restored 3 item\(s\)/);
         assert.ok(fs.existsSync(target), "span written to the caller path");
         const disk = fs.readFileSync(target, "utf8");

@@ -48,7 +48,7 @@ test("seam detector: unexplained mid-history break yields a SeamEvent with byte/
     assert.equal(ev!.prevMsgs, 3);
     assert.equal(ev!.curMsgs, 3);
     // /acp-cache surfaces the section.
-    const text = handleAcpCache(s);
+    const text = handleAcpCache(s).text;
     assert.match(text, /CACHE SEAM/);
     assert.match(text, /message\[1\]/);
     const report = buildSessionCacheReport(s);
@@ -81,7 +81,7 @@ test("seam detector: structural attributions and small residuals never flag", ()
     assert.notEqual(led.lines[led.lines.length - 1]!.seam, 1, "unknown-cache line must not flag");
     assert.equal(led.agg.seamSuspects, 0);
     assert.equal(buildSessionCacheReport(s).seam.suspects, 0);
-    assert.ok(!handleAcpCache(s).includes("CACHE SEAM"), "no seam section when nothing flagged");
+    assert.ok(!handleAcpCache(s).text.includes("CACHE SEAM"), "no seam section when nothing flagged");
 });
 
 test("seam detector: fold-owned misses never flag (the sanctioned anchor cost)", () => {
@@ -107,7 +107,7 @@ test("seam detector: lane without body capture flags the aggregate but records n
     const led = getCacheLedger(s);
     assert.equal(led.agg.seamSuspects, 1, "aggregate flag still set");
     assert.equal(led.seamEvents, undefined, "no forensic event without bodies");
-    assert.match(handleAcpCache(s), /aggregate flag only/);
+    assert.match(handleAcpCache(s).text, /aggregate flag only/);
 });
 
 test("seam events are bounded (ring keeps the last 8)", () => {
@@ -137,7 +137,7 @@ test("seam detector: client rewind (fewer messages) attributes to HISTORY REWOUN
     assert.equal(led.agg.rewinds, 1);
     assert.ok(led.agg.rewindMissed > 0);
     assert.equal(led.agg.seamSuspects, 0, "rewind must not cry seam");
-    const text = handleAcpCache(s);
+    const text = handleAcpCache(s).text;
     assert.match(text, /HISTORY REWOUND/);
     assert.ok(!/CACHE SEAM \(/.test(text), "no seam section for a pure rewind");
 });
@@ -153,7 +153,7 @@ test("seam detector: byte-stable resend attributes to PROVIDER-SIDE MISS, not a 
     assert.equal(led.agg.providerSideMisses, 1);
     assert.ok(led.agg.providerSideMissed > 0);
     assert.equal(led.agg.seamSuspects, 0, "stable wire must not cry seam");
-    assert.match(handleAcpCache(s), /PROVIDER-SIDE MISS/);
+    assert.match(handleAcpCache(s).text, /PROVIDER-SIDE MISS/);
 });
 
 test("seam detector: tail-append turn attributes to PROVIDER-SIDE MISS, not a seam (#2059)", () => {
@@ -170,7 +170,7 @@ test("seam detector: tail-append turn attributes to PROVIDER-SIDE MISS, not a se
     assert.ok(led.agg.providerSideMissed > 0);
     assert.equal(led.agg.seamSuspects, 0, "tail-append must not cry seam");
     assert.notEqual(led.lines[led.lines.length - 1]!.seam, 1);
-    const text = handleAcpCache(s);
+    const text = handleAcpCache(s).text;
     assert.match(text, /PROVIDER-SIDE MISS/);
     assert.ok(!/CACHE SEAM \(/.test(text), "no seam section for a pure tail-append miss");
 });
@@ -241,7 +241,7 @@ test("seam detector: abort correlation marks missed samples near a client abort"
     const line = led.lines[led.lines.length - 1]!;
     assert.equal(line.abortedNear, 1);
     assert.equal(line.seam, 1, "still a seam candidate — correlation is orthogonal");
-    assert.match(handleAcpCache(s), /ABORT-CORRELATED/);
+    assert.match(handleAcpCache(s).text, /ABORT-CORRELATED/);
 });
 
 test("seam detector: pre-upgrade ledger shape normalizes attribution counters (no NaN after reload)", () => {

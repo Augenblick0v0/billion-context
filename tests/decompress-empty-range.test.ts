@@ -68,37 +68,37 @@ function ctxOf(f: FoldResult) {
 
 test("#1712: both range fields blank → whole-block restore, no failure", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "", endId: "" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "", endId: "" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/, `blank range fields must not fail: ${out.slice(0, 120)}`);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: whitespace-only range fields count as omitted too", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "   ", endId: "\t" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "   ", endId: "\t" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: one field missing + other blank → whole-block restore", () => {
     const f = fold({ ccr: true });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "" }, ctxOf(f)).text;
     assert.doesNotMatch(out, /FAILED/);
     assert.match(out, new RegExp(`^\\[Block ${f.blockId} content \\u2014`));
 });
 
 test("#1712: one-sided non-blank still requires both, and steers to omitting them", () => {
     const f = fold({ ccr: true });
-    const outStart = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "" }, ctxOf(f));
+    const outStart = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "" }, ctxOf(f)).text;
     assert.match(outStart, /startId and endId must be given together/);
     assert.match(outStart, /omit both to restore the whole block/);
-    const outEnd = resolveDecompress({ blockId: f.blockId, endId: "m00004" }, ctxOf(f));
+    const outEnd = resolveDecompress({ blockId: f.blockId, endId: "m00004" }, ctxOf(f)).text;
     assert.match(outEnd, /startId and endId must be given together/);
 });
 
 test("#1712: plugin mode without CCR points at the working call shape instead of dead-end param filling", () => {
     const f = fold({ ccr: false, plugin: "omp" });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f)).text;
     assert.match(out, /plugin-mode session does not have/);
     assert.ok(out.includes(`{"blockId":"${f.blockId}"}`), `copy-pasteable guidance: ${out}`);
     assert.doesNotMatch(out, /is proxy-mode only/);
@@ -106,7 +106,7 @@ test("#1712: plugin mode without CCR points at the working call shape instead of
 
 test("#1712: proxy mode without CCR keeps the enable-CCR error", () => {
     const f = fold({ ccr: false });
-    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f));
+    const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctxOf(f)).text;
     assert.match(out, /requires CCR \u2014 enable compress\.ccr\.enabled/);
 });
 

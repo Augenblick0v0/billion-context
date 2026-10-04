@@ -115,9 +115,10 @@ async function surfaceProxyJson(
         }
         let result: string;
         try {
-            result = mutating
+            const toolResult = mutating
                 ? await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs))
                 : executeProxyTool(call.name, args, ctx, call.callId, rawArgs);
+            result = toolResult.text;
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
@@ -181,9 +182,9 @@ export async function compressLoopResponsesJson(
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)} (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
                 rawArgs = call.arguments;
             }
-            const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs));
-            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
+            const toolResult = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId, rawArgs));
+            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
+            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, toolResult.text) });
         }
         // #1097: retrieval injections ride the re-request after their ack —
         // coreToResponses re-voices system as developer, so mirror that here.

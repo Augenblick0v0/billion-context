@@ -259,7 +259,7 @@ test("#1001 问题3: split-element line form compresses instead of failing (kern
     const out = applyRanges(
         parseCompressInput({ content: ["m00001\u2013m00012 前期调试与决策", "## TASK AS OF THIS BLOCK\n- goal\n- decisions with reasons"] }),
         { core, config, messages: turn.messages, session, log: (m: string) => logs.push(m) },
-    );
+    ).text;
     assert.ok(!out.startsWith("[Compression FAILED"), `split line form must parse: ${out}`);
     assert.ok(session.state.blocks.length > 0, "one block created from the coalesced range");
     assert.match(logs.join("\n"), /compress requested 1 range\(s\): m00001\u2013m00012/, "range reached the compress funnel");

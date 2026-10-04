@@ -85,7 +85,7 @@ test("#1026: exhausted refs fall back to compressing ACTIVE blocks by real id", 
 test("#1026: no-valid-ranges receipt carries the live span", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeFoldedCtx();
-    const out = applyRanges(parseCompressInput({ content: [{ summary: "no bounds" }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ summary: "no bounds" }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), `failure receipt: ${out}`);
     assert.ok(out.includes("Live compressible refs: m00021–m00080"), `span inside receipt: ${out}`);
 });
@@ -94,7 +94,7 @@ test("#1026: blocksCreated=0 receipt carries the live span", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeFoldedCtx();
     // stale refs (never assigned) → kernel rejects the range → 0 blocks
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m09999", endId: "m09999", summary: "s" }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m09999", endId: "m09999", summary: "s" }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), `failure receipt: ${out}`);
     assert.ok(out.includes("Live compressible refs: m00021–m00080"), `span inside receipt: ${out}`);
 });

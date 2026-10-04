@@ -10,6 +10,7 @@ import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, 
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
+import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 
@@ -30,7 +31,7 @@ export type RewriteCtx = {
 // path uses (loop/core.ts executeProxyTool). compress mutates context
 // (handled by applyRanges); the other three are read-only queries whose result
 // becomes a text block replacing the intercepted tool_use.
-function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
+function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): ProxyToolResult {
     if (toolName === COMPRESS_TOOL_NAME) {
         return applyRanges(parseCompressInput(args), ctx);
     }
@@ -41,7 +42,8 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         // drained injections ride inline right after the ack. Whole-block
         // decompress queues nothing — behavior unchanged.
         const injections = drainPendingRetrievals(ctx.session);
-        return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
+        if (injections.length === 0) return ack;
+        return { ...ack, text: injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack.text) };
     }
     if (toolName === "search_context") {
         return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state, ctx);
@@ -61,14 +63,15 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         // inline right after the ack inside the converted text block.
         const ack = executeRetrieve(args, ctx.session);
         const injections = drainPendingRetrievals(ctx.session);
-        return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
+        if (injections.length === 0) return ack;
+        return { ...ack, text: injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack.text) };
     }
     if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
         // Restore is passive egress behavior (the next forward re-emits the
         // cached original), so there is nothing to drain inline.
         return executeImageFull(args, ctx.session, ctx.config);
     }
-    return `[Unknown proxy tool: ${toolName}]`;
+    return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
 
 /** Numeric part of a ref ("m00042" → 42, "b3" → 3); 0 for non-numeric. Used to
@@ -307,7 +310,7 @@ function applyErrorNote(r: { errors: string[] }): string {
 // hosts that want to penalize this shape grep the warn marker below.
 const DEGENERATE_FOLD_COVERAGE = 0.8;
 
-export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
+export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): ProxyToolResult {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
@@ -351,13 +354,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
         if (isEmptyCall) {
-            return `[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}]`;
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}]`, "refused", 0);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return `[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}]`;
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}]`, "refused", 0);
         }
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`;
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`, "refused", 0);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -446,7 +449,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
             const dropped = droppedEntriesNote(diagnostics);
-            return `[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}${noViableAnywhere}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
+            return compressResult(`[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}${noViableAnywhere}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`, "refused", 0);
         }
         clearCompressFailures(ctx.session);
 
@@ -569,10 +572,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         msg += tail;
         logMsg += tail;
         ctx.log(`[acp-proxy: ${logMsg}]`);
-        return msg;
+        // #1875: blocksCreated > 0 with parse-dropped entries or per-range apply
+        // errors is a PARTIAL fold — neither clean applied nor refused.
+        return compressResult(msg, dropped !== "" || r.errors.length > 0 ? "partial" : "applied", r.blocksCreated);
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
-        return `[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`;
+        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`, "refused", 0);
     }
 }
 
@@ -588,7 +593,7 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
         if (blk.type === "tool_use" && typeof blk.name === "string" && isProxyToolFor(blk.name, ctx.session, ctx.config)) {
             converted = true;
             const args = (blk.input && typeof blk.input === "object" ? blk.input : {}) as Record<string, unknown>;
-            newContent.push({ type: "text", text: executeAnthropicProxyTool(blk.name, args, ctx) });
+            newContent.push({ type: "text", text: executeAnthropicProxyTool(blk.name, args, ctx).text });
         } else {
             if (blk.type === "tool_use") sawRealToolUse = true;
             newContent.push(block);
