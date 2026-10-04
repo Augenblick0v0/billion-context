@@ -2810,6 +2810,12 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
                         rewriteRetryIds(evOut);
+                        // Hosts finish on this frame, before EOF settles billing and late usage.
+                        if (session && acc.inputTokens !== undefined && acc.inputTokens > 0) {
+                            const credit = session.stats.compressCreditTokens ?? 0;
+                            recordContextObservation(session, Math.max(0, acc.inputTokens - credit), credit > 0 ? "estimate" : "usage");
+                            markDirty(session);
+                        }
                         await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
                     }
