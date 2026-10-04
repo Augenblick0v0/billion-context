@@ -489,13 +489,18 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 ];
 
 // Relay/vLLM deployments serve models under "prefix/name" ids that miss
-// every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the bare
-// basename too; the full name keeps precedence (#736).
+// every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i, #736). The
+// bare basename is the PRIMARY family signal: a family rule describes the
+// MODEL, and testing the full id first lets the provider segment hijack the
+// match ("Kimi/glm-5" → ^kimi 200K instead of ^glm-5 1M; "deepseek/
+// deepseek-r1" skips the specific ^deepseek-(r1|v3|ocr) rule because of the
+// "/" and falls to broad ^deepseek 1M — #2074). The full id remains the
+// FALLBACK for tails carrying no family signal whose provider segment does
+// ("qwen/qwq-32b").
 function modelRoots(model: string): string[] {
-    const roots = [model];
     const slash = model.lastIndexOf("/");
-    if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
-    return roots;
+    if (slash > 0 && slash < model.length - 1) return [model.slice(slash + 1), model];
+    return [model];
 }
 
 export function lookupContextLimit(model: string | undefined): number | undefined {

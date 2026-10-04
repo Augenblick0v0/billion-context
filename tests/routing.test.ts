@@ -107,6 +107,23 @@ test("lookupContextLimit returns undefined for unknown models", () => {
     assert.equal(lookupContextLimit(undefined), undefined);
 });
 
+test("lookupContextLimit classifies by the model segment, not the provider prefix (#2074)", () => {
+    // A provider segment starting with a family keyword must not hijack the match.
+    assert.equal(lookupContextLimit("Kimi/glm-5"), 1_000_000);
+    assert.equal(lookupContextLimit("Qwen/DeepSeek-V4-Pro"), 1_000_000);
+    // Specific rules win over broad ones once the prefix is off the tested
+    // segment (deepseek/deepseek-r1 used to fall to ^deepseek → 1M).
+    assert.equal(lookupContextLimit("deepseek/deepseek-r1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v3"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v3.1"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-ocr-2"), 128_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-v4-flash"), 1_000_000);
+    // Non-family provider prefixes behave exactly as before (#736 baseline).
+    assert.equal(lookupContextLimit("traework/glm-5.3"), 1_000_000);
+    // The provider hint still rescues tails carrying no family signal of their own.
+    assert.equal(lookupContextLimit("qwen/qwq-32b"), 200_000);
+});
+
 // ── resolveContextLimit: longest-prefix matching on URL keys ──────────────
 // The key is the /bili/<this> string. A request matches when its embedded
 // upstream URL equals the key, or starts with key + "/". Longest key wins
