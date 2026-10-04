@@ -197,6 +197,13 @@ const MAX_PLUGIN_CONVERSATIONS = 1024;
 
 const conversations = new Map<string, ConversationEntry>();
 const remembered = new Map<string, RememberedMessages>();
+// #2077: which content-store object each session's stored-refs list was last
+// evaluated against. Store updates are immutable (storeOriginal returns a new
+// object), so a changed object identity is the exact signal that the refs
+// list needs re-evaluation — an unchanged-view resend can skip even the refs
+// walk. Restored sessions are fresh objects, so their first remember
+// re-evaluates automatically.
+const snapshotRefsEvaluatedStore = new WeakMap<Session, unknown>();
 
 // #1158: one-shot "no model requests arrived" warnings, keyed by conversation
 // id. A tool call proves the model already answered, so an id with ZERO model
@@ -336,32 +343,119 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     remembered.set(sessionId, { processed, original, nudge });
     const session = peekSession(sessionId);
     if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
-        const snapshotCandidate = structuredClone(original);
+        // #2077: copy-on-write snapshot maintenance. A raw id is a SHA-256 of
+        // the message identity plus a deterministic within-conversation
+        // duplicate-cluster index (acp-kernel wire/message-id.ts), but ids
+        // alone do NOT name the bytes: adapters attach wire flags outside the
+        // CoreMessage interface (toolIsError — see forkToolIsError), so the
+        // walk below compares full views (sameSnapshotView: exactly the field
+        // set forkMessageIdentityHash digests, plus id). Steady state costs a
+        // field scan instead of clone + serialize: a pure extension clones
+        // only its tail and extends the tracked byte count rather than
+        // re-cloning and re-serializing the whole history every request.
         const cap = publicSnapshotCapBytes();
-        if (cap > 0 && stableJson(snapshotCandidate).length > cap) {
+        const dropOverCap = () => {
             session.pluginSnapshot = undefined;
             session.metadata.publicSnapshotCapped = true;
+            delete session.metadata.publicSnapshotBytes;
+        };
+        let changed = false;
+        const prev = session.pluginSnapshot;
+        if (!prev || session.metadata.publicSnapshotCapped === true) {
+            // First write (fresh session, lazy-persist restore gap) or recovery
+            // after a cap-drop. Measure BEFORE cloning so an over-cap history
+            // pays one serialize, not clone + serialize.
+            const bytes = stableJson(original).length;
+            if (cap > 0 && bytes > cap) dropOverCap();
+            else {
+                session.pluginSnapshot = structuredClone(original);
+                session.metadata.publicSnapshotBytes = bytes;
+                delete session.metadata.publicSnapshotCapped;
+            }
+            changed = true;
         } else {
-            session.pluginSnapshot = snapshotCandidate;
-            delete session.metadata.publicSnapshotCapped;
-        }
-        const previousRefs = session.metadata.publicSnapshotStoredRefs;
-        session.metadata.publicSnapshotStoredRefs = [...new Set([
-            ...(Array.isArray(previousRefs) ? previousRefs : []),
-            ...original.flatMap((m) => {
-                const ref = session.state.messageRefs.byRaw[m.id];
-                return ref && session.contentStore?.byRef[ref] ? [ref] : [];
-            }),
-        ])];
-        if (rawWire !== undefined) {
-            try {
-                const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
-                session.metadata.publicSnapshotTextComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
-            } catch {
-                session.metadata.publicSnapshotTextComparable = false;
+            const n = original.length;
+            let k = 0;
+            while (k < prev.length && k < n && sameSnapshotView(prev[k], original[k])) k++;
+            if (k === n && n === prev.length) {
+                // Identical view (e.g. an upstream retry re-forwarding the
+                // same body): snapshot, byte count and refs list stay valid,
+                // and skipping markDirty keeps the revision cache warm so
+                // status polls stay O(1). The cap is still enforced from the
+                // tracked count on every request, and legacy records predate
+                // the count — measure them once into it.
+                const trackedBytes = typeof session.metadata.publicSnapshotBytes === "number" ? session.metadata.publicSnapshotBytes : undefined;
+                const bytes = trackedBytes ?? stableJson(prev).length;
+                if (trackedBytes === undefined) session.metadata.publicSnapshotBytes = bytes;
+                if (cap > 0 && bytes > cap) dropOverCap();
+                if (trackedBytes === undefined || cap > 0 && bytes > cap) changed = true;
+            } else if (k === prev.length) {
+                // Pure extension: append the tail (per-element clones keep the
+                // snapshot independent of the request's live arrays) and extend
+                // the byte count — len(stableJson([a, b])) is
+                // len(sj(a)) + len(sj(b)) + 1, so each appended element costs
+                // its own length plus one comma.
+                let bytes = typeof session.metadata.publicSnapshotBytes === "number"
+                    ? session.metadata.publicSnapshotBytes
+                    : stableJson(prev).length;
+                for (let i = k; i < n; i++) bytes += stableJson(original[i]).length + 1;
+                if (cap > 0 && bytes > cap) dropOverCap();
+                else {
+                    for (let i = k; i < n; i++) prev.push(structuredClone(original[i]));
+                    session.metadata.publicSnapshotBytes = bytes;
+                    delete session.metadata.publicSnapshotCapped;
+                }
+                changed = true;
+            } else {
+                // Replacement (compression rewrote the history, restart
+                // divergence): full rebuild, measured before cloning as above.
+                const bytes = stableJson(original).length;
+                if (cap > 0 && bytes > cap) dropOverCap();
+                else {
+                    session.pluginSnapshot = structuredClone(original);
+                    session.metadata.publicSnapshotBytes = bytes;
+                    delete session.metadata.publicSnapshotCapped;
+                }
+                changed = true;
             }
         }
-        markDirty(session);
+        // The refs list must re-evaluate whenever the store object changed —
+        // CCR can gain entries between remembers without any history change,
+        // and the fork-time fail-closed check reads this list against the
+        // CURRENT store.
+        const storeChanged = snapshotRefsEvaluatedStore.get(session) !== session.contentStore;
+        if (changed || storeChanged) {
+            const previousRefs = session.metadata.publicSnapshotStoredRefs;
+            session.metadata.publicSnapshotStoredRefs = [...new Set([
+                ...(Array.isArray(previousRefs) ? previousRefs : []),
+                ...(session.pluginSnapshot ?? []).flatMap((m) => {
+                    const ref = session.state.messageRefs.byRaw[m.id];
+                    return ref && session.contentStore?.byRef[ref] ? [ref] : [];
+                }),
+            ])];
+            snapshotRefsEvaluatedStore.set(session, session.contentStore);
+        }
+        if (rawWire !== undefined) {
+            // The comparable verdict is a property of the wire body: hash it
+            // (native speed) and only re-parse + walk when the body actually
+            // changed, so a retry with an identical body stays cheap.
+            const wireHash = createHash("sha256").update(rawWire).digest("hex");
+            if (session.metadata.publicSnapshotWireHash !== wireHash) {
+                let comparable: boolean;
+                try {
+                    const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
+                    comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+                } catch {
+                    comparable = false;
+                }
+                session.metadata.publicSnapshotWireHash = wireHash;
+                if (session.metadata.publicSnapshotTextComparable !== comparable) {
+                    session.metadata.publicSnapshotTextComparable = comparable;
+                    changed = true;
+                }
+            }
+        }
+        if (changed || storeChanged) markDirty(session);
     }
 }
 
@@ -768,6 +862,20 @@ function forkMessageIdentityHash(message: CoreMessage): string {
     return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
 }
 
+/** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
+ *  exactly the field set forkMessageIdentityHash digests, plus id. An id
+ *  prefix match alone would keep a stale snapshot when a resent history flips
+ *  an adapter-attached flag (toolIsError) under unchanged ids — the snapshot
+ *  must track every byte fork matching can see. If an adapter ever attaches a
+ *  new runtime field, it MUST be added here and to forkMessageIdentityHash
+ *  together. */
+function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
+    return a.id === b.id && a.role === b.role && a.contentType === b.contentType
+        && a.text === b.text && a.toolName === b.toolName && a.toolCallId === b.toolCallId
+        && a.thinkingTokens === b.thinkingTokens && a.summaryOfBlockId === b.summaryOfBlockId
+        && forkToolIsError(a) === forkToolIsError(b);
+}
+
 /** Read under the session lock; compare ordered semantics, never just an id set. */
 export function publicForkInputMatches(session: Session, protocol: WireProtocol, parsed: unknown): boolean {
     const prefix = session.pluginSnapshot;
@@ -960,6 +1068,14 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
             remembered.set(child.id, { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) });
+            // #2077: the parent snapshot is now an external contract — this child
+            // was cut from it, and later forks/replays depend on its continuity.
+            // The receipt lives on the CHILD only, so without this sticky flag a
+            // lazily-persisted parent would drop its snapshot on disk and the next
+            // restart would 409. Flush eagerly (publishForkSession precedent) so
+            // the flag and the snapshot land in one write.
+            parent.metadata.publicSnapshotRetained = true;
+            if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
             forkReply(res, 201, response);
         });
     } catch (err) {

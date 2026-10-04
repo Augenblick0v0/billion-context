@@ -544,6 +544,10 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             }
             parent.contentStore = store;
             parent.contentStoreDirty = true;
+            // #2077 lazy persistence: the raw snapshot only lands in the record
+            // once it is an external contract — pin that contract here so this
+            // test still exercises the corrupted-store detection path.
+            parent.metadata.publicSnapshotRetained = true;
             assert(h.store.flushSync(parent));
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const namespace = join(h.dir, "sessions", parent.meta.protocol!);
@@ -1037,4 +1041,114 @@ test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below i
         else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previous;
         await h.close();
     }
+});
+
+// #2077 regression oracle: exact replica of src/plugin.ts stableJson — the
+// tracked byte count must always equal the canonical serialization length.
+function stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    if (value !== null && typeof value === "object") {
+        const obj = value as Record<string, unknown>;
+        return `{${Object.keys(obj).filter((k) => obj[k] !== undefined).sort().map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+}
+
+test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", async () => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        const base = session.pluginSnapshot!;
+        const baseBytes = session.metadata.publicSnapshotBytes as number;
+        assert(Number.isFinite(baseBytes), "the first write must track the exact canonical size");
+        assert.equal(baseBytes, stableJson(base).length);
+        await sendModel(h, "parent", [...h.messages, { role: "assistant", content: "cow tail response" }, { role: "user", content: "cow tail follow-up" }]);
+        assert.equal(session.pluginSnapshot, base, "a pure extension must reuse the stored array instead of re-cloning the history");
+        assert.equal(base.length, 5);
+        assert.equal(base[3].text, "cow tail response");
+        assert.equal(base[4].text, "cow tail follow-up");
+        assert.equal(session.metadata.publicSnapshotBytes, stableJson(base).length, "incremental accounting must stay exact");
+        await sendModel(h, "parent", [...h.messages, { role: "assistant", content: "cow tail response" }, { role: "user", content: "cow tail follow-up" }]);
+        assert.equal(session.pluginSnapshot, base);
+        assert.equal(base.length, 5);
+        assert.equal(session.metadata.publicSnapshotBytes, stableJson(base).length);
+    } finally { await h.close(); }
+});
+
+test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) while the cap keeps re-evaluating", async () => {
+    const h = await harness();
+    try {
+        const session = getSession("legacy-cap");
+        session.metadata.pluginAgent = "test";
+        const messages = [{ id: "legacy-one", role: "user" as const, contentType: "text" as const, text: "legacy snapshot payload" }, { id: "legacy-two", role: "assistant" as const, contentType: "text" as const, text: "legacy second payload" }];
+        session.pluginSnapshot = structuredClone(messages);
+        const epochOf = () => session.revisionEpoch ?? 0;
+        const epochBefore = epochOf();
+        rememberPluginMessages(session.id, messages, messages);
+        assert.equal(typeof session.metadata.publicSnapshotBytes, "number", "a legacy record must gain its byte count on the next change");
+        const bytes = session.metadata.publicSnapshotBytes as number;
+        assert.equal(bytes, stableJson(messages).length);
+        assert.equal(epochOf(), epochBefore + 1, "the one-time measurement marks dirty exactly once");
+        rememberPluginMessages(session.id, messages, messages);
+        assert.equal(epochOf(), epochBefore + 1, "a tracked identical resend must not mark dirty");
+        const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+        process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = String(Math.max(1, bytes - 1));
+        try {
+            rememberPluginMessages(session.id, messages, messages);
+            assert.equal(session.pluginSnapshot, undefined, "a knob shrink must drop the snapshot even without history change");
+            assert.equal(session.metadata.publicSnapshotCapped, true);
+        } finally {
+            if (previous === undefined) delete process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+            else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previous;
+        }
+    } finally { await h.close(); }
+});
+
+test("HTTP the raw snapshot persists only once a fork makes it an external contract", async () => {
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        assert(h.store.flushSync(parent));
+        const beforeFork = h.store.loadSync("parent") as { pluginSnapshot?: unknown[]; metadata?: Record<string, unknown> } | null;
+        assert(beforeFork);
+        assert.equal(beforeFork.pluginSnapshot, undefined, "non-forking sessions must not pay the snapshot disk cost (#2077)");
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
+        const afterFork = h.store.loadSync("parent") as { pluginSnapshot?: unknown[]; metadata?: Record<string, unknown> } | null;
+        assert(afterFork);
+        assert(Array.isArray(afterFork.pluginSnapshot) && afterFork.pluginSnapshot!.length === 3, "a forked parent must persist its raw snapshot");
+        assert.equal(afterFork.metadata?.publicSnapshotRetained, true);
+    } finally { await h.close(); }
+});
+
+test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact byte count", async () => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        const before = session.pluginSnapshot!;
+        await sendModel(h, "parent", [...h.messages.slice(0, 2), { role: "user", content: "replacement third message" }]);
+        const replaced = session.pluginSnapshot!;
+        assert.notEqual(replaced, before, "a rewritten prefix must rebuild the snapshot, not extend it");
+        assert.equal(replaced.length, 3);
+        assert.equal(replaced[2].text, "replacement third message");
+        assert.notEqual(replaced[2].id, before[2].id, "changed content changes the derived id, proving the replacement path ran");
+        assert.equal(session.metadata.publicSnapshotBytes, stableJson(replaced).length);
+    } finally { await h.close(); }
+});
+
+test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", async () => {
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        assert(h.store.flushSync(parent));
+        h.store.cancelAll();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        const restored = getSession("parent");
+        assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        await sendModel(h, "parent", h.messages);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+    } finally { await h.close(); }
 });

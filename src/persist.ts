@@ -704,7 +704,12 @@ function buildRecord(session: Session): PersistedSession {
         stats: { ...session.stats, ...(observation ? { contextTokens: observation.tokens, contextTokensSource: observation.source } : {}) },
         messages: snapshot,
         messagesFolded: snapshot ? true : undefined,
-        pluginSnapshot: session.pluginSnapshot,
+        // #2077: the raw snapshot is persisted lazily — only once it becomes an
+        // external contract (a fork receipt exists on this session, or a fork
+        // was cut from this one and set the sticky retained flag). Non-forking
+        // sessions pay no disk cost; the in-memory copy self-heals on the next
+        // model request because plugin agents resend their full history.
+        pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
         forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
