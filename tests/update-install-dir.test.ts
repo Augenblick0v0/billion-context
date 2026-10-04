@@ -117,7 +117,11 @@ test("findInstallDir: resolves this running copy's own root", async () => {
 });
 
 test("describeInstallLocation: names target, symlink real, and running module", async () => {
-    const base = mkdtempSync(path.join(tmpdir(), "bc-installdir-"));
+    // Resolve the fixture dir itself: on macOS tmpdir() is /var/folders/…, a
+    // system symlink to /private/var/folders/…, which the implementation's
+    // realpath legitimately reports — making the "plain" case look like a
+    // symlink hop and flaking the /real=/ assertion below (#2068).
+    const base = realpathSync(mkdtempSync(path.join(tmpdir(), "bc-installdir-")));
     try {
         const real = path.join(base, "global", "node_modules", PKG);
         writePkg(real, { name: PKG, version: "0.1.129" });
