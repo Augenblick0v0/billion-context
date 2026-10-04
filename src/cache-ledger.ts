@@ -375,6 +375,20 @@ function detectSeam(session: Session, led: CacheLedger): void {
             agg.providerSideMissed += line.tr;
             return;
         }
+        // #2059: tail-append turns — the previous request's ENTIRE message list
+        // survives byte-identically as this one's prefix (msgIndex == prevMsgs)
+        // and only the tail grew, so there is NO mid-history break: provider-side
+        // again. The byte-LCP test above can't see it (it demands the whole body
+        // match, which a growing conversation never satisfies), so before this the
+        // common append+no-cache case falsely cried seam. Both bodies must be
+        // uncapped: one truncated at SEAM_BODY_CAP parses to zero messages and
+        // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
+        // an empty prior list out.
+        if (prev.length < SEAM_BODY_CAP && cur.length < SEAM_BODY_CAP && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
+            agg.providerSideMisses += 1;
+            agg.providerSideMissed += line.tr;
+            return;
+        }
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -1023,8 +1037,8 @@ function formatSeam(r: BiliCacheReport): string {
         out.push(`  ${r.seam.rewinds.count} sample(s) · ${fmtTok(r.seam.rewinds.missed)} tok re-billed once for the retained prefix — sanctioned client intent, not a rebuild seam`);
     }
     if (r.seam.providerSide.count > 0) {
-        out.push("▲ PROVIDER-SIDE MISS (wire was byte-stable)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the outbound body matched the previous request's prefix; the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's entire message list is byte-for-byte a prefix of this request (any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
