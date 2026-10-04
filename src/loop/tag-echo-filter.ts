@@ -1034,9 +1034,12 @@ export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestTex
     return obj;
 }
 
-// Plugin-passthrough parity for the Anthropic wire: strip `delta.{text,
-// thinking}` on content_block_delta streams and `content[].{text,thinking}`
-// on non-streaming message bodies. Mutates in place.
+// Plugin-passthrough parity for the Anthropic wire: strip `delta.text` on
+// content_block_delta streams and `content[].text` on non-streaming message
+// bodies. Signed `thinking` / `redacted_thinking` blocks are LEFT byte-for-byte
+// (#1960/KDD#10): they are verified against their signature on replay, so any
+// rewrite desyncs them and bricks the session — matching the loop adapters'
+// "prose filters never touch thinking" treatment. Mutates in place.
 export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
@@ -1044,15 +1047,14 @@ export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText
     if (d && typeof d === "object") {
         const dd = { ...(d as Record<string, unknown>) };
         dd["text"] = stripIfString(dd["text"], drop, requestText);
-        dd["thinking"] = stripIfString(dd["thinking"], drop, requestText);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
         o["content"] = (o["content"] as unknown[]).map((c) => {
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
-            if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
-            return { ...cc, text: stripIfString(cc["text"], drop, requestText), thinking: stripIfString(cc["thinking"], drop, requestText) };
+            if (typeof cc["text"] !== "string") return c;
+            return { ...cc, text: stripIfString(cc["text"], drop, requestText) };
         });
     }
     return obj;
@@ -1195,5 +1197,26 @@ export function composeStreamFilters(a: TagEchoFilter, b: TagEchoFilter): TagEch
             outputChars: b.stats().outputChars,
             dropped: a.dropped() || b.dropped(),
         }),
+    };
+}
+
+// #1960/KDD#10 — signature-verified channels (signed Anthropic `thinking`
+// deltas, Gemini `thought` parts) must ride byte-for-byte: any rewrite
+// desyncs them from their signature and bricks replay. This identity filter
+// passes every delta through unchanged while keeping honest char accounting,
+// so degenerate-turn detection (#673) still sees real input/output sizes.
+export function createIdentityStreamFilter(): TagEchoFilter {
+    let inputChars = 0;
+    let outputChars = 0;
+    return {
+        push: (delta: string) => {
+            inputChars += delta.length;
+            outputChars += delta.length;
+            return delta;
+        },
+        flush: () => "",
+        dropped: () => false,
+        pending: () => false,
+        stats: () => ({ inputChars, outputChars, dropped: false }),
     };
 }

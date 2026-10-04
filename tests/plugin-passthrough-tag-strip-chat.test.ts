@@ -233,7 +233,7 @@ test("plugin chat passthrough resolves held tail at stream end without [DONE]", 
     assert.ok(!text.includes("m0"), "unclosed tag content dropped at stream end");
 });
 
-test("plugin anthropic passthrough strips render tags from text_delta and thinking_delta", async () => {
+test("plugin anthropic passthrough strips render tags from text_delta but keeps signed thinking_delta byte-for-byte (#1960)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -246,7 +246,10 @@ test("plugin anthropic passthrough strips render tags from text_delta and thinki
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "anthropic", session);
     const text = out.join("");
-    assert.ok(!text.includes("m00009") && !text.includes("m00010"), "render tags stripped from both delta types");
+    // #1960/KDD#10: signed thinking rides byte-for-byte — rewriting it desyncs
+    // its signature and bricks replay. Only the text channel is stripped.
+    assert.ok(text.includes("m00009"), "signed thinking_delta stays byte-for-byte (#1960)");
+    assert.ok(!text.includes("m00010"), "render tags stripped from the text channel");
     assert.ok(text.includes("hi  bye"), "text prose survives");
     assert.ok(text.includes("hmm "), "thinking prose survives");
     assert.equal((session.stats as Record<string, unknown>)["lastInputTokens"], 42, "usage sampled from message_start");

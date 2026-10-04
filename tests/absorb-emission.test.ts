@@ -331,7 +331,7 @@ type AnthropicBody = {
     content?: Array<{ type: string; thinking?: string; text?: string }>;
 };
 
-test("stripAnthropicText: thinking channel gets the same treatment (category 8)", () => {
+test("stripAnthropicText: signed thinking stays byte-for-byte even when armed (#1960)", () => {
     const make = (): AnthropicBody => JSON.parse(JSON.stringify({
         delta: { type: "thinking_delta", thinking: EMISSION },
         content: [
@@ -339,13 +339,14 @@ test("stripAnthropicText: thinking channel gets the same treatment (category 8)"
             { type: "text", text: EMISSION },
         ],
     }));
+    // #1960/KDD#10: signed thinking is verified against its signature on replay —
+    // any rewrite desyncs it and bricks the session. So the emission drop and tag
+    // strip apply to the TEXT channel only; thinking rides byte-for-byte whether
+    // armed or not (matching the loop adapters' treatment).
     const armed = stripAnthropicText(make(), true);
-    assert.equal(armed.delta?.thinking, "");
-    assert.equal(armed.content![0].thinking, "");
-    assert.equal(armed.content![1].text, "");
-    const echo = JSON.stringify({ messages: [{ role: "user", content: EMISSION.trim() }] });
-    assert.equal(stripAnthropicText(make(), true, echo).delta?.thinking, EMISSION);
-    assert.equal(stripAnthropicText(make(), false).content![0].thinking, EMISSION);
+    assert.equal(armed.delta?.thinking, EMISSION, "armed leaves the signed thinking delta byte-for-byte");
+    assert.equal(armed.content![0].thinking, EMISSION, "armed leaves the signed thinking block byte-for-byte");
+    assert.equal(armed.content![1].text, "", "text channel still drops the whole emission when armed");
 });
 
 type ResponsesEvent = {

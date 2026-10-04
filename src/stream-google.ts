@@ -34,7 +34,10 @@ export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             continue;
         }
         if (fc) sawReal = true;
-        if (typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
+        // #1960/KDD#10: a thought part carries a thoughtSignature the client
+        // echoes back verbatim — rewriting its text desyncs the signature and
+        // bricks replay. Strip prose only from non-thought parts.
+        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
             ctx.log(`[warn: tag echo] non-stream google output contains ACP echo (render tags/markers/internal artifacts), stripped: ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAcpTags(part.text, absorbArmed, requestText);
         }
