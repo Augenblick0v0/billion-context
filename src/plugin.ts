@@ -1188,9 +1188,9 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected tool object");
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
@@ -1201,22 +1201,27 @@ export async function handlePluginTool(
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
     if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });
     if (parsed.expectedRevision !== undefined && !conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision requires conversationId" });
-    // Explicit ids never yield to another session's outbound witness.
-    // #1685 zero-injection routing ladder for id-less tool POSTs:
-    //   1. outbound witness — this proxy streamed the very tool_use being
-    //      answered; a unique hit names the session (the free-text summary is
-    //      a unique anchor).
-    //   2. single-active arbitration — one fresh conversation on the proxy.
-    //   3. anything else is a loud 400 (never a silent guess).
+    // Explicit ids never yield to another session's outbound witness. A
+    // conflicting witness rejects unconfirmed ids; host-stamped ids (#2024)
+    // remain authoritative. Id-less calls use a unique witness, then a single
+    // fresh conversation, or fail loudly without guessing (#1685).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
+    // #2024: true only when the shim PROVES the body id is host-stamped
+    // per-call metadata. Model-transcribed ids and static env/meta bindings
+    // never set it, so witness conflicts for those ids still fail closed.
+    const nativeCaller = parsed.nativeCaller === true;
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
-    let routedBy: "witness" | "body" | "arb" = "body";
+    let routedBy: "witness" | "body" | "arb" | "native" = "body";
     if (conversationId) {
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
-        if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+        if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
+            if (!nativeCaller) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+            routedBy = "native";
+            deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+        }
     } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];
         session = peekSession(wit);

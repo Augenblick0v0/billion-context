@@ -59,7 +59,7 @@ interface StatusResponse {
 type PluginResponse<Path extends string> = Path extends "/__bili/plugin/manifest"
     ? { tools: { openai: { type: "function"; function: { name: string; parameters: Record<string, unknown> } }[] }; capabilities: { fork: { protocolVersion: number; endpoint: string; snapshotEndpoint: string } } }
     : Path extends "/__bili/plugin/fork" ? ForkResponse
-    : Path extends "/__bili/plugin/tool" ? { result: string; code?: string }
+    : Path extends "/__bili/plugin/tool" ? { result: string; code?: string; conversationId?: string }
     : Path extends `/__bili/plugin/status${string}` ? StatusResponse
     : SnapshotResponse;
 
@@ -275,6 +275,33 @@ test("HTTP tool witnesses never override explicit parent, child or sibling ident
         assert.equal((await h.request("/__bili/plugin/tool", { tool: "compress", args })).status, 200);
         assert.equal(resolveConversation("sibling").session!.state.blocks.length, 1);
         assert.equal(resolveConversation("parent").session!.state.blocks.length, 0);
+    } finally { await h.close(); }
+});
+
+test("HTTP native callers honor fork identity and revision despite a sibling witness", async () => {
+    const h = await harness();
+    try {
+        const parent = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(parent, "child", 3))).status, 201);
+        const child = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        const args = { content: [{ startId: "m00001", endId: "m00002", summary }] };
+        recordToolWitness("parent", "compress", args);
+        const payload = { conversationId: "child", tool: "compress", args, expectedRevision: child.parentRevision };
+        const unconfirmed = await h.request("/__bili/plugin/tool", { ...payload, nativeCaller: "true" });
+        assert.equal(unconfirmed.status, 409);
+        assert.equal(unconfirmed.body.code, "TOOL_CONVERSATION_CONFLICT");
+        const stale = await h.request("/__bili/plugin/tool", { ...payload, nativeCaller: true, expectedRevision: "0".repeat(64) });
+        assert.equal(stale.status, 409);
+        assert.equal(stale.body.code, "PARENT_REVISION_CONFLICT");
+        const unknown = await h.request("/__bili/plugin/tool", { ...payload, conversationId: "unknown-child", nativeCaller: true });
+        assert.equal(unknown.status, 404);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
+        const confirmed = await h.request("/__bili/plugin/tool", { ...payload, nativeCaller: true });
+        assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+        assert.equal(confirmed.body.conversationId, "child");
+        assert.equal(resolveConversation("child").session!.state.blocks.length, 1);
+        assert.equal(resolveConversation("parent").session!.state.blocks.length, 0);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, parent.parentRevision);
     } finally { await h.close(); }
 });
 
