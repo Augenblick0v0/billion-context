@@ -382,6 +382,54 @@ None of the three has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit
 that surface). Launcher-only by design.
 
+## Pi (pi.dev coding agent)
+
+Pi has a full native mode (`bili plugin install pi`, README quickstart
+option 1); this section covers what the one-line table can't — **which model
+transports the native intercept actually covers**. Pi is the only host that
+brings WebSocket model traffic into the loop.
+
+**How routing works.** The pi extension bootstraps (or attaches to) its own
+proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
+is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the
+`x-bili-plugin*` headers through pi's `before_provider_headers` event. Every
+HTTP-based provider (Anthropic, OpenAI chat/completions/responses, Gemini,
+Mistral, OpenRouter, Azure, custom relays…) rides this path as a named
+plugin-mode session.
+
+**The WebSocket gap (#2073).** A WebSocket connection never goes through
+`globalThis.fetch`, so pi's WebSocket model transports bypass the native
+intercept entirely whenever the handshake succeeds:
+
+| Provider / transport | Status |
+|---|---|
+| All HTTP providers | ✅ covered — named plugin-mode session |
+| `openai-codex-responses` (ChatGPT backend-api), `transport: "sse"` | ✅ covered — identical to any HTTP provider |
+| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ❌ bypasses the proxy while the WebSocket succeeds — the ACP tools are still registered and their calls still reach the proxy, but no model request from that session ever arrives, so no conversation state exists. Tool calls fail at the routing stage (`unknown plugin conversation` + `NO MODEL REQUESTS`, #1158 diagnostic). Until #2072 ships the failure is worse than loud: a stale outbound witness from a *sibling* subagent session can silently answer with that other session's state (#2063) — treat status panels from such sessions as untrustworthy until you check bili.log |
+| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (tracked under #2073) |
+
+**Workaround for the codex provider.** Force the SSE lane in pi's settings
+(`~/.pi/agent/settings.json`; project `.pi/settings.json` overrides):
+
+```json
+{ "transport": "sse" }
+```
+
+The default `"auto"` tries WebSocket first and falls back to SSE only when
+the handshake fails; the legacy boolean key `"websockets": false` migrates
+automatically. The key is global but only multi-transport providers (today:
+the codex provider) consume it — HTTP-only providers ignore it. Verified on
+Windows + Pi 1.0.2 (#2063 owner repro): explicit `sse` enters bili with the
+correct session id.
+
+The tracked fix (client-side `globalThis.WebSocket` interception, owner-gated
+per #2073) is viable rather than speculative: pi sends the same `session-id`
+header on its WebSocket upgrades as on SSE (value = the pi session id),
+Node's built-in WebSocket forwards constructor `headers` (verified on Node
+22), and the proxy side already speaks the wire — the WS bridge admits the
+prefix shape `/bili/<upstream>/responses` keyed on exactly that header
+(`src/ws-bridge.ts`, `src/responses-ws.ts` `codexResponsesCodec`).
+
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 
 Some clients (VS Code-based IDEs: CodeBuddy, Cursor, Windsurf, …) only offer an HTTP **proxy** setting (`http.proxy`, `codingcopilot.httpProxyURL`, …) — no model base-URL to rewrite. Such clients send `CONNECT <model-host>:443` through the proxy instead of plain `/bili/…` requests. That path is only decrypted when the model host is on bili's **MITM whitelist**; otherwise bili blind-tunnels the TLS bytes (opaque relay) and can never see — or compress — the model requests (#897).
