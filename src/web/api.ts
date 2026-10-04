@@ -5,12 +5,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
     allowDshCompactionState,
+    normalizeLegacyAllowDshCompaction,
     parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
     rejectLegacyRoute,
     safeReadJson,
+    type DshFileSettings,
     type UpstreamProxyMode,
 } from "../config.js";
 import { log } from "../logger.js";
@@ -118,7 +120,7 @@ export async function handleConfigPut(
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
-    const hasDsh = Object.prototype.hasOwnProperty.call(body, "allowDshCompaction");
+    const hasDsh = Object.prototype.hasOwnProperty.call(body, "dsh");
     const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
     if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, dsh compaction settings, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
@@ -130,7 +132,9 @@ export async function handleConfigPut(
         try {
             const p = JSON.parse(body.file);
             if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
-            next = p as ConfigShape;
+            const rec = p as Record<string, unknown>;
+            normalizeLegacyAllowDshCompaction(rec);
+            next = rec as ConfigShape;
         } catch (error) {
             return sendError(res, 400, `file is not valid JSON: ${String(error)}`);
         }
@@ -153,10 +157,11 @@ export async function handleConfigPut(
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
         if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
-        if (next.allowDshCompaction !== undefined && next.allowDshCompaction !== null && typeof next.allowDshCompaction !== "boolean") return sendError(res, 400, "allowDshCompaction must be a boolean or null");
-        if (next.allowDshCompaction === true || next.allowDshCompaction === false) {
+        const fileDshFlag = ((next.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction;
+        if (fileDshFlag !== undefined && fileDshFlag !== null && typeof fileDshFlag !== "boolean") return sendError(res, 400, "dsh.allowDshCompaction must be a boolean");
+        if (fileDshFlag === true || fileDshFlag === false) {
             const dshForced = allowDshCompactionState(process.env);
-            if (dshForced.source === "env" && (next.allowDshCompaction === true) !== dshForced.enabled) return sendError(res, 409, "allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+            if (dshForced.source === "env" && fileDshFlag !== dshForced.enabled) return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
         }
         try {
             atomicWriteConfig(next);
@@ -240,13 +245,14 @@ export async function handleConfigPut(
     // contradicting file write would be a silent no-op: refuse with the exact
     // way out instead. A matching write or a clear (null) stays allowed.
     if (hasDsh) {
-        if (body.allowDshCompaction !== null && typeof body.allowDshCompaction !== "boolean") {
-            return sendError(res, 400, "allowDshCompaction must be a boolean or null");
+        const dshBody = (body.dsh ?? {}) as Partial<DshFileSettings>;
+        if (dshBody.allowDshCompaction !== null && dshBody.allowDshCompaction !== undefined && typeof dshBody.allowDshCompaction !== "boolean") {
+            return sendError(res, 400, "dsh.allowDshCompaction must be a boolean or null");
         }
-        if (body.allowDshCompaction !== null) {
+        if (dshBody.allowDshCompaction === true || dshBody.allowDshCompaction === false) {
             const dshState = allowDshCompactionState(process.env);
-            if (dshState.source === "env" && (body.allowDshCompaction === true) !== dshState.enabled) {
-                return sendError(res, 409, "allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+            if (dshState.source === "env" && dshBody.allowDshCompaction !== dshState.enabled) {
+                return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
             }
         }
     }
@@ -267,8 +273,14 @@ export async function handleConfigPut(
         else delete config.passthrough;
     }
     if (hasDsh) {
-        if (body.allowDshCompaction === true) config.allowDshCompaction = true;
-        else delete config.allowDshCompaction;
+        const curDsh = (config.dsh ?? undefined) as Partial<DshFileSettings> | undefined;
+        if (((body.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction === true) {
+            config.dsh = { ...curDsh, allowDshCompaction: true };
+        } else if (curDsh) {
+            const rest: Partial<DshFileSettings> = { ...curDsh };
+            delete rest.allowDshCompaction;
+            config.dsh = Object.keys(rest).length > 0 ? rest : undefined;
+        }
     }
     try {
         atomicWriteConfig(config);

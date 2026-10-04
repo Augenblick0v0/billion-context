@@ -44,16 +44,18 @@ function envWith(value: string | undefined): NodeJS.ProcessEnv {
 
 test("#2028: allowDshCompaction resolution — file, env, default OFF", () => {
     withConfig(null, () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, false, "default OFF (#1729 behavior unchanged)"));
-    withConfig('{"allowDshCompaction":true}', () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, true, "file enables"));
-    withConfig('{"allowDshCompaction":true}', () => assert.equal(loadOptions(envWith("0")).allowDshCompaction, false, "env 0 beats file"));
+    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, true, "file enables (nested dsh.* section)"));
+withConfig('{"allowDshCompaction":true}', () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, true, "legacy top-level location still enables (auto-relocated)"));
+    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.equal(loadOptions(envWith("0")).allowDshCompaction, false, "env 0 beats file"));
     withConfig(null, () => assert.equal(loadOptions(envWith("1")).allowDshCompaction, true, "env 1 enables"));
     withConfig(null, () => assert.equal(loadOptions(envWith("yes")).allowDshCompaction, true, "non-\"0\" env values enable (house BILI_ boolean semantics)"));
 });
 
 test("#2028: allowDshCompactionState source resolution", () => {
     withConfig(null, () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: false, source: null }));
-    withConfig('{"allowDshCompaction":true}', () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: true, source: "file" }));
-    withConfig('{"allowDshCompaction":true}', () => assert.deepEqual(allowDshCompactionState(envWith("0")), { enabled: false, source: "env" }));
+    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: true, source: "file" }));
+withConfig('{"allowDshCompaction":true}', () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: true, source: "file" }));
+    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.deepEqual(allowDshCompactionState(envWith("0")), { enabled: false, source: "env" }));
     withConfig(null, () => assert.deepEqual(allowDshCompactionState(envWith("1")), { enabled: true, source: "env" }));
 });
 
@@ -191,9 +193,9 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         assert.equal(received.length, 0, "refused call never reaches the upstream");
 
         // B: enable through the live web API → hot-forward, byte-exact envelope.
-        r = await put(port, "/__bili/config", { allowDshCompaction: true });
+        r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
         assert.equal(r.status, 200, r.body);
-        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).allowDshCompaction, true, "file gained the key");
+        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).dsh.allowDshCompaction, true, "file gained the key under dsh.*");
         assert.deepEqual((await cfgJson()).allowDshCompaction, { enabled: true, source: "file" });
         r = await compactionPost();
         assert.equal(r.status, 200, `allowed call must be forwarded (got ${r.status}: ${r.body})`);
@@ -201,16 +203,17 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         assert.ok(received[0].includes(DSH_COMPACTION_INSTRUCTION_PREFIX), "envelope forwarded byte-exact");
 
         // C: clear (null) → key removed, guard active again.
-        r = await put(port, "/__bili/config", { allowDshCompaction: null });
+        r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: null } });
         assert.equal(r.status, 200, r.body);
-        assert.ok(!("allowDshCompaction" in JSON.parse(readFileSync(cfgFile, "utf8"))), "key cleared from the file");
+        const clearedFile = JSON.parse(readFileSync(cfgFile, "utf8"));
+        assert.ok(!clearedFile.dsh || !("allowDshCompaction" in clearedFile.dsh), "key cleared from the file");
         assert.deepEqual((await cfgJson()).allowDshCompaction, { enabled: false, source: null });
         r = await compactionPost();
         assert.equal(r.status, 403, "guard restored after clear");
         assert.equal(received.length, 1, "still refused after clear");
 
         // D: validation errors.
-        r = await put(port, "/__bili/config", { allowDshCompaction: "yes" });
+        r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: "yes" } });
         assert.equal(r.status, 400);
         assert.match(r.body, /must be a boolean or null/);
         r = await put(port, "/__bili/config", {});
@@ -218,9 +221,14 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         assert.match(r.body, /dsh compaction settings/);
 
         // E: whole-file save honors the same field.
+        r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {}, dsh: { allowDshCompaction: true } }) });
+        assert.equal(r.status, 200, r.body);
+        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).dsh.allowDshCompaction, true);
         r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {}, allowDshCompaction: true }) });
         assert.equal(r.status, 200, r.body);
-        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).allowDshCompaction, true);
+        const relocatedFile = JSON.parse(readFileSync(cfgFile, "utf8"));
+        assert.equal(relocatedFile.dsh.allowDshCompaction, true, "legacy top-level key relocated into dsh.* on save");
+        assert.ok(!("allowDshCompaction" in relocatedFile), "top-level position no longer present");
         r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {} }) });
         assert.equal(r.status, 200, r.body);
         assert.ok(!("allowDshCompaction" in JSON.parse(readFileSync(cfgFile, "utf8"))));
@@ -228,19 +236,19 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
         // F: env-forced contradiction → 409 (mirrors the #405 passthrough contract).
         process.env.BILI_ALLOW_DSH_COMPACTION = "0";
         try {
-            r = await put(port, "/__bili/config", { allowDshCompaction: true });
+            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
             assert.equal(r.status, 409, r.body);
             assert.match(r.body, /BILI_ALLOW_DSH_COMPACTION/);
-            r = await put(port, "/__bili/config", { allowDshCompaction: false });
+            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: false } });
             assert.equal(r.status, 200, "matching write allowed");
-            r = await put(port, "/__bili/config", { allowDshCompaction: null });
+            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: null } });
             assert.equal(r.status, 200, "clear allowed under env force");
-            r = await put(port, "/__bili/config", { file: JSON.stringify({ allowDshCompaction: true }) });
+            r = await put(port, "/__bili/config", { file: JSON.stringify({ dsh: { allowDshCompaction: true } }) });
             assert.equal(r.status, 409, "whole-file contradiction refused");
             process.env.BILI_ALLOW_DSH_COMPACTION = "1";
-            r = await put(port, "/__bili/config", { allowDshCompaction: false });
+            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: false } });
             assert.equal(r.status, 409, "env=1 forces allow; writing false contradicts");
-            r = await put(port, "/__bili/config", { allowDshCompaction: true });
+            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
             assert.equal(r.status, 200, "matching write allowed");
         } finally {
             delete process.env.BILI_ALLOW_DSH_COMPACTION;

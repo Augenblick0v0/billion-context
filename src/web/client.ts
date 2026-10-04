@@ -1292,8 +1292,8 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
-            dsgRow.inp.checked = draft.allowDshCompaction === true;
-            dsgWarnNote.hidden = draft.allowDshCompaction !== true;
+            dsgRow.inp.checked = Boolean(draft.dsh && draft.dsh.allowDshCompaction === true);
+            dsgWarnNote.hidden = !(draft.dsh && draft.dsh.allowDshCompaction === true);
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1387,7 +1387,10 @@ export const WEB_CLIENT = `(function () {
         dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
         dsgEnvNote.hidden = true;
         box.appendChild(dsgEnvNote);
-        dsgRow.inp.addEventListener("change", () => commit((d) => { if (dsgRow.inp.checked) d.allowDshCompaction = true; else delete d.allowDshCompaction; }));
+        dsgRow.inp.addEventListener("change", () => commit((d) => {
+            if (dsgRow.inp.checked) { if (!d.dsh || typeof d.dsh !== "object") d.dsh = {}; d.dsh.allowDshCompaction = true; }
+            else { if (d.dsh) { delete d.dsh.allowDshCompaction; if (Object.keys(d.dsh).length === 0) delete d.dsh; } }
+        }));
         if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";

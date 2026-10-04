@@ -807,9 +807,22 @@ export type ProxyOptions = {
      *  AUTO-triggering — only manual /compact benefits there; on web
      *  profiles (where no patch layer reaches the preset-nested instance,
      *  #1772) auto-triggering works as-is. Enable with
-     *  `allowDshCompaction: true` or env BILI_ALLOW_DSH_COMPACTION=1. */
+     *  `{ "dsh": { "allowDshCompaction": true } }` in the config file, or env
+     *  BILI_ALLOW_DSH_COMPACTION=1. */
     allowDshCompaction?: boolean;
 };
+
+/** #2028: dsh client-lane settings namespace — home for dsh-specific file
+ *  config so future dsh keys have a section instead of cluttering the root.
+
+ *  The field below USED to sit at the top level (`"allowDshCompaction": true`) in pre-review drafts;
+ *  a top-level value in an existing file is auto-relocated here on load
+ *  (normalizeLegacyAllowDshCompaction) rather than dropped (§7.3).
+ */
+export interface DshFileSettings {
+    /** Enable with `{ "dsh": { "allowDshCompaction": true } }`; full behavior contract on the FileConfig side. */
+    allowDshCompaction?: boolean;
+}
 
 /** The routing fields a provider entry can carry — exactly what
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
@@ -966,7 +979,7 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
 // the web config API (single source of truth — the GET handler must not
 // re-derive it). Same "0-off" env semantics as the loadOptions line.
 export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
-    const fileAllow = loadConfigFile().allowDshCompaction === true;
+    const fileAllow = loadConfigFile().dsh?.allowDshCompaction === true;
     if (env.BILI_ALLOW_DSH_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_DSH_COMPACTION !== "0", source: "env" };
     return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
@@ -1215,7 +1228,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
         // #2028: default OFF keeps the #1729 wire refusal unconditional unless
         // explicitly opted out — see the Options.allowDshCompaction docstring.
-        allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.allowDshCompaction === true ? "1" : "0")) !== "0",
+        allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.dsh?.allowDshCompaction === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -1346,10 +1359,12 @@ type FileConfig = {
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
-    /** Set `true` to let dsh native compaction calls run through bili
-     *  (#2028, default OFF = the #1729 guard refuses them); env
-     *  BILI_ALLOW_DSH_COMPACTION wins over the file. */
-    allowDshCompaction?: boolean;
+    /** dsh client-lane settings (#2028) — nested under `dsh.*` so future dsh keys
+     *  get a home instead of cluttering the root; see {@link DshFileSettings}. A
+     *  legacy bare top-level `"allowDshCompaction"` value is auto-relocated onto
+     *  `dsh.allowDshCompaction` on load/save (normalizeLegacyAllowDshCompaction).
+     *  Env BILI_ALLOW_DSH_COMPACTION still wins over the file. */
+    dsh?: DshFileSettings;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).
@@ -1501,7 +1516,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
-    "allowDshCompaction",
+    "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
@@ -1566,8 +1581,10 @@ export function loadConfigFile(): FileConfig {
         if (cached && cached.raw === raw) return cached.value;
         const parsed: unknown = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
-            value = parsed as FileConfig;
+            const obj = parsed as Record<string, unknown>;
+            normalizeLegacyAllowDshCompaction(obj);
+            warnUnknownTopLevelKeys(obj);
+            value = obj as FileConfig;
         } else {
             value = {};
         }
@@ -1585,6 +1602,29 @@ export function loadConfigFile(): FileConfig {
     return value;
 }
 
+
+// #2028 relocation: a bare top-level allowDshCompaction predates the dsh.*
+// section (it never shipped beyond preview builds, but hand-saved files may
+// carry it) — carry the value into dsh.allowDshCompaction instead of letting
+// the loader drop it silently (§7.3 never-silently-clobber). A null/missing
+// value is a clear intent (dropped quietly); anything non-boolean is left in
+// place so the unknown-top-level-key warning still names it.
+let warnedLegacyDshConflict = false;
+export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>): void {
+    if (!Object.prototype.hasOwnProperty.call(obj, "allowDshCompaction")) return;
+    const legacy = obj.allowDshCompaction;
+    if (legacy === null || legacy === undefined) { delete obj.allowDshCompaction; return; }
+    if (typeof legacy !== "boolean") return;
+    delete obj.allowDshCompaction;
+    const d = obj.dsh;
+    const dObj = d !== null && typeof d === "object" && !Array.isArray(d) ? (d as Record<string, unknown>) : undefined;
+    if (dObj === undefined) { obj.dsh = { allowDshCompaction: legacy }; return; }
+    if (dObj.allowDshCompaction === undefined) { dObj.allowDshCompaction = legacy; return; }
+    if (!warnedLegacyDshConflict) {
+        warnedLegacyDshConflict = true;
+        loggerLog("warn", "[acp-config] both top-level \"allowDshCompaction\" and \"dsh.allowDshCompaction\" present — the dsh.* value wins, the top-level one is dropped");
+    }
+}
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
 export interface ResignFileSettings {
     enabled?: boolean;
