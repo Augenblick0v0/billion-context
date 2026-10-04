@@ -12,6 +12,12 @@
     "updated": "2026-10-04",
     "releases": [
       {
+        "version": "0.1.183",
+        "date": "2026-10-04",
+        "tier": "recommended",
+        "summary": "Strict-backend role wave: post-compression re-requests no longer carry mid-history system/developer items on any Responses path, so Qwen3-family vLLM/SGLang stop rejecting folded turns. Knobs resolve env > config file > default (retired env names moved to config.json). Carrier lookup is single-pass; raw-snapshot retention capped 16 MiB; stale installs surface in /acp."
+      },
+      {
         "version": "0.1.182",
         "date": "2026-10-04",
         "tier": "recommended",
