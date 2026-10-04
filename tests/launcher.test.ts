@@ -87,6 +87,7 @@ import {
     resolveCodexBudgetArgs,
     codexRunModePinned,
     codexSupportsNoDaemon,
+    buildWindowsCommandLine,
     resolveClaudeBudgetEnv,
     resolveQoderBudgetEnv,
     buildQoderEnv,
@@ -1054,6 +1055,29 @@ function makeFakeChild(pid: number): SpawnChild {
             handlers.set(event, list);
         },
     };
+}
+
+// #679/#1867 test seam: inverse of planClientSpawn's comspec wrapping — splits
+// the single `comspec /d /s /c "<line>"` arg back into tokens (quote-aware;
+// quoteWinToken only quotes whitespace-bearing tokens, so this round-trips it).
+function splitWindowsCommandLine(line: string): string[] {
+    const tokens: string[] = [];
+    let cur = "";
+    let quoted = false;
+    for (const ch of line) {
+        if (ch === '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && /\s/.test(ch)) {
+            if (cur !== "") tokens.push(cur);
+            cur = "";
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur !== "") tokens.push(cur);
+    return tokens;
 }
 
 test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded", async () => {
@@ -4211,6 +4235,18 @@ test("codexRunModePinned: detects user-pinned run mode (#1867)", () => {
     assert.equal(codexRunModePinned(["--remote=ws://127.0.0.1:9"]), true);
 });
 
+test("splitWindowsCommandLine: round-trips buildWindowsCommandLine quoting (#679/#1867)", () => {
+    // helper contract: the inner line, i.e. the comspec arg minus its outer quote pair
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\temp\\fake-codex.cmd", ["--no-daemon", "-c", "model_context_window=400000"]).slice(1, -1)),
+        ["C:\\temp\\fake-codex.cmd", "--no-daemon", "-c", "model_context_window=400000"],
+    );
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\Users\\Some User\\temp\\fake-codex.cmd", ["--remote", "ws://127.0.0.1:9"]).slice(1, -1)),
+        ["C:\\Users\\Some User\\temp\\fake-codex.cmd", "--remote", "ws://127.0.0.1:9"],
+    );
+});
+
 test("codexSupportsNoDaemon: probes --help output, fails soft (#1867)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-"));
     const isWin = process.platform === "win32";
@@ -4263,19 +4299,27 @@ test("runLaunch codex: --no-daemon pinned when supported, escape hatches honored
     fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\n');
 
     const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
     const spawnImpl: SpawnFn = (cmd, args) => {
-        if (cmd === fakeCodex) {
-            clientArgsSeen.push([...args]);
-            const child = makeFakeChild(0);
-            const orig = child.on!.bind(child);
-            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
-                orig(event, listener);
-                if (event === "exit") setTimeout(() => listener(0, null), 0);
-                return child;
-            };
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
             return child;
-        }
-        return makeFakeChild(42422);
+        };
+        return child;
     };
     const fetchImpl = async () => ({ ok: true });
     const prevExit = process.exit;
@@ -4358,19 +4402,27 @@ test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)
     fs.writeFileSync(path.join(codexHome, "config.toml"), "");
 
     const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
     const spawnImpl: SpawnFn = (cmd, args) => {
-        if (cmd === fakeCodex) {
-            clientArgsSeen.push([...args]);
-            const child = makeFakeChild(0);
-            const orig = child.on!.bind(child);
-            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
-                orig(event, listener);
-                if (event === "exit") setTimeout(() => listener(0, null), 0);
-                return child;
-            };
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
             return child;
-        }
-        return makeFakeChild(42422);
+        };
+        return child;
     };
     const fetchImpl = async () => ({ ok: true });
     const prevExit = process.exit;
