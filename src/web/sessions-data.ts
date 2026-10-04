@@ -1,4 +1,5 @@
 import { listSessions, type Session } from "../session.js";
+import { conflictEventsOf } from "../conflict-watch.js";
 import { SessionStore } from "../persist.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
@@ -129,6 +130,9 @@ export interface WebSessionDetail extends WebSessionSummary {
     handoffMd: string;
     handoffHtml: string;
     handoffTruncated: boolean;
+    /** #2102: this session's compression-conflict ledger (#1206) — the detail
+     *  surface the global banner points users to; absent when empty. */
+    conflicts?: Array<{ at: number; kind: string; detail: string }>;
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -420,6 +424,7 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
     const pluginAgent = typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
+    const conflicts = conflictEventsOf(session);
 
     return {
         ...summaryOf(session, !!live),
@@ -438,6 +443,7 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
         handoffMd,
         handoffHtml: markdownToHtml(handoffMd),
         handoffTruncated,
+        ...(conflicts.length > 0 ? { conflicts } : {}),
         blockDetails: session.state.blocks.map((b) => ({
             blockId: b.blockId,
             tier: b.tier,

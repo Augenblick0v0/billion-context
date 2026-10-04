@@ -3,6 +3,11 @@
 // this conversation lands here so the user can SEE it (acp_status / web UI /
 // stats) instead of finding out later from scrambled context. Bounded ring —
 // the ledger is diagnostic, not history.
+// #2102: lifecycle — the display layer must treat it as diagnostic: events are
+// split ACTIVE (within CONFLICT_ACTIVE_WINDOW_MS) vs historical so a months-old
+// stock ledger no longer reads as a live alarm, and the whole ledger can be
+// wiped via clearConflictEvents (POST /__bili/conflicts/clear). Wiping loses
+// no conversation data — only the evidence notes.
 
 import { markDirty, type Session } from "./session.js";
 
@@ -15,6 +20,20 @@ export interface ConflictEvent {
 }
 
 export const CONFLICT_LEDGER_MAX = 20;
+
+/** #2102: events newer than this count as ACTIVE (live double-compression
+ *  risk); older ones are historical stock. Internal constant — deliberately
+ *  NOT a config knob (config surface is owner-gated). The 7-day yardstick
+ *  matches BILI_SESSION_GC_MAX_AGE_DAYS so "stale" means the same thing
+ *  everywhere in bili. */
+export const CONFLICT_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function splitConflictEvents(events: ConflictEvent[], now: number = Date.now()): { active: ConflictEvent[]; historical: ConflictEvent[] } {
+    const active: ConflictEvent[] = [];
+    const historical: ConflictEvent[] = [];
+    for (const e of events) (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS ? active : historical).push(e);
+    return { active, historical };
+}
 
 export function conflictEventsOf(session: Session): ConflictEvent[] {
     const raw = session.metadata.conflictEvents;
@@ -43,9 +62,13 @@ function isSuspectedEvent(e: ConflictEvent): boolean {
     return e.kind === "third-party-plugin" && e.detail.endsWith("[suspected]");
 }
 
-export function formatConflictSection(events: ConflictEvent[]): string[] {
+export function formatConflictSection(events: ConflictEvent[], now: number = Date.now()): string[] {
     const lines: string[] = [];
-    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session. Two compressors on one conversation (bili + a third-party compression plugin or client native compaction) double-compress and corrupt message refs:`);
+    // #2102: label the age split up front — an all-historical section must not
+    // read as a live alarm (it previously said "two compressors ..." imperatively
+    // even when every event was months old).
+    const { active, historical } = splitConflictEvents(events, now);
+    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). Two compressors on one conversation (bili + a third-party compression plugin or client native compaction) double-compress and corrupt message refs:`);
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
@@ -57,30 +80,60 @@ export function formatConflictSection(events: ConflictEvent[]): string[] {
         lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
     }
     const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
-    lines.push(allSuspected
-        ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
-        : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+    lines.push(active.length === 0
+        ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compressor is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
+        : allSuspected
+            ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
+            : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
     return lines;
 }
 
 export interface ConflictSummary {
     sessions: number;
     events: number;
+    /** #2102: events within CONFLICT_ACTIVE_WINDOW_MS of `now` (live risk). */
+    active: number;
+    /** #2102: events older than the window (historical stock). */
+    historical: number;
+    /** #2102: timestamp of the newest event across all sessions, or null. */
+    lastAt: number | null;
     kinds: Partial<Record<ConflictKind, number>>;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
 }
 
-export function summarizeConflicts(sessions: Session[]): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, kinds: {}, latest: [] };
+export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [] };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
         summary.sessions += 1;
         summary.events += events.length;
-        for (const e of events) summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
+        for (const e of events) {
+            summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
+            if (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS) summary.active += 1; else summary.historical += 1;
+            if (summary.lastAt === null || e.at > summary.lastAt) summary.lastAt = e.at;
+        }
         const last = events[events.length - 1]!;
         summary.latest.push({ sessionId: s.id, at: last.at, kind: last.kind, detail: last.detail });
     }
     summary.latest.sort((a, b) => b.at - a.at);
     return summary;
+}
+
+/** #2102: wipe diagnostic ledgers — globally, or one session by id. Wiping is
+ *  safe by design (#1206: "diagnostic, not history") and loses no conversation
+ *  data. Returns how much was actually cleared. */
+export function clearConflictEvents(sessions: Session[], sessionId?: string): { events: number; sessions: number } {
+    let events = 0;
+    let clearedSessions = 0;
+    for (const s of sessions) {
+        if (sessionId !== undefined && s.id !== sessionId) continue;
+        const raw = conflictEventsOf(s);
+        if (raw.length === 0) continue;
+        delete s.metadata.conflictEvents;
+        markDirty(s);
+        events += raw.length;
+        clearedSessions += 1;
+    }
+    return { events, sessions: clearedSessions };
 }

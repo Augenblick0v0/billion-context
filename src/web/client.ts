@@ -20,31 +20,52 @@ export const WEB_CLIENT = `(function () {
         return String(value).replace(/[&<>"']/g, (c) => c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === \'"\' ? "&quot;" : "&#39;");
     }
     // #1206 ledger detail carries per-event identity (client/entry/source);
-    // #2045: render it in FULL — keep the source path and list EVERY distinct
-    // entry, no truncation — so the alert is accurate and complete without
-    // forcing users into acp_status to find out what/where.
-    function shortConflictDetail(e) {
-        if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") return "";
-        let s = e.detail;
-        const suspected = s.indexOf("[suspected]") >= 0;
-        const si = s.lastIndexOf("[suspected]");
-        if (si >= 0) s = s.slice(0, si);
-        return s.trim() + (suspected ? " [suspected]" : "");
+    // #2045: third-party plugin entries render in FULL — keep the source path and
+    // list EVERY distinct entry, no truncation.
+    // #2102: non-plugin kinds (unannounced-rewrite / orphan-reap / native-compaction)
+    // carry time + short detail — the banner sentence must attribute exactly what
+    // this line names, never a fixed "third-party plugin" claim.
+    function conflictItemName(e) {
+        if (!e || typeof e.detail !== "string" || !e.detail) return "";
+        if (e.kind === "third-party-plugin") {
+            let s = e.detail;
+            const suspected = s.indexOf("[suspected]") >= 0;
+            const si = s.lastIndexOf("[suspected]");
+            if (si >= 0) s = s.slice(0, si);
+            return s.trim() + (suspected ? " [suspected]" : "");
+        }
+        const at = Number(e.at);
+        const time = Number.isFinite(at) ? new Date(at).toISOString().slice(0, 16).replace("T", " ") + "Z" : "?";
+        const sid = e.sessionId && String(e.sessionId).length > 8 ? String(e.sessionId).slice(0, 5) + "…" : null;
+        const d = e.detail.length > 60 ? e.detail.slice(0, 57) + "..." : e.detail;
+        return "[" + time + "]" + (sid ? " " + sid : "") + ": " + d;
     }
     function bili_conflictLine(c) {
         const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
         const items = [];
         for (const e of c.latest || []) {
-            const name = shortConflictDetail(e);
+            const name = conflictItemName(e);
             if (!name) continue;
             const hit = items.find((x) => x.name === name);
             if (hit) hit.n += 1;
-            else items.push({ name: name, n: 1 });
+            else items.push({ name: name, n: 1, plugin: e.kind === "third-party-plugin" });
+        }
+        // #2102: the banner is a summary surface — plugin identities stay complete
+        // (#2045), other kinds are capped so a stock ledger doesn't become a log dump.
+        const shown = [];
+        let hidden = 0;
+        for (const x of items) {
+            if (x.plugin || shown.filter((y) => !y.plugin).length < 4) shown.push(x);
+            else hidden += 1;
         }
         let line = c.events + " event(s) in " + c.sessions + " session(s)" + (kinds ? ": " + kinds : "");
-        if (items.length > 0) {
-            line += " — " + items.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
+        if (typeof c.active === "number" && typeof c.historical === "number") {
+            line += " · " + c.active + " active · " + c.historical + " historical";
         }
+        if (shown.length > 0) {
+            line += " — " + shown.map((x) => escapeHtml(x.name) + (x.n > 1 ? "×" + x.n : "")).join(" · ");
+        }
+        if (hidden > 0) line += " · …+" + hidden + " more (GET /__bili/stats → conflicts)";
         return line;
     }
     window.bili_conflictLine = bili_conflictLine;
@@ -284,7 +305,31 @@ export const WEB_CLIENT = `(function () {
             if (c && c.events > 0) {
                 cb.hidden = false;
                 cb.classList.add("show");
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono">(' + bili_conflictLine(c) + ")</span>";
+                // #2102: attribute per kind family present; split active from historical
+                // stock; detail pointer must target a cross-session surface (acp_status
+                // renders conflicts for the CURRENT session only).
+                const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
+                const nativeN = c.events - pluginN;
+                const what = [pluginN > 0 ? t("conflict.what_plugin") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
+                const active = typeof c.active === "number" ? c.active : c.events;
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical")) + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.classList.toggle("info", active === 0);
+                cb.classList.toggle("warn", active > 0);
+                const btn = $("conflicts-clear-btn");
+                if (btn) {
+                    btn.addEventListener("click", async () => {
+                        busy(btn, true);
+                        try {
+                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            toast(t("conflict.cleared"), "ok");
+                            await loadOverview(true);
+                        } catch (e) {
+                            toast(e.message, "err");
+                        } finally {
+                            busy(btn, false);
+                        }
+                    });
+                }
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
@@ -863,6 +908,17 @@ export const WEB_CLIENT = `(function () {
             });
         }
         parts.push("</div></div>");
+        if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
+            // #2102: per-session evidence rows — the banner aggregates across sessions,
+            // so this page is where its detail pointer lands.
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.conflicts_title") + '</span><span class="hint">' + t("det.conflicts_hint") + '</span></div><div class="card-b">');
+            for (const ev of d.conflicts.slice(-10).reverse()) {
+                parts.push('<div class="alert-row"><span class="mono">' + escapeHtml(fmtDT(ev.at)) + ' · ' + escapeHtml(ev.kind) + "</span><span>" + escapeHtml(ev.detail) + "</span></div>");
+            }
+            if (d.conflicts.length > 10) parts.push('<div class="dim small">' + t("det.conflicts_more", { n: d.conflicts.length - 10 }) + "</div>");
+            parts.push('<div style="margin-top:10px"><button id="session-conflicts-clear" class="btn sm">' + t("det.conflicts_clear") + "</button></div>");
+            parts.push("</div></div>");
+        }
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
         // #1426: copy / download actions over the rendered handoff document
         parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
@@ -890,6 +946,21 @@ export const WEB_CLIENT = `(function () {
             bindHandoffActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
+            const cc = $("session-conflicts-clear");
+            if (cc) {
+                cc.addEventListener("click", async () => {
+                    busy(cc, true);
+                    try {
+                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        toast(t("det.conflicts_cleared"), "ok");
+                        await loadDetail(id);
+                    } catch (e) {
+                        toast(e.message, "err");
+                    } finally {
+                        busy(cc, false);
+                    }
+                });
+            }
             const tc = $("title-copy");
             if (tc && d.title) tc.addEventListener("click", () => copyText(d.title, tc));
         } catch (e) {
