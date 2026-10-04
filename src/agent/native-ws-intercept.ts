@@ -152,7 +152,19 @@ class DeferredWebSocket {
         }
         // Re-check AFTER the await: a close() may have landed mid-window.
         if (this.cancelled || this.real !== undefined) return;
-        this.attach(this.construct(finalUrl ?? this.requestedUrl, rest));
+        try {
+            this.attach(this.construct(finalUrl ?? this.requestedUrl, rest));
+        } catch (error) {
+            // constructLive exhausted every candidate: surface a socket error +
+            // abnormal close so client cleanup proceeds, instead of letting the
+            // rejected promise become an unhandledRejection in the host process.
+            const errEvent = new Event("error");
+            Object.assign(errEvent, { error });
+            this.dispatchEvent(errEvent);
+            const closeEvent = new Event("close");
+            Object.assign(closeEvent, { code: 1006, reason: "", wasClean: false });
+            this.dispatchEvent(closeEvent);
+        }
     }
 
     private attach(real: WsInstanceLike): void {
@@ -201,6 +213,11 @@ class DeferredWebSocket {
             else entry.el.handleEvent(event);
             if (entry.once) this.removeEventListener(event.type, entry.el);
         }
+        // A real EventTarget fires the on* handler property alongside listeners —
+        // a client registered via ws.onclose = fn must not miss a window-phase
+        // close frame.
+        const handler = this.handlers[(`on${event.type}`) as "onopen" | "onerror" | "onclose" | "onmessage"];
+        if (typeof handler === "function") handler.call(this, event);
         return !event.defaultPrevented;
     }
 
@@ -356,11 +373,11 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                 return new RoutedWebSocket(url, ...rest);
             }
             const rewrite = (origin: string): unknown => {
-        const rewritten = rewriteCodexResponsesWsUrl(target, origin);
-        // Record the HTTP-shaped origin — the fetch lane records http origins and the
-        // attach-lane comparisons (observeRoutedOrigin / verifyAttachAndRecover) match
-        // against them; a "ws://" origin would never equal one of them (#2111).
-        noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
+                const rewritten = rewriteCodexResponsesWsUrl(target, origin);
+                // Record the HTTP-shaped origin — the fetch lane records http origins and the
+                // attach-lane comparisons (observeRoutedOrigin / verifyAttachAndRecover) match
+                // against them; a "ws://" origin would never equal one of them (#2111).
+                noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
                 state.onDispatch?.(rewritten, "rewrite");
                 return new RoutedWebSocket(rewritten, ...rest);
             };
@@ -381,8 +398,8 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                         state.onDispatch?.(target, "direct");
                         return undefined;
                     }
-            const rewritten = rewriteCodexResponsesWsUrl(target, settled);
-            noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
+                    const rewritten = rewriteCodexResponsesWsUrl(target, settled);
+                    noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
                     state.onDispatch?.(rewritten, "rewrite");
                     return rewritten;
                 },

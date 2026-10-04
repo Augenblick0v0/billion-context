@@ -14,6 +14,8 @@ class FakeWs {
     static CLOSING = 2;
     static CLOSED = 3;
     static instances: FakeWs[] = [];
+    /** When set, every construction throws — seam for the total-failure path. */
+    static ctorFail = false;
     readonly ctorArgs: unknown[];
     url: string;
     readyState = 0;
@@ -30,6 +32,7 @@ class FakeWs {
     private listeners = new Map<string, Array<{ fn: EventListener; once: boolean }>>();
 
     constructor(...ctorArgs: unknown[]) {
+        if (FakeWs.ctorFail) throw new TypeError("FakeWs construction disabled (test seam)");
         this.ctorArgs = ctorArgs;
         this.url = String(ctorArgs[0] ?? "");
         FakeWs.instances.push(this);
@@ -307,6 +310,56 @@ test("deferred: close() during the window cancels and emits an abnormal close fr
         await tick();
         assert.equal(FakeWs.instances.length, 0, "no connection was ever opened");
         assert.deepEqual(closes, [1006]);
+    });
+});
+
+test("deferred: close() during the window reaches onclose property handlers", async () => {
+    await withPatchedGlobal(async () => {
+        const state = pendingState();
+        installNativeWebSocketIntercept(state);
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => {
+            readyState: number;
+            close: () => void;
+            onclose: EventListener | null;
+        };
+        const ws = new top(UPSTREAM_WS, {});
+        const closes: Array<number> = [];
+        ws.onclose = ((e: { code?: number }) => { closes.push(e.code ?? -1); }) as EventListener;
+        ws.close();
+        assert.equal(ws.readyState, 2, "CLOSING while cancelled");
+        state.readyResolve(ORIGIN);
+        await tick();
+        await tick();
+        assert.equal(FakeWs.instances.length, 0, "no connection was ever opened");
+        assert.deepEqual(closes, [1006], "the on* property handler received the abnormal close frame");
+    });
+});
+
+test("deferred: total construct failure surfaces error + close instead of an unhandled rejection", async () => {
+    await withPatchedGlobal(async () => {
+        const state = pendingState();
+        installNativeWebSocketIntercept(state);
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => {
+            readyState: number;
+            addEventListener: (t: string, f: EventListener) => void;
+        };
+        const ws = new top(UPSTREAM_WS, {});
+        const errors: Array<unknown> = [];
+        const closes: Array<number> = [];
+        ws.addEventListener("error", ((e: { error?: unknown }) => { errors.push(e.error); }) as EventListener);
+        ws.addEventListener("close", ((e: { code?: number }) => { closes.push(e.code ?? -1); }) as EventListener);
+        FakeWs.ctorFail = true;
+        try {
+            state.readyResolve(ORIGIN);
+            await tick();
+            await tick();
+            assert.equal(FakeWs.instances.length, 0, "no connection was constructed");
+            assert.ok(errors.length === 1 && errors[0] instanceof TypeError, "error event carries the constructor failure");
+            assert.deepEqual(closes, [1006], "abnormal close follows the error");
+            assert.equal(ws.readyState, 0, "shell stays CONNECTING with no live socket");
+        } finally {
+            FakeWs.ctorFail = false;
+        }
     });
 });
 
