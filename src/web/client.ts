@@ -677,9 +677,14 @@ export const WEB_CLIENT = `(function () {
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
         const blocks = [];
         let cur = null;
+        // #2065: only known roles open a block — an in-body Markdown heading
+        // ("### 7.1 …" inside a user's rules blob) is content, not a divider.
+        const KNOWN_ROLE = { user: 1, assistant: 1, tool: 1 };
         for (let i = start; i < lines.length; i++) {
             const l = lines[i];
-            if (l.indexOf("### ") === 0) { cur = { role: l.slice(4).trim(), lines: [] }; blocks.push(cur); continue; }
+            let divider = null;
+            if (l.indexOf("### ") === 0) { const r = l.slice(4).trim(); if (KNOWN_ROLE[r]) divider = r; }
+            if (divider) { cur = { role: divider, lines: [] }; blocks.push(cur); continue; }
             if (cur) cur.lines.push(l);
         }
         const html = [];
@@ -705,6 +710,7 @@ export const WEB_CLIENT = `(function () {
         }
         return html.join("");
     }
+    window.bili_renderHandoffMd = renderHandoffMd;
     function buildDetailHtml(d) {
         const parts = [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
