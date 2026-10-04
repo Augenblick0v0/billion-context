@@ -36,6 +36,9 @@ jobs:
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
       - run: npm run typecheck
+      # Kernel boundary (#2092): the kernel's own unit suite against its TS
+      # source — both test layers must be green on every PR (AGENTS.md rule 5).
+      - run: npm --prefix kernel test
       # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
       # running here: the runner is dedicated, so their process/port
       # observations are reliable (#1248 gates them off for loaded local

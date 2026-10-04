@@ -23,8 +23,9 @@ on:
       - "src/persist.ts"
       - "src/agent/**"
       - "tests/e2e/**"
-      # acp-kernel is pinned exactly and bundled INLINE into the pipeline —
-      # a pin bump IS a pipeline change (#1289-class guard).
+      # The in-repo kernel (kernel/) is bundled INLINE into the pipeline —
+      # a kernel change IS a pipeline change (#1289-class guard; #2092).
+      - "kernel/**"
       - "package-lock.json"
       - ".github/workflows/ci-e2e.yml"
 
