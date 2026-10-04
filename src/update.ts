@@ -28,6 +28,7 @@ import * as tar from "tar";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { safeSuffix } from "./text-safe.js";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
@@ -1211,7 +1212,7 @@ async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<st
         let stderr = "";
         child.stderr?.on("data", (chunk: Buffer) => {
             stderr += chunk.toString();
-            if (stderr.length > 8192) stderr = stderr.slice(-8192);
+            if (stderr.length > 8192) stderr = safeSuffix(stderr, 8192);
         });
         const timer = setTimeout(() => {
             child.kill();
@@ -1227,7 +1228,8 @@ async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<st
                 resolve(null);
                 return;
             }
-            const tail = stderr.trim().length > 0 ? `: ${stderr.trim().split("\n").filter((l) => l.trim().length > 0 && !l.trim().startsWith("at ") && !/^Node\.js v/.test(l.trim())).slice(-4).join(" | ")}` : "";
+            const lines = stderr.split("\n").filter((l) => l.trim().length > 0 && !l.trim().startsWith("at ") && !/^Node\.js v/.test(l.trim()));
+            const tail = lines.length > 0 ? `: ${safeSuffix(lines.join(" | "), 600)}` : "";
             resolve(`boot smoke exited ${code ?? signal}${tail}`);
         });
     });
