@@ -136,6 +136,18 @@ export function proxyKeepAliveMaxMs(): number {
             : Number.isFinite(v) && v > 0 ? Math.floor(v) : PROXY_KEEPALIVE_MAX_MS;
 }
 
+export const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
+
+/** BILI_POST_RESPONSE_LINGER_MS > network.postResponseLingerMs > 5000 (#1982
+ *  post-response close linger budget; mirrors nginx lingering_time). Env tier
+ *  preserves the historical parseInt parsing byte-exact: set (even empty/
+ *  garbage) wins and non-numeric or non-positive values fall back to the
+ *  default without consulting the file tier. */
+export function postResponseLingerMs(): number {
+    const v = tInt("BILI_POST_RESPONSE_LINGER_MS", fileNetwork().postResponseLingerMs);
+    return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
+}
+
 export const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */

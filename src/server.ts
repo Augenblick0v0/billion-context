@@ -139,6 +139,7 @@ import {
     keepResponseId as knobKeepResponseId,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
+    postResponseLingerMs as knobPostResponseLingerMs,
     preflightDeadEndCooldownMs as knobPreflightDeadEndCooldownMs,
     preflightHoldGraceMs as knobPreflightHoldGraceMs,
     rawDumpDir as knobRawDumpDir,
@@ -386,17 +387,6 @@ export function googleModelFromPath(urlPath: string): string | undefined {
 }
 
 
-// #1982: budget for the post-response close linger (see installPostResponseLinger).
-// Default 5s mirrors nginx's lingering_time: a peer that FINs promptly costs one
-// RTT of extra hold; a silent peer costs at most this window per fd.
-// Env-overridable like BILI_MITM_HANDSHAKE_TIMEOUT_MS (tests + operator tuning);
-// non-numeric or non-positive values fall back to the default.
-const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
-function postResponseLingerMs(): number {
-    const v = Number.parseInt(process.env.BILI_POST_RESPONSE_LINGER_MS ?? "", 10);
-    return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
-}
-
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -601,7 +591,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             if (socket.destroyed) return;
             if (why === "backstop") {
                 rec.lingerBackstopAt = performance.now();
-                log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${postResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
+                log("warn", `[conn#${rec.id}] ${rec.kind} linger backstop: no peer close signal ${knobPostResponseLingerMs()}ms after post-response close — destroying (peer may see RST/ECONNRESET)`);
             } else if (why === "peer-fin") {
                 log("debug", `[conn#${rec.id}] ${rec.kind} linger complete: peer close signal received — closing cleanly`);
             }
@@ -619,7 +609,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 return origDestroy();
             }
             armed = true;
-            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${postResponseLingerMs()}ms)`);
+            log("info", `[conn#${rec.id}] ${rec.kind} post-response close: lingering for peer close signal (budget ${knobPostResponseLingerMs()}ms)`);
             // http leaves the socket paused between requests; without resume()
             // the peer's EOF would never reach us and every linger would run
             // out on the backstop. Draining also removes unread recv residual
@@ -627,7 +617,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             socket.resume();
             socket.once("end", () => finishLinger("peer-fin"));
             socket.once("error", () => finishLinger("error"));
-            backstopTimer = setTimeout(() => finishLinger("backstop"), postResponseLingerMs());
+            backstopTimer = setTimeout(() => finishLinger("backstop"), knobPostResponseLingerMs());
             backstopTimer.unref?.();
             return socket;
         };
