@@ -392,9 +392,9 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             } else if (k === prev.length) {
                 // Pure extension: append the tail (per-element clones keep the
                 // snapshot independent of the request's live arrays) and extend
-                // the byte count — len(stableJson([a, b])) is
-                // len(sj(a)) + len(sj(b)) + 1, so each appended element costs
-                // its own length plus one comma.
+                // the byte count incrementally — appending an element e to an
+                // array A grows len(sj(A)) by len(sj(e)) + 1 (its serialization
+                // plus one separating comma), so no re-serialization is needed.
                 let bytes = typeof session.metadata.publicSnapshotBytes === "number"
                     ? session.metadata.publicSnapshotBytes
                     : stableJson(prev).length;
