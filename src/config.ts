@@ -1378,6 +1378,12 @@ type FileConfig = {
         max?: number;
         gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
     };
+    /** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw
+     *  wire-history snapshot retained per plugin session for the public
+     *  fork API — beyond the cap the session stops being forkable (409)
+     *  instead of retaining an unbounded raw copy. Default 16 MiB; `0`
+     *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
+    plugin?: { snapshotCapBytes?: number };
     /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
     update?: { registry?: string; checkIntervalMs?: number };
     /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /

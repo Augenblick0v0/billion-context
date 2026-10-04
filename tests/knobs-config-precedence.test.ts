@@ -58,6 +58,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 10_000);
     assert.equal(knobs.persistEnabled(), true);
     assert.equal(knobs.persistZstdEnabled(), false);
+    assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
     assert.equal(knobs.persistDebounceMs(), 500);
     assert.equal(knobs.persistTailTokens(), 16384);
     assert.equal(knobs.persistEpermAlertThreshold(), 5);
@@ -71,6 +72,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.updateRegistryBase(), undefined);
     assert.equal(knobs.updateCheckIntervalMs(), 180_000);
     assert.equal(knobs.ccrRetrievalTtlMs(), 10 * 60 * 1000);
+    assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
     assert.equal(knobs.codexCompactMode(), "intercept");
     assert.equal(knobs.decompressTmpCap(), 50);
     assert.equal(knobs.bodyDumpEnabled(), false);
@@ -105,6 +107,7 @@ test("file tier: every migrated block resolves from the config file", () => {
             countTokensPassthrough: true, compressProtocol: "text",
         },
         fakeCompletion: { retries: 2, bufCapBytes: 1048576 },
+        plugin: { snapshotCapBytes: 999 },
         codexCompact: "pass",
         ccrRetrievalTtlMs: 300000,
         decompressTmpCap: 7,
@@ -112,6 +115,7 @@ test("file tier: every migrated block resolves from the config file", () => {
         compat: { noCacheControl: true, keepResponseId: true },
     });
     assert.equal(knobs.upstreamTimeoutMs(), 60000);
+    assert.equal(knobs.publicSnapshotCapBytes(), 999);
     assert.equal(knobs.requestWatchdogBudgetMs(), 90000);
     assert.equal(knobs.keepAliveTimeoutMs(), 7000);
     assert.equal(knobs.clientErrorBackstopMs(), 45000);
@@ -183,11 +187,13 @@ test("env tier always wins over the file (live test seams)", () => {
 
 test("set env owns the knob: garbage env resolves exactly as pre-migration", () => {
     setConfig({ network: { upstreamTimeoutMs: 60000, replayRetryBaseMs: 250, proxyKeepAliveMaxMs: 60000 }, persist: { debounceMs: 900 } });
+    setConfig({ plugin: { snapshotCapBytes: 999 } });
     withEnv({
         BILI_UPSTREAM_TIMEOUT_MS: "abc",
         BILI_REPLAY_RETRY_BASE_MS: "xyz",
         BILI_PROXY_KEEPALIVE_MAX_MS: "junk",
         BILI_PERSIST_DEBOUNCE_MS: "soon",
+        BILI_PUBLIC_SNAPSHOT_CAP_BYTES: "junk",
     }, () => {
         // each parses exactly as it did before the migration: garbage → default;
         // the file tier is untouched by a stale export
@@ -195,6 +201,12 @@ test("set env owns the knob: garbage env resolves exactly as pre-migration", () 
         assert.equal(knobs.replayBaseDelayMs(), REPLAY_BASE_DELAY_MS);
         assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
         assert.equal(knobs.persistDebounceMs(), 500);
+        assert.equal(knobs.publicSnapshotCapBytes(), 16_777_216);
+    });
+    // the plugin cap's pre-migration parser (Number(env)) treated "" as 0 —
+    // "disables retention" — and that quirk survives byte-exact
+    withEnv({ BILI_PUBLIC_SNAPSHOT_CAP_BYTES: "" }, () => {
+        assert.equal(knobs.publicSnapshotCapBytes(), 0);
     });
     // loose parsers historically guarded with `if (!raw)`: empty env = unset,
     // so the file tier applies where no value was really given
@@ -205,7 +217,7 @@ test("set env owns the knob: garbage env resolves exactly as pre-migration", () 
 });
 
 test("garbage file values fall back to defaults, never throw", () => {
-    setConfig({ network: { upstreamTimeoutMs: "fast", replayRetryMax: -3 }, persist: { tailTokens: null }, ccrRetrievalTtlMs: "whenever" });
+    setConfig({ network: { upstreamTimeoutMs: "fast", replayRetryMax: -3 }, persist: { tailTokens: null }, ccrRetrievalTtlMs: "whenever", plugin: { snapshotCapBytes: "huge" } });
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
     assert.equal(knobs.replayMaxAttempts(), REPLAY_MAX_ATTEMPTS);
     assert.equal(knobs.persistTailTokens(), 16384);

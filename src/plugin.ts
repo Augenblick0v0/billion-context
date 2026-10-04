@@ -1,4 +1,5 @@
 import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -305,18 +306,6 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-function publicSnapshotCapBytes(): number {
-    // #2016 D-B review follow-up: the raw wire snapshot is what the public
-    // fork API serves. Without a cap, every plugin session retains its FULL
-    // raw history forever (multiplied across forks) and disk grows without
-    // bound. When the serialized snapshot exceeds the cap we refuse to
-    // retain it — the session stops being forkable (snapshot/fork answer
-    // 409 SNAPSHOT_UNAVAILABLE with the capped reason) instead of growing
-    // disk forever. 0 disables the cap (operator override / tests).
-    const raw = Number(process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES);
-    return Number.isFinite(raw) && raw >= 0 ? raw : 16_777_216;
-}
-
 export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,

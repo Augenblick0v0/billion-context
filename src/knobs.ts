@@ -247,6 +247,23 @@ export function updateCheckIntervalMs(): number {
 
 // --- CCR / codex / misc host-adjacent knobs ---
 
+/** BILI_PUBLIC_SNAPSHOT_CAP_BYTES > plugin.snapshotCapBytes > 16 MiB (#2017
+ *  D-B). Caps the raw wire-history snapshot retained per plugin session for
+ *  the public fork API; beyond it the session fails closed (409) instead of
+ *  retaining an unbounded raw copy. `0` disables retention entirely. Env tier
+ *  preserves the original plugin.ts parsing byte-exact: set (even empty/garbage
+ *  → Number() semantics) wins; NaN/negative falls back to the default. */
+export function publicSnapshotCapBytes(): number {
+    const raw = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+    const v = raw !== undefined
+        ? Number(raw)
+        : (() => {
+            const f = loadConfigFile().plugin?.snapshotCapBytes;
+            return typeof f === "number" && Number.isFinite(f) ? f : NaN;
+        })();
+    return Number.isFinite(v) && v >= 0 ? v : 16_777_216;
+}
+
 /** BILI_CCR_RETRIEVAL_TTL_MS > ccrRetrievalTtlMs > 600000. */
 export function ccrRetrievalTtlMs(): number {
     const envRaw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;
