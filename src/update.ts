@@ -20,7 +20,7 @@
  * version and stops trying. No notified Set — failed installs retry next
  * cycle automatically.
  */
-import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename, mkdtemp, readdir } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
@@ -72,6 +72,12 @@ const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
  *  pid was reused by an unrelated process looks alive forever. Without this
  *  cap, one such residue permanently blocks all future auto-updates. (#117) */
 const LOCK_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** Upper bound on the lifetime of per-invocation update temp artifacts. A
+ *  real install never takes this long (same reasoning as LOCK_MAX_AGE_MS), so
+ *  anything older is an orphan of a crashed run — unique temp names mean
+ *  nothing else will ever clean it up (#2106). */
+const UPDATE_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 
 /** Pure steal decision for the update lock — exported for tests.
  *  Dead holders are always stealable; live holders only past LOCK_MAX_AGE_MS. */
@@ -517,7 +523,9 @@ function runNodeCheck(file: string): Promise<{ code: number; stderr: string }> {
  * Syntax-check an ESM entry with `node --check`. The entry is copied to a
  * `.mjs` temp first: extension-based module-goal detection is the only signal
  * `--check` honors consistently across Node versions, and the entry must not
- * be *executed* (running it would start the CLI/server).
+ * be *executed* (running it would start the CLI/server). The temp name is
+ * unique per invocation (#2106) so concurrent checks in different processes
+ * can never overwrite or delete each other's file mid-check.
  * Returns null on success or a short reason on failure.
  */
 async function syntaxCheckEntry(entryAbs: string): Promise<string | null> {
@@ -527,7 +535,7 @@ async function syntaxCheckEntry(entryAbs: string): Promise<string | null> {
     } catch (e) {
         return `entry unreadable: ${String(e)}`;
     }
-    const tmpCheck = path.join(cacheDir(), ".update-syntax-check.mjs");
+    const tmpCheck = path.join(cacheDir(), `.update-syntax-check-${crypto.randomBytes(6).toString("hex")}.mjs`);
     try {
         await mkdir(cacheDir(), { recursive: true });
         await writeFile(tmpCheck, source);
@@ -1235,6 +1243,31 @@ async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<st
     });
 }
 
+/** Best-effort sweep of stale per-invocation update temp artifacts
+ *  (`.update-wip-*` workdirs, `.update-syntax-check-*` files). Unique names
+ *  (#2106) removed the old version-keyed self-cleanup, so orphans of crashed
+ *  runs age out here instead. Never touches `.update-check` / `.update-lock`;
+ *  never throws. */
+async function sweepStaleUpdateTmp(): Promise<void> {
+    try {
+        const dir = cacheDir();
+        const now = Date.now();
+        for (const entry of await readdir(dir)) {
+            if (!entry.startsWith(".update-wip-") && !entry.startsWith(".update-syntax-check-")) continue;
+            try {
+                const st = await lstat(path.join(dir, entry));
+                if (now - st.mtimeMs >= UPDATE_TMP_MAX_AGE_MS) {
+                    await rm(path.join(dir, entry), { recursive: true, force: true });
+                }
+            } catch {
+                // vanished mid-sweep — ignore
+            }
+        }
+    } catch {
+        // cache dir may not exist yet — nothing to sweep
+    }
+}
+
 export async function installViaTarball(
     version: string,
     tarballUrl: string,
@@ -1313,10 +1346,22 @@ export async function installViaTarball(
         return { ok: false, error: `tarball integrity verification failed: ${v.error}` };
     }
 
-    // Write to temp file
-    const tmpFile = path.join(cacheDir(), `.update-${version}.tgz`);
+    // Sweep stale temp artifacts from crashed runs before creating our own.
+    await sweepStaleUpdateTmp();
+
+    // Per-invocation workdir: unique per process+run, so concurrent installs
+    // (test suites, lock-steal edges) can never clobber each other's temps —
+    // the version-keyed fixed names did exactly that (#2106). Orphans of
+    // crashed runs age out via sweepStaleUpdateTmp.
+    let workDir: string;
     try {
         await mkdir(cacheDir(), { recursive: true });
+        workDir = await mkdtemp(path.join(cacheDir(), ".update-wip-"));
+    } catch (e) {
+        return { ok: false, error: `failed to create temp workdir under ${cacheDir()}: ${String(e)}` };
+    }
+    const tmpFile = path.join(workDir, "tarball.tgz");
+    try {
         await writeFile(tmpFile, tgzBuffer);
     } catch (e) {
         return { ok: false, error: `failed to write temp file ${tmpFile}: ${String(e)}` };
@@ -1327,11 +1372,9 @@ export async function installViaTarball(
     // shelling out to the `tar` binary, which is absent or inconsistent on
     // Windows. `--strip-components=1` maps to `strip: 1` (npm tarballs wrap
     // files in a `package/` dir).
-    const stagingDir = path.join(cacheDir(), `.update-staging-${version}`);
+    const stagingDir = path.join(workDir, "staging");
     try {
-        // Clean any leftover staging dir from a previous failed attempt.
-        await rm(stagingDir, { recursive: true, force: true });
-        await mkdir(stagingDir, { recursive: true });
+        await mkdir(stagingDir);
 
         await tar.x({
             file: tmpFile,
@@ -1386,19 +1429,12 @@ export async function installViaTarball(
     // Back up the current install before overwriting. If anything fails after
     // the copy (partial copy, version drift, corrupted entry), the backup is
     // restored so the previously working version keeps running.
-    const backupDir = path.join(cacheDir(), `.update-backup-${version}`);
-    if (pnpmOldLink) {
-        // The displaced artifact IS the link itself (kept at pnpmOldLink) and
-        // the store contents it points into were never touched — nothing to
-        // back up as files.
+    const backupDir = path.join(workDir, "backup");
+    if (!pnpmOldLink) {
+        // The pnpm-link lane needs no file backup: the displaced artifact IS
+        // the link itself (kept at pnpmOldLink) and the store contents it
+        // points into were never touched.
         try {
-            await rm(backupDir, { recursive: true, force: true });
-        } catch {
-            // clearing a stale backup dir failing is not fatal in this branch
-        }
-    } else {
-        try {
-            await rm(backupDir, { recursive: true, force: true });
             await cp(installDir, backupDir, { recursive: true, force: true });
         } catch (e) {
             // Fail closed: without a backup we refuse to overwrite the running
@@ -1482,6 +1518,7 @@ export async function installViaTarball(
             // inert once installDir holds the fresh real directory
         }
     }
+    await rm(workDir, { recursive: true, force: true });
 
     return { ok: true };
 }

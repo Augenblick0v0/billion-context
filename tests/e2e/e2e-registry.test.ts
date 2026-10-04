@@ -151,6 +151,7 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
         for (const entry of fs.readdirSync(cache)) {
             assert.ok(!entry.startsWith(".update-staging"), `leftover staging dir: ${entry}`);
             assert.ok(!entry.startsWith(".update-backup"), `leftover backup dir: ${entry}`);
+            assert.ok(!entry.startsWith(".update-wip"), `leftover temp workdir: ${entry}`);
         }
         assert.ok(!fs.existsSync(path.join(cache, ".update-lock")), "lock must be released after success");
         assert.ok(fs.existsSync(path.join(installDir, "dist", "agent", "opencode-native.js")), "installed tree keeps the agent entrypoint");
