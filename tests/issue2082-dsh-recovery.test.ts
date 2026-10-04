@@ -9,6 +9,10 @@
 // 3. A detached recovery timer keeps retrying while the tools are down even
 //    with zero model traffic (the reported case: the model already gave up on
 //    the missing tools, so nothing re-armed the loop).
+// 4. apply() on a genuinely fresh context clears register.toolsReady (#2101)
+//    — a successful registration into a dead context must not block the new
+//    context from re-registering (stale latch + x-bili-plugin stamp = the
+//    model loses the bili tools until dsh restarts).
 
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -274,6 +278,48 @@ test("#2082 an in-flight registration lands on the LATEST context after a mid-fe
             await waitFor(() => ctx2.registeredTools.length === 1, "in-flight registration landing on the re-activated context");
             assert.equal(ctx2.registeredTools[0].name, "compress");
             assert.equal(ctx1.registeredTools.length, 0, "nothing registered into the deactivated context");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#2101 apply() on a fresh context clears the stale toolsReady latch — a successful registration into a dead context must not block re-registration (#2101)", async () => {
+    // slow manifest: widens the window between apply(ctx2) and the
+    // re-registration landing so the no-stamp assertion below is deterministic
+    const proxy = await startMockProxy(300);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2101-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+
+            // phase 1: ctx1 registers successfully — register.toolsReady latches
+            const ctx1 = mockCtx();
+            apply(ctx1);
+            await waitFor(() => ctx1.registeredTools.length === 1, "initial registration into ctx1");
+            assert.equal(ctx1.registeredTools[0].name, "compress");
+
+            // phase 2: dsh deactivates ctx1 and re-applies on the SAME module
+            // instance (profile switch / settings toggle / desktop copy swap).
+            // Pre-fix: registerTools short-circuits on the stale toolsReady
+            // latch — ctx2 never gets tools.register while headersFor keeps
+            // stamping x-bili-plugin (plugin mode suppresses wire tool
+            // injection), so the model loses the bili tools until dsh restarts.
+            const ctx2 = mockCtx();
+            ctx2.setInitiator({ session: { id: "dsh-2101-session" } });
+            apply(ctx2);
+
+            // while the re-registration is in flight, headersFor must NOT
+            // stamp: stamping flips the proxy into plugin mode, which
+            // suppresses wire injection — a live context without local tools
+            // would mean zero tools for the model.
+            assert.equal(_stateHeadersForTest()?.("http://example.test/v1/messages"), undefined, "no x-bili-plugin stamp while the fresh context lacks tools");
+
+            await waitFor(() => ctx2.registeredTools.length === 1, "re-registration into the fresh context");
+            assert.equal(ctx2.registeredTools[0].name, "compress");
+            await waitFor(() => _stateHeadersForTest()?.("http://example.test/v1/messages") !== undefined, "headers return after re-registration");
         });
     } finally {
         proxy.close();

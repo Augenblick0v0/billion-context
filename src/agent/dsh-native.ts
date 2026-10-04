@@ -726,8 +726,21 @@ export function apply(ctx: PluginContext): void {
     // switch, a settings toggle) poisons register.dead for the whole process
     // lifetime: every later maybeRetry() returns immediately and the bili
     // tools never come back until dsh restarts.
+    const prevCtx = activeCtx;
     register.dead = false;
     activeCtx = ctx;
+    // #2101: a genuinely fresh context (dsh deactivated the prior one — profile
+    // switch / settings toggle / desktop copy swap — and re-applied on the SAME
+    // module instance) invalidates tools registered into the dead context.
+    // Keeping toolsReady would make registerTools short-circuit for the new
+    // context while headersFor keeps stamping x-bili-plugin, so the proxy
+    // suppresses wire tool injection and the model loses the bili tools until
+    // dsh restarts (the #2082 symptom via a different route). Clearing it lets
+    // the state.toolsReady gate below hold the first request until the new
+    // registration lands. Same-context re-apply must NOT clear it — no
+    // gratuitous re-registration churn. If the host re-imported the module
+    // instead, toolsReady is already false and this is a no-op.
+    if (prevCtx !== undefined && prevCtx !== ctx) register.toolsReady = false;
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
