@@ -686,8 +686,8 @@ const CALIBRATION_MIN_ESTIMATE = 2000;
 // Plausibility band for admitting a sample: outside it, the report and the
 // payload it bills demonstrably don't correspond (placeholder billing, relay
 // echo, mock upstreams) — a ratio there must never teach a factor.
-const CALIBRATION_SAMPLE_MIN = 0.2;
-const CALIBRATION_SAMPLE_MAX = 5;
+export const CALIBRATION_SAMPLE_MIN = 0.2;
+export const CALIBRATION_SAMPLE_MAX = 5;
 // Final clamp on the published factor: bounds how far calibration can move
 // any decision away from the raw estimate. One-way by design: the clamp max
 // is 1, so a learned factor can only DEFLATE the estimate (fire later than
@@ -697,11 +697,11 @@ const CALIBRATION_SAMPLE_MAX = 5;
 // eliminates the class "calibration itself causes an earlier trigger": the
 // observed #1933 damage was over-triggering (37% window tax, fold churn),
 // while the opposite error already has a backstop. Discussion: PR #1940.
-const CALIBRATION_CLAMP_MIN = 0.25;
-const CALIBRATION_CLAMP_MAX = 1;
+export const CALIBRATION_CLAMP_MIN = 0.25;
+export const CALIBRATION_CLAMP_MAX = 1;
 // Evidence requirements: ≥2 recent same-route samples agreeing within ×2.
 // One lucky/degenerate pair must not flip every estimate on the route.
-const CALIBRATION_SAMPLE_WINDOW = 3;
+export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
 
 export function settleUsageReport(

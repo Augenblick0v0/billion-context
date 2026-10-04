@@ -19,7 +19,7 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
-import { currentContextObservation } from "./cache-ledger.js";
+import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -113,9 +113,23 @@ interface PersistedSession {
         cacheSamples?: number;
         lastInputTokens?: number;
         lastInputTokensSource?: string;
+        lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
         contextTokens?: number;
         contextTokensSource?: string;
+        // #2129: measurement-state fields buildRecord persists via spread —
+        // declared here so the on-disk schema documents what the loader must
+        // restore (the five decision-grade ones below plus the in-memory-only
+        // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
+        // but are deliberately not restored — see buildSession).
+        localInputEstimate?: number;
+        lastUsageGradeTokens?: number;
+        calibratedEstimate?: number;
+        calibratedEstimateOrigin?: string;
+        calibrationRing?: { origin: string; values: number[] };
+        pendingFoldUsage?: boolean;
+        lastLocalTextEstimate?: number;
+        lastLocalTextEstimateOrigin?: string;
         retrieveCalls?: number;
         retrieveHits?: number;
         retrieveMisses?: number;
@@ -725,6 +739,30 @@ function isBlockView(v: unknown): v is BlockView {
     return !!v && typeof v === "object" && typeof (v as BlockView).text === "string" && typeof (v as BlockView).count === "number";
 }
 
+// #2129: restore-time validation for the #1933 F1 calibrated factor. The learner
+// publishes factors clamped to [CLAMP_MIN, CLAMP_MAX], but applyEstimateCalibration
+// applies whatever it is given UNCLAMPED — a corrupt/hand-edited file with k̂>1
+// would INFLATE every estimate (violating the one-way deflate contract) and
+// k̂<0.25 over-deflates past the published band. Reject out-of-band values instead
+// of trusting them: absent falls back to the raw estimate (today's behavior).
+function restoreCalibratedEstimate(v: unknown): number | undefined {
+    return typeof v === "number" && Number.isFinite(v) && v >= CALIBRATION_CLAMP_MIN && v <= CALIBRATION_CLAMP_MAX ? v : undefined;
+}
+
+// #2129: same discipline for the evidence ring — keep only samples the learner
+// itself would admit (finite, within the plausibility band) and only the newest
+// window-size entries; anything else drops the ring wholesale so a malformed
+// file can neither teach a factor nor mask a fresh learning run on restart.
+function restoreCalibrationRing(v: unknown): { origin: string; values: number[] } | undefined {
+    if (!v || typeof v !== "object") return undefined;
+    const ring = v as { origin?: unknown; values?: unknown };
+    if (typeof ring.origin !== "string" || ring.origin.length === 0) return undefined;
+    if (!Array.isArray(ring.values)) return undefined;
+    const values = ring.values.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= CALIBRATION_SAMPLE_MIN && x <= CALIBRATION_SAMPLE_MAX);
+    const recent = values.slice(-CALIBRATION_SAMPLE_WINDOW);
+    return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
+}
+
 function buildSession(parsed: PersistedSession): Session {
     const blockContents = new Map<string, BlockContent>();
     for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
@@ -775,6 +813,24 @@ function buildSession(parsed: PersistedSession): Session {
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
             // #1839: display provenance — legacy files lack it; absent = no marker.
             contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
+            // #2129: measurement-state fields buildRecord persists via spread but this
+            // reader used to drop — after a restart the preflight gate judged on the
+            // UNCALIBRATED local estimate (k̂ lost → folded fitting payloads) and nudge
+            // sizing fell through to the raw char-count bound (usage anchor lost →
+            // EMERGENCY ghosts, #2122 incident). Restored with the same validation
+            // discipline as the entries above: corrupt values are rejected outright.
+            localInputEstimate: typeof stats.localInputEstimate === "number" && Number.isFinite(stats.localInputEstimate) && stats.localInputEstimate > 0 ? stats.localInputEstimate : undefined,
+            lastUsageGradeTokens: typeof stats.lastUsageGradeTokens === "number" && Number.isFinite(stats.lastUsageGradeTokens) && stats.lastUsageGradeTokens >= 0 ? stats.lastUsageGradeTokens : undefined,
+            lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
+            calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
+            calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
+            calibrationRing: restoreCalibrationRing(stats.calibrationRing),
+            // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
+            // compress execution and consumed only as a log-suffix attribution by the
+            // NEXT usage report (#695) — restoring a stale true would mislabel an
+            // unrelated post-reload report, and losing it costs one log suffix.
+            // lastLocalTextEstimate(+Origin) is the pending k̂ pairing input whose
+            // session.ts doc already says "a restart simply loses one pending pair".
             retrieveCalls: stats.retrieveCalls ?? 0,
             retrieveHits: stats.retrieveHits ?? 0,
             retrieveMisses: stats.retrieveMisses ?? 0,
