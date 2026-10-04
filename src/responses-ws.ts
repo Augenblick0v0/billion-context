@@ -18,6 +18,27 @@ function object(value: unknown): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function describeEventType(frame: unknown): string {
+    if (!object(frame)) return Array.isArray(frame) ? "array" : String(typeof frame);
+    return typeof frame.type === "string" ? frame.type : "<missing type>";
+}
+
+// Transport options the WebSocket lane cannot honor. The lane forces stream:true
+// and owns streaming itself, so HTTP-side transport controls are refused — but
+// only the ones genuinely incompatible with a single WS exchange. stream_options
+// is deliberately NOT refused: it carries streaming delivery hints (codex sends
+// stream_options.reasoning_summary_delivery) that ride a WS connection fine and
+// the upstream transport normalizes it before reaching the real API. Refusing it
+// is what broke codex 0.160.0 over WS (#2126).
+function unsupportedTransportOptions(frame: JsonObject, allowStreamFlag: boolean | undefined): string[] {
+    const offenders: string[] = [];
+    if (frame.stream_id !== undefined) offenders.push("stream_id");
+    const badStreamFlag = allowStreamFlag ? frame.stream !== undefined && frame.stream !== true : frame.stream !== undefined;
+    if (badStreamFlag) offenders.push(allowStreamFlag ? `stream=${JSON.stringify(frame.stream)} (must be true)` : "stream flag (the lane streams unconditionally)");
+    if (frame.background !== undefined) offenders.push("background");
+    return offenders;
+}
+
 function canonical(value: unknown): string {
     if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
     if (object(value)) return `{${Object.keys(value).filter(k => value[k] !== undefined).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
@@ -406,19 +427,37 @@ class ResponsesWsSession implements WsBridgeSession {
         const peer = this.context.peer;
         if (binary) { peer.close(1003, "Responses requires text frames"); return; }
         if (this.busy) { this.context.log("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
-        let frame: unknown;
+        // Each admission failure names its own branch on the wire AND in the log:
+        // the old shared "invalid_request" / "Invalid or oversized" bucket (#2126)
+        // hid whether the client sent an unsupported event, an unsupported
+        // transport option (and which one), or hit the size cap.
+        const refuse = (code: string, message: string, status: number): void => {
+            this.context.log("warn", `client rejected reason=${code} detail=${message}`);
+            peer.send(errorFrame(code, message, status));
+        };
         let body: JsonObject;
         try {
-            frame = JSON.parse(data.toString());
-            if (!object(frame) || frame.type !== "response.create") throw new Error("Unsupported Responses client event");
-            const badStreamFlag = this.context.codec.allowStreamFlag ? (frame.stream !== undefined && frame.stream !== true) : frame.stream !== undefined;
-            if (frame.stream_id !== undefined || badStreamFlag || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
+            const frame: unknown = JSON.parse(data.toString());
+            if (!object(frame) || frame.type !== "response.create") {
+                refuse("invalid_request", `expected a response.create frame, got ${describeEventType(frame)}`, 400);
+                return;
+            }
+            const unsupported = unsupportedTransportOptions(frame, this.context.codec.allowStreamFlag);
+            if (unsupported.length > 0) {
+                refuse("invalid_request", `response.create carries unsupported transport option(s): ${unsupported.join(", ")}`, 400);
+                return;
+            }
             body = { ...this.history.expand(frame), stream: true };
-            if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
+            if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) {
+                refuse("request_too_large", `response.create exceeds the ${Math.round(MAX_REQUEST_BYTES / (1024 * 1024))} MiB request limit`, 413);
+                return;
+            }
         } catch (error) {
-            const code = error instanceof Error && ["previous_response_not_found", "request_too_large"].includes(error.message) ? error.message : "invalid_request";
-            this.context.log("warn", `client rejected reason=${code}`);
-            peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
+            if (error instanceof Error && error.message === "previous_response_not_found") {
+                refuse("previous_response_not_found", "Send full input without previous_response_id", 400);
+                return;
+            }
+            refuse("invalid_request", error instanceof SyntaxError ? "response.create frame is not valid JSON" : error instanceof Error ? error.message : "malformed response.create frame", 400);
             return;
         }
         this.busy = true;
