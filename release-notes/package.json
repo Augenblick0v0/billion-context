@@ -12,6 +12,12 @@
     "updated": "2026-10-04",
     "releases": [
       {
+        "version": "0.1.184",
+        "date": "2026-10-04",
+        "tier": "critical",
+        "summary": "Desktop (dsh): after 0.1.179, an update could make bili tools vanish until restart (#2082) — now self-healing, broken desktop updates roll back; re-activating the plugin after a healthy boot also re-registers its tools (#2101); also fixes tool-call misrouting (#2072). Restart dsh once. 丨 桌面版修复:0.1.179 后升级会使 bili 工具消失(#2082),现已自愈;损坏的桌面更新自动回滚;健康运行后重激活插件也会重新注册工具(#2101);另修 #2072 调用错路由。升级后重启一次 dsh。"
+      },
+      {
         "version": "0.1.182",
         "date": "2026-10-04",
         "tier": "recommended",

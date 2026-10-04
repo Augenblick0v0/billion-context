@@ -455,7 +455,11 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.toolsReady || base === undefined) return;
     register.pending = (async () => {
         const tools = await fetchManifest(base, "anthropic");
-        for (const tool of tools) ctx.tools.register(toolDefinition(tool));
+        // #2082: land on the CURRENT context, not the one that started this
+        // flight — a re-activation mid-fetch must not register into (or die
+        // on) the deactivated context captured at call time.
+        const target = activeCtx ?? ctx;
+        for (const tool of tools) target.tools.register(toolDefinition(tool));
         register.toolsReady = true;
     })()
         .catch((err: unknown) => {
@@ -491,12 +495,20 @@ async function registerTools(ctx: PluginContext): Promise<void> {
 // ops knob); absent it tracks RETRY_INTERVAL_MS. Tests that do not opt in
 // never start a timer at all (NODE_TEST_CONTEXT guard keeps suites quiet).
 let recoveryTimer: NodeJS.Timeout | undefined;
+// #2082: the LATEST context seen by apply()/maybeRetry. Every async recovery
+// path (the timer tick below, an in-flight registration landing after a
+// re-activation) must resolve its context at landing time, not from a capture
+// taken when the retry was armed — a captured context may already be
+// deactivated by then (dsh reload / profile switch), and registering into it
+// throws "inactive context" and would re-poison register.dead, exactly what
+// this fix removes.
+let activeCtx: PluginContext | undefined;
 function recoveryIntervalMs(): number {
     const raw = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
     const parsed = raw === undefined ? Number.NaN : Number(raw);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
 }
-function armRecoveryTimer(ctx: PluginContext): void {
+function armRecoveryTimer(): void {
     if (recoveryTimer !== undefined) return;
     if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.BILI_DSH_RECOVERY_INTERVAL_MS === undefined) return;
     recoveryTimer = setInterval(() => {
@@ -505,13 +517,15 @@ function armRecoveryTimer(ctx: PluginContext): void {
             recoveryTimer = undefined;
             return;
         }
-        maybeRetry(ctx);
+        const ctx = activeCtx;
+        if (ctx !== undefined) maybeRetry(ctx);
     }, recoveryIntervalMs());
     recoveryTimer.unref?.();
 }
 
 function maybeRetry(ctx: PluginContext): void {
-    if (!register.dead && !register.toolsReady) armRecoveryTimer(ctx);
+    activeCtx = ctx;
+    if (!register.dead && !register.toolsReady) armRecoveryTimer();
     if (register.dead || register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
@@ -712,7 +726,23 @@ export function apply(ctx: PluginContext): void {
     // switch, a settings toggle) poisons register.dead for the whole process
     // lifetime: every later maybeRetry() returns immediately and the bili
     // tools never come back until dsh restarts.
+    // #2101: a re-activation ALSO invalidates a SUCCESSFUL registration.
+    // Registrations die with their context: the tools registered into the
+    // previous activation are disposed when that context deactivates, but
+    // register.toolsReady keeps its stale stamp — and every
+    // registerTools()/maybeRetry() early-returns on it, so the new context
+    // never gets the bili tools (the #2082 symptom reached from the success
+    // ordering: a settings toggle, a profile switch or a plugin reload
+    // AFTER a healthy boot loses the tools until dsh restarts). Clear the
+    // stale stamp so the retry loop re-registers into the live context;
+    // retryAt goes with it (#1783: a fresh activation must not stand behind
+    // a stale back-off wall).
+    if (register.toolsReady && activeCtx !== undefined && activeCtx !== ctx) {
+        register.toolsReady = false;
+        register.retryAt = 0;
+    }
     register.dead = false;
+    activeCtx = ctx;
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
@@ -1065,6 +1095,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
         clearInterval(recoveryTimer);
         recoveryTimer = undefined;
     }
+    activeCtx = undefined;
     register.base = base;
     register.toolsReady = false;
     register.dead = false;
