@@ -93,10 +93,12 @@ const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
 // ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
-const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
+// The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
+// tag content, not an element.
+const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$|\x3c" + NAME + "\\s*=\\s*[^<>]*$");
 // A truncated render-tag CLOSE at the end of a string: \x3c/<name> optionally
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
@@ -111,7 +113,15 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // next `<`. A properly terminated opening never matches: its attribute list
 // ends at a `>`, and no `<` can be reached from there within the class.
 const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
-const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
+// A mangled render-tag OPENING: the name, then `=` where the attribute list's
+// first whitespace belongs, e.g. `<acp=1>`. The kernel never emits it — the
+// model mangles the framing it learned from the wire (production session
+// ses_efe4cfcbdffe, 2026-10-03: 5 assistant turns opening with `<acp=1>`).
+// The `=` anchor is what keeps plain HTML safe: `<caption>`, `<font>` and any
+// real element name carry no `=`, and a properly formed render tag matches
+// LONE_OPEN/PAIRED, not this.
+const MANGLED_OPEN = new RegExp("\x3c" + NAME + "\\s*=\\s*[^<>]*>");
+const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c" + NAME + "=|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
@@ -232,7 +242,16 @@ export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");
 }
 
-export function stripAcpTags(text: string): string {
+export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+    // A whole-field tool-call emission first: the field IS the call, so the
+    // span goes whole (see toolCallEmissionSpan). Gated by the caller; the
+    // m00885 echo check keeps a span the user asked to be emitted verbatim.
+    if (dropToolCallEmission) {
+        const span = toolCallEmissionSpan(text);
+        if (span !== null && !emissionEchoesRequest(text.slice(span.start, span.end), requestText)) {
+            text = text.slice(span.end);
+        }
+    }
     // A wrapped-turn imitation first, whole: it swallows the model's turn, and
     // leaving its payload behind hands the client the orphan markup that makes
     // the turn unusable. Each pass removes at least the head, so this ends.
@@ -245,6 +264,7 @@ export function stripAcpTags(text: string): string {
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
+        .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
@@ -278,7 +298,10 @@ export function containsRenderTagText(s: string): boolean {
 // (byte-identical passthrough); only chunks with a tag-head tail ("\x3c", "\x3c/",
 // "\x3ca", "\x3cac", "\x3cacp ...attrs", "\x3c/acp ...") engage it.
 export function mayStartRenderTag(s: string): boolean {
-    return RENDER_TAG_DETECT.test(s) || PARTIAL_TAIL.test(s);
+    // MANGLED_OPEN carries its own ">" (PARTIAL_TAIL only sees unterminated
+    // tails), so it is tested directly: a chunk with a complete mangled open
+    // must engage the machine to drop it.
+    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || PARTIAL_TAIL.test(s);
 }
 
 // #361: tool-call XML template fragments a model may echo from the context
@@ -289,6 +312,145 @@ export function mayStartRenderTag(s: string): boolean {
 const TOOL_CALL_XML = /\x3c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b[^<>]*\x3e|\\u003c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b|\x3c\/?antml:[a-z_]+/i;
 export function containsToolCallXmlFragment(s: string): boolean {
     return TOOL_CALL_XML.test(s);
+}
+
+// ─── Whole-field tool-call EMISSION (production 2026-10-03) ────────────────
+// The #361 fragments above are tool-call markup QUOTED inside prose —
+// legitimate content, detect + warn only. A different shape exists: the
+// model writes the whole call as the prose field's body (the "hybrid"
+// emission in opencode session ses_efe4cfcbdffe, 2026-10-03:
+// \n<parameter=ref>\nm00608\n</parameter>\n<parameter=summary>…prose…\n
+// </parameter>\n</function>\n</function_calls> standing alone in the prose
+// channel). That field IS the call, not prose quoting a call. Its shape is
+// the absorb tool's signature — the only bili tool with a ref+summary
+// parameter pair — so a whole-field shape is a tight discriminator: a
+// tool-call open at the field start, a ref parameter whose body is a kernel
+// ref, a summary parameter, and a call close. Embedded quotes never start
+// the field, so they are untouched. Dropping the span is additionally
+// gated on provenance (the request carried the [ACP absorb] instruction);
+// shape alone never decides.
+export const ABSORB_INSTRUCTION_MARKER = "[ACP absorb]";
+const TC_OPEN_AT_START = /^\x3c(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b/;
+const TC_PARAM_REF = /\x3c(?:antml:)?parameter(?:\s*=\s*["']?ref["']?|\s+name\s*=\s*["']ref["'])?[^<>]*\x3e\s*m\d{4,}\s*\x3c\/(?:antml:)?parameter/i;
+const TC_PARAM_SUMMARY = /\x3c(?:antml:)?parameter(?:\s*=\s*["']?summary["']?|\s+name\s*=\s*["']summary["'])?[^<>]*\x3e/i;
+const TC_CLOSE = /\x3c\/(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b[^<>]*\x3e/i;
+const TC_ORPHAN_HEAD = /^\s*\x3c\/(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b/;
+const TC_TAG_STRIP = /\x3c\/?(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b[^<>]*\x3e/gi;
+// Raw-wire whitespace: inside a JSON body, the gap between the markup and
+// the ref body arrives as two-char escape pairs (\n \r \t) that \s cannot
+// see. Brackets are never JSON-escaped, so a raw presence test is sound.
+const RAW_WS = "(?:\\\\[a-z]|\\s|\\\\)*";
+const TC_PARAM_REF_RAW = new RegExp(
+    "\\x3c(?:antml:)?parameter(?:\\s*=\\s*[\"']?ref[\"']?|\\s+name\\s*=\\s*[\"']ref[\"'])?[^<>]*\\x3e" + RAW_WS + "m\\d{4,}" + RAW_WS + "\\x3c\\/(?:antml:)?parameter",
+    "i"
+);
+
+/** Span of a whole-field tool-call emission: from the field start (after
+ *  leading whitespace) through the last call close. Null when the field is
+ *  not shaped as one. Pure shape — the caller gates the drop on
+ *  provenance. */
+export function toolCallEmissionSpan(text: string): { start: number; end: number } | null {
+    const lead = text.length - text.trimStart().length;
+    const t = text.slice(lead);
+    if (t.length === 0 || !TC_OPEN_AT_START.test(t)) return null;
+    if (!TC_PARAM_REF.test(t) || !TC_PARAM_SUMMARY.test(t)) return null;
+    let end = -1;
+    for (const m of t.matchAll(new RegExp(TC_CLOSE.source, "gi"))) end = m.index + m[0].length;
+    if (end === -1) return null;
+    return { start: lead, end: lead + end };
+}
+
+/** Whole field is a tool-call emission (see above). */
+export function isToolCallEmission(text: string): boolean {
+    return toolCallEmissionSpan(text) !== null;
+}
+
+/** A field that opens on a tool-call CLOSE whose remainder is nothing but
+ *  refs and whitespace — the tail half of an emission split across a field
+ *  boundary (defensive; no production record yet). */
+export function isOrphanToolCallTail(text: string): boolean {
+    if (!TC_ORPHAN_HEAD.test(text)) return false;
+    return /^\s*(?:m\d{4,}\s*)*$/.test(text.replace(TC_TAG_STRIP, ""));
+}
+
+/** Raw-wire pre-check for the emission shape inside an SSE/JSON body (the
+ *  gate runs before parsing; the exact field-level decision is
+ *  toolCallEmissionSpan on parsed field text). */
+export function containsToolCallEmissionText(s: string): boolean {
+    return TC_PARAM_REF_RAW.test(s) && TC_PARAM_SUMMARY.test(s) && TC_CLOSE.test(s);
+}
+
+// Canonical comparison form for the m00885 echo check. The request side is
+// JSON text, where a newline in the user's quote is the two-char escape
+// pair `\n` — dropping the backslash alone would leave a stray `n` between
+// the markup and the ref body and break containment, so escape pairs are
+// resolved first (\uXXXX to the char, \n \t \r and the other pairs to a
+// space) and only then do backslashes and whitespace vanish. Both sides
+// end up in the same form, so a fragment quoted in the request and
+// re-emitted by the model — literal, JSON-escaped, or re-spaced — compares
+// equal.
+function canonicalEmissionForm(t: string): string {
+    return t
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\\n/g, " ")
+        .replace(/\\t/g, " ")
+        .replace(/\\r/g, " ")
+        .replace(/\\[\"\\/btf]/g, " ")
+        .replace(/[\\\s]/g, "");
+}
+
+/** m00885: an emission-shaped span is KEPT when it echoes the shipped
+ *  request — the user asked the model to output a tool-call-shaped fragment
+ *  verbatim as the response, so the fragment is user intent, not a leaked
+ *  internal call. The span (markup + ref body + summary + close) must be
+ *  contained in the request bytes, whitespace/escape-insensitively; a
+ *  model-invented emission (the production shape, where the ref points at a
+ *  tool result the user never wrote) cannot match. */
+export function emissionEchoesRequest(spanText: string, requestText: string | undefined): boolean {
+    if (typeof requestText !== "string" || requestText.length === 0 || spanText.length === 0) return false;
+    if (requestText.includes(spanText)) return true;
+    const needle = canonicalEmissionForm(spanText);
+    if (needle.length === 0) return false;
+    return canonicalEmissionForm(requestText).includes(needle);
+}
+
+const TC_OPEN_NAMES = ["function_calls", "function", "tool_calls", "tool_call", "parameters", "parameter", "invoke"];
+
+/** Whether an accumulated field head could still be, or already is, the
+ *  start of a tool call: "open" when a name head has reached its boundary
+ *  (space/=/>), "prefix" while it may still grow into one, "none" when no
+ *  name head remains possible. */
+export function toolCallOpenStatus(s: string): "none" | "prefix" | "open" {
+    let prefix = false;
+    for (const name of TC_OPEN_NAMES) {
+        for (const head of ["\x3c" + name, "\x3cantml:" + name]) {
+            if (s === head) {
+                prefix = true;
+                continue;
+            }
+            if (s.startsWith(head)) {
+                const nxt = s[head.length];
+                if (nxt === undefined) {
+                    prefix = true;
+                    continue;
+                }
+                if (nxt === " " || nxt === "\t" || nxt === "\n" || nxt === "\r" || nxt === "=" || nxt === ">") return "open";
+            } else if (head.startsWith(s)) {
+                prefix = true;
+            }
+        }
+    }
+    return prefix ? "prefix" : "none";
+}
+
+/** Per-chunk gate: does the chunk contain or end with a tool-call open, so
+ *  the streaming machine must engage to decide whether the field is a
+ *  whole-field emission? */
+export function mayStartToolCallEmission(s: string): boolean {
+    for (let i = s.indexOf("\x3c"); i !== -1; i = s.indexOf("\x3c", i + 1)) {
+        if (toolCallOpenStatus(s.slice(i)) !== "none") return true;
+    }
+    return false;
 }
 
 // ─── #1634: bili-owned internal artifacts echoed by the model ───────────────
@@ -523,8 +685,16 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
+    // Whole-field tool-call emission hold: when the request carried the
+    // [ACP absorb] instruction, the first non-whitespace head of each field
+    // that could be a tool-call open is held until the field is complete, so
+    // the emission decision runs on the WHOLE field (a mid-stream shape
+    // check could never see the closing tags). "pending" = not yet seen a
+    // non-whitespace byte; "committed" = a tool-call open is in the head;
+    // "off" = decided not one (or no instruction in the request).
+    let tcHold: "off" | "pending" | "committed" = absorbInstructed === true ? "pending" : "off";
     let swallowUntilClose = false;
     let swallowed = "";
     /** Which budget the current swallow answers to (SWALLOW_CAP or
@@ -592,8 +762,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             const p = PAIRED.exec(buf);
             const o = LONE_OPEN.exec(buf);
             const c = LONE_CLOSE.exec(buf);
+            // A mangled open (<name=...>) is a complete self-contained tag:
+            // drop it in place, no swallow (a following close dies via
+            // LONE_CLOSE on its own).
+            const g = MANGLED_OPEN.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, o, c]) {
+            for (const cand of [p, o, c, g]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -680,6 +854,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
     return {
         push(delta: string): string {
             inputChars += delta.length;
+            if (tcHold !== "off") {
+                held += delta;
+                const t = held.trimStart();
+                if (t.length === 0) return "";
+                if (t[0] !== "\x3c") tcHold = "off";
+                else {
+                    const st = toolCallOpenStatus(t);
+                    if (st === "open") tcHold = "committed";
+                    else if (st === "none") tcHold = "off";
+                }
+                if (tcHold !== "off") return "";
+                const r = process(held);
+                held = "";
+                outputChars += r.length;
+                return r;
+            }
             const chunk = held + delta;
             held = "";
             const r = process(chunk);
@@ -687,6 +877,36 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             return r;
         },
         flush(): string {
+            if (tcHold !== "off") {
+                // The field ended while its head was held: decide the whole
+                // field, then hand any non-emission rest to the normal path.
+                tcHold = "off";
+                const field = held;
+                held = "";
+                const t = field.trimStart();
+                if (t.length > 0 && t[0] === "\x3c") {
+                    const span = toolCallEmissionSpan(field);
+                    if (span !== null) {
+                        if (!emissionEchoesRequest(field.slice(span.start, span.end), requestText)) {
+                            drop(field.slice(0, span.end));
+                            const rest = field.slice(span.end);
+                            if (rest.length === 0) return "";
+                            const r = process(rest);
+                            outputChars += r.length;
+                            return r;
+                        }
+                        // The span mirrors the request verbatim (m00885): the
+                        // user asked for this fragment as the whole response —
+                        // it is user intent, so it flows through untouched.
+                    } else if (isOrphanToolCallTail(field)) {
+                        drop(field);
+                        return "";
+                    }
+                }
+                const r = process(field);
+                outputChars += r.length;
+                return r;
+            }
             const rest = swallowed + held;
             const wasSwallowing = swallowUntilClose;
             swallowed = "";
@@ -747,17 +967,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
     };
 }
 
-function stripParts(content: unknown): unknown {
+function stripParts(content: unknown, drop: boolean, requestText?: string): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((part) => {
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string) };
+            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string, drop, requestText) };
         }
         return part;
     });
 }
 
-function stripItemContent(it: unknown): unknown {
+function stripItemContent(it: unknown, drop: boolean, requestText?: string): unknown {
     if (!it || typeof it !== "object") return it;
     const io = it as Record<string, unknown>;
     let out: Record<string, unknown> | undefined;
@@ -765,13 +985,13 @@ function stripItemContent(it: unknown): unknown {
         out ??= { ...io };
         out[k] = v;
     };
-    if (Array.isArray(io.content)) set("content", stripParts(io.content));
+    if (Array.isArray(io.content)) set("content", stripParts(io.content, drop, requestText));
     if (Array.isArray(io.summary)) {
         set(
             "summary",
             io.summary.map((s) =>
                 s && typeof s === "object" && typeof (s as Record<string, unknown>).text === "string"
-                    ? { ...(s as Record<string, unknown>), text: stripAcpTags((s as Record<string, unknown>).text as string) }
+                    ? { ...(s as Record<string, unknown>), text: stripAcpTags((s as Record<string, unknown>).text as string, drop, requestText) }
                     : s,
             ),
         );
@@ -779,8 +999,8 @@ function stripItemContent(it: unknown): unknown {
     return out ?? it;
 }
 
-function stripIfString(v: unknown): unknown {
-    return typeof v === "string" ? stripAcpTags(v) : v;
+function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown {
+    return typeof v === "string" ? stripAcpTags(v, drop, requestText) : v;
 }
 
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
@@ -792,7 +1012,7 @@ function stripIfString(v: unknown): unknown {
 // execute/persist, so a shape-based false positive would silently corrupt
 // data — only model prose is stripped. Mutates in place, mirroring
 // stripResponsesText.
-export function stripOpenaiChatText<T>(obj: T): T {
+export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     if (!Array.isArray(o["choices"])) return obj;
@@ -803,9 +1023,9 @@ export function stripOpenaiChatText<T>(obj: T): T {
             const h = ch[holder];
             if (h && typeof h === "object") {
                 const hh = { ...(h as Record<string, unknown>) };
-                hh["content"] = stripIfString(hh["content"]);
-                hh["reasoning_content"] = stripIfString(hh["reasoning_content"]);
-                hh["reasoning"] = stripIfString(hh["reasoning"]);
+                hh["content"] = stripIfString(hh["content"], drop, requestText);
+                hh["reasoning_content"] = stripIfString(hh["reasoning_content"], drop, requestText);
+                hh["reasoning"] = stripIfString(hh["reasoning"], drop, requestText);
                 ch[holder] = hh;
             }
         }
@@ -817,14 +1037,14 @@ export function stripOpenaiChatText<T>(obj: T): T {
 // Plugin-passthrough parity for the Anthropic wire: strip `delta.{text,
 // thinking}` on content_block_delta streams and `content[].{text,thinking}`
 // on non-streaming message bodies. Mutates in place.
-export function stripAnthropicText<T>(obj: T): T {
+export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     const d = o["delta"];
     if (d && typeof d === "object") {
         const dd = { ...(d as Record<string, unknown>) };
-        dd["text"] = stripIfString(dd["text"]);
-        dd["thinking"] = stripIfString(dd["thinking"]);
+        dd["text"] = stripIfString(dd["text"], drop, requestText);
+        dd["thinking"] = stripIfString(dd["thinking"], drop, requestText);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
@@ -832,7 +1052,7 @@ export function stripAnthropicText<T>(obj: T): T {
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
             if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
-            return { ...cc, text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) };
+            return { ...cc, text: stripIfString(cc["text"], drop, requestText), thinking: stripIfString(cc["thinking"], drop, requestText) };
         });
     }
     return obj;
@@ -846,25 +1066,25 @@ export function stripAnthropicText<T>(obj: T): T {
 // fragment carriers) are deliberately untouched (#1039): they carry user
 // intent that hosts execute/persist, so a shape-based false positive would
 // silently corrupt data — only model prose is stripped.
-export function stripResponsesText<T>(obj: T): T {
+export function stripResponsesText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
-    if (typeof o.text === "string") o.text = stripAcpTags(o.text);
+    if (typeof o.text === "string") o.text = stripAcpTags(o.text, drop, requestText);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
-        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string) };
+        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string, drop, requestText) };
     }
     if (o.item && typeof o.item === "object") {
-        o.item = stripItemContent(o.item);
+        o.item = stripItemContent(o.item, drop, requestText);
     }
     if (o.response && typeof o.response === "object") {
         const resp = { ...(o.response as Record<string, unknown>) };
         if (Array.isArray(resp.output)) {
-            resp.output = resp.output.map(stripItemContent);
+            resp.output = (resp.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
         }
         o.response = resp;
     }
     if (Array.isArray(o.output)) {
-        o.output = o.output.map(stripItemContent);
+        o.output = (o.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
     }
     return obj;
 }

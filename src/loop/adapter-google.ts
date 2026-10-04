@@ -294,11 +294,19 @@ export function createGoogleAdapter(
             // text from signature and bricks the session. Thought echoes are
             // forwarded verbatim; cosmetic leaks inside a thought pane are
             // accepted (#1960 verdict).
+            // m00885: whole-field absorb-emission drop is armed only when this
+            // request instructed the model about absorb (server-side provenance
+            // — the absorb section exists on this request's wire iff absorbName
+            // was resolved for it).
+            const absorbArmedLocal = absorbName !== undefined;
+            // m00885: the shipped request text lets the filter keep an
+            // emission-shaped span the user asked to be output verbatim.
+            const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
                         loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                    }),
+                    }, absorbArmedLocal, requestText),
                     createMarkerLineFilter((snippet) => {
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
