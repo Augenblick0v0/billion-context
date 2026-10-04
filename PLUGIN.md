@@ -121,6 +121,7 @@ Context-level visibility for plugin UIs (status bars / slash commands):
   "outputTokens": 40021,
   "cachedTokens": 180000,
   "requests": 42,
+  "lastCompressAt": 1755300000123,
   "blocks": [{ "id": "b3", "tier": 1, "active": true }],
   "lastSeen": 1755300000000
 }
@@ -131,6 +132,8 @@ Context-level visibility for plugin UIs (status bars / slash commands):
 Forwarding a new model request replaces the previous observation with an estimate until a real positive usage report arrives. That report restores `usage`; zero/missing usage cannot revive an older measured generation. A real report netted against outstanding fold credit remains an estimate of the effective view, not a measurement of that view. Forks start with independent estimates, not inherited parent usage.
 
 `contextTokensAt` is the observation time in Unix milliseconds (not the status read time), independently of the last usage timestamp. `contextGeneration` is an opaque change detector covering a unique observation id, context, revision, model and limit: successive observations remain distinct even at the same timestamp with identical token counts; repeated status reads do not create observations. Unavailable context has null tokens, timestamp and generation. Legacy persisted sessions without an independently attributed observation are unavailable until another request establishes one. `sessionId` and nullable `sessionRevision` identify the resolved session and its fork state. Pre-first-request/chain-only responses explicitly report unavailable context. Persisted sessions are loaded by the requested id before considering an explicitly requested `fallback=latest`. Errors: `400` missing `conversationId`, `404` unknown conversation.
+
+`lastCompressAt` is the Unix-millisecond time of the last landed fold — a successful model-driven `compress` or a preflight overflow compress, both stamped when the fold lands — or `null` until the first fold in this process. The pi/omp plugin's compaction-takeover watchdog (#2110) reads it to release native auto-compaction after a bounded streak of cancelled passes without a NEWER fold; field ABSENCE (an older proxy that never had it) means `null` (new proxy, no folds yet) and selects the legacy unconditional-cancel behavior instead.
 
 `compressibleRanges` is the live kernel recommendation as structured `{startRef, endRef, count, ...}` entries for `sessionRevision`, or `null` if it cannot be computed. An empty list means there is no recommended range. Read the exact conversation without `fallback=latest`, match the snapshot revision and ordered refs, and submit manual `compress` with `expectedRevision`; never parse the human panel or guess a fixed prefix. Hosts must exclude their retained first-user anchor from summaries: kernel pruning retains it even if a recommendation spans it. A concurrent mutation is rejected by the revision guard.
 
