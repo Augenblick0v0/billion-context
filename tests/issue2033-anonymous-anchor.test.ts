@@ -207,7 +207,7 @@ test("#2033 A1: anchored anonymous session keeps sizing on the usage anchor afte
         const sized = lastNudgeSized(h.logs, s.id);
         assert.ok(sized >= 0, "nudge diagnostic present");
         // Pre-fix this returned the char-count upper bound of the FULL
-        // resubmitted history (~15k here): the anonymous early return ran
+        // resubmitted history (58701 here, measured pre-fix): the anonymous early return ran
         // before the usage-grade anchor check, the exact ghost path #1839
         // closed for explicit sessions.
         assert.equal(sized, ANCHOR_INPUT, "anchored anonymous session sizes on the last real usage report, not the raw-history bound");
