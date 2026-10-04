@@ -43,10 +43,20 @@ function writeFile(file: string, content: string): void {
     fs.writeFileSync(file, content);
 }
 
-// Hermetic env: every client home resolves under root, nothing leaks to the
-// developer's real home directories.
+// Hermetic env: pins HOME + XDG_CONFIG_HOME under root. (#2038) This alone does
+// NOT pin pi/omp — those resolvers fall back to os.homedir() (the REAL process
+// home) when PI_HOME / PI_CODING_AGENT_DIR are unset, so their tests supply the
+// var explicitly and assertTestOwned below guards every fixture write.
 function hermeticEnv(root: string): NodeJS.ProcessEnv {
     return { HOME: root, XDG_CONFIG_HOME: path.join(root, ".config") };
+}
+
+// #2038: refuse any fixture write escaping its temp root — an unresolved
+// client home would otherwise target the developer's real ~/.pi / ~/.omp config.
+function assertTestOwned(file: string, root: string): void {
+    const rel = path.relative(root, file);
+    assert.ok(!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`),
+        `refusing to write outside test-owned root ${root}: ${file}`);
 }
 
 test("conflictScanEnabled defaults on, honors 0/false", () => {
@@ -140,15 +150,28 @@ test("opencode scan: without a .git anchor the walk stops at cwd", () => {
     }
 });
 
+test("#2038: assertTestOwned allows writes under root, rejects escaping it (incl. real home)", () => {
+    const root = tmp("bili-1206-2038-guard-");
+    assert.doesNotThrow(() => assertTestOwned(path.join(root, ".pi", "agent", "settings.json"), root));
+    // The original defect: an unresolved client home resolved to the REAL process
+    // home and the fixture write clobbered the user's actual ~/.pi / ~/.omp config.
+    assert.throws(() => assertTestOwned(path.join(os.homedir(), ".pi", "agent", "settings.json"), root));
+    assert.throws(() => assertTestOwned("/etc/passwd", root));
+});
+
 test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili-self skipped", () => {
     clearScanCache();
     const root = tmp("bili-1206-pi-");
     const cwd = tmp("bili-1206-pi-cwd-");
-    const home = resolvePiHome(hermeticEnv(root));
+    // #2038: pin pi's home under root via PI_HOME (a bare hermetic env would let
+    // resolvePiHome fall back to os.homedir() and target the real ~/.pi).
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_HOME: path.join(root, ".pi", "agent") };
+    const home = resolvePiHome(env);
+    assertTestOwned(path.join(home, "settings.json"), root);
     writeFile(path.join(home, "settings.json"), JSON.stringify({
         packages: ["npm:billion-context-pi", "npm:context-compactor", "npm:context-forge", "/u/node_modules/billion-context/dist/agent/pi.js"],
     }));
-    const res = scanClientPlugins("pi", { env: hermeticEnv(root), cwd });
+    const res = scanClientPlugins("pi", { env, cwd });
     const bcp = res.findings.find((f) => f.entry === "npm:billion-context-pi");
     assert.equal(bcp?.match, "known");
     assert.equal(bcp?.knownId, "billion-context-pi");
@@ -160,7 +183,11 @@ test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili
 test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", () => {
     clearScanCache();
     const root = tmp("bili-1206-omp-");
-    const home = resolveOmpHome(hermeticEnv(root));
+    // #2038: pin omp's home under root via PI_CODING_AGENT_DIR (the only var
+    // resolveOmpHome honors besides its ~/.omp/agent default = real process home).
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_CODING_AGENT_DIR: path.join(root, ".omp", "agent") };
+    const home = resolveOmpHome(env);
+    assertTestOwned(path.join(home, "config.yml"), root);
     writeFile(path.join(home, "config.yml"), [
         "model: m",
         "extensions:",
@@ -170,7 +197,7 @@ test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", (
         "providers:",
         "  default: openai",
     ].join("\n"));
-    const res = scanClientPlugins("omp", { env: hermeticEnv(root), cwd: root });
+    const res = scanClientPlugins("omp", { env, cwd: root });
     assert.equal(res.findings.length, 1, "action-token kept, bare-'context' dropped (#1736)");
     assert.equal(res.findings[0]?.entry, "npm:context-compactor");
     assert.equal(res.findings[0]?.match, "keyword");
