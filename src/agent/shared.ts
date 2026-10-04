@@ -248,7 +248,9 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
     // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
-    if (nativeCaller && conversationId.length > 0) body.nativeCaller = true;
+    // Truthiness guard (not .length): a host passing a non-string id degrades to
+    // the legacy id-less wire instead of throwing (same shape as src/mcp.ts).
+    if (nativeCaller && conversationId) body.nativeCaller = true;
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },

@@ -202,12 +202,16 @@ test("#2072 client: forwardTool stamps nativeCaller only for confirmed host ids"
         await forwardTool(cap.url, "host-sid-1", "acp_status", {}, undefined, true);
         await forwardTool(cap.url, "host-sid-2", "acp_status", {});
         await forwardTool(cap.url, "", "acp_status", {}, undefined, true);
-        assert.equal(cap.bodies.length, 3);
+        // A host can pass a non-string id despite the static type — the guard
+        // must degrade to the legacy id-less wire (no throw, no stamp), not crash.
+        await forwardTool(cap.url, undefined as unknown as string, "acp_status", {}, undefined, true);
+        assert.equal(cap.bodies.length, 4);
         assert.deepEqual(
             cap.bodies.map((b) => b.nativeCaller),
-            [true, undefined, undefined],
-            "flagged+id stamps; default stays byte-identical to the legacy wire; an empty id is never claimed as host-stamped",
+            [true, undefined, undefined, undefined],
+            "flagged+id stamps; default stays byte-identical to the legacy wire; an empty or missing id is never claimed as host-stamped",
         );
+        assert.ok(!("conversationId" in cap.bodies[3]), "a missing id drops out of the wire exactly as pre-#2072");
         assert.equal(cap.bodies[0].conversationId, "host-sid-1");
         assert.equal(cap.bodies[0].tool, "acp_status");
         assert.deepEqual(cap.bodies[0].args, {});
