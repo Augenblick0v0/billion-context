@@ -284,7 +284,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
-                const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal);
+                const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal, true);
                 return { content: [{ type: "text", text: output }] };
             } catch (err) {
                 return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
@@ -652,7 +652,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const toolArgs = /(^|\s)(--)?full(\s|$)/.test(args ?? "") ? { detail: "full" as const } : {};
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs);
+                        text = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, true);
                     } catch (err) {
                         notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
@@ -713,7 +713,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     }
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs);
+                        text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs, undefined, true);
                     } catch (err) {
                         notify(`bili: acp_rule failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;

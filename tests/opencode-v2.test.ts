@@ -575,7 +575,7 @@ test("v2 setup: /acp-cache registered and renders the cache report via synthetic
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
                 assert.match(fake.syntheticCalls[0].text, /not an instruction/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
-                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {} }]);
+                assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {}, nativeCaller: true }]);
             } finally {
                 cleanup();
             }
@@ -596,7 +596,7 @@ test("v2 /acp-cache: full flag maps to detail=full; long reports keep the leadin
                 await cache.execute({ sessionID: "ses_cache_full", arguments: "full" });
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
-                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" } });
+                assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "ses_cache_full", tool: "acp_cache", args: { detail: "full" }, nativeCaller: true });
 
                 await cache.execute({ sessionID: "ses_cache_long" });
                 await until(() => fake.syntheticCalls.length === 2);

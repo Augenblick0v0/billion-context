@@ -501,7 +501,7 @@ export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
     /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown) => Promise<string>;
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<string>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -663,7 +663,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             }
             maybeReportDerived(base, input.sessionID);
         };
-        const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
+        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true)));
         if (legacy !== undefined) {
             // Tool slots carry acp's DCP schemas (kernel-parseable object form)
             // for BOTH lanes; executors route per session. acp_context_recap
@@ -681,7 +681,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        return forward(base, v1ctx.sessionID, name, args);
+                        return forward(base, v1ctx.sessionID, name, args, true);
                     },
                 };
             }
@@ -697,7 +697,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            return forward(base, v1ctx.sessionID, fn.name, args);
+                            return forward(base, v1ctx.sessionID, fn.name, args, true);
                         },
                     };
                 }

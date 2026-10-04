@@ -343,7 +343,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -362,8 +362,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown };
-                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args });
+                const parsed = JSON.parse(body) as { conversationId?: string; tool?: string; args?: unknown; nativeCaller?: unknown };
+                toolCalls.push({ conversationId: parsed.conversationId ?? "", tool: parsed.tool ?? "", args: parsed.args, ...(parsed.nativeCaller === true ? { nativeCaller: true } : {}) });
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: true, result: "compressed 42 tokens" }));
             });
@@ -385,7 +385,7 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
     const server = http.createServer(mockBiliHandler(toolCalls, statusResponder));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
@@ -504,7 +504,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
                 const t2 = ctx2.registeredTools[0];
                 const out = await t2.execute({ summary: "s" }, { agent: { session: { id: "session-7" } } });
                 assert.equal(out, "compressed 42 tokens");
-                assert.deepEqual(calls, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" } }]);
+                assert.deepEqual(calls, [{ conversationId: "session-7", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
                 // agentless execution fails loudly
                 await assert.rejects(() => t2.execute({ summary: "s" }, {}), /requires an owning agent session/);
             } finally {
@@ -544,13 +544,13 @@ test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator sess
                 ctx.setInitiator({ session: { id: "session-9" } });
                 const bound = await cacheCmd.handler();
                 assert.equal(bound.kind, "success");
-                assert.deepEqual(calls, [{ conversationId: "session-9", tool: "acp_cache", args: {} }]);
+                assert.deepEqual(calls, [{ conversationId: "session-9", tool: "acp_cache", args: {}, nativeCaller: true }]);
 
                 ctx.setInitiator(undefined);
                 calls.length = 0;
                 const latest = await cacheCmd.handler();
                 assert.equal(latest.kind, "success");
-                assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+                assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {}, nativeCaller: true }]);
                 // #1791: settle the attach chain while the mock is still open
                 await _stateToolsReadyForTest();
             } finally {
@@ -625,7 +625,7 @@ test("apply() /acp-cache (#1677): binds acp_cache to the invoking agent's sessio
                 // NO initiator set — only the invocation carries the session id
                 const out = await cacheCmd.handler({ agent: { session: { id: "session-inv" } } });
                 assert.equal(out.kind, "success");
-                assert.deepEqual(calls, [{ conversationId: "session-inv", tool: "acp_cache", args: {} }]);
+                assert.deepEqual(calls, [{ conversationId: "session-inv", tool: "acp_cache", args: {}, nativeCaller: true }]);
                 assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
                 // #1791: settle the attach chain while the mock is still open
                 await _stateToolsReadyForTest();
@@ -1095,7 +1095,7 @@ test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and 
             // tools are live against the fallback origin
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s983" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(calls, [{ conversationId: "s983", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(calls, [{ conversationId: "s983", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
         });
     } finally {
         console.error = origErr;
@@ -1519,7 +1519,7 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
             // fallback origin without any re-registration
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1130" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(calls, [{ conversationId: "s1130", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(calls, [{ conversationId: "s1130", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
             // plugin-mode header stamping keeps working against the fallback
             const headersFor = _stateHeadersForTest();
             assert.ok(headersFor !== undefined, "headersFor installed");
@@ -1571,7 +1571,7 @@ test("#1365 apply() attach mode: routed evidence pins the channel — a transien
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the user's target stays frozen");
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365a" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(toolCalls, [{ conversationId: "s1365a", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365a", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
         });
     } finally {
         clearTimeout(upTimer);
@@ -1621,7 +1621,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
             await waitFor(() => ctx.registeredTools.length === 1, "self-healed tool registration");
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365b" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(toolCalls, [{ conversationId: "s1365b", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365b", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
             assert.equal(spawnCalls, 0, "self-heal re-attaches — it never spawns");
         });
     } finally {
@@ -1659,7 +1659,7 @@ test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to 
             }
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365c" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(bCalls, [{ conversationId: "s1365c", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(bCalls, [{ conversationId: "s1365c", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
             assert.deepEqual(aCalls, []);
         });
     } finally {
@@ -1708,7 +1708,7 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin);
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365d" } } });
             assert.equal(out, "compressed 42 tokens");
-            assert.deepEqual(toolCalls, [{ conversationId: "s1365d", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365d", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
         });
     } finally {
         clearTimeout(upTimer);

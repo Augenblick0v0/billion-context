@@ -69,7 +69,7 @@ test("/acp-cache forwards acp_cache and renders the wrapped report via session.p
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
         await assert.rejects(hooks["command.execute.before"]!({ command: "acp-cache", sessionID: "ses_x" }), HANDLED);
-        assert.deepEqual(proxy.calls, [{ conversationId: "ses_x", tool: "acp_cache", args: {} }]);
+        assert.deepEqual(proxy.calls, [{ conversationId: "ses_x", tool: "acp_cache", args: {}, nativeCaller: true }]);
         assert.equal(prompts.length, 1);
         assert.equal(prompts[0].sid, "ses_x");
         assert.equal(prompts[0].text, wrapCacheReport("REPORT-BODY"));

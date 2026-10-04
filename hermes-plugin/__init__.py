@@ -543,14 +543,21 @@ def apply_env(origin: str) -> None:
 def make_tool_handler(tool_name: str) -> Callable[..., str]:
     def handler(args: Dict[str, Any], **kwargs: Any) -> str:
         origin = _state.get("origin")
-        conversation = kwargs.get("session_id") or (args or {}).get("conversation_id")
+        # #2072: the kwargs session_id is host machine metadata stamped per call;
+        # the args conversation_id fallback is model-transcribed and must keep
+        # the #1685 witness precedence (no nativeCaller flag on that channel).
+        session_id = kwargs.get("session_id")
+        conversation = session_id or (args or {}).get("conversation_id")
         if not origin:
             return json.dumps({"error": "billion-context proxy is not available in this session"})
         if not conversation:
             return json.dumps({"error": "no hermes session id — cannot bind the compression conversation"})
+        body: Dict[str, Any] = {"conversationId": str(conversation), "tool": tool_name, "args": args or {}}
+        if session_id:
+            body["nativeCaller"] = True
         status, payload = http_post_json(
             origin.rstrip("/") + "/__bili/plugin/tool",
-            {"conversationId": str(conversation), "tool": tool_name, "args": args or {}},
+            body,
             TOOL_TIMEOUT_S,
         )
         if status == 200 and isinstance(payload, dict) and payload.get("ok"):

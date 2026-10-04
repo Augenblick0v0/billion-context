@@ -59,7 +59,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -161,6 +161,46 @@ test("forwardTool rejects immediately when the caller's signal is already aborte
         const ac = new AbortController();
         ac.abort();
         await assert.rejects(forwardTool(proxy.origin, "conv-1", "compress", { content: [] }, ac.signal), /abort/i);
+    } finally {
+        await proxy.close();
+    }
+});
+
+// #2072 client-side body contract: the nativeCaller stamp follows the exact
+// mcp.ts:136 rule (flag true AND non-empty id) so the server's #2024 rung
+// treats host-native agent lanes like the MCP shim lanes.
+test("forwardTool stamps nativeCaller only for flagged non-empty ids (#2072)", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        await forwardTool(proxy.origin, "conv-a", "compress", {});
+        assert.equal(proxy.toolCalls.at(-1)?.nativeCaller, undefined, "unflagged callers stay byte-for-byte #1685");
+        await forwardTool(proxy.origin, "conv-b", "compress", {}, undefined, true);
+        assert.deepEqual(proxy.toolCalls.at(-1), { conversationId: "conv-b", tool: "compress", args: {}, nativeCaller: true });
+        await forwardTool(proxy.origin, "", "compress", {}, undefined, true);
+        assert.equal(proxy.toolCalls.at(-1)?.nativeCaller, undefined, "flag with empty id must not stamp");
+        await forwardTool(proxy.origin, "conv-c", "compress", {}, undefined, false);
+        assert.equal(proxy.toolCalls.at(-1)?.nativeCaller, undefined, "explicit false stays unflagged");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("pi lane stamps nativeCaller even on the unknown-session fallback id (#2072)", async () => {
+    const proxy = await startFakeProxy();
+    const pi = makeFakePi();
+    try {
+        biliPlugin(pi as never);
+        const noSessionCtx: Record<string, unknown> = {
+            model: { contextWindow: 1000000, baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            cwd: "/tmp",
+        };
+        await pi.events.get("session_start")!({}, noSessionCtx);
+        await waitForTools(pi, 2);
+        const out = await pi.tools[0]!.execute("call-x", { content: [] }, undefined, undefined, noSessionCtx);
+        assert.equal(out.isError, undefined);
+        // degenerate no-session-id path: the sentinel id goes up flagged, so the
+        // server fails loudly (#1158) instead of adopting a sibling's witness.
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "unknown", tool: "compress", args: { content: [] }, nativeCaller: true }]);
     } finally {
         await proxy.close();
     }
@@ -705,7 +745,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         const out = await pi.tools[0]!.execute("call-1", { content: [] }, undefined, undefined, fakeCtx(proxy));
         assert.equal(out.content[0]!.text, "[Compressed m00001-m00002 -> b1]");
         assert.equal(out.isError, undefined);
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] } }]);
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
@@ -1228,15 +1268,15 @@ test("/acp falls back to notify when pi.sendMessage throws", async () => {
     }
 });
 
-function startCacheReportProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string }>; close(): Promise<void> }> {
-    const calls: Array<{ conversationId: string; tool: string }> = [];
+function startCacheReportProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string; nativeCaller?: boolean }>; close(): Promise<void> }> {
+    const calls: Array<{ conversationId: string; tool: string; nativeCaller?: boolean }> = [];
     const server = http.createServer((req, res) => {
         if (req.url === "/__bili/plugin/tool" && req.method === "POST") {
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const data = JSON.parse(body) as { conversationId: string; tool: string };
-                calls.push({ conversationId: data.conversationId, tool: data.tool });
+                const data = JSON.parse(body) as { conversationId: string; tool: string; nativeCaller?: unknown };
+                calls.push({ conversationId: data.conversationId, tool: data.tool, ...(data.nativeCaller === true ? { nativeCaller: true } : {}) });
                 res.writeHead(200, { "content-type": "application/json" });
                 if (error !== undefined) res.end(JSON.stringify({ ok: false, error }));
                 else res.end(JSON.stringify({ ok: true, result }));
@@ -1273,7 +1313,7 @@ test("/acp-cache forwards acp_cache and persists the wrapped report via sendMess
         };
         await cmd!.handler("", ctx);
         // the model-facing tool is forwarded with the session's conversation id
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-cache", tool: "acp_cache" }]);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-cache", tool: "acp_cache", nativeCaller: true }]);
         assert.equal(sent.length, 1, "one custom message sent");
         assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
         assert.equal(sent[0]!.customType, "bili-acp-cache");
@@ -1347,15 +1387,15 @@ test("/acp-cache reports a proxy-side failure via notify error (#800)", async ()
     }
 });
 
-function startRuleProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }>; close(): Promise<void> }> {
-    const calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }> = [];
+function startRuleProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown>; nativeCaller?: boolean }>; close(): Promise<void> }> {
+    const calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown>; nativeCaller?: boolean }> = [];
     const server = http.createServer((req, res) => {
         if (req.url === "/__bili/plugin/tool" && req.method === "POST") {
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const data = JSON.parse(body) as { conversationId: string; tool: string; args?: Record<string, unknown> };
-                calls.push({ conversationId: data.conversationId, tool: data.tool, args: data.args ?? {} });
+                const data = JSON.parse(body) as { conversationId: string; tool: string; args?: Record<string, unknown>; nativeCaller?: unknown };
+                calls.push({ conversationId: data.conversationId, tool: data.tool, args: data.args ?? {}, ...(data.nativeCaller === true ? { nativeCaller: true } : {}) });
                 res.writeHead(200, { "content-type": "application/json" });
                 if (error !== undefined) res.end(JSON.stringify({ ok: false, error }));
                 else res.end(JSON.stringify({ ok: true, result }));
@@ -1391,7 +1431,7 @@ test("/acp-rule forwards acp_rule with empty args and persists the wrapped list 
             ui: { notify: (msg: string) => notes.push(msg) },
         };
         await cmd!.handler("", ctx);
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules", tool: "acp_rule", args: {} }], "no-arg list forwards empty args");
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules", tool: "acp_rule", args: {}, nativeCaller: true }], "no-arg list forwards empty args");
         assert.equal(sent.length, 1, "one custom message sent");
         assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
         assert.equal(sent[0]!.customType, "bili-acp-rule");
@@ -1415,7 +1455,7 @@ test("/acp-rule forwards the text as { rule } to record a rule (#1251)", async (
             ui: { notify: (_msg: string) => {} },
         };
         await cmd.handler("  prefer pnpm  ", ctx);
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-add", tool: "acp_rule", args: { rule: "prefer pnpm" } }], "trimmed text forwarded as { rule }");
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-add", tool: "acp_rule", args: { rule: "prefer pnpm" }, nativeCaller: true }], "trimmed text forwarded as { rule }");
         assert.equal(sent[0]!.customType, "bili-acp-rule");
         assert.equal(sent[0]!.content, wrapRuleReport("Recorded rule2: prefer pnpm"));
     } finally {
@@ -1479,7 +1519,7 @@ test("/acp-rule forwards `remove <id>` as { delete } to acp_rule (#1399)", async
             ui: { notify: (_msg: string) => {} },
         };
         await cmd.handler("remove rule1", ctx);
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-remove", tool: "acp_rule", args: { delete: "rule1" } }], "`remove <id>` forwarded as { delete }");
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-remove", tool: "acp_rule", args: { delete: "rule1" }, nativeCaller: true }], "`remove <id>` forwarded as { delete }");
         assert.equal(sent[0]!.customType, "bili-acp-rule");
         assert.equal(sent[0]!.content, wrapRuleReport("Removed rule1: always run tests first"));
     } finally {
@@ -1500,7 +1540,7 @@ test("/acp-rule forwards bare `clear` as { clear: true } to acp_rule (#1399)", a
             ui: { notify: (_msg: string) => {} },
         };
         await cmd.handler("clear", ctx);
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear", tool: "acp_rule", args: { clear: true } }], "bare clear forwarded as { clear: true }");
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear", tool: "acp_rule", args: { clear: true }, nativeCaller: true }], "bare clear forwarded as { clear: true }");
         assert.equal(sent[0]!.content, wrapRuleReport("Cleared 2 rule(s)."));
     } finally {
         await proxy.close();
@@ -1542,7 +1582,7 @@ test("/acp-rule `clear <text>` records the text instead of wiping (#1399)", asyn
             ui: { notify: (_msg: string) => {} },
         };
         await cmd.handler("clear all caches before deploys", ctx);
-        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear-words", tool: "acp_rule", args: { rule: "clear all caches before deploys" } }], "extra words after clear are recorded, never wiped");
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear-words", tool: "acp_rule", args: { rule: "clear all caches before deploys" }, nativeCaller: true }], "extra words after clear are recorded, never wiped");
         assert.equal(sent.length, 1);
     } finally {
         await proxy.close();

@@ -454,7 +454,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h2["x-bili-plugin-max-output"], "4096");
         assert.equal(out!.second_model_kept, "test-model");
         assert.equal(out!.tool_result, "compressed 3 blocks");
-        assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-1", tool: "compress", args: {} }]);
+        assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-1", tool: "compress", args: {}, nativeCaller: true }]);
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.

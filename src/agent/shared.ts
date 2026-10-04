@@ -243,11 +243,17 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<string> {
+    const body: Record<string, unknown> = { conversationId, tool, args: args ?? {} };
+    // #2072: registered-agent lanes stamp host machine metadata (sessionManager /
+    // agent session / sessionID) — flag it so the proxy's #2024 rung ranks it
+    // above a stale outbound witness (#1685). Unflagged callers keep the exact
+    // #1685 precedence; an empty id asserts nothing and is never flagged.
+    if (nativeCaller && conversationId) body.nativeCaller = true;
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args: args ?? {} }),
+        body: JSON.stringify(body),
     }, TOOL_TIMEOUT_MS, signal);
     const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
     if (!ok || !data?.ok) {
