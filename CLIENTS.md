@@ -331,7 +331,11 @@ proxy never strands a dead URL, and the shell simply attaches to whatever is
 alive. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
-(#760).
+(#760). Codex ≥0.160 additionally stamps the real thread id on every
+`tools/call` via `_meta.threadId`; the shell consumes it per call (strictly
+validated, never written back into the spawn-time binding) and it outranks
+both a stale `BILI_CONVERSATION_ID` residue and the model-transcribed
+`conversation_id` (#2024).
 
 **Responses native chaining (a caveat).** bili compresses by replaying the full
 `input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a
