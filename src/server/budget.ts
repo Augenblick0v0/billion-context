@@ -118,12 +118,16 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
  * the preflight trigger fires ~10-20K late on agent clients with big tool
  * manifests: text alone "fits" while the real billed input already overflows
  * the window. Same term estimateInputTokens applies to the output clamp (#467). */
-export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer): number {
+export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): number {
     let parsed: Record<string, unknown>;
-    try {
-        parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
-    } catch {
-        return 0;
+    if (typeof body === "object" && !Buffer.isBuffer(body)) {
+        parsed = body;
+    } else {
+        try {
+            parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+        } catch {
+            return 0;
+        }
     }
     const sysRaw = protocol === "responses"
         ? parsed.instructions
