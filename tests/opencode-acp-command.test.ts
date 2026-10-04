@@ -185,7 +185,7 @@ test("/acp appends a staleness notice when the on-disk install is newer (#1603)"
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp", sessionID: "s" }), HANDLED);
         assert.equal(prompts.length, 1);
         assert.ok(prompts[0].text.includes("ACP-PANEL"), "panel is preserved");
         assert.match(prompts[0].text, /is stale/);
@@ -205,7 +205,7 @@ test("/acp omits the notice when the running install matches disk (#1603)", asyn
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp", sessionID: "s" }), HANDLED);
         assert.equal(prompts.length, 1);
         assert.equal(prompts[0].text, "ACP-PANEL");
     } finally {
@@ -218,7 +218,7 @@ test("/acp still renders when the /__bili/status probe is unreachable (#1603)", 
     try {
         const prompts: Rendered[] = [];
         const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
-        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        await assert.rejects(hooks["command.execute.before"]!({ command: "acp", sessionID: "s" }), HANDLED);
         assert.equal(prompts.length, 1);
         assert.equal(prompts[0].text, "ACP-PANEL");
     } finally {
