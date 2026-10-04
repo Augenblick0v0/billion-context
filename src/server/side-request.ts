@@ -24,6 +24,7 @@ export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
+    if (requestAgent === "main") return false;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     const field = outputBudgetField(parsed);

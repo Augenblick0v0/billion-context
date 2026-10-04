@@ -58,6 +58,15 @@ test("isSideRequest: host-declared side-request agent outranks the token-budget 
     assert.equal(isSideRequest({ max_tokens: 100 }, "unknown-persona"), true, "unknown persona still honors a tiny budget");
 });
 
+test("isSideRequest: explicit main intent vetoes side heuristics", () => {
+    for (const body of [{ max_tokens: 100 }, { max_completion_tokens: 100 }, { max_output_tokens: 100 }, { generationConfig: { maxOutputTokens: 100 } }]) {
+        assert.equal(isSideRequest(body, "main"), false, "main intent outranks a tiny budget even without tools");
+        assert.equal(isSideRequest(body, "title"), true, "title intent remains side");
+        assert.equal(isSideRequest(body, "other"), true, "unknown intent keeps the budget heuristic");
+        assert.equal(isSideRequest(body), true, "missing intent keeps the budget heuristic");
+    }
+});
+
 const noopLog = (): void => {};
 
 function metaSession(id: string): { id: string; metadata: Record<string, unknown> } {

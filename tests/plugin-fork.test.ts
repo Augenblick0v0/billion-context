@@ -57,7 +57,7 @@ interface StatusResponse {
 }
 
 type PluginResponse<Path extends string> = Path extends "/__bili/plugin/manifest"
-    ? { capabilities: { fork: { protocolVersion: number; endpoint: string; snapshotEndpoint: string } } }
+    ? { tools: { openai: { type: "function"; function: { name: string; parameters: Record<string, unknown> } }[] }; capabilities: { fork: { protocolVersion: number; endpoint: string; snapshotEndpoint: string } } }
     : Path extends "/__bili/plugin/fork" ? ForkResponse
     : Path extends "/__bili/plugin/tool" ? { result: string; code?: string }
     : Path extends `/__bili/plugin/status${string}` ? StatusResponse
@@ -70,7 +70,7 @@ async function responseBody<Path extends string>(response: Response, _path: Path
     return body as PluginResponse<Path>;
 }
 
-async function harness(persist = false) {
+async function harness(persist = false, seedParent = true) {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -86,7 +86,9 @@ async function harness(persist = false) {
         req.on("end", () => {
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
+            res.end(JSON.stringify(req.url?.endsWith("/chat/completions")
+                ? { id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }
+                : { id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -104,9 +106,11 @@ async function harness(persist = false) {
         return { status: r.status, body: await responseBody(r, path) };
     };
     const messages = [{ role: "user", content: "first original ".repeat(250) }, { role: "assistant", content: "second original ".repeat(250) }, { role: "user", content: "tail original" }];
-    const r = await fetch(`${origin}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
-    assert.equal(r.status, 200);
-    await r.text();
+    if (seedParent) {
+        const r = await fetch(`${origin}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        assert.equal(r.status, 200);
+        await r.text();
+    }
     return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
@@ -140,6 +144,99 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
         assert.deepEqual(child.body.orderedMessages, orderedMessages);
         assert.notEqual(child.body.sessionId, snapshot.body.sessionId);
         assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+    } finally { await h.close(); }
+});
+
+async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true) {
+    const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
+    if (announcePlugin) {
+        headers["x-bili-plugin"] = "ekko-agent";
+        headers["x-bili-plugin-conversation"] = conversationId;
+    }
+    if (requestAgent !== undefined) headers["x-bili-plugin-agent"] = requestAgent;
+    const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: maxTokens, stream: false, messages, tools }) });
+    assert.equal(response.status, 200, await response.text());
+}
+
+test("HTTP explicit main with only public ACP tools captures initial history, usage and first fork payload", async () => {
+    const h = await harness(false, false);
+    try {
+        const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
+        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache"]);
+        await sendIntentModel(h, "parent", h.messages, tools, "main");
+        assert.deepEqual(h.forwarded.at(-1)!.tools, tools, "main tools survive unchanged");
+        assert.equal(h.forwarded.at(-1)!.max_tokens, 256);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.deepEqual(snapshot.body.messages.map((message) => message.text), h.messages.map((message) => message.content));
+        const status = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        assert.equal(status.contextTokensSource, "usage");
+        assert.equal(status.contextTokens, 10000);
+        assert.equal(resolveConversation("parent").session!.stats.requests, 1);
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", h.messages.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.status, "exact");
+        const history = [...h.messages, { role: "assistant", content: "first fork continuation" }];
+        await sendIntentModel(h, "child", history, tools, "main");
+        assert.deepEqual(h.forwarded.at(-1)!.tools, tools, "first child request retains the public tools");
+        const forwarded = h.forwarded.at(-1)!.messages as { role: string; content: string }[];
+        assert.equal(forwarded[0].role, "system");
+        assert.match(forwarded[0].content, /^Compression Philosophy:/);
+        assert.deepEqual(forwarded.slice(1).map((message) => ({ role: message.role, content: message.content.replace(/^\x3cacp\b[^\n]*\x3c\/acp\x3e\n/, "") })), history, "the first fork payload retains the exact inherited history in order");
+        const child = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(child.orderedMessages.slice(0, h.messages.length), snapshot.body.orderedMessages);
+        assert.deepEqual(child.messages.map((message) => message.text), history.map((message) => message.content));
+        assert.equal((await h.request("/__bili/plugin/status?conversationId=child")).body.contextTokensSource, "usage");
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.body.parentRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP explicit main without tools survives a tiny output budget", async () => {
+    const h = await harness(false, false);
+    try {
+        await sendIntentModel(h, "parent", h.messages, [], "main", 100);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.deepEqual(snapshot.body.messages.map((message) => message.text), h.messages.map((message) => message.content));
+        assert.equal((await h.request("/__bili/plugin/status?conversationId=parent")).body.contextTokensSource, "usage");
+    } finally { await h.close(); }
+});
+
+test("HTTP title on the same plugin lane cannot replace the main snapshot or usage", async () => {
+    const h = await harness();
+    try {
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const status = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        const session = resolveConversation("parent").session!;
+        const before = JSON.stringify({ state: session.state, stats: session.stats, highWater: session.metadata.outputBudgetHighWater });
+        const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
+        const messages = [{ role: "user", content: "Generate a title." }];
+        await sendIntentModel(h, "parent", messages, tools, "title", 1024);
+        assert.equal(h.forwarded.at(-1)!.tools, undefined);
+        assert.deepEqual(h.forwarded.at(-1)!.messages, messages);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
+        const after = (await h.request("/__bili/plugin/status?conversationId=parent")).body;
+        for (const field of ["sessionRevision", "contextTokensSource", "contextTokens", "contextTokensAt", "contextGeneration", "inputTokens", "compressCreditTokens"] as const) assert.equal(after[field], status[field]);
+        assert.equal(JSON.stringify({ state: session.state, stats: session.stats, highWater: session.metadata.outputBudgetHighWater }), before);
+    } finally { await h.close(); }
+});
+
+test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main cannot claim plugin intent", async () => {
+    const h = await harness(false, false);
+    try {
+        const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
+        for (const requestAgent of [undefined, "other"]) {
+            const id = requestAgent ?? "missing-intent";
+            await sendIntentModel(h, id, h.messages, tools, requestAgent);
+            assert.equal(h.forwarded.at(-1)!.tools, undefined);
+            assert.equal((await h.request(`/__bili/plugin/snapshot?conversationId=${id}`)).status, 409);
+            assert.equal(resolveConversation(id).session!.stats.requests, 0);
+        }
+        await sendIntentModel(h, "anonymous-main", h.messages, [], "main", 100, false);
+        assert.deepEqual(h.forwarded.at(-1)!.messages, h.messages, "unannounced persona must still pass through as a tiny utility request");
+        assert.equal(getSession("anonymous-main").stats.requests, 0);
+        assert.equal(getSession("anonymous-main").metadata.pluginAgent, undefined);
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=anonymous-main")).status, 409);
     } finally { await h.close(); }
 });
 

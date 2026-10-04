@@ -2718,9 +2718,10 @@ async function handle(
         // all-bili-tools demotion is vetoed for them (side requests on this lane
         // are identified by the #1699 persona header instead).
         const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
-        // A verified public-fork prefix also proves this is main history.
+        const requestAgent = pluginRequestAgentHeader(req.headers);
+        // Explicit main intent and a verified public-fork prefix each veto heuristic demotion.
         const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
-            && !wsLaneEnvelope && !publicForkPrefix
+            && requestAgent !== "main" && !wsLaneEnvelope && !publicForkPrefix
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
@@ -2773,7 +2774,6 @@ async function handle(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
-        const requestAgent = pluginRequestAgentHeader(req.headers);
         if (!countTokens && !responsesCompact && protocol !== null && !publicForkPrefix && (demotedSide || isSideRequest(parsed, requestAgent))) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a

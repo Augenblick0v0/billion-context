@@ -82,9 +82,9 @@ export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mu
  *  cannot express: opencode v2 title-gen requests carry NO max_tokens (options
  *  {} for kind==="title"), so the output-budget side-request heuristic (#388)
  *  can never see them — they were misclassified as main turns and got the full
- *  compress prompt + tool injected into the title model. The proxy acts only on
- *  known side-request agents (side-request.ts SIDE_REQUEST_AGENTS); main-persona
- *  ids are inert telemetry. */
+ *  compress prompt + tool injected into the title model. Known side-request
+ *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
+ *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 export const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
@@ -168,8 +168,8 @@ export function pluginReportedModel(headers: Record<string, string | string[] | 
 }
 
 /** #1699: per-request persona id, honored ONLY from an announced plugin (same
- *  gate as window/model): a plain client must not be able to declare a side
- *  request by name to dodge compression. A real plugin stamps both headers. */
+ *  gate as window/model): a plain client must not be able to change request
+ *  classification by name. A real plugin stamps both headers. */
 export function pluginRequestAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     if (pluginAgentHeader(headers) === undefined) return undefined;
     return headerValue(headers, PLUGIN_REQUEST_AGENT_HEADER);
