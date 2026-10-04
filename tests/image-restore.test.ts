@@ -158,7 +158,7 @@ test("writeRestoredImage: writes decoded bytes 0600 under retrieve/img, idempote
     assert.ok(p && p.endsWith(join("retrieve", "img", "m00042.png")), `path ${p}`);
     assert.ok(existsSync(p!));
     assert.deepEqual(readFileSync(p!), Buffer.from(PNG, "base64"), "decoded bytes round-trip");
-    assert.equal(statSync(p!).mode & 0o777, 0o600, "not world-readable");
+    if (process.platform !== "win32") assert.equal(statSync(p!).mode & 0o777, 0o600, "not world-readable");
     // Multi-image suffix + extension mapping.
     const p2 = writeRestoredImage("m00042", 1, pngImg);
     assert.ok(p2!.endsWith("m00042-1.png"));
