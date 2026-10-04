@@ -18,10 +18,20 @@
  *    version flap can never loop-restart. A successful re-exec cannot
  *    re-trigger either way: the child runs the new version and is not stale.
  *
- * The replacement is spawned non-detached with inherited stdio/env: it joins
- * this process's group (a launcher's stopProxy() kills the whole group, so
- * the replacement stays collectable — #414) and inherits BILI_PARENT_PID /
- * BILI_LAUNCH_TOKEN (the launcher liveness watcher keeps working).
+ * The replacement always inherits env (BILI_PARENT_PID / BILI_LAUNCH_TOKEN, so
+ * the launcher liveness watcher keeps working). Spawn options are split by
+ * platform (#2095): on win32 the child is spawned DETACHED + windowsHide with
+ * ignored stdio — a NON-detached child of a console-attached parent rides
+ * libuv's kill-on-job-close job object and is terminated the instant the parent
+ * exits mid-boot, taking bili offline after every auto-update until something
+ * else starts it; detaching removes both the console attachment and the job
+ * object so the replacement outlives the parent, and ignoring stdio loses
+ * nothing because the durable log file (logger.ts) is independent of stderr.
+ * On POSIX the child stays NON-detached with inherited stdio: it joins this
+ * process's group so a launcher's stopProxy() group kill still reaches it
+ * (#414) and logs wherever the parent does. The #414 group-kill rationale is
+ * moot on win32 — stopProxy() relies on the BILI_PARENT_PID watchdog there,
+ * never a group kill — so detaching costs nothing there.
  */
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import net from "node:net";
@@ -123,6 +133,27 @@ function probeReady(host: string, port: number): Promise<boolean> {
     });
 }
 
+/** #2095: spawn options for the self-restart replacement, split by platform.
+ *  win32: a NON-detached child of a console-attached parent rides libuv's
+ *  kill-on-job-close job object and dies the moment the parent exits mid-boot —
+ *  bili goes offline after every auto-update until something else starts it.
+ *  Detaching (DETACHED_PROCESS) removes both the console attachment and the job
+ *  object so the replacement outlives the parent; stdio is ignored because the
+ *  durable log file (logger.ts) is independent of stderr, mirroring the
+ *  launcher's own proxy spawn (detached + windowsHide + redirected stdio). The
+ *  #414 group-kill rationale does not apply here: on win32 stopProxy() relies on
+ *  the BILI_PARENT_PID watchdog, never a group kill.
+ *  posix: unchanged — non-detached + inherited stdio keeps the replacement in
+ *  this process's group so a launcher's stopProxy() group kill reaches it
+ *  (#414) and it logs wherever the parent does. Exported pure so tests can pin
+ *  both branches without faking the OS. */
+export function selfRestartSpawnOptions(platform: NodeJS.Platform): SpawnOptions {
+    if (platform === "win32") {
+        return { detached: true, windowsHide: true, stdio: "ignore", env: process.env };
+    }
+    return { stdio: "inherit", env: process.env };
+}
+
 export type SelfRestartDeps = {
     server: http.Server;
     host: string;
@@ -150,6 +181,9 @@ export type SelfRestartDeps = {
      *  one (#1724). Defaults to conversations + sessions + prefix-affinity.
      *  Injectable for tests. */
     preSpawnFlush?: () => Promise<void> | void;
+    /** Platform seam (defaults to process.platform). Injectable so tests can
+     *  pin the win32 vs posix spawn options without faking the OS (#2095). */
+    platform?: NodeJS.Platform;
 };
 
 export type SelfRestartResult = { ok: boolean; error?: string; childPid?: number };
@@ -232,14 +266,15 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
     log("info", `[restart] spawning replacement v${deps.diskVersion} on port ${port}...`);
     let child: ChildProcess;
     try {
-        // Non-detached: the replacement joins THIS process's group, so a
-        // launcher's group kill (stopProxy -> kill(-pid)) reaches it (#414).
-        // stdio inherit: launcher children log to a file fd, manual starts to
-        // the terminal — the replacement logs wherever the parent does.
-        child = (deps.spawnImpl ?? spawn)(process.execPath, [entry, ...process.argv.slice(2)], {
-            stdio: "inherit",
-            env: process.env,
-        });
+        // Platform-split (#2095): win32 detaches so the replacement outlives our
+        // exit (a non-detached child rides libuv's kill-on-job-close job object);
+        // posix stays non-detached so the launcher's stopProxy() group kill still
+        // reaches it (#414). Full rationale in selfRestartSpawnOptions.
+        child = (deps.spawnImpl ?? spawn)(
+            process.execPath,
+            [entry, ...process.argv.slice(2)],
+            selfRestartSpawnOptions(deps.platform ?? process.platform),
+        );
     } catch (e) {
         log("error", `[restart] spawn failed: ${String(e)} — resuming service`);
         resumeListening(server, host, port, log);
