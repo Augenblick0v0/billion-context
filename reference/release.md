@@ -2,18 +2,21 @@
 
 > **Not auto-loaded.** On-demand mechanics pulled out of `AGENTS.md` §5 to keep the
 > auto-loaded spec lean. The hard rules (never manual publish, version-only-on-release-branch,
-> acp-kernel ships first, updater changes need a no-op release first) stay in
+> kernel changes are human-gated, updater changes need a no-op release first) stay in
 > [`AGENTS.md` §5](../AGENTS.md#5-release-workflow); this file holds the exact steps,
 > the one-click workflow internals, and the no-op validation protocol.
 
-Releases are **fully automated via CI** (`.github/workflows/release.yml`). The Agent
-prepares a release PR; merging it triggers CI which builds, tests, publishes to npm,
-creates a git tag, and creates a GitHub Release. For routine patch releases there is
-also a one-click fast path below.
+Releases are **fully automated via CI** (`.github/workflows/release.yml`; kernel
+releases use `.github/workflows/release-kernel.yml`). The Agent prepares a release PR;
+merging it triggers CI which builds, tests, publishes to npm, creates a git tag, and
+creates a GitHub Release. For routine patch releases there is also a one-click fast
+path below.
 
 ## Branch Naming
 
 Release branches: `YYYY-MM-DD_release-v{VERSION}` (e.g., `2026-08-08_release-v0.1.17`)
+
+Kernel release branches: `YYYY-MM-DD_release-kernel-v{VERSION}` (e.g. `2026-11-01_release-kernel-v0.0.102`) — see "Kernel releases" below.
 
 ## Process (exact steps)
 
@@ -184,19 +187,30 @@ normal release ≥ 0.1.183).
 - **No publish step for the Agent**: the Agent never runs `npm publish`. The only manual
   fallback (if CI is down) is a human running `npm publish`.
 
-## Cross-repo dependency: acp-kernel MUST ship first
+## Kernel releases (standalone `acp-kernel` artifact, #2092)
 
-`acp-kernel` is pinned in **devDependencies** (exact version, no `^`) and bundled inline
-at build time, so `dist/index.js` is self-contained.
+The kernel source lives in-repo under `kernel/` and is consumed via
+`"acp-kernel": "file:./kernel"`, so every billion-context release bundles the in-tree
+kernel — there is NO registry ordering to manage anymore (the old "acp-kernel MUST
+ship first" rule is obsolete).
 
-⚠️ **When bumping the acp-kernel dependency version:**
-1. Release `acp-kernel` first (merge its release PR, wait for CI publish).
-2. **Verify it is live on npm:** `npm view acp-kernel version` returns the new version.
-3. THEN bump `acp-kernel` in this repo's `package.json` and release billion-context.
+When accumulated kernel changes warrant a standalone npm release of `acp-kernel`
+(downstream consumers such as the legacy billion-context-pi pick it up as usual):
 
-Rationale: billion-context CI runs `npm ci`, which installs the exact `acp-kernel`
-version pinned in `package.json`. A release branch that bumps `acp-kernel` to a
-not-yet-published version fails CI at install time.
+1. Branch `YYYY-MM-DD_release-kernel-v{VERSION}` off master.
+2. ONE commit `release kernel v{VERSION}` changing ONLY the version in
+   `kernel/package.json`.
+3. Open a PR (its body serves as the release notes; no release-notes entry required).
+   HUMAN merges.
+4. `.github/workflows/release-kernel.yml` runs on the merge: full bili gate
+   (typecheck + test + build) plus the kernel suite against its TS source, then
+   publishes `acp-kernel` from `kernel/`, tags `kernel-v{VERSION}`, creates a GitHub
+   Release.
+
+Cross-trigger safety: `*_release-kernel-v*` and `*_release-v*` are mutually exclusive
+in every matching direction (release.yml's merge-branch regex, direct commit messages
+`release v*` vs `release kernel v*`, the version-guard job, the kernel-guard job), and
+the tag namespaces never collide (`v*` vs `kernel-v*`).
 
 ## Auto-update testing
 

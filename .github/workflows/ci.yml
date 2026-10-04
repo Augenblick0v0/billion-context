@@ -36,6 +36,9 @@ jobs:
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
       - run: npm run typecheck
+      # Kernel boundary (#2092): the kernel's own unit suite against its TS
+      # source — both test layers must be green on every PR (AGENTS.md rule 5).
+      - run: npm --prefix kernel test
       # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
       # running here: the runner is dedicated, so their process/port
       # observations are reliable (#1248 gates them off for loaded local
@@ -68,3 +71,51 @@ jobs:
             exit 1
           fi
           echo "✓ version field untouched on non-release branch ($BRANCH)"
+
+  kernel-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify kernel boundary rules (#2092)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_HEAD_REF}"
+          # Kernel release branches bump kernel/package.json alone by design.
+          if [[ "$BRANCH" == *_release-kernel-v* ]]; then
+            echo "✓ kernel release branch ($BRANCH) — kernel version changes allowed"
+            exit 0
+          fi
+          # Rule 1: any PR touching kernel/** must declare 'kernel-change:' in its body.
+          if git diff --name-only origin/master...HEAD -- kernel/ | grep -q .; then
+            if ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
+              echo "::error::This PR modifies kernel/ but does not declare 'kernel-change: <reason>' in its body."
+              echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
+              exit 1
+            fi
+            echo "✓ kernel-change marker present"
+          fi
+          # Rule 2: version discipline — kernel source/build-config changes require a
+          # kernel/package.json version bump, and a bump requires source changes.
+          SRC_CHANGED=0
+          if git diff --name-only origin/master...HEAD -- kernel/src kernel/tsup.config.ts kernel/tsconfig.json | grep -q .; then
+            SRC_CHANGED=1
+          fi
+          BUMPED=0
+          if git diff origin/master...HEAD -- kernel/package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+            BUMPED=1
+          fi
+          if [[ "$SRC_CHANGED" == 1 && "$BUMPED" != 1 ]]; then
+            echo "::error::kernel/ source changed without bumping the version in kernel/package.json."
+            echo "Bump the kernel version so accumulated changes can ship as an independent acp-kernel release later."
+            exit 1
+          fi
+          if [[ "$BUMPED" == 1 && "$SRC_CHANGED" != 1 ]]; then
+            echo "::error::kernel/package.json version bumped without any kernel/ source change."
+            exit 1
+          fi
+          echo "✓ kernel version discipline OK"

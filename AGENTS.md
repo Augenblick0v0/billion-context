@@ -13,9 +13,9 @@
 | Category | Technology |
 |----------|-----------|
 | Language | TypeScript (strict, ESM) |
-| Build | tsup (bundling, inlines acp-kernel) |
+| Build | tsup (bundling; inlines the in-repo kernel `kernel/`) |
 | Test | Node.js built-in: `node --import tsx --test tests/*.test.ts` |
-| Runtime Dep | `acp-kernel` (bundled at build time) + `zod` (external, only used by `dist/agent/opencode-native.js` V1 tools; `dist/index.js` stays dependency-free) |
+| Runtime Dep | the in-repo compression kernel (`kernel/`, npm name `acp-kernel`, bundled inline at build time) + `zod` (external, only used by `dist/agent/opencode-native.js` V1 tools; `dist/index.js` stays dependency-free) |
 
 ### Repository Info
 
@@ -30,15 +30,15 @@
 
 ### Module Map
 
-The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy**. Orientation at a glance: `src/server.ts` (+ `src/loop/**` adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `tests/e2e/` holds the real-client regression suites.
+The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy**. Orientation at a glance: `src/server.ts` (+ `src/loop/**` adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `tests/e2e/` holds the real-client regression suites; the compression engine itself lives in-repo under `kernel/` (the acp-kernel source, #2092).
 
 ### Key Design Decisions
 
-1. **acp-kernel is bundled inline** — tsup does NOT list it in `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
+1. **The in-repo kernel is bundled inline** — `kernel/` (the acp-kernel source, consumed as a `file:` devDependency, #2092) is NOT listed in tsup `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
 2. **Tags use XML format** — messages carry ACP tags like `<acp tokens="2" type="text">m00001</acp>` (an opening element with `tokens=`/`type=` attributes wrapping a ref id, closed by its end element). In **source files** these angle brackets MUST be written as hex escapes (`\x3c`, `\x3e`) to avoid tooling that strips well-formed tags.
 3. **Auto-update**: checks npm registry every 3 min by default (`CHECK_INTERVAL_MS = 3*60*1000`, overridable via `update.checkIntervalMs` / `BILI_UPDATE_CHECK_INTERVAL_MS`, #2030); first check per process ignores throttle.
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
-5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
+5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092).** The acp-kernel source is vendored under `kernel/` and consumed via `"acp-kernel": "file:./kernel"` (devDependency; inlined into `dist` at build time). A commit IS the pin — there is no registry range left to drift. The kernel keeps its OWN version in `kernel/package.json`: any kernel source change MUST bump it (CI-enforced — see Kernel Boundary below), so accumulated changes can later ship as an independent npm release of `acp-kernel`. `package-lock.json` records the file link and stays committed.
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
 7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
    - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
@@ -70,16 +70,27 @@ The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a se
 
 - Host code must NOT prune/repack `session.state.messageRefs` in ways that let a freed number be re-issued (kernel `assignRefsNode` computes its cursor as `highestUsedIndex(map)+1`, so shrinking the map can drop the cursor and re-issue numbers).
 - Known residual: `applyCompactionArchive` (#421, `src/session.ts`) prunes `byRaw/byRef` to live raw ids on native-compaction boundaries. In practice the highest-numbered (newest) messages stay resident so the cursor does not drop, but this is a theoretical re-issue window — drop the map-prune once the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
-- master pins acp-kernel 0.0.101 (the old "do not bump past 0.0.47" guard is obsolete).
+- The kernel source lives in `kernel/` (#2092); its version at migration was 0.0.101 — the old registry-pin guards are obsolete (see Kernel Boundary below).
+
+## Kernel Boundary (in-repo acp-kernel, #2092)
+
+The compression kernel lives IN THIS REPO under `kernel/` (migrated verbatim from ranxianglei/acp-kernel @ v0.0.101 on 2026-10-04; the old repo stays frozen until the move has settled). It keeps its own identity — npm name `acp-kernel`, own `version`, own unit suite (`kernel/tests/`), own build chain (tsup → `kernel/dist` + d.ts) — and the host consumes it through `"acp-kernel": "file:./kernel"` exactly like the old registry package (same exports map, same typing, same JS inlined by tsup). The merge exists to end cross-repo maintenance pain WITHOUT making the kernel easy to disturb. Enforced rules:
+
+1. **Declare before you touch.** Every PR touching anything under `kernel/**` MUST declare `kernel-change: <reason>` in its body (CI job `kernel-guard` fails otherwise) AND needs owner approval BEFORE implementation, via a dedicated issue stating why the host side cannot solve the problem. Commits use the `kernel:` prefix.
+2. **Version discipline (CI-enforced).** Any change under `kernel/src/**` (or `kernel/tsup.config.ts` / `kernel/tsconfig.json`) MUST bump `version` in `kernel/package.json`; a bump without such a change also fails. Normal kernel changes ride along with billion-context releases; when enough accumulates, a dedicated kernel release publishes `acp-kernel` standalone (§5, Kernel releases).
+3. **Human-only review, always.** ALL kernel changes sit at the same review tier as `src/update.ts` and security (§7.4): no auto-merge, ever.
+4. **Behavior constants are golden-pinned.** `tests/golden/wire-contract/kernel.json` pins not just the tool schemas but the behavior surface hosts silently depend on: `defaultConfig(100_000)` (incl. the flat-50K nudge constants), `defaultPrompts` (the four load-bearing prompt rules), tool-name tables, wire markers. Regeneration requires stated justification in the PR; the ledger never shrinks (#1304).
+5. **Two test layers, both must pass.** The kernel's own unit suite (`npm --prefix kernel test` — runs against TS source) plus the bili suite/e2e as the integration layer. A kernel change is done only when BOTH are green on the rebased head.
+6. **Structural invariants stay human-gated** (carried over from the kernel's own spec): zero runtime deps (no new dependency without owner sign-off), platform-agnostic core (no host API / file I/O / network), message-id immutability, wire-artifact format, lossless round-trip, protected-tool hard exclusion, canonical pipeline node ordering.
 
 ## 3. Development Standards
 
 ### Build Commands
 
 ```bash
-npm run build          # tsup bundle (inlines acp-kernel)
-npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
-npm test               # node --import tsx --test tests/*.test.ts
+npm run build          # builds kernel/ first, then tsup bundle (kernel inlined)
+npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests; pre-hooks build kernel/)
+npm test               # node --import tsx --test tests/*.test.ts (bili suite; kernel suite: npm --prefix kernel test)
 ```
 
 ### Local Testing & Install
@@ -126,7 +137,7 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 | **NEVER merge PRs** | Human-only. If asked to merge, reply: "I can't merge PRs — AGENTS.md forbids Agents from merging. Please merge yourself: [PR URL]." |
 | **NEVER run `npm publish`** | CI handles it on release-PR merge. Never manually — incl. `NPM_ALLOW_DANGEROUS=1` or `npm pack` workarounds. If asked, reply: "I can't publish to npm — releases publish automatically via CI. See §5." |
 | **NEVER print the GitHub PAT** | Token stays in a shell variable only. |
-| **Branch naming** | `YYYY-MM-DD_short-title` |
+| **Branch naming** | `YYYY-MM-DD_short-title`; releases: `*_release-v*` (bili) / `*_release-kernel-v*` (kernel, §5) |
 | **NEVER modify `version` off release branches** | `"version"` touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. See Version Bumps below. |
 
 **Opening a PR** (no `gh` CLI — push + credential helper + GitHub REST API): the full token/curl recipe is in [reference/git-pr.md](reference/git-pr.md). Summary: `git push origin HEAD`, extract the token from `git credential fill` (shell var only, never print), POST to `/repos/ranxianglei/billion-context/pulls` with base `master`. Merging stays human-only.
@@ -157,18 +168,18 @@ Split extra findings into their own issues/PRs rather than expanding this one's 
 
 ## 5. Release Workflow
 
-Releases are fully automated via CI (`.github/workflows/release.yml`): the Agent prepares a release PR; merging it builds, tests, publishes to npm, tags, and creates a GitHub Release. There's also a one-click fast path for routine patches. Hard rules (exact steps + internals in [reference/release.md](reference/release.md)):
+Releases are fully automated via CI (`.github/workflows/release.yml`): the Agent prepares a release PR; merging it builds, tests, publishes to npm, tags, and creates a GitHub Release. Kernel releases (`acp-kernel`) use the parallel flow in `.github/workflows/release-kernel.yml` (below). There's also a one-click fast path for routine patches. Hard rules (exact steps + internals in [reference/release.md](reference/release.md)):
 
 - **Branch** `YYYY-MM-DD_release-v{VERSION}`; commit `release v{VERSION}` changing ONLY `version`. The Agent does steps 1–6 (sync master → branch → bump → **release-notes entry if severe (#1870)** → pre-flight typecheck+test+build → commit/push/open PR); HUMAN merges step 7; CI publishes step 8.
 - **Release-notes entry (#1870, OPT-IN since 2026-10-04):** only SEVERE releases need an entry in `release-notes/package.json`; ordinary releases ship with NO entry (the gates log a notice and pass when absent, validate when present). Add a severe entry as its own commit in the SAME release PR; the one-click fast path needs it already merged to master before dispatching. Full rules: [reference/release.md](reference/release.md) + `release-notes/README.md`.
 - **Bugfix carve-out channel (#2011):** emergency hotfixes ship through `.github/workflows/release-bugfix.yml` (dispatch-triggered, no release branch) — mechanics and constraints: [reference/release.md](reference/release.md).
 - **NEVER run `npm publish` manually** — CI does it (§4).
-- **Cross-repo: acp-kernel MUST ship first.** When bumping the acp-kernel pin: release acp-kernel, confirm it's live on npm (`npm view acp-kernel version`), THEN bump here — else CI's `npm ci` fails at install.
+- **Kernel releases (separate artifact, #2092).** `acp-kernel` can be published standalone from this repo when accumulated kernel changes warrant it: branch `YYYY-MM-DD_release-kernel-v{VERSION}`, commit `release kernel v{VERSION}` changing ONLY the version in `kernel/package.json`. Merging runs `.github/workflows/release-kernel.yml`: full bili gate + kernel suite, publish `acp-kernel` to npm, tag `kernel-v{VERSION}` (separate tag namespace — bili tags stay bare `v*`), GitHub Release. No release-notes entry required (different artifact; the PR body serves as notes). The two branch patterns are mutually exclusive, so bili's and kernel's release flows never cross-trigger. Downstream consumers of the npm package update as usual — zero notice needed.
 - **Changing `src/update.ts` (the updater itself) requires a NO-OP validation release FIRST** — a pure version bump proves the *existing* upgrade path is healthy end-to-end before the change ships. A broken updater bricks every future upgrade. Full protocol + rationale: [reference/release.md](reference/release.md).
 
 ## 6. Contributing
 
-Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) understand the module dependency graph, (4) **consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned in BOTH plugin mode and proxy mode; correct-in-one-mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`.
+Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) understand the module dependency graph, (4) **consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned in BOTH plugin mode and proxy mode; correct-in-one-mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`. (5) **Kernel changes follow the Kernel Boundary** — declaration marker, owner approval, version discipline, two-layer tests; the kernel is relatively stable by design, touch it only when necessary.
 
 Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release:`.
 
@@ -199,7 +210,7 @@ Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release
 - **Prefer native stable identifiers.** Use a client's native stable session id when available (survives credential/model/provider switches); report clients that expose none; never build identity from derived hashes that drift on switch (#280).
 - **Wire fidelity (host-side duty).** Never alter upstream protocol shape beyond intended injection: preserve tool_call ids/ordering, SSE structure, and upstream invariants (e.g. `compaction_trigger` must remain the last input item, #283/#209). Reason in BOTH compression modes (§6).
   - *Tool-call arguments are user intent (#1039).* Any payload a host will EXECUTE or PERSIST — tool-call `arguments` in every wire shape (OpenAI `tool_calls[].function.arguments`, Anthropic `input_json_delta.partial_json` / `tool_use.input`, Responses `function_call_arguments.*`), fragment or whole — is forwarded **byte-exact**. NEVER filter, strip, or "clean" it, not even to remove model-echoed render tags: a shape-based filter cannot distinguish an echo from a literal the user genuinely wants written (bash command strings, write/edit file contents), so any such "fix" silently corrupts executed/persisted data. Echoed tags surfacing in a host TUI is cosmetic noise — the fix belongs on the injection side (host renderTags policy, #933), never in the argument path. Tag-echo stripping applies to model PROSE only (content/reasoning/thinking/summary text fields); see the invariant block atop `src/loop/tag-echo-filter.ts`.
-  - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP artifacts (the compression tags, block refs, `acp_summary` structure — KDD #2) and the **id-never-reused guarantee** belong to **acp-kernel**, not this repo (§2 Kernel Contract). This repo only consumes them faithfully. Codifying the kernel-side spec is a separate acp-kernel change — deferred; cross-repo work stays manual for now.
+  - *Kernel-owned split:* the FORMAT CONTRACT of the kernel-emitted ACP artifacts (the compression tags, block refs, `acp_summary` structure — KDD #2) and the **id-never-reused guarantee** belong to **acp-kernel**, not this repo (§2 Kernel Contract). This repo only consumes them faithfully. Codifying the kernel-side spec is a change under `kernel/` — human-gated per the Kernel Boundary.
 - **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify against upstream logs — repeated-compression logs may be an upstream rate-limit retry illusion, not over-compression (#282).
 - **Wire-constraint ledger only grows (#1304).** Every upstream rejection or validation constraint discovered in production or provider docs (e.g. #1299: Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`) becomes a PERMANENT entry in the wire-contract suite — the ledger (`WIRE_RULES`, defined in `tests/wire-contract-fakes.ts`) plus the gates in `tests/wire-contract.test.ts` (with provenance citing where the constraint was learned) plus enforcement in the matching validation-parity fake upstream (`tests/wire-contract-fakes.ts`) — INSIDE THE FIXING PR. The ledger never shrinks without owner sign-off. Golden schema snapshots (`tests/golden/wire-contract/*.json`) change only via explicit regeneration (`node --import tsx scripts/update-wire-contract-goldens.ts`) with the justification stated in the PR. A pin bump or tool-surface change that trips a gate is a stop-the-line signal, not something to loosen.
 - **Honest output.** Never emit misleading messages for degenerate states (#155: export claimed "original conversation" for a 0-block session).
@@ -213,15 +224,15 @@ A bugfix may **auto-merge** only if ALL hold:
 1. Single-module scoped fix; no architectural change.
 2. A regression test reproduces the original bug and now passes.
 3. Green **on the rebased head** (typecheck + full test suite + build).
-4. No change to: config schema, persistence format/version, wire protocol / message shape, or cross-repo dependencies (acp-kernel).
+4. No change to: config schema, persistence format/version, wire protocol / message shape, or any change under `kernel/`.
 5. Pure `fix:` — no new capability surface (not feat/refactor).
 6. Clean diff: no unrelated changes, no mass whitespace/reformat, no generated or lock-file churn.
 7. References its issue via `Fixes #N`.
-8. Does NOT touch load-bearing infra: `src/update.ts`, release workflow, CI publish, the acp-kernel pin, message-ref/id logic, or security (MITM/CA/credentials).
+8. Does NOT touch load-bearing infra: `src/update.ts`, release workflow, CI publish, `kernel/` (any facet), message-ref/id logic, or security (MITM/CA/credentials).
 
-**Must stay human** (any hit): wire/message-shape changes (both modes affected), config schema or persistence version, cross-repo dependencies, `src/update.ts` (needs a no-op release first), identity/session-binding logic, feat/refactor/architecture, security-related, or any fallback/default-value change (a product decision).
+**Must stay human** (any hit): wire/message-shape changes (both modes affected), config schema or persistence version, any `kernel/` change, `src/update.ts` (needs a no-op release first), identity/session-binding logic, feat/refactor/architecture, security-related, or any fallback/default-value change (a product decision).
 
-> **Scope note:** auto-merge applies to THIS repo only. Cross-repo changes (acp-kernel bumps, anything spanning repos) remain manual/human for now.
+> **Scope note:** auto-merge applies to THIS repo only. Kernel changes (anything under `kernel/`, including its version bumps and releases) remain manual/human.
 
 ### 7.5 Reviewer Focus — the "重灾区" (second-round zones)
 

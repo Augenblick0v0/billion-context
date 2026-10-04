@@ -83,6 +83,30 @@ function buildKernelGolden(): Record<string, unknown> {
             RETRIEVE_TOOL_OPENAI: K.RETRIEVE_TOOL_OPENAI,
             RETRIEVE_TOOL_RESPONSES: K.RETRIEVE_TOOL_RESPONSES,
         },
+        // Behavior constants (#2092 kernel boundary): the defaults, prompts,
+        // names, and wire markers that host behavior silently depends on.
+        behavior: {
+            defaultConfig100k: defaultConfig(100_000),
+            defaultPrompts: K.defaultPrompts,
+            toolNames: {
+                ACP_TOOL_NAMES: K.ACP_TOOL_NAMES,
+                COMPRESS_TOOL_NAME: K.COMPRESS_TOOL_NAME,
+                DECOMPRESS_TOOL_NAME: K.DECOMPRESS_TOOL_NAME,
+                SEARCH_CONTEXT_TOOL_NAME: K.SEARCH_CONTEXT_TOOL_NAME,
+                ACP_STATUS_TOOL_NAME: K.ACP_STATUS_TOOL_NAME,
+                ACP_CACHE_TOOL_NAME: K.ACP_CACHE_TOOL_NAME,
+                ABSORB_TOOL_NAME: K.ABSORB_TOOL_NAME,
+                RETRIEVE_TOOL_NAME: K.RETRIEVE_TOOL_NAME,
+                RULE_TOOL_NAME: K.RULE_TOOL_NAME,
+                IMAGE_FULL_TOOL_NAME: K.IMAGE_FULL_TOOL_NAME,
+            },
+            markers: {
+                ACP_TEXT_OPEN: K.ACP_TEXT_OPEN,
+                ACP_TEXT_CLOSE: K.ACP_TEXT_CLOSE,
+                ABSORB_PROMPT_MARKER: K.ABSORB_PROMPT_MARKER,
+                DEFAULT_STEERING_SENTINEL: K.DEFAULT_STEERING_SENTINEL,
+            },
+        },
     };
 }
 
