@@ -388,6 +388,38 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
     );
 }
 
+/** #1999 residual (non-streaming Responses JSON loop): that loop rebuilds its
+ * re-request input from the RAW client body (plus its own pushed visibility
+ * markers / retrieval injections as `developer` items), so the two projection
+ * chokepoints that run `systemToUser` before the codec never see those items —
+ * a mid-history system/developer item still reaches strict single-system
+ * backends (Qwen3-family "system-first" templates behind developer→system
+ * mapping engines) and 400s the re-request. Unlike `systemToUser` above, this
+ * variant preserves the LEADING system/developer PREFIX verbatim: on this path
+ * the head carrier comes from the client's own raw input (its developer head /
+ * system message), and flattening it to user would change the request's voice;
+ * only items AFTER the first non-system/developer item are re-voiced (with
+ * output_text parts normalized to input_text, the user-side convention). No-op
+ * (same array) when nothing after the prefix needs converting. */
+export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
+    const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
+    let head = 0;
+    while (head < items.length && isSysDev(items[head]!)) head++;
+    let touched = false;
+    const out = items.map((it, i) => {
+        if (i < head || !isSysDev(it)) return it;
+        touched = true;
+        const content = Array.isArray(it.content)
+            ? it.content.map((part) =>
+                part && typeof part === "object" && (part as { type?: string }).type === "output_text"
+                    ? { ...(part as object), type: "input_text" }
+                    : part)
+            : it.content;
+        return { ...it, role: "user", content } as T;
+    });
+    return touched ? out : items;
+}
+
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or
  * tool_calls ("Invalid assistant message: content or tool_calls must be set").

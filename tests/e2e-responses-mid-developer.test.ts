@@ -312,3 +312,99 @@ test("#1999 proxy lane: inline compress loop keeps the Responses wire strict-bac
         assertNoMidSysDev("final request", last);
     });
 });
+
+// #1999 residual (ework review): the NON-STREAMING Responses JSON loop
+// (compressLoopResponsesJson) rebuilds its re-request input from the raw client
+// body and pushes its own `developer` visibility markers mid-history — it never
+// passes through the two projection chokepoints re-voiced above. These tests
+// pin the wire invariant on THAT path directly: the re-request body's
+// system/developer message items form a contiguous leading prefix (client head
+// preserved verbatim), everything mid-history rides as user.
+import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
+import { createCore } from "acp-kernel";
+import { getSession } from "../src/session.ts";
+
+function jsonLoopCtx(): Parameters<typeof compressLoopResponsesJson>[1] {
+    return {
+        core: createCore(),
+        config: { modelContextLimit: 400_000 } as Parameters<typeof compressLoopResponsesJson>[1]["config"],
+        messages: [],
+        session: getSession("middev-json-loop"),
+        log: () => {},
+    };
+}
+
+function compressCallResponse(): Record<string, unknown> {
+    return {
+        id: "resp_middev_json",
+        status: "completed",
+        output: [{
+            type: "function_call",
+            id: "fc_middev_json",
+            call_id: "call_middev_json",
+            name: "compress",
+            arguments: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "MIDDEV-JSON-LOOP folded" }] }),
+        }],
+    };
+}
+
+test("#1999 non-stream JSON loop: mid developer marker re-voiced, leading developer head preserved", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ id: "r", status: "completed", output: [] }), { status: 200 });
+    }) as typeof fetch;
+    try {
+        const request = {
+            model: "gpt-test",
+            instructions: "middev json loop agent",
+            input: [
+                { type: "message", role: "developer", content: [{ type: "input_text", text: "client head carrier" }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+            ],
+        };
+        await compressLoopResponsesJson(compressCallResponse(), jsonLoopCtx(), structuredClone(request), { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(bodies.length, 1, "mutating compress triggers exactly one re-request");
+        const input = bodies[0]!.input as Array<{ type: string; role?: string; content?: unknown }>;
+        assert.equal(input[0]?.role, "developer", "leading developer head must stay developer");
+        const marker = input.find((it) => JSON.stringify(it.content).includes("[ACP]"));
+        assert.ok(marker, "visibility marker must ride the re-request");
+        assert.equal(marker!.role, "user", `mid developer marker must be re-voiced to user, got "${marker!.role}"`);
+        const bad = findMidSysDev(JSON.stringify(bodies[0]));
+        assert.equal(bad, null, `strict-backend invariant violated: role "${bad?.role}" at index ${bad?.index}`);
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
+
+test("#1999 non-stream JSON loop: client-origin mid system re-voiced, head prefix untouched", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ id: "r", status: "completed", output: [] }), { status: 200 });
+    }) as typeof fetch;
+    try {
+        const request = {
+            model: "gpt-test",
+            input: [
+                { type: "message", role: "developer", content: [{ type: "input_text", text: "client head" }] },
+                { type: "message", role: "system", content: [{ type: "input_text", text: "second head-class message inside the leading prefix" }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: "turn one" }] },
+                { type: "message", role: "system", content: "OMP-style mid-history checkpoint (the #1996 shape)" },
+            ],
+        };
+        await compressLoopResponsesJson(compressCallResponse(), jsonLoopCtx(), structuredClone(request), { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(bodies.length, 1, "mutating compress triggers exactly one re-request");
+        const input = bodies[0]!.input as Array<{ type: string; role?: string; content?: unknown }>;
+        assert.equal(input[0]?.role, "developer", "leading developer head must stay developer");
+        assert.equal(input[1]?.role, "system", "system inside the leading prefix must stay system (head-class, index 1)");
+        assert.equal(input[3]?.role, "user", `mid system must be re-voiced to user, got "${input[3]?.role}"`);
+        assert.ok(JSON.stringify(input[3]?.content).includes("OMP-style"), "content preserved verbatim through the re-voicing");
+        const bad = findMidSysDev(JSON.stringify(bodies[0]));
+        assert.equal(bad, null, `strict-backend invariant violated: role "${bad?.role}" at index ${bad?.index}`);
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
