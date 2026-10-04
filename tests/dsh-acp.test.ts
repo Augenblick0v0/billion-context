@@ -125,7 +125,8 @@ test("/acp-cache forwards acp_cache bound to the latest conversation", async () 
     assert.equal(outcome.kind, "success");
     assert.equal(outcome.text, "CACHE-BODY");
     const toolCall = calls.find((c) => c.url.endsWith("/__bili/plugin/tool"));
-    assert.deepEqual(toolCall?.body, { conversationId: "conv_1", tool: "acp_cache", args: {} });
+    // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
+    assert.deepEqual(toolCall?.body, { conversationId: "conv_1", tool: "acp_cache", args: {}, nativeCaller: true });
 });
 
 test("/acp-cache on an armed-but-idle proxy says to send a request first", async () => {
