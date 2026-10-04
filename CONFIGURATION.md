@@ -79,6 +79,13 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Network interface the proxy binds to. `127.0.0.1` (default) listens only on localhost — safe for a local sidecar. Use `::` for IPv4 + IPv6 dual-stack. Use `0.0.0.0` (or a LAN IP) to expose the proxy to other machines — typically inside a container or on a trusted LAN: remote agents then point their model `baseURL` at `http://<this-host>:<port>/bili/…`, and MITM-mode `CONNECT` accepts remote clients for whitelisted model hosts only (blind tunnels stay loopback-only, and `/__bili/` management endpoints remain loopback-only). There is no authentication — ensure the surrounding network is trusted. Overridden by `ACP_HOST` / `--host`.
 
+### `upstream`
+
+- **Type:** `string` (base URL)
+- **Default:** `https://api.anthropic.com`
+- **Status:** ACTIVE
+- **Description:** Fallback base URL for path-only model requests: a client that POSTs to `/v1/messages` without a host is forwarded to `${upstream}/v1/messages`. Trailing slashes are stripped. Overridden by `ACP_UPSTREAM`. Also reported as `upstream` in `GET /__bili/health`.
+
 ### `sessionHeader`
 
 - **Type:** `string`
@@ -92,6 +99,13 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Enable per-request logging. Set `false` (or `ACP_LOG=0`) to silence the standard request log.
+
+### `logFile`
+
+- **Type:** `string`
+- **Default:** XDG state path (`~/.local/state/billion-context/bili.log`)
+- **Status:** ACTIVE
+- **Description:** Location of the proxy's tee log (file + stderr). Set `"off"` to disable file logging entirely (stderr only). Auto-rotates at 10 MB into `bili.log.old`. Overridden by `ACP_LOG_FILE` when set (an empty value resolves back to the default path, not off).
 
 ### `debug`
 
@@ -166,6 +180,20 @@ Top-level keys that control how the proxy listens and behaves globally.
   }
   ```
 
+### `upstreamProxy`
+
+- **Type:** `string` (proxy URL)
+- **Default:** *(none)*
+- **Status:** ACTIVE
+- **Description:** The config-file carrier of the Web UI manual proxy control — the UI writes this key (it survives restarts; `BILI_UPSTREAM_PROXY` is the env tier above it in the ladder). When set without an explicit `upstreamProxyMode`, the effective mode becomes `"manual"` so this value is what gets used. It takes its place in the [`proxy`](#proxy) resolution order between `BILI_UPSTREAM_PROXY` and the top-level `proxy`. An empty string is treated as unset.
+
+### `upstreamProxyMode`
+
+- **Type:** `"auto" | "manual" | "direct"` (anything else parses as `"direct"`)
+- **Default:** *(unset — resolves to `"manual"` when `upstreamProxy` is set, else `"direct"`)*
+- **Status:** ACTIVE
+- **Description:** Selection mode for the proxy's own outbound connections (see the [`proxy`](#proxy) resolution order for the full ladder): `"manual"` uses the Web UI manual proxy (`upstreamProxy`), falling back to the top-level `proxy` when it is empty; `"auto"` and `"direct"` use the top-level `proxy`; an EXPLICITLY set `"direct"` additionally opts the auxiliary egress (MITM blind tunnels) out of proxy fallbacks. `BILI_UPSTREAM_PROXY` always wins as an explicit proxy regardless of mode. Overridden by `BILI_UPSTREAM_PROXY_MODE`.
+
 ### `imageBilling`
 
 - **Type:** `"auto" | "pixels" | "bytes"`
@@ -226,6 +254,139 @@ Top-level keys that control how the proxy listens and behaves globally.
   - `providers.<url>.resign["<scheme>"]` (level 2) — `{ enabled?, passthrough?, credentialRef? }` under the same scheme key, per-field over the global block.
   - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy. Scheme lookup itself is case-insensitive (wire tokens arrive as `SDK-HMAC-SHA256 Access=…`, keys are lowercase).
 
+### `modelContextLimit`
+
+- **Type:** `number`
+- **Default:** `200000`
+- **Status:** ACTIVE
+- **Description:** Process-wide absolute context limit (tokens) — the fallback tier when neither a provider entry nor a model entry declares its own limit. Overridden by `ACP_MODEL_CONTEXT_LIMIT`. Distinct from the `compress.modelContextLimit` merge key under [Compression Tuning](#compression-tuning), which participates in the per-provider/per-model three-level cascade.
+
+### `providersPath`
+
+- **Type:** `string`
+- **Default:** *(none — providers come from the inline `providers` block in this file)*
+- **Status:** ACTIVE
+- **Description:** Path to an external `providers.json` (legacy / shared-file form of the inline [`providers`](#providers) table). Overridden by `ACP_PROVIDERS`.
+
+### `promptCache`
+
+- **Type:** `{ routing?: "auto" | "enabled" | "disabled" }`
+- **Default:** `{ routing: "auto" }` (anything unrecognized parses as `"auto"`)
+- **Status:** ACTIVE
+- **Description:** Routing for Responses-wire `prompt_cache_key` stamping. An explicit client-supplied `prompt_cache_key` always wins untouched; otherwise bili stamps its own stable conversation-derived key subject to the mode: `"enabled"` = always stamp, `"disabled"` = never stamp, `"auto"` (default) = stamp only when the upstream host is exactly `api.openai.com`. Overridden by `ACP_PROMPT_CACHE_ROUTING`.
+
+### `autoUpdate`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Periodic npm-registry version check (every `update.checkIntervalMs`, default 3 min; the first check per process ignores throttle). Detects newer builds on the configured `updateTag` channel; whether the running process actually swaps depends on `autoRestartOnUpdate` (self-restart) or the advisory lane (forced install). Disabled by `ACP_AUTO_UPDATE=0`. Independent of `advisoryCheck`: installs with auto-update off still escape known-broken version ranges via the advisory watcher.
+
+### `autoRestartOnUpdate`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Opt-in self-restart after an auto-update install (#811): requires zero in-flight requests, passes an install sanity check, and honors a 10-minute cooldown marker; on failure the original listener resumes. Enabled by `ACP_AUTO_RESTART_ON_UPDATE=1` (any non-`0` value).
+
+### `updateTag`
+
+- **Type:** `string` (npm dist-tag)
+- **Default:** `"latest"`
+- **Status:** ACTIVE
+- **Description:** Dist-tag channel the auto-updater follows (e.g. `dev`). The rolling `pr` tag tracks the newest PR test build across all PRs; legacy per-PR `pr-N` tags are frozen at that PR's last build and are only followed when explicitly configured. Overridden by `ACP_UPDATE_TAG`.
+
+### `advisoryCheck`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Critical-defect advisory watcher (#1481): polls the companion package `billion-context-advisories` (CI-published from `advisories/`) and force-installs the pinned `target` version — which may be a ROLLBACK — when the running version falls inside a declared broken range. Runs independently of `autoUpdate`, so installs with auto-update off still get force-updated out of known-broken versions. Fail-open: an unreachable or malformed source only warns and never blocks model traffic. Disabled by `BILI_ADVISORY_CHECK=0`.
+
+### `advisoryUrl`
+
+- **Type:** `string` (URL)
+- **Default:** *(companion package `billion-context-advisories` on the configured registry — `update.registry` aware)*
+- **Status:** ACTIVE
+- **Description:** Override for the advisory document URL. Overridden by `BILI_ADVISORY_URL`.
+
+### `releaseNotesCheck`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Release-notes visibility watcher (#1870): fetches the companion `billion-context-release-notes` document and surfaces "CRITICAL update ready — restart to finish" or "critical update available" on `acp_status` and the `/acp` panel ONLY when the pending span contains a `critical`-tier entry — routine releases never surface (silent by design, #1977). Never installs, never restarts; fail-open. Disabled by `BILI_RELEASE_NOTES_CHECK=0`.
+
+### `releaseNotesUrl`
+
+- **Type:** `string` (URL)
+- **Default:** *(companion package `billion-context-release-notes` on the configured registry — `update.registry` aware)*
+- **Status:** ACTIVE
+- **Description:** Override for the release-notes document URL. Overridden by `BILI_RELEASE_NOTES_URL`.
+
+### `maskHosts`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Host masking in proxy logs (#897/#255): non-public target hosts (private relays, internal domains) are logged as `<private-host>` instead of verbatim, because logs routinely get pasted into public issues. Credential-header masking is independent and always on. Real target hosts remain available without touching this flag via `GET /__bili/stats` → `blindTunnels` and `GET /__bili/health` (both loopback-only). Disabled by `BILI_LOG_MASK_HOSTS=0`.
+
+### `subagentSplit`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Claude Code background-subagent session splitting (#970): anthropic-wire requests carrying the `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` pair get their own `<session>\|sub:<agent-id>` session — own lock chain and compression state — instead of queueing behind the main session's lock. Disabled by `BILI_SUBAGENT_SPLIT=0`.
+
+### `forkAdoption`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Fork block-adoption for ANONYMOUS (prefix-affinity) clients (#629): when such a client forks its history mid-conversation (edit-and-resend / regenerate an earlier turn), the new session inherits the parent's compression blocks whose source content is fully present in the forked request, instead of restarting with zero compression state and re-folding the shared prefix from scratch. Identified resume-forks are NOT governed by this switch — they adopt blocks together with `resumeInheritance` (#1834). The adoptable inventory is logged on every anonymous fork even while disabled, so you can size the win before enabling. Enabled by `BILI_FORK_ADOPTION=1`.
+
+### `resumeInheritance`
+
+- **Type:** `boolean`
+- **Default:** `true`
+- **Status:** ACTIVE
+- **Description:** Resume inheritance for identified clients (#1486/#1834): when a client sending its own session id (e.g. Claude Code's `x-claude-code-session-id`) resumes a conversation under a NEW session id while replaying the full transcript (`cc --resume` forks a fresh UUID), bili matches the incoming history byte-exactly against that client's tracked chains (≥8 messages, append-only tracking) and, on the resumed session's first request, inherits the parent's ref assignments — stale model citations resolve to their ORIGINAL messages instead of mis-hitting renumbered ones — adopts the fully-present compression blocks, and records the `derivedFrom` lineage. The parent is never modified and fresh messages number above the parent's ref space. A resume must strictly EXTEND the parent's history — an equal-depth byte-exact replay under another id is a duplicate, not a resume. Anonymous sessions keep their own pfa-* world (#309). Disabled by `BILI_RESUME_INHERITANCE=0`.
+
+### `stableSystemAnchor`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Stable-system anchoring (#1085) — a best-effort wire-layer fallback for prefix caching; the root fix belongs client-side (the client owns its history and decides how to present instruction changes). Plain-proxy mode only: plugin-mode agents (`x-bili-plugin`) own their context management and are never anchored. When enabled, bili remembers each session's first-seen head system/instructions block and keeps re-sending those exact bytes when the client's system prompt later changes: a LOCALIZED change (a file-style edit sharing ≥70% of lines with the version in effect so far) appends a trailing `[System context update] …` user note carrying a compact line diff (`-` removed / `+` added); a NON-LOCALIZED change (structural reshuffle, tool-def churn, timestamped banners, heads over 400 lines) is adopted outright — one deliberate cache miss beats appending noise that would mislead the model; more than 8 accumulated notes likewise replace the anchor with the newest text. The anchor and note log persist with the session metadata and survive compression/compaction. Excluded from anchoring: title-gen micro-requests (OpenAI/Google), Responses compaction-trigger requests, auto-mode classifier requests. Enabled by `BILI_STABLE_SYSTEM_ANCHOR=1`.
+
+### `chainContentDetection`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Body-content detection of bili→bili chain awareness (#1086/#1421/#1683 follow-up): when an inbound request carries compression artifacts (render tags / historical `acp_status`+`search_context` tool calls) or a digest-bearing `<bili-chain …/>` checkpoint in its BODY but neither the `x-bili-hop` header nor local compression state for its session, bili records an advisory observation and/or applies first-processor-wins passthrough. Default OFF because scanning the request BODY can false-positive on CCR/file-introduced text and model-echoed tags that look like real markers — enable only for the narrow multi-bili relay case where an intermediate box strips `x-bili-hop` and you accept that false-positive risk. The `x-bili-hop` signal itself is unaffected either way. Enabled by `BILI_CHAIN_CONTENT=1`.
+
+### `chainEgressStamp`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Egress emission of the model-visible `<bili-chain …/>` chain-integrity checkpoint carrier (#1683): when enabled, every request THIS instance actually processes leaves with a digest-bearing stamp so a downstream bili applies first-processor-wins even when the `x-bili-hop` header was stripped in transit (#1421). The carrier lands in a slot the terminal model also reads (a trailing `user` message on OpenAI/Responses, a trailing text part on Anthropic/Google), so models treat it as phantom user input and burn tokens commenting on it — which is why it is off by default. Independent of `chainContentDetection` (inbound body-detection) and of the `x-bili-hop` passthrough, which works either way. Enable only for the narrow multi-bili relay case above. Enabled by `BILI_CHAIN_STAMP=1`.
+
+### `claude`
+
+- **Type:** `{ nativePort?: number }`
+- **Default:** `{}` (lane rides the self-managed port zone)
+- **Status:** ACTIVE
+- **Description:** claude native-lane settings. `nativePort` pins an EXACT port for the hook-spawned proxy (#964/#1660): strict-port semantics — a squatter on the port is refused loudly instead of hopping — and the baked managed `ANTHROPIC_BASE_URL` points at it. Without it the lane rides the self-managed zone (`BILI_ZONE_PORT` base + per-lane sticky) and re-pins the managed URL to the live origin each session, so port drift self-heals. Overridden by `BILI_CLAUDE_NATIVE_PORT`.
+
+### `native`
+
+- **Type:** `{ attachExternal?: boolean }`
+- **Default:** `{}` (attach gate closed for lane'd instances)
+- **Status:** ACTIVE
+- **Description:** Native-hook attach policy (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog; an unarmed lane'd listener (a crashed session's orphan) is refused loudly instead of being silently ridden — a manually started `bili start` daemon (no lane) is user-zone and attachable by default (#1660). Set `attachExternal: true` to attach to *lane'd* unarmed listeners anyway (any code/lane-compatible listener becomes attachable regardless of watchdog state, including pre-#1330 builds). Overridden by `BILI_NATIVE_ATTACH_EXTERNAL` (`1` opens the gate even over a closed file; `0` closes it even over a permissive file). Full mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660).
+
 ### Process-level blocks (#2030)
 
 Since #2030 every pure-behavior knob has a config-file key alongside its env var. Resolution is **env var > config file > built-in default**: a *set* env value owns its knob even when garbage (it parses exactly as pre-#2030 — falling back to the default) and neither leaks into nor gets shadowed by the file tier. These blocks scope the **proxy process** (transport timing, persistence, session lifecycle, self-update, diagnostics). They deliberately do **not** participate in the three-level compress merge ([global → provider → model](#three-level-merge-example)): none of these knobs has per-provider or per-model semantics — their env-var form was process-global, so a top-level key preserves scope exactly. All keys are optional; omitting a block changes nothing. Exhaustive per-knob semantics live in the [env mapping table](#config-file-keys-for-environment-knobs-2030) below.
@@ -246,7 +407,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
     "streamKeepAliveMs": 15000,           // SSE keepalive during upstream silence; 0 disables
     "preflightHoldMs": 30000,             // grace before a long preflight hold starts
     "preflightDeadEndCooldownMs": 300000, // cooldown after a dead-end preflight verdict
-    "proxyKeepAliveMaxMs": 55000          // upstream-proxy connection reuse cap; 0 uncapped
+    "proxyKeepAliveMaxMs": 55000,         // upstream-proxy connection reuse cap; 0 uncapped
+    "postResponseLingerMs": 5000          // post-response close linger budget (#1982)
   },
 
   // Session persistence
@@ -302,10 +464,10 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `network`
 
-- **Type:** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number }`
-- **Default:** `{}` (built-ins: `720000`, `2× upstream timeout`, `3`, `1500`, unset, `5000`, `30000`, `3600000`, `15000`, `30000`, `300000`, `55000`)
+- **Type:** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number }`
+- **Default:** `{}` (built-ins: `720000`, `2× upstream timeout`, `3`, `1500`, unset, `5000`, `30000`, `3600000`, `15000`, `30000`, `300000`, `55000`, `5000`)
 - **Status:** ACTIVE
-- **Description:** Process-wide transport and retry timing (ms). Each key resolves env > file > default via its twin (`BILI_UPSTREAM_TIMEOUT_MS`, `BILI_REQUEST_WATCHDOG_MS`, `BILI_REPLAY_RETRY_MAX`, `BILI_REPLAY_RETRY_BASE_MS`, `BILI_MAX_SHRINK_PER_COMPRESS`, `BILI_KEEP_ALIVE_TIMEOUT_MS`, `BILI_CLIENT_ERROR_BACKSTOP_MS`, `BILI_EXPOSURE_LOG_INTERVAL_MS`, `BILI_STREAM_KEEPALIVE_MS`, `BILI_PREFLIGHT_HOLD_MS`, `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`, `BILI_PROXY_KEEPALIVE_MAX_MS`). Semantics: `upstreamTimeoutMs` bounds time-to-first-byte and inter-chunk silence end-to-end (#551); `requestWatchdogMs` is the total-request budget (a negative value opts out); `replayRetryMax` counts attempts after transient upstream rejections (#189/#1688); `maxShrinkPerCompress` caps how much one compress may shrink the request before bili steers toward smaller ranges (#189); `streamKeepAliveMs` emits an SSE comment when the response has written zero bytes for that long (#1647); `proxyKeepAliveMaxMs` caps connection reuse through an upstream proxy below its recycle cadence (#1263), `0` uncaps. Full details in the [env table](#config-file-keys-for-environment-knobs-2030).
+- **Description:** Process-wide transport and retry timing (ms). Each key resolves env > file > default via its twin (`BILI_UPSTREAM_TIMEOUT_MS`, `BILI_REQUEST_WATCHDOG_MS`, `BILI_REPLAY_RETRY_MAX`, `BILI_REPLAY_RETRY_BASE_MS`, `BILI_MAX_SHRINK_PER_COMPRESS`, `BILI_KEEP_ALIVE_TIMEOUT_MS`, `BILI_CLIENT_ERROR_BACKSTOP_MS`, `BILI_EXPOSURE_LOG_INTERVAL_MS`, `BILI_STREAM_KEEPALIVE_MS`, `BILI_PREFLIGHT_HOLD_MS`, `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`, `BILI_PROXY_KEEPALIVE_MAX_MS`, `BILI_POST_RESPONSE_LINGER_MS`). Semantics: `upstreamTimeoutMs` bounds time-to-first-byte and inter-chunk silence end-to-end (#551); `requestWatchdogMs` is the total-request budget (a negative value opts out); `replayRetryMax` counts attempts after transient upstream rejections (#189/#1688); `maxShrinkPerCompress` caps how much one compress may shrink the request before bili steers toward smaller ranges (#189); `streamKeepAliveMs` emits an SSE comment when the response has written zero bytes for that long (#1647); `proxyKeepAliveMaxMs` caps connection reuse through an upstream proxy below its recycle cadence (#1263), `0` uncaps; `postResponseLingerMs` is the graceful-close budget after a proxy-initiated post-response close — the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (`reason=linger-backstop`) (#1982). Full details in the [env table](#config-file-keys-for-environment-knobs-2030).
 
 ### `persist`
 
@@ -951,6 +1113,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
+| `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | `5000` |
 | `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
 | `BILI_PERSIST` | `persist.enabled` | `true` |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
@@ -1004,7 +1167,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_HOST` | Override the listen host. |
 | `ACP_UPSTREAM` | Override the default upstream base URL. |
 | `ACP_LOG` | Set to `0` to disable request logging. |
-| `ACP_AUTO_UPDATE` | Set to `0` to disable auto-update checks. |
+| `ACP_AUTO_UPDATE` | Set to `0` to disable auto-update checks. File-config key: `autoUpdate`. |
+| `ACP_AUTO_RESTART_ON_UPDATE` | Set to `1` (any non-`0` value) to enable self-restart after an auto-update install (#811): the restart requires zero in-flight requests, passes an install sanity check, honors a 10-minute cooldown marker, and resumes the original listener on failure. File-config key: `autoRestartOnUpdate`. |
 | `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. The rolling `pr` tag tracks the newest PR test build across all PRs; legacy per-PR `pr-N` tags are frozen at that PR's last build and are only followed when explicitly configured. |
 | `BILI_UPDATE_REGISTRY` | Base URL override for the npm registry used by the auto-updater and `bili update` (default `https://registry.npmjs.org`). Intended for hermetic testing against a loopback registry (the verdaccio instance in the `ACP_TEST_REGISTRY` e2e suite); leave unset in production (#1153). |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | Auto-update check period in milliseconds (default `180000`, i.e. 3 minutes; values ≤ 0 are ignored and the default applies). Shortened by the hermetic e2e suite so it never waits a full cycle (#1153). |
@@ -1066,7 +1230,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
  | `BILI_LAUNCHER_LANE` | Internal: the launcher hands its client's lane name (pi / codex / claude / …) to the spawned proxy, which records it in the instance file (#1225). Reuse is identity-based: two instances with *different declared* lanes never attach to each other; an instance without a declared lane is a manually-started user-zone daemon — attachable by default (#1660). Only the launcher sets it — no user configuration. |
 | `BILI_LAUNCHER_PLUGIN` | Set `0` to disable the launcher's bili MCP server injection for claude/codex (pure wire mode); `1` forces plugin mode. Default: injected — except codex with a local/private upstream (sglang/vllm/ollama cannot parse codex's namespace tool type, so bili auto-falls back to wire tools there). See [Launcher Reference](#launcher-reference). |
  | `BILI_LAUNCHER_DIRECT` | Set `1` for direct-URL routing in the launcher (drop MITM/CA trust). See [Launcher Reference](#launcher-reference). |
- | `BILI_NATIVE_ATTACH_EXTERNAL` | Attach-gate escape hatch (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog (`watchdog.armed == true` in `/__bili/health`) — an unarmed *lane'd* proxy (a crashed session's orphan, or an instance whose lifecycle state cannot be verified) is refused loudly instead of being silently ridden. #1660: a **manually started `bili start` daemon** (no lane, no launch token) is user-zone by definition — native hooks attach to it by default, so a deliberate resident daemon “just works” without this env; you then own its lifetime and version. Set `1`/`true` to also attach to *lane'd* unarmed listeners anyway: any code/lane-compatible listener becomes attachable regardless of watchdog state (including pre-#1330 builds that report no `watchdog` field at all). `"native": { "attachExternal": true }` in the config file does the same; the env var wins (`0`/`false` closes the gate even over a permissive file — including for user-zone daemons, forcing fresh lane spawns). Default is closed (for lane'd instances). Full mechanics (reuse rules, listener table, escape hatch): [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232). |
+ | `BILI_NATIVE_ATTACH_EXTERNAL` | Attach-gate escape hatch (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog (`watchdog.armed == true` in `/__bili/health`) — an unarmed *lane'd* proxy (a crashed session's orphan, or an instance whose lifecycle state cannot be verified) is refused loudly instead of being silently ridden. #1660: a **manually started `bili start` daemon** (no lane, no launch token) is user-zone by definition — native hooks attach to it by default, so a deliberate resident daemon “just works” without this env; you then own its lifetime and version. Set `1`/`true` to also attach to *lane'd* unarmed listeners anyway: any code/lane-compatible listener becomes attachable regardless of watchdog state (including pre-#1330 builds that report no `watchdog` field at all). `"native": { "attachExternal": true }` in the config file does the same; the env var wins (`0`/`false` closes the gate even over a permissive file — including for user-zone daemons, forcing fresh lane spawns). Default is closed (for lane'd instances). Full mechanics (reuse rules, listener table, escape hatch): [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660). |
  | `BILI_ZCODE_ROUTE` | zcode native-plugin routing scope (#1622): `all` (default — every provider entry with a usable http(s) baseURL rides compression, pi/dsh parity), `plans` (pre-#1622 bigmodel coding-plan whitelist), `none` (opt out; the bootstrap leaves the store direct). Compat escape hatch — there is **no** file equivalent; routing is on by default. |
  | `BILI_ZONE_PORT` | Base of the self-managed port zone (#1660, default `18787`): every *lane-spawned* proxy (claude/zcode native hooks, launcher lanes riding port 0) tries the lane's sticky record first, else this base; port collisions resolve via the child's +1 ladder — except when the holder is a same-lane predecessor running a different build (an upgrade-restart overlap), which the child waits out (up to 5s) and then rebinds the SAME port instead of drifting (#1723) — and the settled port is recorded sticky under `<state>/port-zone.json` so later launches follow drift automatically. Manual `bili start` keeps its own default (`8787`) — the user zone is never touched by lanes. |
  | `BILI_ZCODE_PORT` | Pin an **exact** port for the zcode native lane's proxy (#1660): the launch becomes strict-port — a squatter is refused loudly instead of hopping — and wrappers written into the shared store survive session restarts even without handoff. Without it the lane rides the self-managed zone (`BILI_ZONE_PORT` base + sticky drift following). |
