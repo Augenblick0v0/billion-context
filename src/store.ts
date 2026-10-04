@@ -18,6 +18,7 @@ import { log as loggerLog } from "./logger.js";
 import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
+import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
 import type { PendingRetrieval, Session } from "./session.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
@@ -218,7 +219,6 @@ type UndeliveredEntry = { ref: string; tokens: number; chars: number };
 // the same path and clear on the first confirmed delivery.
 export type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
 const MAX_DROP_NOTES = 64;
-const DEFAULT_RETRIEVAL_TTL_MS = 10 * 60 * 1000;
 
 function readLedger(session: Session): UndeliveredEntry[] {
     const v = session.metadata.ccrUndelivered;
@@ -233,10 +233,7 @@ function carrierOf(session: Session): PendingRetrieval[] {
 }
 
 function retrievalTtlMs(): number {
-    const raw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;
-    if (raw === undefined || raw === "") return DEFAULT_RETRIEVAL_TTL_MS;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_RETRIEVAL_TTL_MS;
+    return knobCcrRetrievalTtlMs();
 }
 
 function bufferDropNote(session: Session, refs: string[], reason: string): void {

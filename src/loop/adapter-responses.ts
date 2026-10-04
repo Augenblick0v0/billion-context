@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
+import { keepResponseId as knobKeepResponseId } from "../knobs.js";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -313,7 +314,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const rebuilt: Record<string, unknown> = { ...requestBody, input: finalInput };
             // #1954: same as the HTTP path — warn when we strip a non-empty
             // chain ref, since a delta continuation then loses its history silently.
-            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") {
+            if (!knobKeepResponseId()) {
                 const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
                 if (chainWarn) loggerLog("warn", `[acp-responses] ${chainWarn}`);
                 delete rebuilt.previous_response_id;

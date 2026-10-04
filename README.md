@@ -399,6 +399,28 @@ The full configuration reference — config file location, top-level keys,
 providers, compression tuning, environment variables — lives in
 **[CONFIGURATION.md](CONFIGURATION.md)**.
 
+### Config file
+
+One JSON document at `~/.config/billion-context/billion-context.json`
+(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`).
+Precedence when several sources set the same knob: **CLI flag (where one exists) > env var > config file > built-in default** — every env var keeps working as the override tier.
+
+What's inside (details in CONFIGURATION.md):
+
+- `providers` — per-provider routing table: upstream override, model context windows, per-provider/model compress tuning, wire-protocol declaration, compaction opt-in.
+- `compress` — three-level compression tuning (global → provider → model): thresholds, nudge cadence, preservation rules, prompts, tiers.
+- Server-level blocks — process-wide behavior, including the #2030 additions: `network` (timeouts / retry / keep-alive / preflight cadence), `persist` (session persistence format + tail), `sessions` (cap + GC policy), `update` (registry mirror + check interval), `diagnostics` (dumps, render-tag mode, injection switches), `fakeCompletion`, plus scalars `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` and extensions `mitm.handshakeTimeoutMs`, `compat.noCacheControl`, `compat.keepResponseId`.
+
+Minimal example:
+
+```json
+{
+  "network": { "upstreamTimeoutMs": 900000 },
+  "persist": { "zstd": true },
+  "sessions": { "gc": { "enabled": true, "maxAgeDays": 14 } }
+}
+```
+
 Two knobs people look for first:
 
 - **Upstream proxy (firewall/GFW)** — routing the proxy's own outbound traffic through v2rayA/clash: full resolution order, empty-string = explicit direct, SOCKS5 rejection, both egress paths, and the `mitm://` vs `https://` key schemes live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `proxy`; Providers → key schemes).

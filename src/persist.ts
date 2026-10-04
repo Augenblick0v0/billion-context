@@ -4,6 +4,14 @@ import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
+import {
+    persistEnabled as knobPersistEnabled,
+    persistZstdEnabled as knobPersistZstdEnabled,
+    persistDebounceMs as knobPersistDebounceMs,
+    persistTailTokens as knobPersistTailTokens,
+    persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
+    persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
+} from "./knobs.js";
 import { log as loggerLog } from "./logger.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
@@ -828,27 +836,19 @@ function defaultDir(): string {
 }
 
 function defaultDebounce(): number {
-    const env = process.env.BILI_PERSIST_DEBOUNCE_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 500;
+    return knobPersistDebounceMs();
 }
 
 function persistEnabled(): boolean {
-    const env = process.env.BILI_PERSIST;
-    if (env === "0" || env === "false") return false;
-    return true;
+    return knobPersistEnabled();
 }
 
 /** #1080 (owner decision): session files stay plain JSON by default —
  *  recoverability (jq/grep-debuggable, no downgrade tail risk) beats silent
- *  disk savings. Only BILI_PERSIST_ZSTD=1/true opts into zstd (BILIZSTD1);
- *  anything else (0/false/unset) keeps plain JSON. */
+ *  disk savings. Only persist.enabled=false / BILI_PERSIST_ZSTD=1/true opts
+ *  into zstd (BILIZSTD1); anything else keeps plain JSON. */
 function persistZstdEnabled(): boolean {
-    const env = process.env.BILI_PERSIST_ZSTD;
-    return env === "1" || env === "true";
+    return knobPersistZstdEnabled();
 }
 
 /** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
@@ -877,12 +877,7 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
  *  OLDEST messages are dropped until the view fits. 0 disables message
  *  persistence entirely (block summaries + blockContents survive). */
 function persistTailTokens(): number {
-    const env = process.env.BILI_PERSIST_TAIL_TOKENS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 16384;
+    return knobPersistTailTokens();
 }
 
 /** Bounded folded-view snapshot for the on-disk record (#401). See
@@ -913,21 +908,11 @@ function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
 }
 
 function epermAlertThreshold(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_THRESHOLD;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n > 0) return n;
-    }
-    return 5;
+    return knobPersistEpermAlertThreshold();
 }
 
 function epermAlertRepeatMs(): number {
-    const env = process.env.BILI_PERSIST_EPERM_ALERT_REPEAT_MS;
-    if (env) {
-        const n = Number.parseInt(env, 10);
-        if (Number.isFinite(n) && n >= 0) return n;
-    }
-    return 0;
+    return knobPersistEpermAlertRepeatMs();
 }
 
 function defaultLogger(level: string, m: string): void {
