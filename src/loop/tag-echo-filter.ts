@@ -501,8 +501,14 @@ export function mayStartBiliInternal(s: string): boolean {
 // literal marker line, truncated internal-artifact open/header) is dead to the
 // host like an empty turn, so degenerate-turn detection counts it as residue;
 // plain prose (CJK leads included) is visible output, not residue.
+// #2023 review: the probe is PARTIAL_TAIL's \x3c -prefixed alternatives ONLY.
+// Its refs-run alternatives match genuine citations released at EOF; counting
+// those as residue made every bare-citation answer read as degenerate and fire
+// the one-shot retry (#732/#821) on a healthy turn. Tagged echoes need no help
+// here: their drop already sets sawStrippedEcho upstream.
+const TAG_PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 export function isOrphanMarkupText(s: string): boolean {
-    return mayStartRenderTag(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
+    return RENDER_TAG_DETECT.test(s) || TAG_PARTIAL_TAIL.test(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
 }
 
 function tailHoldLen(s: string): number {
