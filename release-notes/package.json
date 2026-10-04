@@ -21,7 +21,7 @@
         "version": "0.1.182",
         "date": "2026-10-04",
         "tier": "recommended",
-        "summary": "Emergency carve-out: the output-budget clamp now floors to an integer, so max_tokens / max_completion_tokens / max_output_tokens are always whole numbers. Strict OpenAI-compatible upstreams no longer reject requests with 'max_tokens: Input should be a valid integer' (400) or 'Endpoint is unavailable' (422) — which killed whole agent turns (#2011). Only this fix, on top of v0.1.181."
+        "summary": "max_tokens & completion/output variants now floor to integers — OpenAI-compatible upstreams stop rejecting requests that killed whole agent turns (#2011). #1977: update visibility is silent by default — routine/recommended releases no longer nag on the /acp panel or acp_status; only critical-tier entries surface (staleness: web banner, /acp line on OpenCode, GET /__bili/status)."
       },
       {
         "version": "0.1.181",
