@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -247,13 +247,17 @@ test("hermes scan: plugin dirs matched by dir name only, bili skipped", () => {
     assert.deepEqual(res.findings.map((f) => f.entry), ["context-compactor"]);
 });
 
-test("#920: opencode-acp is design-absorbed only under bili's own opencode mode", () => {
-    const known: ThirdPartyFinding = { client: "opencode", entry: "opencode-acp", source: "global", match: "known", knownId: "opencode-acp" };
-    assert.equal(isDesignAbsorbed(known, "opencode"), true);
-    assert.equal(isDesignAbsorbed(known, undefined), false, "wire mode: still a conflict");
-    assert.equal(isDesignAbsorbed(known, "pi"), false);
+test("#920/#2045: bili's own sibling compressors are design-benign only under that client's own mode", () => {
+    const ocKnown: ThirdPartyFinding = { client: "opencode", entry: "opencode-acp", source: "global", match: "known", knownId: "opencode-acp" };
+    assert.equal(isDesignBenign(ocKnown, "opencode"), true);
+    assert.equal(isDesignBenign(ocKnown, undefined), false, "wire mode: still a conflict");
+    assert.equal(isDesignBenign(ocKnown, "pi"), false);
+    const piKnown: ThirdPartyFinding = { client: "pi", entry: "npm:billion-context-pi", source: "/h/.pi/agent/settings.json", match: "known", knownId: "billion-context-pi" };
+    assert.equal(isDesignBenign(piKnown, "pi"), true, "#2045: stands down via BILLION_CONTEXT_NATIVE/PROXY — no web popup");
+    assert.equal(isDesignBenign(piKnown, undefined), false, "wire/plain-proxy mode: still a conflict");
+    assert.equal(isDesignBenign(piKnown, "opencode"), false);
     const suspected: ThirdPartyFinding = { client: "opencode", entry: "acp-helper", source: "global", match: "keyword" };
-    assert.equal(isDesignAbsorbed(suspected, "opencode"), false, "keyword tier is never absorbed");
+    assert.equal(isDesignBenign(suspected, "opencode"), false, "keyword tier is never benign");
 });
 
 test("dsh scan: profile deps scanned; bare-'context' dashboard dropped, action-token compressors kept (#1736)", () => {

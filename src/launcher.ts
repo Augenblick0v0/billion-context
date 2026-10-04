@@ -143,7 +143,7 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
-import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins } from "./thirdparty-scan.js";
+import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
@@ -4161,8 +4161,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         try {
             const scan = scanClientPlugins(base, { env: discoveryEnv, cwd: process.cwd() });
             for (const f of scan.findings) {
-                if (isDesignAbsorbed(f, base)) {
-                    console.error(`bili: note: opencode-acp present (${f.entry}, ${f.source}) — kept by design for legacy-session absorption (#920); new sessions route through bili only.`);
+                if (isDesignBenign(f, base)) {
+                    console.error(`bili: note: ${f.entry} present (${f.source}) — bili's own ${f.client} sibling compressor; it stands down / is absorbed while bili owns this session, no action needed (#920/#2045).`);
                     continue;
                 }
                 const risk = f.match === "known"

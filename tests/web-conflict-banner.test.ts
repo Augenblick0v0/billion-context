@@ -16,7 +16,7 @@ function bannerLine(): (c: { events?: number; sessions?: number; kinds?: Record<
     return new Function(src)() as (c: { events?: number; sessions?: number; kinds?: Record<string, number>; latest?: Array<{ kind: string; detail?: string }> }) => string;
 }
 
-test("banner line names distinct third-party plugins with dedupe, weights, suspected marker", () => {
+test("banner line shows FULL identity (client: entry + source), dedupe, weights, suspected marker (#2045)", () => {
     const f = bannerLine();
     const out = f({
         events: 40, sessions: 23,
@@ -29,26 +29,26 @@ test("banner line names distinct third-party plugins with dedupe, weights, suspe
         ],
     });
     assert.equal(out,
-        "40 event(s) in 23 session(s): third-party-plugin×40 — pi: npm:billion-context-pi · pi: npm:context-forge [suspected]×2 · opencode: opencode-acp");
+        "40 event(s) in 23 session(s): third-party-plugin×40 — pi: npm:billion-context-pi (/home/dog/.pi/agent/settings.json) · pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]×2 · opencode: opencode-acp (~/.config/opencode/opencode.json)");
 });
 
-test("banner line escapes HTML in names", () => {
+test("banner line escapes HTML across the full detail incl. source path", () => {
     const f = bannerLine();
     const out = f({
         events: 1, sessions: 1, kinds: { "third-party-plugin": 1 },
         latest: [{ kind: "third-party-plugin", detail: "pi: npm:a<b&c (settings.json)" }],
     });
-    assert.equal(out, "1 event(s) in 1 session(s): third-party-plugin×1 — pi: npm:a&lt;b&amp;c");
+    assert.equal(out, "1 event(s) in 1 session(s): third-party-plugin×1 — pi: npm:a&lt;b&amp;c (settings.json)");
 });
 
-test("banner line truncates beyond four distinct entries", () => {
+test("banner line lists ALL distinct entries without truncation (#2045: 显示全尽量)", () => {
     const f = bannerLine();
     const latest = ["a-one", "a-two", "a-three", "a-four", "a-five"].map((n) => ({
         kind: "third-party-plugin" as const, detail: `pi: ${n} (/tmp/settings.json)`,
     }));
     const out = f({ events: 5, sessions: 5, kinds: { "third-party-plugin": 5 }, latest });
     assert.equal(out,
-        "5 event(s) in 5 session(s): third-party-plugin×5 — pi: a-one · pi: a-two · pi: a-three · pi: a-four …+1");
+        "5 event(s) in 5 session(s): third-party-plugin×5 — pi: a-one (/tmp/settings.json) · pi: a-two (/tmp/settings.json) · pi: a-three (/tmp/settings.json) · pi: a-four (/tmp/settings.json) · pi: a-five (/tmp/settings.json)");
 });
 
 test("banner line degrades gracefully: no latest / non-plugin kinds keep old count shape", () => {
