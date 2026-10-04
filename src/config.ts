@@ -795,6 +795,20 @@ export type ProxyOptions = {
      *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
      *  `stableSystemAnchor: true` in the config file (env wins). */
     stableSystemAnchor?: boolean;
+    /** #2028: opt-in to letting dsh's built-in auto-compaction (compaction-basic)
+     *  run through bili instead of being refused by the #1729 wire guard.
+     *  Default OFF (= guard active): dsh compaction envelopes (final user
+     *  message = COMPACTION_INSTRUCTION template, ≤4 messages) are refused
+     *  locally with 403 — bili owns compression on that lane. When ON the
+     *  call is forwarded and may LAND: a landed checkpoint durably shadows
+     *  the raw history (irreversible) and destroys bili's compression
+     *  substrate, which is why this stays off by default. On non-web
+     *  profiles the shipped bundle patch (`auto: false`) still suppresses
+     *  AUTO-triggering — only manual /compact benefits there; on web
+     *  profiles (where no patch layer reaches the preset-nested instance,
+     *  #1772) auto-triggering works as-is. Enable with
+     *  `allowDshCompaction: true` or env BILI_ALLOW_DSH_COMPACTION=1. */
+    allowDshCompaction?: boolean;
 };
 
 /** The routing fields a provider entry can carry — exactly what
@@ -946,6 +960,15 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     const filePassthrough = loadConfigFile().passthrough === true;
     if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
+}
+
+// #2028: resolved dsh-native-compaction opt-in state shared by loadOptions and
+// the web config API (single source of truth — the GET handler must not
+// re-derive it). Same "0-off" env semantics as the loadOptions line.
+export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
+    const fileAllow = loadConfigFile().allowDshCompaction === true;
+    if (env.BILI_ALLOW_DSH_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_DSH_COMPACTION !== "0", source: "env" };
+    return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
@@ -1190,6 +1213,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #2028: default OFF keeps the #1729 wire refusal unconditional unless
+        // explicitly opted out — see the Options.allowDshCompaction docstring.
+        allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.allowDshCompaction === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -1320,6 +1346,10 @@ type FileConfig = {
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
+    /** Set `true` to let dsh native compaction calls run through bili
+     *  (#2028, default OFF = the #1729 guard refuses them); env
+     *  BILI_ALLOW_DSH_COMPACTION wins over the file. */
+    allowDshCompaction?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).
@@ -1471,6 +1501,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "allowDshCompaction",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",

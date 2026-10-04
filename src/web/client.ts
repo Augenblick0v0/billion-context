@@ -1274,6 +1274,8 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            dsgRow.inp.checked = draft.allowDshCompaction === true;
+            dsgWarnNote.hidden = draft.allowDshCompaction !== true;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1351,6 +1353,23 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
+        // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
+        const dsgEnvForced = Boolean(cfg.allowDshCompaction && cfg.allowDshCompaction.source === "env");
+        const dsgRow = row("quick-dsg", t("cfg.q_dsh_compact"));
+        if (!dsgEnvForced) qCtrls.push(dsgRow.inp);
+        const dsgWarnNote = document.createElement("div");
+        dsgWarnNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#9a6700";
+        dsgWarnNote.textContent = t("cfg.q_dsh_compact_warn");
+        dsgWarnNote.hidden = true;
+        box.appendChild(dsgWarnNote);
+        const dsgEnvNote = document.createElement("div");
+        dsgEnvNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
+        dsgEnvNote.hidden = true;
+        box.appendChild(dsgEnvNote);
+        dsgRow.inp.addEventListener("change", () => commit((d) => { if (dsgRow.inp.checked) d.allowDshCompaction = true; else delete d.allowDshCompaction; }));
+        if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);

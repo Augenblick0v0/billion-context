@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
+    allowDshCompactionState,
     parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
@@ -90,6 +91,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         passthrough: passthroughState(process.env),
+        allowDshCompaction: allowDshCompactionState(process.env),
         ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
@@ -116,8 +118,9 @@ export async function handleConfigPut(
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
+    const hasDsh = Object.prototype.hasOwnProperty.call(body, "allowDshCompaction");
     const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough settings, or the full config file");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, dsh compaction settings, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
     // structured payload, then replace the ENTIRE config — preserving unknown keys such
     // as promptPack/ccr that per-field PUTs cannot touch.
@@ -150,6 +153,11 @@ export async function handleConfigPut(
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
         if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
+        if (next.allowDshCompaction !== undefined && next.allowDshCompaction !== null && typeof next.allowDshCompaction !== "boolean") return sendError(res, 400, "allowDshCompaction must be a boolean or null");
+        if (next.allowDshCompaction === true || next.allowDshCompaction === false) {
+            const dshForced = allowDshCompactionState(process.env);
+            if (dshForced.source === "env" && (next.allowDshCompaction === true) !== dshForced.enabled) return sendError(res, 409, "allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+        }
         try {
             atomicWriteConfig(next);
             onChanged?.();
@@ -227,6 +235,22 @@ export async function handleConfigPut(
         }
     }
 
+    // #2028: same read/clear contract as passthrough (#405) — an env
+    // BILI_ALLOW_DSH_COMPACTION outranks the file on every reload, so a
+    // contradicting file write would be a silent no-op: refuse with the exact
+    // way out instead. A matching write or a clear (null) stays allowed.
+    if (hasDsh) {
+        if (body.allowDshCompaction !== null && typeof body.allowDshCompaction !== "boolean") {
+            return sendError(res, 400, "allowDshCompaction must be a boolean or null");
+        }
+        if (body.allowDshCompaction !== null) {
+            const dshState = allowDshCompactionState(process.env);
+            if (dshState.source === "env" && (body.allowDshCompaction === true) !== dshState.enabled) {
+                return sendError(res, 409, "allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+            }
+        }
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = rawProviders;
     if (hasProxy) {
@@ -242,6 +266,10 @@ export async function handleConfigPut(
         if (body.passthrough === true) config.passthrough = true;
         else delete config.passthrough;
     }
+    if (hasDsh) {
+        if (body.allowDshCompaction === true) config.allowDshCompaction = true;
+        else delete config.allowDshCompaction;
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
@@ -253,6 +281,7 @@ export async function handleConfigPut(
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
     if (hasPassthrough) changed.push("passthrough");
+    if (hasDsh) changed.push("dsh compaction");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders && rawProviders ? Object.keys(rawProviders).length : undefined }));
