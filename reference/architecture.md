@@ -125,7 +125,8 @@ billion-context/
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
-│   │   ├── native-intercept.ts   #   Fetch-interception self-heal (BILI_RECLAIM_FETCH_PATCH)
+ │   │   ├── native-intercept.ts   #   Fetch-interception self-heal (BILI_RECLAIM_FETCH_PATCH)
+ │   │   ├── native-ws-intercept.ts #  WebSocket-companion intercept: Codex Responses upgrades → /bili/ lane (#2111)
 │   │   ├── opencode-acp-command.ts #  /acp + /acp-cache command hooks (V1+V2)
 │   │   ├── opencode.ts           #   opencode V1 plugin (attach respawn + test seam)
 │   │   ├── opencode-v2.ts        #   opencode V2 plugin (ModelApi probe, #1569)
