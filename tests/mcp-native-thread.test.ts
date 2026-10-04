@@ -468,8 +468,8 @@ test("#2024 proxy: host-stamped native caller outranks a conflicting unique witn
         resetToolRingForTest();
         await modelTurn(h, "nt-b", "WITNESS:acp_cache second beta witness turn");
         r = await toolPost(h, { tool: "acp_cache", args: {}, conversationId: "nt-a" });
-        assert.equal(r.status, 409);
-        assert.equal(r.json?.code, "TOOL_CONVERSATION_CONFLICT");
+        assert.equal(r.status, 409, "unmarked resolvable body id contradicted by a unique witness must fail closed (#2016)");
+        assert.equal((r.json as Record<string, unknown> | null)?.code, "TOOL_CONVERSATION_CONFLICT");
     } finally {
         await h.stop();
     }

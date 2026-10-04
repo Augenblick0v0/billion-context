@@ -305,6 +305,18 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
+function publicSnapshotCapBytes(): number {
+    // #2016 D-B review follow-up: the raw wire snapshot is what the public
+    // fork API serves. Without a cap, every plugin session retains its FULL
+    // raw history forever (multiplied across forks) and disk grows without
+    // bound. When the serialized snapshot exceeds the cap we refuse to
+    // retain it — the session stops being forkable (snapshot/fork answer
+    // 409 SNAPSHOT_UNAVAILABLE with the capped reason) instead of growing
+    // disk forever. 0 disables the cap (operator override / tests).
+    const raw = Number(process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 16_777_216;
+}
+
 export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
@@ -335,7 +347,15 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     remembered.set(sessionId, { processed, original, nudge });
     const session = peekSession(sessionId);
     if (session && typeof session.metadata.pluginAgent === "string" && original.length > 0) {
-        session.pluginSnapshot = structuredClone(original);
+        const snapshotCandidate = structuredClone(original);
+        const cap = publicSnapshotCapBytes();
+        if (cap > 0 && stableJson(snapshotCandidate).length > cap) {
+            session.pluginSnapshot = undefined;
+            session.metadata.publicSnapshotCapped = true;
+        } else {
+            session.pluginSnapshot = snapshotCandidate;
+            delete session.metadata.publicSnapshotCapped;
+        }
         const previousRefs = session.metadata.publicSnapshotStoredRefs;
         session.metadata.publicSnapshotStoredRefs = [...new Set([
             ...(Array.isArray(previousRefs) ? previousRefs : []),
@@ -778,7 +798,7 @@ export function publicForkInputMatches(session: Session, protocol: WireProtocol,
 
 function forkSnapshot(session: Session) {
     const messages = session.pluginSnapshot;
-    if (!messages) throw new Error("raw snapshot unavailable; send a fresh plugin model request");
+    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;

@@ -990,3 +990,51 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.notEqual(resolveConversation("nested").session!.state.blocks[1].directBlockIds, parent.state.blocks[1].directBlockIds);
     } finally { await h.close(); }
 });
+
+test("HTTP raw-snapshot retention cap fails closed instead of growing without bound (D-B)", async () => {
+    // #2016 review: without a cap every plugin session retains its full raw
+    // history forever. With BILI_PUBLIC_SNAPSHOT_CAP_BYTES set tiny, the
+    // session refuses to retain the snapshot and the public endpoints answer
+    // 409 SNAPSHOT_UNAVAILABLE with the capped reason — never a stale guess.
+    const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+    process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        assert.equal(session.pluginSnapshot, undefined, "an over-cap raw snapshot must not be retained");
+        assert.equal(session.metadata.publicSnapshotCapped, true);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal((snapshot.body as { error?: string }).error, "Error: raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy");
+        const fork = await h.request("/__bili/plugin/fork", { protocolVersion: 1, parentConversationId: "parent", childConversationId: "child", parentRevision: "a".repeat(64), branchPoint: { messageCount: 0, orderHash: createHash("sha256").update("[]").digest("hex") }, orderedMessages: [], idempotencyKey: "op-1" });
+        assert.equal(fork.status, 409);
+        assert.equal(fork.body.code, "SNAPSHOT_UNAVAILABLE");
+    } finally {
+        if (previous === undefined) delete process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+        else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previous;
+        await h.close();
+    }
+});
+
+test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", async () => {
+    const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+    process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
+    const h = await harness();
+    try {
+        const session = getSession("cap-recover");
+        session.metadata.pluginAgent = "test";
+        const messages = [{ id: "cap-recovered", role: "user" as const, contentType: "text" as const, text: "resending the whole history keeps ids stable" }];
+        rememberPluginMessages(session.id, messages, messages);
+        assert.equal(session.pluginSnapshot, undefined);
+        assert.equal(session.metadata.publicSnapshotCapped, true);
+        process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = String(64 * 1024 * 1024);
+        rememberPluginMessages(session.id, messages, messages);
+        const recovered: unknown = session.pluginSnapshot;
+        assert.equal(Array.isArray(recovered) && recovered.length, 1, "an under-cap resend must restore the retained snapshot");
+        assert.equal(session.metadata.publicSnapshotCapped, undefined);
+    } finally {
+        if (previous === undefined) delete process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+        else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previous;
+        await h.close();
+    }
+});
