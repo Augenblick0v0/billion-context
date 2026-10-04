@@ -204,6 +204,34 @@ const seamLastSent = new WeakMap<Session, string>();
 const seamLastSettled = new WeakMap<Session, string>();
 const lastClientAbort = new WeakMap<Session, number>();
 
+export interface ContextObservation {
+    sessionId: string;
+    tokens: number;
+    source: "usage" | "estimate";
+    at: number;
+    generation: string;
+}
+
+/** Public context provenance is separate from billing and nudge baselines. */
+export function recordContextObservation(session: Session, tokens: number, source: ContextObservation["source"]): void {
+    if (!Number.isFinite(tokens) || tokens < 0) {
+        delete session.metadata?.publicContextObservation;
+        return;
+    }
+    session.metadata ??= {};
+    session.metadata.publicContextObservation = { sessionId: session.id, tokens, source, at: Date.now(), generation: randomUUID() } satisfies ContextObservation;
+}
+
+export function currentContextObservation(session: Session): ContextObservation | undefined {
+    const raw = session.metadata?.publicContextObservation;
+    if (!raw || typeof raw !== "object") return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.sessionId !== session.id || typeof o.tokens !== "number" || !Number.isFinite(o.tokens) || o.tokens < 0 ||
+        (o.source !== "usage" && o.source !== "estimate") || typeof o.at !== "number" || !Number.isFinite(o.at) || o.at < 0 ||
+        typeof o.generation !== "string" || o.generation.length === 0) return undefined;
+    return { sessionId: session.id, tokens: o.tokens, source: o.source, at: o.at, generation: o.generation };
+}
+
 /** #1592 follow-up: stamp the wall-clock time of a client mid-stream abort
  *  (wired at both forward abort chokepoints). The next settle in the same
  *  session reads it to mark abort-correlated samples. */
@@ -216,6 +244,9 @@ export function noteClientAbort(session: Session): void {
  *  the next settleUsageReport pairs it with the usage report it produced. */
 export function noteForwardedBody(session: Session, body: string): void {
     seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
+    // prepare may reuse a measured baseline; this new payload is not measured yet.
+    if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
+    else delete session.metadata?.publicContextObservation;
 }
 
 // #1843 L1: learned per-route image cost. The prior (pixel tile model or bytes)
@@ -676,6 +707,10 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        session.stats.contextTokens = session.stats.lastInputTokens;
+        session.stats.contextTokensSource = "usage";
+        if (session.metadata) session.metadata.contextTokensAt = Date.now();
+        recordContextObservation(session, session.stats.lastInputTokens, (session.stats.compressCreditTokens ?? 0) > 0 ? "estimate" : "usage");
         // #1933 F2: record which route measured this baseline — the gate uses
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);

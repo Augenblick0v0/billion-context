@@ -10,7 +10,6 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { type CompressSettings } from "../src/config.ts";
-import type { AddressInfo } from "node:net";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession } from "../src/session.ts";
@@ -89,11 +88,15 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
     const upstream = makeUpstream(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = (upstream.address() as AddressInfo).port;
+    const upstreamAddress = upstream.address();
+    assert(upstreamAddress && typeof upstreamAddress !== "string");
+    const upstreamPort = upstreamAddress.port;
 
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
     await once(proxy, "listening");
-    const proxyPort = (proxy.address() as AddressInfo).port;
+    const proxyAddress = proxy.address();
+    assert(proxyAddress && typeof proxyAddress !== "string");
+    const proxyPort = proxyAddress.port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
     const headers = { "content-type": "application/json", "x-acp-session": "issue1987-anchor-sess" };
 

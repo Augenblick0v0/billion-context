@@ -321,6 +321,13 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 - **Status:** ACTIVE
 - **Description:** `max` caps in-memory sessions with LRU eviction (twin `BILI_MAX_SESSIONS`; disk remains the source of truth). `gc` controls stale-session-file cleanup (twins `BILI_SESSION_GC*`) — **opt-in**, because session files are user data: compressed sessions are never deleted, deletions are audit-logged, and the age + lossless-size gates apply. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
 
+### `plugin`
+
+- **Type:** `{ snapshotCapBytes?: number }`
+- **Default:** `{ snapshotCapBytes: 16777216 }`
+- **Status:** ACTIVE
+- **Description:** Plugin-surface knobs (#2017). `snapshotCapBytes` caps the raw wire-history snapshot retained per plugin session for the public fork API (`GET /__bili/plugin/snapshot`, `POST /__bili/plugin/fork`): when the serialized snapshot exceeds the cap, bili refuses to retain it — the session stops being forkable (snapshot/fork answer `409` with the capped reason) instead of retaining an unbounded raw copy on disk. Default `16 MiB`; `0` disables retention entirely (no session is forkable); twins `BILI_PUBLIC_SNAPSHOT_CAP_BYTES`. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+
 ### `update`
 
 - **Type:** `{ registry?: string; checkIntervalMs?: number }`
@@ -956,6 +963,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | `16777216` |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | npm public registry |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
@@ -1045,6 +1053,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | Re-alert window for the persist EPERM alert, in ms. `0` (default) = alert once then stay silent; `>0` = re-alert at most every that many ms while the failures continue. |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | Retention cap (bytes) for the raw wire-history snapshot kept per plugin session to serve the public fork API (#2017). A plugin session whose serialized snapshot exceeds the cap stops being forkable — `GET /__bili/plugin/snapshot` and `POST /__bili/plugin/fork` fail closed with `409` and the capped reason — instead of retaining an unbounded raw copy of the history forever. The cap is re-evaluated on every plugin model request: a session that shrinks back under the cap (after a fork trimmed it, or the host shrank the history) resumes being forkable. Default `16777216` (16 MiB); `0` disables retention entirely (no session is forkable; existing snapshots are dropped on the next request). File twin: `plugin.snapshotCapBytes`. |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
 | `BILI_SESSION_GC` | Cleanup of stale session files (#1082) is **opt-in**: set to `1`/`true`/`on` to enable — off by default, because session files are user data (exportable, resumable) and there is no silent deletion policy. When enabled, the sweep (boot + hourly) deletes a file only when BOTH conditions hold: older than `BILI_SESSION_GC_MAX_AGE_DAYS`, AND small in the lossless sense — the session was **never compressed** (zero folded blocks) and its newest request body ≤ the token ceiling below, so resuming it costs one cold rebuild from the client's own history and nothing else. Safety rails: compressed sessions are NEVER deleted (their summaries cannot be rebuilt losslessly); a session still held in memory is skipped unless idle since its last disk write; unreadable/corrupt files are left in place; every deletion is audit-logged individually (path, size, age) plus one summary line per non-empty sweep; only the sessions dir is ever touched; emptied protocol subdirectories are removed. Note the resident guard is per-process: another proxy instance sharing `BILI_SESSIONS_DIR` that does not persist (e.g. `BILI_PERSIST=0`) never refreshes file mtimes, so its still-live session files can age out and be swept — the cost is the same bounded cold rebuild, backstopped by the age gate. CCR content stores (#1097) share the session's lifecycle (#1180): a `<hash>.content-store.json` companion is deleted together with its session file, an orphaned companion (session file already gone) is swept once past the age gate, and an unreadable companion keeps its session file too (never guessed at). |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | Minimum age (days) before a session file becomes a GC candidate (default `7`). Keep it far beyond any plausible resume window: after deletion a resumed session restarts message numbering from m00001 while a resuming agent's transcript may still cite old numbers (kernel contract: ids are never reused). |

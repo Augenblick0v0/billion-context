@@ -108,7 +108,7 @@ export interface ForkAdoptionPlan {
  *  in-place marking (prepareResponses's `__bili_inplace_sysdev`) is
  *  deliberately NOT replicated: marked or hoisted, those items contribute
  *  no core message either way, so the id set is identical. */
-function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): CoreMessage[] | null {
+export function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): CoreMessage[] | null {
     if (!SUPPORTED.has(protocol)) return null;
     const clone = structuredClone(parsed) as Record<string, unknown>;
     if (protocol === "responses") {

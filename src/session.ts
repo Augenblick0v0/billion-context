@@ -288,6 +288,15 @@ export type Session = {
      *  the state ranges). Cleared by snapshotMessages on the next live
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
+    pluginSnapshot?: CoreMessage[];
+    /** In-memory only (NOT persisted — buildRecord omits it): monotone counter
+     *  bumped by markDirty after every mutation. Keys the fork-revision cache
+     *  below so status polling skips re-hashing the whole history (#2017). */
+    revisionEpoch?: number;
+    /** In-memory only (NOT persisted): cached fork parentRevision valid for
+     *  the current revisionEpoch — forkSnapshot() is a pure function of the
+     *  session content, so same epoch ⇒ same hash. */
+    pluginRevisionCache?: { epoch: number; revision: string };
     /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
     *  owned and mutated only by kernel processTurn (ccr-store node) via
     *  adoptContentStore. Lazily loaded from the session's content-store.json;
@@ -534,7 +543,13 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
         }
     }
-    const session: Session = {
+    const session = createSession(id, meta);
+    sessions.set(id, session);
+    return session;
+}
+
+export function createSession(id: string, meta?: Session["meta"]): Session {
+    return {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
         stats: zeroStats(),
@@ -547,8 +562,14 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         persisted: false,
         pendingRetrievals: [],
     };
-    sessions.set(id, session);
-    return session;
+}
+
+export function publishForkSession(session: Session): void {
+    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.size >= MAX_SESSIONS && !evictOldest()) throw new Error("session pool exhausted");
+    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
+    session.persisted = getStore().enabled;
+    sessions.set(session.id, session);
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.
@@ -688,6 +709,7 @@ export function snapshotMessages(session: Session, messages: CoreMessage[]): voi
 /** Mark a session's state as changed so it is persisted on the next debounce.
  *  Call this after any mutation (processTurn, compress, decompress, orphan GC). */
 export function markDirty(session: Session): void {
+    session.revisionEpoch = (session.revisionEpoch ?? 0) + 1;
     getStore().scheduleSave(session);
 }
 

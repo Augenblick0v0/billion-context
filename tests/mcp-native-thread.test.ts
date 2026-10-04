@@ -9,8 +9,8 @@
 //      never rewritten); malformed metadata falls through to the legacy
 //      channels; registration stays one-shot on the default binding;
 //   B. proxy routing policy — real startServer: a host-stamped nativeCaller
-//      outranks a conflicting unique outbound witness, while UNMARKED ids keep
-//      the exact #1685 precedence; an unresolvable native id fails loudly
+//      outranks a conflicting unique outbound witness, while UNMARKED ids fail
+//      closed on conflicting witnesses; an unresolvable native id fails loudly
 //      (no witness rescue, no sibling adoption);
 //   C. incident shape end-to-end — real server + real shim over stdio with a
 //      stale env id: interleaved main/child threads each route home, and a
@@ -155,13 +155,13 @@ async function modelTurn(h: Harness, conv: string, userText: string): Promise<vo
     await res.json();
 }
 
-async function toolPost(h: Harness, body: Record<string, unknown>): Promise<{ status: number; json: { ok?: boolean; result?: string; error?: string } | null }> {
+async function toolPost(h: Harness, body: Record<string, unknown>): Promise<{ status: number; json: { ok?: boolean; result?: string; error?: string; code?: string } | null }> {
     const res = await fetch(`${h.baseUrl}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
     });
-    return { status: res.status, json: (await res.json().catch(() => null)) as { ok?: boolean; result?: string; error?: string } | null };
+    return { status: res.status, json: (await res.json().catch(() => null)) as { ok?: boolean; result?: string; error?: string; code?: string } | null };
 }
 
 /** The served session's Web UI deep link (contains its session id) — the
@@ -447,7 +447,7 @@ test("#2024 shim: malformed or absent _meta.threadId never shadows the legacy ch
 
 // ─────────────────────── Part B: proxy routing policy ────────────────────────
 
-test("#2024 proxy: host-stamped native caller outranks a conflicting unique witness; unmarked ids keep #1685 precedence", async () => {
+test("#2024 proxy: host-stamped native caller outranks a conflicting unique witness; unmarked ids fail closed", async () => {
     const h = await boot();
     try {
         await modelTurn(h, "nt-a", "alpha plain turn");
@@ -463,14 +463,13 @@ test("#2024 proxy: host-stamped native caller outranks a conflicting unique witn
         assert.ok(String(r.json?.result ?? "").includes(urlA), "the NATIVE caller's session must be served, not the witnessing one");
         assert.ok(!String(r.json?.result ?? "").includes(urlB), "the witnessing session must NOT be served");
 
-        // Control leg: the SAME request WITHOUT the flag keeps losing to the
-        // unique witness — #1685 precedence for model-transcribed/static ids
-        // is byte-for-byte unchanged.
+        // Without the host stamp, a conflicting witness must not silently
+        // redirect a model-written/static body id into another session.
         resetToolRingForTest();
         await modelTurn(h, "nt-b", "WITNESS:acp_cache second beta witness turn");
         r = await toolPost(h, { tool: "acp_cache", args: {}, conversationId: "nt-a" });
-        assert.equal(r.status, 200);
-        assert.ok(String(r.json?.result ?? "").includes(urlB), "unmarked body id must still lose to a unique witness (#1685)");
+        assert.equal(r.status, 409, "unmarked resolvable body id contradicted by a unique witness must fail closed (#2016)");
+        assert.equal((r.json as Record<string, unknown> | null)?.code, "TOOL_CONVERSATION_CONFLICT");
     } finally {
         await h.stop();
     }
