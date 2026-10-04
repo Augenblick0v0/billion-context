@@ -65,6 +65,9 @@ type FakeProxy = {
     /** Extra fields merged into the 200 /__bili/plugin/status body (tests mutate
      *  this between calls to simulate fold progress, #2110). */
     statusBody: Record<string, unknown>;
+    /** Served /__bili/plugin/status request count — pins #2110's verdict
+     *  reuse: exactly one loopback read per compaction event, not two. */
+    statusCalls(): number;
     close(): Promise<void>;
 };
 
@@ -73,6 +76,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     const registers: FakeProxy["registers"] = [];
     const runtimeInfos: FakeProxy["runtimeInfos"] = [];
     const statusBody: Record<string, unknown> = {};
+    let statusCalls = 0;
     const server = http.createServer((req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
@@ -125,6 +129,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
             return;
         }
         if (url.startsWith("/__bili/plugin/status")) {
+            statusCalls += 1;
             if (opts.statusOk === false) {
                 res.writeHead(404, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
@@ -140,7 +145,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, registers, runtimeInfos, statusBody, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    return { origin, toolCalls, registers, runtimeInfos, statusBody, statusCalls: () => statusCalls, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -559,12 +564,15 @@ test("#2110: takeover watchdog releases auto compaction when no proxy fold lands
         await withEnv({ BILLION_CONTEXT_PROXY: slow.origin }, async () => {
             slow.statusBody.lastCompressAt = 1_000_000;
             const pi = makeFakePi();
-            createBiliPlugin("pi", { takeover: { maxStaleCancels: 100, timeoutMs: 30 } })(pi as never);
+            // Wide margins on purpose: each pass is a loopback round-trip, so a
+            // tight window can elapse between passes on a loaded runner and flip
+            // the mid-window assertions (determinism rule #7.2).
+            createBiliPlugin("pi", { takeover: { maxStaleCancels: 100, timeoutMs: 500 } })(pi as never);
             const ctx = await stampLocalEvidence(slow, pi, "sess-slow");
             const handler = pi.events.get("session_before_compact")!;
             assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "baseline within the window");
             assert.deepEqual(await handler({ reason: "threshold" }, ctx), { cancel: true }, "stale #1 within the window");
-            await sleep(40);
+            await sleep(600);
             assert.equal(await handler({ reason: "threshold" }, ctx), undefined, "timeout elapsed → native compaction released");
         });
     } finally {
@@ -650,6 +658,7 @@ test("#2110: takeover watchdog releases auto compaction when no proxy fold lands
             assert.deepEqual(await fire(), { cancel: true }, "omp: stale #1 → cancelled");
             assert.deepEqual(await fire(), { cancel: true }, "omp: stale #2 → cancelled");
             assert.equal(await fire(), undefined, "omp: stale #3 hits the limit → released");
+            assert.equal(ompProxy.statusCalls(), 4, "ownership probe's status is reused by the verdict — one loopback read per event, not two");
         });
     } finally {
         await ompProxy.close();
