@@ -22,6 +22,7 @@ import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { describeRestorable, writeRestoredImage } from "./image-restore.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -166,6 +167,12 @@ export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
 ): ProxyToolResult {
+    // #1995: image recovery is a distinct mode selected by imageRef (an mNNNNN ref,
+    // or "list"), independent of blockId/range — intercepted first so an image-ref
+    // call never trips the blockId-required gate below.
+    if (args.imageRef !== undefined) {
+        return resolveImageRestore(args, ctx);
+    }
     const rawBlockId = args.blockId;
     if (typeof rawBlockId !== "string" || rawBlockId.length === 0) {
         return toolFail("[decompress FAILED: blockId is required]");
@@ -249,6 +256,40 @@ export function resolveDecompress(
         ctx.log(`[acp-decompress-inline] ${blockId}: flagged restoredInline${marked.result?.restoredStartRef ? ` (${marked.result.restoredStartRef}–${marked.result.restoredEndRef})` : ""}`);
     }
     return toolOk(`${header}\n${body}\n\n${refoldHint(blockId, marked.result)}`);
+}
+
+// #1995: restore the original pixels of a stripped/folded image by ref. Delivery
+// is file-first — each image is written under <stateDir>/retrieve/img/ and its
+// path returned for the model to open with its read tool — uniform across all four
+// wires (no per-protocol inline-image rendering). "list" enumerates what is
+// currently restorable instead of writing anything.
+function resolveImageRestore(args: Record<string, unknown>, ctx: ProxyToolCtx): ProxyToolResult {
+    const index = ctx.session.incomingImageIndex;
+    const raw = typeof args.imageRef === "string" ? args.imageRef.trim() : "";
+    if (raw === "" || raw.toLowerCase() === "list") {
+        if (!index || index.size === 0) {
+            return toolOk("[No restorable images right now — this request carries no indexed historical images (stripImages must be enabled and the client must resend them).]");
+        }
+        const lines = describeRestorable(index);
+        return toolOk(`[Restorable images (${lines.length}):]\n${lines.join("\n")}\nRestore one with decompress({ imageRef: "<ref>" }); it is written to a file you open with the read tool.`);
+    }
+    if (!index) {
+        return toolFail(`[decompress FAILED: no image history is indexed for this request (stripImages off?) — cannot restore "${raw}".]`);
+    }
+    const imgs = index.get(raw);
+    if (!imgs || imgs.length === 0) {
+        return toolFail(`[decompress FAILED: no restorable image for ref "${raw}" (it carries no image, is URL-sourced with no stored bytes, or is not in this request's history). Call decompress({ imageRef: "list" }) to see what is available.]`);
+    }
+    const written: string[] = [];
+    for (let i = 0; i < imgs.length; i++) {
+        const p = writeRestoredImage(raw, i, imgs[i]);
+        if (p) written.push(p);
+    }
+    if (written.length === 0) {
+        return toolFail(`[decompress FAILED: could not write restored image(s) for "${raw}" to disk.]`);
+    }
+    ctx.log(`[acp-image-restore] ${raw}: restored ${written.length} image(s) → ${written.join(", ")}`);
+    return toolOk(`[Restored ${written.length} image(s) for ${raw}:\n${written.map((p) => `  ${p}`).join("\n")}\nOpen them with the read tool to view the pixels.]`);
 }
 
 // #1294 P2: close the loop on an inline restore — kernel K2 updates the
