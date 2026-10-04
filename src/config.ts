@@ -53,10 +53,11 @@ export type ProviderRoute = {
      *  custom paths; MITM'd clients that cannot carry a /bili/ explicit
      *  marker). Resolved independently of every other field: ALL matching
      *  keys are scanned longest-prefix-first and the deepest key that
-     *  EXPLICITLY declares `protocol` wins, so a path-scoped key
-     *  (`"https://relay.example.com/my/custom/complete": {"protocol":"openai"}`)
-     *  neither shadows nor requires duplicating the host key's other
-     *  settings. The /bili/<protocol>/ URL marker still outranks it; the
+     *  EXPLICITLY declares `protocol` wins, so a host-level declaration keeps
+     *  applying under a silent path-scoped key without duplication. The OTHER
+     *  fields keep findRoute's single-entry longest-key semantics — a
+     *  protocol-only path key still becomes the winning entry under its
+     *  subtree for them. The /bili/<protocol>/ URL marker still outranks it; the
      *  body must still parse as the declared protocol or it relays verbatim
      *  (#1284). Invalid values reject the config load loudly. */
     protocol?: WireProtocol;
@@ -611,10 +612,12 @@ export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: str
 /** #1909: the user-declared wire protocol for this destination — scans ALL
  *  matching keys longest-prefix-first and returns the deepest key that
  *  explicitly declares `protocol`. Unlike findRoute (single longest entry,
- *  every field from it), this one field resolves through the prefix
- *  hierarchy, so a path-scoped declaration neither shadows nor requires
- *  duplicating the host key's other settings — and a host-level declaration
- *  still inherits down onto path-scoped keys that stay silent. undefined = no
+ *  every field from it), this one field resolves through the prefix hierarchy:
+ *  a host-level declaration inherits down onto path-scoped keys that stay
+ *  silent, and a path-scoped declaration needs no duplication of the host
+ *  entry to take effect. The other fields keep findRoute's single-entry
+ *  semantics — a protocol-only path key still wins for them under its subtree.
+ *  undefined = no
  *  declaration anywhere → callers fall back to the built-in path-suffix
  *  inference. The query string is ignored (same as the built-in table). */
 export function resolveDeclaredProtocol(routes: ProviderRoutes, url: string | undefined): WireProtocol | undefined {

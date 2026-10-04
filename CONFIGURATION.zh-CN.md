@@ -334,7 +334,7 @@
 
   `<protocol>` ∈ `anthropic` | `openai` | `responses` | `google`。无论路径是什么，它都强制该 wire 协议，且**高于**一切服务端声明（也高于内置后缀表）。不带协议段的普通形式（`/bili/<absolute-url>`）不变：协议仍从路径推断。URL 形式按客户端生效；当 base URL 改不了（硬编码端点、MITM 拦截的 host）时，用这个 `providers.protocol` 字段按 lane 生效。
 
-  **非遮蔽（#1909）：** `protocol` 独立于其他 provider 字段解析 —— 所有匹配的键按最长前缀优先扫描，**显式声明了** `protocol` 的最深键胜出。因此只写 `{ "protocol": "openai" }` 的路径键仍继承 host 键的 `compressProtocol`/`compress`/`models`/…；host 键的声明也继续作用于沉默的路径键。（*其他*字段维持既有的单条目最长键语义。）不声明 `protocol` 的路径键仍只是路由配置；`mitm://` 键遵循与其他字段相同的 scheme 划分。非法值在配置加载时响亮报错（web 保存得到 400）。
+  **非遮蔽（#1909）：** `protocol` 独立于其他 provider 字段解析 —— 所有匹配的键按最长前缀优先扫描，**显式声明了** `protocol` 的最深键胜出，因此 host 键的声明继续作用于沉默的路径键（无需重复书写）。*其他*字段维持既有的单条目最长键语义：与任何路径键一样，只写 `protocol` 的路径键在其子树内成为胜出条目，所以 URL 作用域字段（`compress`、`models`、…）的 host 级值不会进入该子树，除非在路径键上重复声明。一个例外：`compressProtocol` 只按上游 origin 解析，路径键无法遮蔽它的 host 级取值。不声明 `protocol` 的路径键仍只是路由配置；`mitm://` 键遵循与其他字段相同的 scheme 划分。非法值在配置加载时响亮报错（web 保存得到 400）。
 
 ### `compress`
 

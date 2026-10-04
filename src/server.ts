@@ -1636,8 +1636,8 @@ async function handle(
         // like every other provider field); the /bili/<protocol>/ explicit
         // marker still outranks the declaration. POST-with-body only, same
         // gate as the built-in table. Resolved through the prefix hierarchy
-        // (deepest EXPLICIT declarer wins) so a path-scoped key never shadows
-        // the host key's other settings.
+        // (deepest EXPLICIT declarer wins); the other fields keep findRoute's
+        // single-entry longest-key semantics.
         const declaredProtocol = req.method === "POST" && bodyBuffer.length > 0
             ? resolveDeclaredProtocol(
                 opts.routes,
