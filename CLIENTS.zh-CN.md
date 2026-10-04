@@ -125,6 +125,8 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 | 原生(免启动器) | `bili plugin install opencode` | 自拉起插件写进真实配置;照常启动 `opencode` |
 | 纯代理(兜底) | baseURL 加 `/bili/` 前缀 | 无插件 —— wire 级工具注入 |
 
+这三条路径**互斥**——每条都拥有同一批请求的路由权,每个宿主实例只能激活其中一条。手写的 `/bili/` provider baseURL 是纯代理路径的标记;在原生插件已装的情况下写它就是**矛盾配置**(#1958):运行时会每会话警告一次(按 origin 去重)并附修复指引——去掉前缀或卸掉插件——请求则留在其编码的纯代理路径上(无插件会话标记)。受支持的例外是对**同一** origin 的显式钉住——`BILLION_CONTEXT_PROXY` 指向 URL 已经在走的那个代理——保持静默。
+
 ### 启动器 —— `bili opencode`
 
 HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC 注释照单接受,合并方式与 opencode 自身一致;相对本地插件路径在副本里重新锚定为绝对路径 —— opencode 按声明所在配置文件目录解析,#826)。宿主代次用 `--version` 探测(探测失败默认按 1.x):**2.x** 宿主注入内置 V2 插件(`dist/agent/opencode.js`),以临时包装目录形式给出(目录入口 `index.js` 再 re-export 插件文件 —— 2.x 拒绝配置 `plugin` 数组里的裸文件路径);**1.x** 宿主直接给裸文件路径。
@@ -175,6 +177,8 @@ OpenAI/ChatGPT 凭据。
 ```
 
 注意:2.0 AI-SDK provider 即使本地端点从不校验也要求 `apiKey` 字段 —— 随便填个非空值。
+
+这条路径意味着**无插件**:若同时装了原生插件,运行时每会话警告一次——每个 provider 只选一条路径(#1958)。
 
 ### 状态:`/acp` 与 `acp_status`
 
