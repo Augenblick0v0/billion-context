@@ -128,7 +128,7 @@ export class ResponsesWsUpstream {
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES) {}
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -197,6 +197,12 @@ export class ResponsesWsUpstream {
             let retryFull = request.previous_response_id !== undefined;
             let receivedEvents = 0;
             const encoder = new TextEncoder();
+            // Backpressure (#2076): the WS socket cannot be paused, so frames arriving
+            // while the consumer lags wait in the stream's own queue — delivery is
+            // consumer-paced by construction. retained tracks that backlog (exact while
+            // the queue is under the highWaterMark, conservative beyond) so the guard
+            // below still bounds memory for a consumer that never catches up.
+            let retained = 0;
             const clean = (): void => {
                 ended = true;
                 socket.removeEventListener("message", message);
@@ -267,11 +273,14 @@ export class ResponsesWsUpstream {
                         const readable = new ReadableStream<Uint8Array>({
                             start: c => { controller = c; },
                             cancel: () => { fail(new DOMException("Aborted", "AbortError"), "response-cancel"); this.close("response-cancel"); },
-                        }, { highWaterMark: MAX_REQUEST_BYTES, size: chunk => chunk.byteLength });
+                        }, { highWaterMark: this.requestBytes, size: chunk => chunk.byteLength });
                         resolve(new Response(readable, { headers: { "content-type": "text/event-stream" } }));
                     }
-                    if ((controller?.desiredSize ?? 0) < 0) throw new Error("Responses WebSocket upstream buffer limit exceeded");
-                    controller?.enqueue(encoder.encode(`event: ${frame.type}\ndata: ${event.data}\n\n`));
+                    const block = `event: ${frame.type}\ndata: ${event.data}\n\n`;
+                    const desired = controller?.desiredSize ?? 0;
+                    retained = desired > 0 ? this.requestBytes - desired : retained + Buffer.byteLength(block);
+                    controller?.enqueue(encoder.encode(block));
+                    if (retained > 2 * this.requestBytes) throw new Error("Responses WebSocket upstream buffer limit exceeded");
                     if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete" || frame.type === "error") {
                         clean();
                         if (completed) this.history.clear();

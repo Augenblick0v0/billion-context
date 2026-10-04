@@ -762,3 +762,94 @@ test(`Responses WS: actual fold and successive tool results survive ${terminalOu
     } finally { await f.close(); }
 });
 }
+
+// #2076: bare upstream WS + direct transport (no proxy). The consumer stalls
+// while the upstream pushes more than the highWaterMark, exercising the
+// held-backlog path of ResponsesWsUpstream.fetch.
+async function backpressureFixture(budget: number, deltas: number) {
+    const log: string[] = [];
+    const upstream = http.createServer((req, res) => { res.writeHead(404).end(); });
+    const wss = new WebSocketServer({ server: upstream });
+    let connections = 0;
+    let serial = 0;
+    let sentAll: (() => void) | undefined;
+    const sentAllPromise = new Promise<void>(resolve => { sentAll = () => resolve(); });
+    wss.on("connection", peer => {
+        connections++;
+        peer.on("message", raw => {
+            const request = JSON.parse(raw.toString()) as Item;
+            if (!Array.isArray(request.input)) return;
+            const id = `resp_bp_${++serial}`;
+            const send = (type: string, fields: Item): void => peer.send(JSON.stringify({ type, ...fields }));
+            send("response.created", { response: { id, status: "in_progress", output: [] } });
+            for (let i = 0; i < deltas; i++) send("response.output_text.delta", { item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: `${i}_${"x".repeat(8190)}` });
+            const item: Item = { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
+            send("response.output_item.done", { output_index: 0, item });
+            send("response.completed", { response: { id, object: "response", status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } });
+            sentAll!();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
+    const transport = new ResponsesWsUpstream((_level, message) => log.push(message), budget);
+    return { origin, transport, log, wss, connections: () => connections, sentAllPromise, close: async () => {
+        transport.close();
+        for (const client of wss.clients) client.terminate();
+        await new Promise<void>(resolve => upstream.close(() => resolve()));
+        wss.close();
+    } };
+}
+
+test("Responses WS backpressure: a stalled consumer pauses the lane instead of failing the exchange", { timeout: 30000 }, async () => {
+    // budget 64KiB: highWaterMark 64KiB, held-backlog ceiling 128KiB. Fifteen
+    // ~8KiB deltas (~125KB total) cross the old hard-fail point (~HWM of stream
+    // backlog, delta 8) while staying under the new ceiling (held ~66KiB).
+    const f = await backpressureFixture(64 * 1024, 15);
+    try {
+        const response = await f.transport.fetch(`${f.origin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: true, input: [user("backpressure")] }) });
+        assert.equal(response.headers.get("content-type"), "text/event-stream");
+        assert.ok(response.body);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const types: string[] = [];
+        const collect = (value: Uint8Array): void => {
+            for (const line of decoder.decode(value, { stream: true }).split("\n")) if (line.startsWith("event: ")) types.push(line.slice(7));
+        };
+        const first = await reader.read();
+        assert.ok(!first.done);
+        assert.ok(first.value);
+        collect(first.value);
+        await f.sentAllPromise;
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) collect(value);
+        }
+        assert.deepEqual(types, ["response.created", ...Array(15).fill("response.output_text.delta"), "response.output_item.done", "response.completed"]);
+        assert.doesNotMatch(f.log.join("\n"), /buffer limit|checkpoint reset|upstream failed|aborted/);
+        // The socket survived the stall: the next turn rides the same connection.
+        const second = await f.transport.fetch(`${f.origin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: false, input: [user("next turn")] }) });
+        assert.equal(((await second.json()) as Item).status, "completed");
+        assert.equal(f.connections(), 1);
+    } finally { await f.close(); }
+});
+
+test("Responses WS backpressure: a permanently stalled consumer still trips the buffer guard", { timeout: 30000 }, async () => {
+    // Thirty ~8KiB deltas (~250KB total): held backlog crosses the 128KiB
+    // ceiling (delta ~23) while nobody reads, so the OOM guard must still fire.
+    const f = await backpressureFixture(64 * 1024, 30);
+    try {
+        const response = await f.transport.fetch(`${f.origin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: true, input: [user("stuck consumer")] }) });
+        assert.ok(response.body);
+        const reader = response.body.getReader();
+        const first = await reader.read();
+        assert.ok(!first.done);
+        await f.sentAllPromise;
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
+        await assert.rejects(reader.read(), /buffer limit exceeded/);
+        assert.match(f.log.join("\n"), /upstream checkpoint reset reason=invalid-event/);
+        await until(() => f.wss.clients.size === 0);
+    } finally { await f.close(); }
+});
