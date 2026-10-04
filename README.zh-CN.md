@@ -105,7 +105,7 @@ QQ群:
 
 | 客户端 | 用这个 |
 |---|---|
-| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#pipidev-coding-agent) |
 | **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](CLIENTS.zh-CN.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
