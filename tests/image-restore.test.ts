@@ -10,6 +10,7 @@ import {
     describeRestorable,
     messageImageBytes,
     writeRestoredImage,
+    type IndexedImage,
     type RestorableImage,
 } from "../src/image-restore.ts";
 import { resolveDecompress, type ProxyToolCtx } from "../src/decompress-shared.ts";
@@ -51,7 +52,7 @@ function buildIndex(proto: WireProtocol, body: unknown, excludeImaged = false) {
     });
     return buildIncomingImageIndex(body, proto, state);
 }
-function ctxWith(index: Map<string, RestorableImage[]> | undefined): ProxyToolCtx {
+function ctxWith(index: Map<string, IndexedImage[]> | undefined): ProxyToolCtx {
     // Only the imageRef branch of resolveDecompress is exercised here; it touches
     // nothing but session.incomingImageIndex and log, so a minimal ctx suffices.
     return { session: { incomingImageIndex: index }, log: () => undefined } as unknown as ProxyToolCtx;
@@ -106,7 +107,9 @@ test("buildIncomingImageIndex: indexes carried images by mNNNNN ref (all protoco
     assert.equal(openai.size, 1, "exactly one imaged message indexed");
     const [ref, imgs] = [...openai.entries()][0];
     assert.match(ref, /^m\d+$/);
-    assert.equal(imgs[0].b64, PNG);
+    assert.ok(existsSync(imgs[0].path), "image spilled to disk at index time");
+    assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "spilled bytes round-trip");
+    assert.ok(!("b64" in imgs[0]), "index retains metadata + path only, never base64 (#1995 memory bound)");
 
     // Anthropic splits a multi-block message into one core msg per block; only the
     // image block is indexed.
@@ -115,18 +118,18 @@ test("buildIncomingImageIndex: indexes carried images by mNNNNN ref (all protoco
         { role: "assistant", content: [{ type: "text", text: "ok" }] },
     ] });
     assert.equal(anthro.size, 1);
-    assert.equal([...anthro.values()][0][0].b64, PNG);
+    assert.deepEqual(readFileSync([...anthro.values()][0][0].path), Buffer.from(PNG, "base64"));
 
     const responses = buildIndex("responses", { model: "gpt", input: [
         { type: "message", role: "user", content: [{ type: "input_text", text: "see" }, { type: "input_image", image_url: dataUrl }] },
         { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] },
     ] });
     assert.equal(responses.size, 1);
-    assert.equal([...responses.values()][0][0].b64, PNG);
+    assert.deepEqual(readFileSync([...responses.values()][0][0].path), Buffer.from(PNG, "base64"));
 
     const google = buildIndex("google", { contents: [{ role: "user", parts: [{ text: "see" }, { inlineData: { mimeType: "image/png", data: PNG } }] }] });
     assert.equal(google.size, 1);
-    assert.equal([...google.values()][0][0].b64, PNG);
+    assert.deepEqual(readFileSync([...google.values()][0][0].path), Buffer.from(PNG, "base64"));
 });
 
 test("buildIncomingImageIndex: skips unref'd tail messages and image-free bodies", () => {
@@ -141,9 +144,10 @@ test("buildIncomingImageIndex: skips unref'd tail messages and image-free bodies
 });
 
 test("describeRestorable: one line per image, sorted, capped", () => {
-    const idx = new Map<string, RestorableImage[]>([
-        ["m00005", [pngImg, { ...pngImg, mediaType: "image/gif" }]],
-        ["m00002", [pngImg]],
+    const meta = (mediaType: string): IndexedImage => ({ mediaType, bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: "/nonexistent/x.png" });
+    const idx = new Map<string, IndexedImage[]>([
+        ["m00005", [meta("image/png"), meta("image/gif")]],
+        ["m00002", [meta("image/png")]],
     ]);
     const lines = describeRestorable(idx);
     assert.equal(lines.length, 3);
@@ -169,16 +173,16 @@ test("writeRestoredImage: writes decoded bytes 0600 under retrieve/img, idempote
 });
 
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {
-    const idx = new Map<string, RestorableImage[]>([["m00042", [pngImg]]]);
+    const p = writeRestoredImage("m00042", 0, pngImg)!;
+    const idx = new Map<string, IndexedImage[]>([["m00042", [{ mediaType: "image/png", bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: p }]]]);
     const list = resolveDecompress({ imageRef: "list" }, ctxWith(idx));
     assert.match(list, /\[Restorable images \(1\):\]/);
     assert.match(list, /m00042/);
 
     const restored = resolveDecompress({ imageRef: "m00042" }, ctxWith(idx));
     assert.match(restored, /Restored 1 image\(s\) for m00042/);
-    const pathMatch = restored.match(/(\S*m00042\.png)/);
-    assert.ok(pathMatch && existsSync(pathMatch[1]), "restored file exists");
-    assert.deepEqual(readFileSync(pathMatch![1]), Buffer.from(PNG, "base64"));
+    assert.ok(existsSync(p), "restored file exists");
+    assert.deepEqual(readFileSync(p), Buffer.from(PNG, "base64"));
 
     assert.match(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)), /no restorable image for ref "m99999"/);
     assert.match(resolveDecompress({ imageRef: "" }, ctxWith(idx)), /\[Restorable images \(1\):\]/, "empty string == list");

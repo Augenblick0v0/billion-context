@@ -13,7 +13,7 @@
 // sends no such bytes to the proxy, so those belong to the agent's in-process
 // recovery (cf. billion-context-pi#594), not here.
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     anthropicToCore,
@@ -40,6 +40,18 @@ export interface RestorableImage {
     mediaType: string;
     b64: string;
     bytes: number;
+}
+
+/** A spilled image as retained in the session index: metadata plus the on-disk
+ *  path, but NO base64 — the bytes live in the file, so a long image-heavy
+ *  session pins only O(refs) of metadata in memory instead of every pixel
+ *  (unbounded-residency finding from the #1995 review). */
+export interface IndexedImage {
+    mediaType: string;
+    bytes: number;
+    width?: number;
+    height?: number;
+    path: string;
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -152,8 +164,8 @@ export function buildIncomingImageIndex(
     parsed: unknown,
     protocol: WireProtocol,
     state: CompressionState,
-): Map<string, RestorableImage[]> {
-    const index = new Map<string, RestorableImage[]>();
+): Map<string, IndexedImage[]> {
+    const index = new Map<string, IndexedImage[]>();
     const byRaw = state?.messageRefs?.byRaw;
     if (!byRaw) return index;
     let result: unknown;
@@ -174,9 +186,22 @@ export function buildIncomingImageIndex(
         if (!ref) continue;
         const imgs = messageImageBytes(m);
         if (imgs.length === 0) continue;
-        const existing = index.get(ref);
-        if (existing) existing.push(...imgs);
-        else index.set(ref, imgs);
+        const arr = index.get(ref) ?? [];
+        if (!index.has(ref)) index.set(ref, arr);
+        imgs.forEach((im, i) => {
+            // #1995 review: spill at index-time so the session retains only
+            // metadata + path (never base64). Skip-if-exists keeps the steady
+            // state to one stat per image per turn, not a full decode + write.
+            const path = writeRestoredImage(ref, i, im);
+            if (!path) return;
+            let width: number | undefined;
+            let height: number | undefined;
+            try {
+                const d = decodeImageDims(im.b64);
+                if (d) { width = d.w; height = d.h; }
+            } catch {}
+            arr.push({ mediaType: im.mediaType, bytes: im.bytes, width, height, path });
+        });
     }
     return index;
 }
@@ -189,7 +214,7 @@ function refNum(ref: string): number {
 /** Human-readable one-line-per-image listing of what is currently restorable
  *  ("m00042 [png 1024x768 · 240KB]"), sorted by ref then position. Capped so a
  *  very image-heavy history cannot blow up the tool result. */
-export function describeRestorable(index: Map<string, RestorableImage[]>, cap = 50): string[] {
+export function describeRestorable(index: Map<string, IndexedImage[]>, cap = 50): string[] {
     const lines: string[] = [];
     const refs = [...index.keys()].sort((a, b) => refNum(a) - refNum(b));
     outer: for (const ref of refs) {
@@ -197,10 +222,7 @@ export function describeRestorable(index: Map<string, RestorableImage[]>, cap = 
         for (let i = 0; i < imgs.length; i++) {
             const im = imgs[i];
             let note = im.mediaType.includes("/") ? im.mediaType.split("/").pop()! : im.mediaType;
-            try {
-                const dims = decodeImageDims(im.b64);
-                if (dims) note += ` ${dims.w}x${dims.h}`;
-            } catch {}
+            if (im.width != null && im.height != null) note += ` ${im.width}x${im.height}`;
             note += ` · ${Math.max(1, Math.round(im.bytes / 1024))}KB`;
             lines.push(`${ref}${i > 0 ? `[-${i}]` : ""} [${note}]`);
             if (lines.length >= cap) break outer;
@@ -223,13 +245,14 @@ function extFor(mediaType: string): string {
 
 /** Write one restorable image to disk (decoded bytes, 0600 — conversation
  *  content is not world-readable on multi-user hosts) and return its absolute
- *  path. Content-addressed by ref (+index), so a repeated restore rewrites
- *  identical bytes (idempotent). Returns null on write failure. */
+ *  path. Content-addressed by ref (+index); a repeated call skips the rewrite
+ *  when the file is already present (idempotent). Returns null on write failure. */
 export function writeRestoredImage(ref: string, idx: number, img: RestorableImage): string | null {
     const safeRef = ref.replace(/[^a-zA-Z0-9_-]/g, "-");
     const dir = restoreExportDir();
     const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}.${extFor(img.mediaType)}`);
     try {
+        if (existsSync(path)) return path;
         mkdirSync(dir, { recursive: true });
         writeFileSync(path, Buffer.from(img.b64, "base64"), { mode: 0o600 });
         return path;
