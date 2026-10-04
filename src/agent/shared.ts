@@ -243,11 +243,16 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<string> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+    // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
+    // by the host's own session manager — declare it so a stale sibling witness
+    // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
+    if (nativeCaller && conversationId.length > 0) body.nativeCaller = true;
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args: args ?? {} }),
+        body: JSON.stringify(body),
     }, TOOL_TIMEOUT_MS, signal);
     const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
     if (!ok || !data?.ok) {

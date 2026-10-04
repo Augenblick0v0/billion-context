@@ -382,7 +382,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 const panel = status?.["panel"];
                                 if (typeof panel === "string" && panel.length > 0) return { content: panel };
                             }
-                            const result = await forwardTool(base, tctx.sessionID, t.name, args);
+                            const result = await forwardTool(base, tctx.sessionID, t.name, args, undefined, true);
                             return { content: result };
                         } catch (err) {
                             const msg = err instanceof Error ? err.message : String(err);
@@ -491,7 +491,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp-cache again)";
                             } else {
                                 try {
-                                    text = await forwardTool(base, sid, "acp_cache", toolArgs);
+                                    text = await forwardTool(base, sid, "acp_cache", toolArgs, undefined, true);
                                 } catch (err) {
                                     const msg = err instanceof Error ? err.message : String(err);
                                     text = msg.includes("no model request has arrived")

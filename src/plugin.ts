@@ -1230,9 +1230,11 @@ export async function handlePluginTool(
     // remain authoritative. Id-less calls use a unique witness, then a single
     // fresh conversation, or fail loudly without guessing (#1685).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
-    // #2024: true only when the shim PROVES the body id is host-stamped
-    // per-call metadata. Model-transcribed ids and static env/meta bindings
-    // never set it, so witness conflicts for those ids still fail closed.
+    // #2024/#2072: true only when the caller PROVES the body id is host-stamped
+    // per-call metadata — the MCP shim's _meta.threadId, or a host-native agent's
+    // own session-manager id (pi / dsh / opencode). Model-transcribed ids and
+    // static env/meta bindings never set it, so witness conflicts for those
+    // still fail closed.
     const nativeCaller = parsed.nativeCaller === true;
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;

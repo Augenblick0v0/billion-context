@@ -99,7 +99,7 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
             } else if (input.command === "acp-cache") {
                 const toolArgs = /(^|\s)(--)?full(\s|$)/.test(input.arguments ?? "") ? { detail: "full" as const } : {};
                 try {
-                    const report = await forwardTool(proxyBase, sid, "acp_cache", toolArgs);
+                    const report = await forwardTool(proxyBase, sid, "acp_cache", toolArgs, undefined, true);
                     await showAcpText(ctx, sid, wrapCacheReport(report));
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
