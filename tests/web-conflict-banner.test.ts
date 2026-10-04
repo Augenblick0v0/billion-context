@@ -99,13 +99,17 @@ test("banner line appends the active/historical split when present, degrades whe
             { kind: "unannounced-rewrite", at: Date.UTC(2026, 9, 3, 4, 58), sessionId: "abcdef123456", detail: "d1" },
         ],
     };
+    // Non-plugin item NAMES carry their own timestamp ([time] sid: detail), so
+    // entries at distinct times stay separate rows — each row keeps its "when"
+    // (the whole point of #2102 sub-problem ①). The ×N weight only collapses
+    // identity-only names (plugin entries), never time-stamped ones.
     const withSplit = f({ ...base, active: 0, historical: 22 });
     assert.equal(withSplit,
-        "22 event(s) in 6 session(s): unannounced-rewrite×22 · 0 active · 22 historical — [2026-10-03 05:02Z] abcde…: d1×2");
+        "22 event(s) in 6 session(s): unannounced-rewrite×22 · 0 active · 22 historical — [2026-10-03 05:02Z] abcde…: d1 · [2026-10-03 04:58Z] abcde…: d1");
     const withoutSplit = f(base);
     assert.equal(withoutSplit.indexOf("active"), -1, "old payloads without active/historical keep the old shape");
     assert.equal(withoutSplit,
-        "22 event(s) in 6 session(s): unannounced-rewrite×22 — [2026-10-03 05:02Z] abcde…: d1×2");
+        "22 event(s) in 6 session(s): unannounced-rewrite×22 — [2026-10-03 05:02Z] abcde…: d1 · [2026-10-03 04:58Z] abcde…: d1");
 });
 
 test("banner line caps NON-plugin items at 4 with a stats pointer; plugin items stay uncapped (#2102)", () => {
