@@ -913,9 +913,9 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; nativeCaller?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; nativeCaller?: unknown };
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
@@ -924,6 +924,11 @@ export async function handlePluginTool(
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
     // #1685 zero-injection routing ladder for id-less tool POSTs:
+    //   0. native caller (#2024) — the MCP shim stamped nativeCaller because
+    //      the body id came from the host's per-call machine metadata (Codex
+    //      _meta.threadId). Host-stamped identity outranks rung 1: a
+    //      colliding/stale witness must not redirect a confirmed call. The id
+    //      then resolves through rung 2 and fails loudly when unknown.
     //   1. outbound witness — this proxy streamed the very tool_use being
     //      answered; a unique hit names the session (the free-text summary is
     //      a unique anchor). Wins over a body id when they disagree.
@@ -932,19 +937,38 @@ export async function handlePluginTool(
     //   3. single-active arbitration — one fresh conversation on the proxy.
     //   4. anything else is a loud 400 (never a silent guess).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
+    // #2024: true only when the shim PROVES the body id is host-stamped
+    // per-call metadata. Model-transcribed ids and static env/meta bindings
+    // never set it, so their precedence against witnesses stays exactly as
+    // #1685 wrote it.
+    const nativeCaller = parsed.nativeCaller === true;
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
-    let routedBy: "witness" | "body" | "arb" = "body";
+    let routedBy: "witness" | "body" | "arb" | "native" = "body";
     if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];
-        session = peekSession(wit);
-        if (session) {
-            const cid = conversationIdForSession(session.id);
-            entry = cid ? conversations.get(cid) : undefined;
-            routedBy = "witness";
-            if (conversationId && conversationId !== cid && conversationId !== session.id) {
-                deps.log("info", `[plugin] tool "${tool}" routed by outbound witness to session ${session.id}${cid ? ` (conversation ${cid})` : ""}; body conversationId "${conversationId}" differs and was ignored (#1685)`);
+        const witSession = peekSession(wit);
+        if (witSession) {
+            const cid = conversationIdForSession(witSession.id);
+            const bodyDisagrees = conversationId.length > 0 && conversationId !== cid && conversationId !== witSession.id;
+            if (nativeCaller && bodyDisagrees) {
+                // #2024: the host told us WHICH thread made this call. A
+                // content-based witness naming ANOTHER session (identical
+                // args streamed within the TTL window) is a collision, not
+                // truth — honor the native caller and fall through to
+                // body-id resolution below; an unresolvable native id fails
+                // loudly there instead of being rescued by the disagreeing
+                // witness or adopted as a sibling binding.
+                routedBy = "native";
+                deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness ${witSession.id}${cid ? ` (${cid})` : ""} — honoring the native caller, refusing the witness (#2024)`);
+            } else {
+                session = witSession;
+                entry = cid ? conversations.get(cid) : undefined;
+                routedBy = "witness";
+                if (bodyDisagrees) {
+                    deps.log("info", `[plugin] tool "${tool}" routed by outbound witness to session ${witSession.id}${cid ? ` (conversation ${cid})` : ""}; body conversationId "${conversationId}" differs and was ignored (#1685)`);
+                }
             }
         }
     } else if (witnessIds.size > 1 && !conversationId) {
