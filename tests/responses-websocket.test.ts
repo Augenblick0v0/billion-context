@@ -838,7 +838,7 @@ test("Responses WS backpressure: a stalled consumer pauses the lane instead of f
 
 test("Responses WS backpressure: a permanently stalled consumer still trips the buffer guard", { timeout: 30000 }, async () => {
     // Thirty ~8KiB deltas (~250KB total): held backlog crosses the 128KiB
-    // ceiling (delta ~23) while nobody reads, so the OOM guard must still fire.
+    // ceiling (delta ~16) while nobody reads, so the OOM guard must still fire.
     const f = await backpressureFixture(64 * 1024, 30);
     try {
         const response = await f.transport.fetch(`${f.origin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: true, input: [user("stuck consumer")] }) });
