@@ -103,7 +103,7 @@ test("#1815: multiple unknown keys list together; fixing some re-warns about the
     }
 });
 
-test("#1815: the full documented top-level surface produces no warning", () => {
+test("#1815: the full documented top-level surface produces no warning (#2062)", () => {
     const { captured, stop } = captureLogs();
     try {
         withConfigFile(
@@ -112,12 +112,18 @@ test("#1815: the full documented top-level surface produces no warning", () => {
                 providersPath: "./providers.json", providers: {}, proxy: "http://127.0.0.1:7890",
                 modelContextLimit: 200000, sessionHeader: true, log: true, debug: true, dumpSse: false,
                 passthrough: {}, autoUpdate: true, autoRestartOnUpdate: true, updateTag: "latest",
-                advisoryCheck: false, advisoryUrl: "", upstreamProxy: "", upstreamProxyMode: "direct",
+                advisoryCheck: false, advisoryUrl: "", releaseNotesCheck: false, releaseNotesUrl: "",
+                upstreamProxy: "", upstreamProxyMode: "direct",
                 logFile: "", compress: { promptPack: "lean" }, promptCache: {}, mitm: {}, maskHosts: true,
                 subagentSplit: true, forkAdoption: false, resumeInheritance: true,
                 chainContentDetection: true, chainEgressStamp: false, stableSystemAnchor: false,
-                compat: {}, imageBilling: "auto",
-                claude: { nativePort: 8901 }, native: { attachExternal: false },
+                compat: {}, imageBilling: "auto", imageTokenCap: 4096,
+                resign: {}, claude: { nativePort: 8901 }, native: { attachExternal: false },
+                network: { upstreamTimeoutMs: 60000 }, persist: { enabled: true },
+                sessions: { max: 64 }, plugin: { snapshotCapBytes: 1048576 },
+                update: { checkIntervalMs: 180000 }, diagnostics: { dumpBody: false },
+                fakeCompletion: { retries: 0 }, codexCompact: "intercept",
+                ccrRetrievalTtlMs: 600000, decompressTmpCap: 50,
             }),
             () => {
                 loadRoutes();
