@@ -348,6 +348,8 @@ elif SCENARIO.startswith("attach"):
         second = mw(request=second_req, original_request=second_req, session_id="sess-1", model="test-model", provider="p", api_mode="chat")
         tool_result = ctx.tools.get("compress", {}).get("handler")({}, session_id="sess-1", task_id="t1")
         no_session_result = ctx.tools.get("compress", {}).get("handler")({}, task_id="t1")
+        # #2072 negative leg: the model-transcribed conversation_id channel stays UNFLAGGED
+        transcribed_result = ctx.tools.get("compress", {}).get("handler")({"conversation_id": "transcribed-9"}, task_id="t2")
         out.update({
             "round1_none": round1 is None,
             "req_unmutated": req == frozen,
@@ -356,6 +358,7 @@ elif SCENARIO.startswith("attach"):
             "second_model_kept": second["request"].get("model") if isinstance(second, dict) else None,
             "tool_result": tool_result,
             "no_session_result": no_session_result,
+            "transcribed_result": transcribed_result,
         })
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
@@ -406,6 +409,7 @@ interface DriverOut {
     second_model_kept?: string | null;
     tool_result?: string;
     no_session_result?: string;
+    transcribed_result?: string;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -454,7 +458,13 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(h2["x-bili-plugin-max-output"], "4096");
         assert.equal(out!.second_model_kept, "test-model");
         assert.equal(out!.tool_result, "compressed 3 blocks");
-        assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-1", tool: "compress", args: {} }]);
+        // #2072: kwargs session_id channel is flagged; the model-transcribed
+        // conversation_id channel must stay unflagged (fail closed, #1685)
+        assert.deepEqual(out!.tool_calls, [
+            { conversationId: "sess-1", tool: "compress", args: {}, nativeCaller: true },
+            { conversationId: "transcribed-9", tool: "compress", args: { conversation_id: "transcribed-9" } },
+        ]);
+        assert.equal(out!.transcribed_result, "compressed 3 blocks");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
