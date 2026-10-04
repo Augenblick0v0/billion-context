@@ -365,12 +365,15 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * (#377). Keeping the summary mid-stream at its anchor (instead of hoisting it
  * to the head) also keeps the head system message — the prefix-cache anchor —
  * byte-stable across compress turns, so a new block does not invalidate the
- * whole-conversation prefix. In plugin/launcher mode the summary carrier is the
- * `compress` tool call (in the agent's own re-sent history), so the kernel's
- * acp_summary is stripped by stripKernelSummaries and this is a no-op there.
- * A summary is a stand-in for the folded history; re-voicing it as a user turn
- * is the accepted trade-off for SGLang compatibility + cache stability. No-op
- * (same array) when there is no system/developer message to convert.
+ * whole-conversation prefix. In plugin/launcher mode the summary carrier is
+ * usually the `compress` tool call in the agent's own re-sent history:
+ * stripKernelSummaries removes the kernel's acp_summary anchor when that pair
+ * rides inbound history, making this a no-op; when the pair does NOT ride
+ * (pruned or line-form echo) the anchor survives, and this re-voicing is what
+ * keeps strict backends legal then (#1999). A summary is a stand-in for the
+ * folded history; re-voicing it as a user turn is the accepted trade-off for
+ * SGLang compatibility + cache stability.
+ * No-op (same array) when there is no system/developer message to convert.
  */
 export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
     let hasSys = false;
@@ -383,6 +386,38 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
             ? ({ ...m, role: "user" } as T)
             : m
     );
+}
+
+/** #1999 residual (non-streaming Responses JSON loop): that loop rebuilds its
+ * re-request input from the RAW client body (plus its own pushed visibility
+ * markers / retrieval injections as `developer` items), so the two projection
+ * chokepoints that run `systemToUser` before the codec never see those items —
+ * a mid-history system/developer item still reaches strict single-system
+ * backends (Qwen3-family "system-first" templates behind developer→system
+ * mapping engines) and 400s the re-request. Unlike `systemToUser` above, this
+ * variant preserves the LEADING system/developer PREFIX verbatim: on this path
+ * the head carrier comes from the client's own raw input (its developer head /
+ * system message), and flattening it to user would change the request's voice;
+ * only items AFTER the first non-system/developer item are re-voiced (with
+ * output_text parts normalized to input_text, the user-side convention). No-op
+ * (same array) when nothing after the prefix needs converting. */
+export function revoiceMidSystemDevelopers<T extends { type?: string; role?: string; content?: unknown }>(items: T[]): T[] {
+    const isSysDev = (it: T): boolean => it.type === "message" && (it.role === "system" || it.role === "developer");
+    let head = 0;
+    while (head < items.length && isSysDev(items[head]!)) head++;
+    let touched = false;
+    const out = items.map((it, i) => {
+        if (i < head || !isSysDev(it)) return it;
+        touched = true;
+        const content = Array.isArray(it.content)
+            ? it.content.map((part) =>
+                part && typeof part === "object" && (part as { type?: string }).type === "output_text"
+                    ? { ...(part as object), type: "input_text" }
+                    : part)
+            : it.content;
+        return { ...it, role: "user", content } as T;
+    });
+    return touched ? out : items;
 }
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages

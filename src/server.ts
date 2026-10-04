@@ -3561,10 +3561,14 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived
-// anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
-// history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
-// growth ref 0) and no compression trigger fires until overflow. Explicit-
-// identity zero-baseline sessions previously stayed at 0 on the assumption
+// anonymously AND hold no usage-grade anchor yet (prefix-affinity
+// mints/forks/reloads, #553): they carry the full raw history but no
+// measurement yet, so feeding 0 blinds the nudge (usage 0%, growth ref 0)
+// and no compression trigger fires until overflow. An anchored anonymous
+// session continues a MEASURED lineage — it sizes on the anchor exactly like
+// an explicit session (#2033); the raw-history bound remains ONLY for the
+// genuinely anchor-less case below. Explicit-identity zero-baseline sessions
+// previously stayed at 0 on the assumption
 // that they "self-heal via the next measured usage report" — an assumption
 // that breaks for upstreams that NEVER report usage (ChatGPT-login backends,
 // #728): lastInputTokens stays 0 for the whole session, and the kernel's
@@ -3592,9 +3596,6 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // the >100% ghost class, and the next real usage report overwrites it.
     if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
     const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
-    if (session.metadata.anonymousPrefixAffinity) return { tokens: raw, source: "estimate" };
-    const est = session.stats.localInputEstimate ?? 0;
-    if (est <= 0) return { tokens: 0, source: "estimate" };
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
     // ghosts enter: #1569 first tried min(est, raw) — the char-count upper
@@ -3607,10 +3608,21 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // itself. Growth between reports is backstopped by preflight (it measures
     // the actual outbound payload before every forward) and the nudge
     // reference re-anchors as soon as the next usage lands (#1595).
-    // Never-reporting upstreams (#553/#728) keep the fail-closed upper bound:
-    // their anchor stays absent.
+    // #2033: this check runs BEFORE the anonymous-prefix-affinity fallback so
+    // an anchored anonymous session (a measured lineage continued through pfa-*
+    // resolution) sizes on the anchor too — pre-fix the anonymous early return
+    // handed it the full raw-history bound right after one failed turn, the
+    // exact ghost path #1839 closed for explicit sessions. Never-reporting
+    // upstreams (#553/#728) are unaffected: their anchor stays absent, so the
+    // fail-closed upper bounds below still apply.
     const grade = session.stats.lastUsageGradeTokens;
     if (grade !== undefined && grade > 0) return { tokens: grade, source: "usage" };
+    // #553: zero-baseline ANCHOR-LESS anonymous sessions (prefix-affinity
+    // mints/forks/reloads) fall back to the raw-history upper bound — see the
+    // function header for why feeding 0 blinds them.
+    if (session.metadata.anonymousPrefixAffinity) return { tokens: raw, source: "estimate" };
+    const est = session.stats.localInputEstimate ?? 0;
+    if (est <= 0) return { tokens: 0, source: "estimate" };
     return { tokens: Math.min(est, raw), source: "estimate" };
 }
 
