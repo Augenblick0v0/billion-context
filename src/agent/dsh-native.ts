@@ -47,6 +47,13 @@ export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
 
 const RETRY_INTERVAL_MS = 10000;
+/** #2082: BILI_DSH_RETRY_INTERVAL_MS — test/ops knob to shrink the retry
+ *  wall without wall-clock waits (same pattern as BILI_MODEL_INFO_RETRY_MS). */
+function retryIntervalMs(): number {
+    const raw = process.env.BILI_DSH_RETRY_INTERVAL_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
+}
 
 type AgentLike = { session?: { id?: unknown } | undefined };
 // #1677: DSH's command executor hands the invoking agent to the handler via the
@@ -465,7 +472,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
             // an armed retryAt would gate the NEXT base's first heal behind a
             // 10s wall — exactly the windows-22 CI deadlock (#1783).
-            if (register.base === base) register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            if (register.base === base) register.retryAt = Date.now() + retryIntervalMs();
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
@@ -474,7 +481,37 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     return register.pending;
 }
 
+// #2082: recovery retries are traffic-driven (headersFor on model
+// requests, statusOutcome on /acp). When the user goes idle — or the model
+// already gave up on the missing tools, exactly the #2082 report — nothing
+// re-arms them, so a proxy that recovered in the meantime sits unused until
+// the next request. A detached repeating timer keeps the loop running while
+// the tools are down and clears itself on the first healthy (or dead) tick.
+// BILI_DSH_RECOVERY_INTERVAL_MS: test hook to shrink the cadence (also an
+// ops knob); absent it tracks RETRY_INTERVAL_MS. Tests that do not opt in
+// never start a timer at all (NODE_TEST_CONTEXT guard keeps suites quiet).
+let recoveryTimer: NodeJS.Timeout | undefined;
+function recoveryIntervalMs(): number {
+    const raw = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
+    const parsed = raw === undefined ? Number.NaN : Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
+}
+function armRecoveryTimer(ctx: PluginContext): void {
+    if (recoveryTimer !== undefined) return;
+    if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.BILI_DSH_RECOVERY_INTERVAL_MS === undefined) return;
+    recoveryTimer = setInterval(() => {
+        if (register.dead || register.toolsReady) {
+            if (recoveryTimer !== undefined) clearInterval(recoveryTimer);
+            recoveryTimer = undefined;
+            return;
+        }
+        maybeRetry(ctx);
+    }, recoveryIntervalMs());
+    recoveryTimer.unref?.();
+}
+
 function maybeRetry(ctx: PluginContext): void {
+    if (!register.dead && !register.toolsReady) armRecoveryTimer(ctx);
     if (register.dead || register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
@@ -483,9 +520,18 @@ function maybeRetry(ctx: PluginContext): void {
         // without this branch the plugin never recovers and tools die for
         // good. Self-heal: re-arm the respawn every retry interval until a
         // proxy comes back (attach mode arms one since #1130).
-        const respawn = state.respawn;
-        if (respawn === undefined) return;
-        register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+        let respawn = state.respawn;
+        if (respawn === undefined) {
+            // #2082: nothing armed the respawn hook — a plan edge (attach
+            // landing after a dead spawn chain) or an apply() that ran under
+            // the NODE_TEST_CONTEXT spawn guard. A base-less register with no
+            // respawn armed stays dead forever; arm the fallback here so the
+            // retry chain below has something to drive.
+            if (_spawnForTest === undefined && process.env.NODE_TEST_CONTEXT !== undefined) return;
+            respawn = singleFlight(_spawnForTest ?? bootstrap);
+            state.respawn = respawn;
+        }
+        register.retryAt = Date.now() + retryIntervalMs();
         void trackChain(respawn())
             .then((origin) => {
                 if (origin === undefined) return;
@@ -658,6 +704,15 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+
+    // #2082: a fresh activation invalidates the "host tearing down" verdict.
+    // Without this reset, ONE registerTools rejection carrying "inactive
+    // context" (a cordis deactivate/reactivate cycle — dsh reloading the
+    // plugin after the desktop profile copy was swapped in place, a profile
+    // switch, a settings toggle) poisons register.dead for the whole process
+    // lifetime: every later maybeRetry() returns immediately and the bili
+    // tools never come back until dsh restarts.
+    register.dead = false;
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
@@ -1006,6 +1061,10 @@ export function apply(ctx: PluginContext): void {
 /** Test hook: reset the module-level registration lifecycle so suites can
  *  drive apply() repeatedly with a fresh mock ctx. */
 export function _resetRegisterForTest(base: string | undefined): void {
+    if (recoveryTimer !== undefined) {
+        clearInterval(recoveryTimer);
+        recoveryTimer = undefined;
+    }
     register.base = base;
     register.toolsReady = false;
     register.dead = false;
@@ -1014,6 +1073,13 @@ export function _resetRegisterForTest(base: string | undefined): void {
     modelInfo.cached = undefined;
     modelInfo.services = undefined;
     modelInfo.refreshing = false;
+}
+
+/** Test hook (#2082): drive the recovery loop directly — production callers
+ *  are traffic-side (headersFor / statusOutcome); tests trigger the same
+ *  path without fabricating model traffic. */
+export function maybeRetryForTest(ctx: PluginContext): void {
+    maybeRetry(ctx);
 }
 
 /** Test hook (#1797): resolve once every in-flight attach/recovery chain has

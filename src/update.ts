@@ -21,7 +21,7 @@
  * cycle automatically.
  */
 import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
 import * as tar from "tar";
@@ -842,9 +842,9 @@ export async function refreshDshDesktopCopy(
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
             return;
         }
-        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env);
+        const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env, { bootSmoke: true });
         if (result.ok) {
-            log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it`);
+            log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it (the running app keeps the old code in memory; across the handoff bili tools may fail once until dsh restarts, #2082)`);
         } else {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed: ${result.error}; retrying next cycle`);
         }
@@ -1177,6 +1177,62 @@ export function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?:
  *  over the install directory. `dispatcher` (optional) routes the download
  *  through a proxy (#609); omitted = direct connection. */
 
+const BOOT_SMOKE_TIMEOUT_MS = 20_000;
+
+/** #2082: run the freshly installed copy's CLI entry with --version in a
+ *  clean child process. Loading the module graph and exiting 0 is the smoke;
+ *  any non-zero exit, timeout, or spawn failure returns a short reason (with
+ *  the last stderr lines) for the caller to log before rolling back.
+ *  Env scrub: the child must not inherit the parent's BILLION_CONTEXT_* /
+ *  BILI_* knobs (a preset proxy origin would make --version spin up lanes)
+ *  nor NODE_OPTIONS / NODE_TEST_CONTEXT interference. */
+async function bootSmoke(installDir: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+    let entry: string | undefined;
+    try {
+        const pkg = JSON.parse(await readFile(path.join(installDir, "package.json"), "utf8")) as { main?: string };
+        if (typeof pkg.main === "string" && pkg.main.length > 0) entry = pkg.main;
+    } catch (err) {
+        return `package.json unreadable: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (entry === undefined) return "package.json declares no main entry to smoke";
+    const childEnv: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) continue;
+        if (key.startsWith("BILI_") || key.startsWith("BILLION_CONTEXT_") || key.startsWith("ACP_")) continue;
+        if (key === "NODE_OPTIONS" || key === "NODE_TEST_CONTEXT" || key === "NODE_ENV") continue;
+        childEnv[key] = value;
+    }
+    return await new Promise<string | null>((resolve) => {
+        const child = spawn(process.execPath, [path.join(installDir, entry!), "--version"], {
+            cwd: installDir,
+            env: childEnv,
+            stdio: ["ignore", "ignore", "pipe"],
+        });
+        let stderr = "";
+        child.stderr?.on("data", (chunk: Buffer) => {
+            stderr += chunk.toString();
+            if (stderr.length > 8192) stderr = stderr.slice(-8192);
+        });
+        const timer = setTimeout(() => {
+            child.kill();
+            resolve(`boot smoke timed out after ${BOOT_SMOKE_TIMEOUT_MS}ms`);
+        }, BOOT_SMOKE_TIMEOUT_MS);
+        child.on("error", (err) => {
+            clearTimeout(timer);
+            resolve(`boot smoke could not spawn ${process.execPath}: ${err.message}`);
+        });
+        child.on("close", (code, signal) => {
+            clearTimeout(timer);
+            if (code === 0) {
+                resolve(null);
+                return;
+            }
+            const tail = stderr.trim().length > 0 ? `: ${stderr.trim().split("\n").filter((l) => l.trim().length > 0 && !l.trim().startsWith("at ") && !/^Node\.js v/.test(l.trim())).slice(-4).join(" | ")}` : "";
+            resolve(`boot smoke exited ${code ?? signal}${tail}`);
+        });
+    });
+}
+
 export async function installViaTarball(
     version: string,
     tarballUrl: string,
@@ -1185,6 +1241,7 @@ export async function installViaTarball(
     shasum?: string,
     dispatcher?: object,
     env: NodeJS.ProcessEnv = process.env,
+    opts: { bootSmoke?: boolean } = {},
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -1394,6 +1451,23 @@ export async function installViaTarball(
     if (postEntryErr) {
         const rb = await restoreFromBackup();
         return { ok: false, error: rb ?? postEntryErr };
+    }
+
+    // #2082: optional boot smoke. verifyEntries proves the declared entries
+    // PARSE; it cannot prove the artifact BOOTS (a top-level throw, a broken
+    // import graph, a runtime dependency the flattened copy no longer
+    // resolves — all syntactically valid). The desktop lane swaps this copy
+    // in place under a RUNNING dsh whose plugin respawns from it on the next
+    // proxy death; an unbootable copy turns that respawn into an infinite
+    // give-up loop and the bili tools vanish until dsh restarts. Run the new
+    // copy's CLI entry with --version once — the module graph loads and exits
+    // immediately. Any failure rolls the working copy back to the backup.
+    if (opts.bootSmoke) {
+        const smokeErr = await bootSmoke(installDir, env);
+        if (smokeErr !== null) {
+            const rb = await restoreFromBackup();
+            return { ok: false, error: rb ?? `boot smoke failed (rolled back to the previous copy): ${smokeErr}` };
+        }
     }
 
     // Success: the backup is no longer needed, and neither is the displaced
