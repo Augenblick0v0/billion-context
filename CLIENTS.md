@@ -331,7 +331,11 @@ proxy never strands a dead URL, and the shell simply attaches to whatever is
 alive. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
-(#760).
+(#760). Codex ≥0.160 additionally stamps the real thread id on every
+`tools/call` via `_meta.threadId`; the shell consumes it per call (strictly
+validated, never written back into the spawn-time binding) and it outranks
+both a stale `BILI_CONVERSATION_ID` residue and the model-transcribed
+`conversation_id` (#2024).
 
 **Responses native chaining (a caveat).** bili compresses by replaying the full
 `input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a
@@ -392,7 +396,7 @@ To actually compress such a client: add its model domain to `"mitm".domains` in 
 
 ## An unrecognized endpoint goes direct and nothing compresses (#1290)
 
-bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**. There is no config seam to declare an arbitrary new wire today; adding one is a separate feature, not a switch you can flip.
+bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**.
 
 That outcome is now loud instead of silent (#1290):
 
@@ -400,7 +404,20 @@ That outcome is now loud instead of silent (#1290):
 - `unrecognizedPaths` (per-path counts) in `curl -s http://localhost:8787/__bili/stats` (loopback-only);
 - an `UNRECOGNIZED PATHS (instance-level)` section in `acp_status` output while such requests exist.
 
-If you expected compression at such an endpoint, use the provider's standard protocol endpoint instead (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress); a genuinely custom wire needs its own support.
+Two seams now cover the "custom path, standard wire" case — an endpoint whose path is nonstandard but whose request/response shape is one of the four known protocols:
+
+1. **Client-side, per client** — set the client's model base URL to the protocol-segment form of the `/bili/` tunnel:
+
+   ```text
+   http://127.0.0.1:8787/bili/<protocol>/<upstream-base-url>
+   # e.g. http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+   ```
+
+   `<protocol>` is one of `anthropic`, `openai`, `responses`, `google`. It forces the wire protocol regardless of the path — it **outranks** every server-side signal. Use it when you control the client's base URL but the endpoint path is nonstandard.
+
+2. **Server-side, per lane (#1909)** — declare `"protocol"` on the provider key that already routes the host/path (see [CONFIGURATION.md → `protocol`](CONFIGURATION.md#protocol)). Use it when the client's base URL cannot be changed (hardcoded endpoints, MITM-intercepted hosts).
+
+Either way the declaration only *identifies* the wire — a body that does not parse as that protocol still relays verbatim (#1284). A genuinely custom wire (own request/response shape, e.g. Command Code's `/alpha/generate`) still needs its own support; the fix for that is to use the provider's standard protocol endpoint (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress).
 
 ## OpenCode
 
@@ -417,6 +434,8 @@ on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
 | Launcher (easiest) | `bili opencode` | one command brings up proxy + client; real config untouched |
 | Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
 | Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
+
+These paths are **mutually exclusive** — each one owns routing of the same requests, so exactly one may be active per host instance. A hand-written `/bili/` provider baseURL is the pure-proxy path's marker; writing it while the native plugin is installed is a **conflicting configuration** (#1958): the runtime warns once per session (deduplicated per origin) with a fix-it guide — remove the prefix or remove the plugin — and the requests stay on the plain-proxy path they encode (no plugin session markers). The supported exception is an explicit pin of the **same** origin — `BILLION_CONTEXT_PROXY` pointing at the proxy the URLs already ride — which stays silent.
 
 ### Launcher — `bili opencode`
 
@@ -518,6 +537,9 @@ Point the provider baseURL at the proxy like any other client:
 
 Note: 2.0 AI-SDK providers require an `apiKey` field even for local
 endpoints that never check it — set any non-empty value.
+
+This path means **no plugin**: if the native plugin is also installed, the
+runtime warns once per session — pick one path per provider (#1958).
 
 ### Status: `/acp` and `acp_status`
 

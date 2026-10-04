@@ -228,7 +228,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
 ```jsonc
 {
   "providers": {
@@ -239,6 +239,9 @@ The `providers` block maps **upstream URLs** to per-provider configuration. Each
       "proxy": "http://10.0.0.1:7890",
       "compressProtocol": "tools",
       "compress": { "maxContextLimit": "70%" }
+    },
+    "https://relay.example.com/my/custom/complete": {
+      "protocol": "openai"
     }
   }
 }
@@ -277,7 +280,7 @@ The two schemes never overlap: a `mitm://` key targets only MITM (login-client) 
 A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its own it is routing-inert — longest-prefix match never hits it — and carries only agent-side identity such as [`compactionOptIn`](#compactionoptin). With a `bind` field it becomes a pure **alias** of another lane:
 
 - **Type:** `string` — the http(s) base URL of the lane to alias.
-- Resolution happens **purely at config-load time**: the entry's routing fields (`compress`, `models`, `proxy`, `passthrough`, `compressProtocol`, `compat`, `imageBilling`, `imageTokenCap`) are deep-merged onto the bound URL's route and apply exactly as if written under that URL key. The name itself never appears in the request path or on the wire; the proxy keeps its single URL-prefix routing.
+- Resolution happens **purely at config-load time**: the entry's routing fields (`compress`, `models`, `proxy`, `passthrough`, `compressProtocol`, `compat`, `imageBilling`, `imageTokenCap`, `protocol`) are deep-merged onto the bound URL's route and apply exactly as if written under that URL key. The name itself never appears in the request path or on the wire; the proxy keeps its single URL-prefix routing.
 - **Precedence (per field):** an explicit URL-key entry beats any alias field; between sources the external `ACP_PROVIDERS` file beats inline config at every level (aliases fold in source order, first-set wins). Objects merge per key; arrays/scalars are taken wholesale from the winner — no element-wise merging.
 - A named key without `bind` that still carries routing fields is dead config: bili logs a startup warning naming the key and the inert fields ("add `bind`, or move these under the URL entry") instead of silently ignoring them. Invalid `bind` values (non-string, non-http(s) URL) warn and leave the entry inert; `bind` on a URL key warns and is ignored (the key is already a lane).
 
@@ -318,12 +321,24 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 - **Status:** ACTIVE
 - **Description:** How compression tools are injected into the request. `"tools"` (default) injects them as native function-call tools. `"marker"` uses a text-trigger protocol instead — use this for upstreams that cannot coexist with a declared `tools` field.
 
-### `compress`
+### `protocol`
 
-- **Type:** `CompressSettings`
-- **Default:** *(inherits global `compress`)*
+- **Type:** `"anthropic" | "openai" | "responses" | "google"`
+- **Default:** *(none — inferred from the request path)*
 - **Status:** ACTIVE
-- **Description:** Per-provider compression overrides. This is **level 2 of 3** in the merge hierarchy — see [Compression Tuning](#compression-tuning).
+- **Description:** Declares the wire protocol for this lane (#1909), for endpoints whose path does not match the built-in suffix table (`/chat/completions`, `/messages`, `/responses`, Google paths). Two granularities: a bare host key (`"https://relay.example.com": { "protocol": "openai" }`) covers every POST-with-body under that host; a path key (`"https://relay.example.com/my/custom/complete": { "protocol": "openai" }`) covers only that subtree. This is the server-side counterpart of the client-side `/bili/<protocol>/<origin>` escape hatch — it covers clients whose base URL you cannot change (relays with custom endpoint paths, MITM-intercepted hosts). Priority: `/bili/<protocol>/` explicit marker **outranks** the declaration, which outranks the built-in suffix table. The declaration only ever *identifies* a request — it does not relax the safety nets: a body that does not parse as the declared protocol is relayed verbatim (#1284), and a GET without a body never becomes a declared protocol.
+
+  **Client-side counterpart — the `/bili/<protocol>/<origin>` escape hatch:** when you *do* control the client's base URL but the endpoint path is nonstandard, skip config entirely and put the protocol in the URL itself:
+
+  ```text
+  http://127.0.0.1:8787/bili/openai/https://relay.example.com/api/custom/complete
+  ```
+
+  `<protocol>` ∈ `anthropic` | `openai` | `responses` | `google`. It forces the wire protocol regardless of the path and **outranks** every server-side declaration (and the built-in suffix table). The plain form without a protocol segment (`/bili/<absolute-url>`) is unchanged: protocol still inferred from the path. Use the URL form per client; use this `providers.protocol` field per lane when the base URL cannot be changed (hardcoded endpoints, MITM-intercepted hosts).
+
+  **Non-shadowing (#1909):** `protocol` resolves independently of the other provider fields — all matching keys are scanned longest-prefix-first and the deepest key that *explicitly declares* `protocol` wins, so a host-key declaration keeps applying under a silent path key (no duplication needed). The *other* fields keep their existing single-entry longest-key semantics: like every path key, a protocol-only path key becomes the winning entry under its subtree, so host-level values of URL-scoped fields (`compress`, `models`, …) do not reach that subtree unless repeated on the path key. One exception: `compressProtocol` resolves against the upstream origin only, so no path key can shadow a host-level value there. A path key **without** `protocol` in it is still just routing config; `mitm://` keys follow the same scheme split as every other field. Invalid values fail config load loudly (web saves get a 400).
+
+### `compress`
 
 ### `compat`
 
@@ -959,6 +974,8 @@ Clients you configure with an **API key** (not a login) let you change the upstr
 // after (prepend the proxy origin + /bili/):
 "baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
+
+**OpenCode note.** This is the **no-plugin** path for OpenCode. If the native plugin is also installed over such a config, the runtime warns once per session with a fix-it guide (remove the prefix or remove the plugin); the requests themselves keep riding the plain-proxy path. The three mutually exclusive OpenCode access paths are documented in [CLIENTS.md](CLIENTS.md#opencode).
 
 **Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
 
