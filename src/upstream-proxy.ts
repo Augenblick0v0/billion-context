@@ -7,6 +7,7 @@ import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS } from "./upstream-fail.js";
+import { proxyKeepAliveMaxMs as knobProxyKeepAliveMaxMs } from "./knobs.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -325,8 +326,7 @@ export function resolveProxy(
 export const PROXY_KEEPALIVE_MAX_MS = 55_000;
 
 export function proxyKeepAliveMaxMs(): number {
-    const raw = Number(process.env.BILI_PROXY_KEEPALIVE_MAX_MS);
-    return Number.isFinite(raw) && raw < 0 ? PROXY_KEEPALIVE_MAX_MS : raw === 0 ? 0 : Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : PROXY_KEEPALIVE_MAX_MS;
+    return knobProxyKeepAliveMaxMs();
 }
 
 /** Proxy dispatchers carry the same timeout policy as direct ones (#551):

@@ -1254,7 +1254,8 @@ type FileConfig = {
      *  `compress`. */
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
-    mitm?: { enabled?: boolean; domains?: string[] };
+    /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
+    mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
@@ -1309,8 +1310,12 @@ type FileConfig = {
      *  `streamErrorShape` (#1455): "protocol" (default) presents upstream
      *  stream failures as protocol-native error frames; "completion" restores
      *  the legacy shape that delivered the failure text inside a synthesized
-     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file. */
-    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[] };
+     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file.
+     *  `noCacheControl` (#2030): set `true` to stop stamping Anthropic
+     *  cache_control marks entirely (env BILI_NO_CACHE_CONTROL wins).
+     *  `keepResponseId` (#2030): set `true` to preserve previous_response_id
+     *  on rebuilt Responses requests (env ACP_KEEP_RESPONSE_ID=1 wins). */
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string; dropFields?: string[]; noCacheControl?: boolean; keepResponseId?: boolean };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
@@ -1330,6 +1335,74 @@ type FileConfig = {
      *  their own armed session proxy instead (#1322). Env
      *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
     native?: { attachExternal?: boolean };
+    /** Network & timing knobs (#2030) — every field was an env-only variable
+     *  before (BILI_*_MS / BILI_REPLAY_* family); env still wins when set.
+     *  Resolved by src/knobs.ts. */
+    network?: {
+        /** Upstream fetch timeout (was BILI_UPSTREAM_TIMEOUT_MS; default 720000). */
+        upstreamTimeoutMs?: number;
+        /** Request watchdog budget (was BILI_REQUEST_WATCHDOG_MS; default 2× upstream timeout). */
+        requestWatchdogMs?: number;
+        /** Server keep-alive timeout (was BILI_KEEP_ALIVE_TIMEOUT_MS; default 5000). */
+        keepAliveTimeoutMs?: number;
+        /** Client-error backstop (was BILI_CLIENT_ERROR_BACKSTOP_MS; default 30000). */
+        clientErrorBackstopMs?: number;
+        /** Exposure log interval, 0 disables (was BILI_EXPOSURE_LOG_INTERVAL_MS; default 3600000). */
+        exposureLogIntervalMs?: number;
+        /** Preflight stream keep-alive hold, 0 disables (was BILI_STREAM_KEEPALIVE_MS; default 15000). */
+        streamKeepAliveMs?: number;
+        /** Preflight hold grace (was BILI_PREFLIGHT_HOLD_MS; default 30000). */
+        preflightHoldMs?: number;
+        /** Preflight dead-end cooldown (was BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS; default 300000). */
+        preflightDeadEndCooldownMs?: number;
+        /** Max replay attempts on transient upstream errors (was BILI_REPLAY_RETRY_MAX; default 3). */
+        replayRetryMax?: number;
+        /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
+        replayRetryBaseMs?: number;
+        /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
+        maxShrinkPerCompress?: number;
+        /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
+        proxyKeepAliveMaxMs?: number;
+    };
+    /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
+    persist?: {
+        enabled?: boolean;
+        zstd?: boolean;
+        debounceMs?: number;
+        tailTokens?: number;
+        epermAlertThreshold?: number;
+        epermAlertRepeatMs?: number;
+    };
+    /** Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC*. */
+    sessions?: {
+        max?: number;
+        gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number };
+    };
+    /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
+    update?: { registry?: string; checkIntervalMs?: number };
+    /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
+     *  ACP_RAW_DUMP_DIR / BILI_DUMP_4XX* / ACP_RENDER_NONE / ACP_NO_INJECT_TOOL /
+     *  ACP_NO_COMPRESS_PROMPT / ACP_COUNT_TOKENS_PASSTHROUGH / ACP_COMPRESS_PROTOCOL. */
+    diagnostics?: {
+        dumpBody?: boolean;
+        dumpReq?: boolean;
+        rawDumpDir?: string;
+        dump4xx?: boolean;
+        dump4xxMaxBytes?: number;
+        renderNone?: boolean;
+        noInjectTool?: boolean;
+        noCompressPrompt?: boolean;
+        countTokensPassthrough?: boolean;
+        compressProtocol?: string;
+    };
+    /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
+    fakeCompletion?: { retries?: number; bufCapBytes?: number };
+    /** Codex compaction kill-switch (#2030) — was BILI_CODEX_COMPACT ("intercept" | "pass"). */
+    codexCompact?: string;
+    /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
+    ccrRetrievalTtlMs?: number;
+    /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
+    decompressTmpCap?: number;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1371,6 +1444,9 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "compat", "imageBilling", "claude", "native", "resign",
+    // #2030 subsystem blocks:
+    "network", "persist", "sessions", "update", "diagnostics",
+    "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1406,7 +1482,11 @@ export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] ignoring unknown top-level config key(s): ${unknown.join(", ")}${hint}`);
 }
 
-function loadConfigFile(): FileConfig {
+/** Read the JSON config file fresh on every call (no cache): the file is small,
+ *  hot-reloadable (web-UI Apply rewrites it), and test seams mutate it between
+ *  calls. Exported so src/knobs.ts can resolve the file tier of every knob
+ *  through this single reader (#2030). */
+export function loadConfigFile(): FileConfig {
     const parsed = safeReadJson(configFile());
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         warnUnknownTopLevelKeys(parsed as Record<string, unknown>);

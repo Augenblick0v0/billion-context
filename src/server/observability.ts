@@ -1,13 +1,14 @@
 import { log as loggerLog } from "../logger.js";
 import { maskUrlsInText } from "../log-mask.js";
+import { bodyDumpEnabled as knobBodyDumpEnabled } from "../knobs.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
 // req-*-REREQUEST.json) write the full plaintext request body and are off by
 // default. They are decoupled from --debug (verbose logging) and enabled only
-// with ACP_DUMP_BODY=1 so `bili <client>` users don't leak conversation bodies
-// to disk by default (#276).
+// with ACP_DUMP_BODY=1 / diagnostics.dumpBody so `bili <client>` users don't
+// leak conversation bodies to disk by default (#276).
 export function bodyDumpEnabled(): boolean {
-    return process.env.ACP_DUMP_BODY === "1";
+    return knobBodyDumpEnabled();
 }
 
 // Raw dumps are best-effort: a failure (disk full, locked dir, EPERM) must not

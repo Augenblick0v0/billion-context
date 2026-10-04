@@ -322,6 +322,28 @@ bili --no-auto-update        # 本次启动禁用自动更新
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
 见 **[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)**。
 
+### 配置文件
+
+一份 JSON 文档:`~/.config/billion-context/billion-context.json`
+(`$XDG_CONFIG_HOME/billion-context/`;用 `BILI_CONFIG_FILE` 可改路径)。
+同一开关有多个来源时的优先级:**CLI 参数(如有)> 环境变量 > 配置文件 > 内置默认值** —— 每个环境变量都继续作为覆盖层可用。
+
+里面有什么(细节见 CONFIGURATION.zh-CN.md):
+
+- `providers` —— 按 provider 的路由表:上游覆盖、模型上下文窗口、按 provider/模型的压缩调参、wire 协议声明、compaction opt-in。
+- `compress` —— 三级压缩调参(全局 → provider → 模型):阈值、nudge 节奏、保留规则、prompts、tiers。
+- 服务端级配置块 —— 进程级行为,含 #2030 新增:`network`(超时 / 重试 / keep-alive / preflight 节奏)、`persist`(会话持久化格式 + tail)、`sessions`(上限 + GC 策略)、`update`(registry 镜像 + 检查间隔)、`diagnostics`(dump、render-tag 模式、注入开关)、`fakeCompletion`,以及标量 `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap` 和扩展项 `mitm.handshakeTimeoutMs`、`compat.noCacheControl`、`compat.keepResponseId`。
+
+最小示例:
+
+```json
+{
+  "network": { "upstreamTimeoutMs": 900000 },
+  "persist": { "zstd": true },
+  "sessions": { "gc": { "enabled": true, "maxAgeDays": 14 } }
+}
+```
+
 两个最常找的开关:
 
 - **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。

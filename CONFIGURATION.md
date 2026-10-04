@@ -124,13 +124,15 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `compat`
 
-- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion" }`
+- **Type:** `{ roles?: Record<string, string>; dropFields?: string[]; streamErrorShape?: "protocol" | "completion"; noCacheControl?: boolean; keepResponseId?: boolean }`
 - **Default:** `{}` (disabled)
 - **Status:** ACTIVE
 - **Description:** Global wire-compat role map. `roles` maps message roles to the role name your upstream accepts, e.g. `{"compat":{"roles":{"developer":"system"}}}` rewrites `developer` → `system` on the final forwarded body for upstreams that reject the `developer` role (#552, newer codex clients). Applies to `openai` chat-completions and `responses` requests; exact-match roles only, everything else in the body is untouched; re-sent compress-retry bodies carry the same rewrite. Per-provider `compat.roles` entries (see [Providers](#providers)) win per key. Default `{}` forwards bodies byte-for-byte unchanged.
 - **Learn-on-failure:** with no compat configured, an upstream `400 Invalid role: …` is auto-fixed — bili rewrites the offending role to `system`, retries once, and remembers the mapping **session-scoped** (in-memory on the session; never written to config). Later requests in that session skip the 400 round-trip. The info log emitted when the fix fires carries the permanent per-provider snippet.
 - **dropFields:** dot-path list of fields to delete from the final forwarded body — for strict-schema upstreams that reject a field the *client* always sends but the upstream does not accept (#1757). Paths use plain-object segments only (`reasoning.summary`); wildcards and array indices are not supported; nonexistent paths and non-object intermediates are skipped silently; string values are never inspected or altered — structural keys only, so tool arguments and message content stay byte-exact. Unlike `roles`, it applies on every wire protocol (any JSON request body). Global and per-provider lists merge **additively** (union) — a provider entry can add paths but never retract a global one. Applied after role mapping / output steering on the final outbound body (before the prompt-cache stamp), to every body the compress-retry loops re-send, and to verbatim pass-through forwards alike. A body with no matching field is forwarded byte-for-byte unchanged; when ≥1 field is actually dropped an info line logs the dropped paths. Opt-in only — no learn-on-failure in v1: `"compat":{"dropFields":["reasoning.summary"]}`.
 - **streamErrorShape:** how an upstream stream failure is presented on the anthropic/openai wire once the 200 response is already committed (`"protocol"`, default, or `"completion"`). `protocol` rides the protocol-native failure channel — anthropic/responses get an `event: error` frame, openai a top-level `error` frame followed by `[DONE]` — so clients can distinguish "this turn failed" from "this turn finished" and keep their own retry logic armed (#1455: the old synthesized `end_turn`/`finish_reason` dressed a dead turn as a normal completion and silently consumed client retry budgets). `completion` restores that legacy shape (failure text inside a synthesized successful completion) for hosts whose SDK cannot surface in-band error events. Config file: `"compat":{"streamErrorShape":"completion"}`; env `BILI_STREAM_ERROR_SHAPE` wins. Only the google wire is unaffected (already native error frames); on the responses wire this knob changes the server-side exit from the synthesized item-lifecycle completion to the `event: error` frame (its in-loop exit was already native via `response.failed`).
+- **noCacheControl:** (`#2030`) `true` disables bili's Anthropic-lane `cache_control` breakpoint stamping — the escape hatch for upstreams that reject the field or relays with their own breakpoint policy. Env twin `BILI_NO_CACHE_CONTROL` wins; full mechanics in its [env entry](#environment-variables).
+- **keepResponseId:** (`#2030`) `true` keeps `previous_response_id` on kernel-rebuilt Responses requests instead of stripping it (default strips it, so a rebuilt body never references a response id the upstream never issued for the rewritten input). Env twin `ACP_KEEP_RESPONSE_ID=1` wins.
 
 ### `proxy`
 
@@ -223,6 +225,131 @@ Top-level keys that control how the proxy listens and behaves globally.
   - `models.<name>.benefit: boolean` (level 3) — whether THIS model on THIS provider bills against the CodeArts free quota (its re-signed requests carry the signed `maas_type: benefit` header). `true`/`false` are explicit — `false` opts a default-set model out; unset falls through to the built-in fallback `glm-5.3-flash, deepseek-v4.1-flash` (the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK` mirror). Env `BILI_RESIGN_BENEFIT` (comma-separated) wins over the whole tree.
   - `providers.<url>.resign["<scheme>"]` (level 2) — `{ enabled?, passthrough?, credentialRef? }` under the same scheme key, per-field over the global block.
   - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy. Scheme lookup itself is case-insensitive (wire tokens arrive as `SDK-HMAC-SHA256 Access=…`, keys are lowercase).
+
+### Process-level blocks (#2030)
+
+Since #2030 every pure-behavior knob has a config-file key alongside its env var. Resolution is **env var > config file > built-in default**: a *set* env value owns its knob even when garbage (it parses exactly as pre-#2030 — falling back to the default) and neither leaks into nor gets shadowed by the file tier. These blocks scope the **proxy process** (transport timing, persistence, session lifecycle, self-update, diagnostics). They deliberately do **not** participate in the three-level compress merge ([global → provider → model](#three-level-merge-example)): none of these knobs has per-provider or per-model semantics — their env-var form was process-global, so a top-level key preserves scope exactly. All keys are optional; omitting a block changes nothing. Exhaustive per-knob semantics live in the [env mapping table](#config-file-keys-for-environment-knobs-2030) below.
+
+```jsonc
+// ~/.config/billion-context/billion-context.json — #2030 process-level blocks (all optional)
+{
+  // Transport & retry timing
+  "network": {
+    "upstreamTimeoutMs": 720000,          // idle budget per upstream request (12 min default)
+    "requestWatchdogMs": 1440000,         // total request budget; default = 2× upstream timeout
+    "replayRetryMax": 3,                  // attempts after transient upstream 429/5xx
+    "replayRetryBaseMs": 1500,            // backoff base; 0 disables the delay
+    "maxShrinkPerCompress": 0.4,          // max fraction (0,1] one compress may shrink; omit = no steering
+    "keepAliveTimeoutMs": 5000,           // client-facing socket keep-alive
+    "clientErrorBackstopMs": 30000,       // half-open client socket destroy backstop
+    "exposureLogIntervalMs": 3600000,     // [exposure] telemetry interval; 0 disables
+    "streamKeepAliveMs": 15000,           // SSE keepalive during upstream silence; 0 disables
+    "preflightHoldMs": 30000,             // grace before a long preflight hold starts
+    "preflightDeadEndCooldownMs": 300000, // cooldown after a dead-end preflight verdict
+    "proxyKeepAliveMaxMs": 55000          // upstream-proxy connection reuse cap; 0 uncapped
+  },
+
+  // Session persistence
+  "persist": {
+    "enabled": true,                      // false = in-memory only, lost on restart
+    "zstd": false,                        // true = BILIZSTD1 files (#1080 owner decision: off)
+    "debounceMs": 500,
+    "tailTokens": 16384,                  // persisted snapshot budget; 0 = no message persistence
+    "epermAlertThreshold": 5,             // Windows AV-exclusion alert after N failures
+    "epermAlertRepeatMs": 0               // 0 = alert once
+  },
+
+  // Session lifecycle
+  "sessions": {
+    "max": 256,                           // in-memory LRU cap
+    "gc": {
+      "enabled": false,                   // opt-in (#1082): session files are user data
+      "maxAgeDays": 7,
+      "maxTokens": 1000000,
+      "intervalMs": 3600000
+    }
+  },
+
+  // Self-updater
+  "update": {
+    "registry": "https://registry.npmjs.org",
+    "checkIntervalMs": 180000
+  },
+
+  // Debug & diagnostic toggles
+  "diagnostics": {
+    "dumpBody": false,                    // dump full request/response bodies
+    "dumpReq": true,                      // gate for request-body dumps
+    "rawDumpDir": null,                   // raw-dump location; null = <state dir>/raw
+    "dump4xx": false,                     // capture rejected 4xx bodies
+    "dump4xxMaxBytes": 2097152,
+    "renderNone": false,                  // stop injecting mNNNNN render tags
+    "noInjectTool": false,                // suppress compress tool injection
+    "noCompressPrompt": false,            // suppress compress prompt text
+    "countTokensPassthrough": false,      // forward /count_tokens verbatim
+    "compressProtocol": "tools"           // "tools" | "text"
+  },
+
+  // Fake-completion safety net (#371, opt-in)
+  "fakeCompletion": { "retries": 0, "bufCapBytes": 16777216 },
+
+  // Scalars
+  "codexCompact": "intercept",            // or "pass"
+  "ccrRetrievalTtlMs": 600000,            // queued acp_retrieve expiry; 0 disables
+  "decompressTmpCap": 50                  // max concurrent decompress temp files
+}
+```
+
+### `network`
+
+- **Type:** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number }`
+- **Default:** `{}` (built-ins: `720000`, `2× upstream timeout`, `3`, `1500`, unset, `5000`, `30000`, `3600000`, `15000`, `30000`, `300000`, `55000`)
+- **Status:** ACTIVE
+- **Description:** Process-wide transport and retry timing (ms). Each key resolves env > file > default via its twin (`BILI_UPSTREAM_TIMEOUT_MS`, `BILI_REQUEST_WATCHDOG_MS`, `BILI_REPLAY_RETRY_MAX`, `BILI_REPLAY_RETRY_BASE_MS`, `BILI_MAX_SHRINK_PER_COMPRESS`, `BILI_KEEP_ALIVE_TIMEOUT_MS`, `BILI_CLIENT_ERROR_BACKSTOP_MS`, `BILI_EXPOSURE_LOG_INTERVAL_MS`, `BILI_STREAM_KEEPALIVE_MS`, `BILI_PREFLIGHT_HOLD_MS`, `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`, `BILI_PROXY_KEEPALIVE_MAX_MS`). Semantics: `upstreamTimeoutMs` bounds time-to-first-byte and inter-chunk silence end-to-end (#551); `requestWatchdogMs` is the total-request budget (a negative value opts out); `replayRetryMax` counts attempts after transient upstream rejections (#189/#1688); `maxShrinkPerCompress` caps how much one compress may shrink the request before bili steers toward smaller ranges (#189); `streamKeepAliveMs` emits an SSE comment when the response has written zero bytes for that long (#1647); `proxyKeepAliveMaxMs` caps connection reuse through an upstream proxy below its recycle cadence (#1263), `0` uncaps. Full details in the [env table](#config-file-keys-for-environment-knobs-2030).
+
+### `persist`
+
+- **Type:** `{ enabled?: boolean; zstd?: boolean; debounceMs?: number; tailTokens?: number; epermAlertThreshold?: number; epermAlertRepeatMs?: number }`
+- **Default:** `{ enabled: true, zstd: false, debounceMs: 500, tailTokens: 16384, epermAlertThreshold: 5, epermAlertRepeatMs: 0 }`
+- **Status:** ACTIVE
+- **Description:** Session-persistence behavior (twins `BILI_PERSIST`, `BILI_PERSIST_ZSTD`, `BILI_PERSIST_DEBOUNCE_MS`, `BILI_PERSIST_TAIL_TOKENS`, `BILI_PERSIST_EPERM_ALERT_THRESHOLD`, `BILI_PERSIST_EPERM_ALERT_REPEAT_MS`). `enabled: false` keeps sessions in memory only; `zstd: true` writes `BILIZSTD1` files (#1080 owner decision: plain JSON stays the default for recoverability); `tailTokens` budgets the persisted folded snapshot (`0` disables message persistence entirely); the two `eperm*` keys tune the Windows antivirus-exclusion alert. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+
+### `sessions`
+
+- **Type:** `{ max?: number; gc?: { enabled?: boolean; maxAgeDays?: number; maxTokens?: number; intervalMs?: number } }`
+- **Default:** `{ max: 256, gc: { enabled: false, maxAgeDays: 7, maxTokens: 1000000, intervalMs: 3600000 } }`
+- **Status:** ACTIVE
+- **Description:** `max` caps in-memory sessions with LRU eviction (twin `BILI_MAX_SESSIONS`; disk remains the source of truth). `gc` controls stale-session-file cleanup (twins `BILI_SESSION_GC*`) — **opt-in**, because session files are user data: compressed sessions are never deleted, deletions are audit-logged, and the age + lossless-size gates apply. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+
+### `update`
+
+- **Type:** `{ registry?: string; checkIntervalMs?: number }`
+- **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }`
+- **Status:** ACTIVE
+- **Description:** Self-updater sources (twins `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`). Both resolve at import time, so they take effect on the next restart — same as the env vars did. `registry` is intended for hermetic testing (the verdaccio e2e lane); leave it at the default in production (#1153).
+
+### `diagnostics`
+
+- **Type:** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
+- **Default:** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
+- **Status:** ACTIVE
+- **Description:** Debug/diagnostic toggles that used to be env-only (`ACP_DUMP_BODY`, `ACP_DUMP_REQ`, `ACP_RAW_DUMP_DIR`, `BILI_DUMP_4XX`, `BILI_DUMP_4XX_MAX_BYTES`, `ACP_RENDER_NONE`, `ACP_NO_INJECT_TOOL`, `ACP_NO_COMPRESS_PROMPT`, `ACP_COUNT_TOKENS_PASSTHROUGH`, `ACP_COMPRESS_PROTOCOL`). Mostly read live per request (no restart needed), except `compressProtocol` which resolves once at boot like the env var did. `renderNone` stops the `mNNNNN` render tags from being injected into outgoing history — disable only if your workflow doesn't need ref-based compression (#933). Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+
+### `fakeCompletion`
+
+- **Type:** `{ retries?: number; bufCapBytes?: number }`
+- **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
+- **Status:** ACTIVE
+- **Description:** Fake-completion safety net for hosts that abort mid-stream (#371) — **opt-in**, `retries: 0` (default) is the pre-#371 passthrough. `bufCapBytes` is the OOM guard on the buffered response. Twins `BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP`.
+
+### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
+
+- **Type:** `string` ("intercept" | "pass") / `number` / `number`
+- **Default:** `"intercept"` / `600000` / `50`
+- **Status:** ACTIVE
+- **Description:** Top-level scalars. `codexCompact`: whether bili intercepts codex native-compaction requests and forges a local ACP handoff, or passes them upstream (twin `BILI_CODEX_COMPACT`; read per request, so either tier flips without restart). `ccrRetrievalTtlMs`: expiry for queued-but-undelivered `acp_retrieve` injections, dropped loudly on expiry (twin `BILI_CCR_RETRIEVAL_TTL_MS`; `0` disables). `decompressTmpCap`: max concurrent decompress temp files (twin `BILI_DECOMPRESS_TMP_CAP`).
+
+Three more #2030 keys extend existing blocks: [`mitm.handshakeTimeoutMs`](#client-integration) (default `10000`, twin `BILI_MITM_HANDSHAKE_TIMEOUT_MS`), [`compat.noCacheControl`](#compat), and [`compat.keepResponseId`](#compat).
 
 ---
 
@@ -797,6 +924,58 @@ For a request to `https://api.anthropic.com/v1/messages` with model `claude-sonn
 
 Environment variables take precedence over the config file. They are useful for environment-specific overrides (CI, containers) without editing the file.
 
+**Precedence model (#2030).** Every behavior knob resolves as **env var > config file > built-in default**. Since #2030 each pure-behavior knob ALSO has a config-file key, so a deployment can live entirely in `billion-context.json`; the env var remains the override tier. A *set* env var owns its knob even when its value is garbage — it parses exactly as it did before #2030 (falling back to the default) and neither leaks into nor gets shadowed by the file tier. Env-only variables are reserved for what cannot live in the file: secrets (`BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY`), per-process channels written by another bili component at spawn (`BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*`), host-side posture read inside third-party host processes (`BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH`), path relocation (`BILI_CONFIG_FILE`, `BILI_SESSIONS_DIR`, `ACP_DUMP_DIR`, `XDG_*`), and third-party conventions (`CLAUDE_CODE_SESSION_ID`, `CODEX_HOME`, `https_proxy`). New knobs follow the rules in AGENTS.md "Environment Variable Discipline".
+
+### Config-file keys for environment knobs (#2030)
+
+File keys resolve only when the matching env var is unset. Defaults in parentheses are the built-ins.
+
+| Env var | Config key | Default |
+|---------|------------|---------|
+| `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | `720000` |
+| `BILI_REQUEST_WATCHDOG_MS` | `network.requestWatchdogMs` | `2×` upstream timeout |
+| `BILI_REPLAY_RETRY_MAX` | `network.replayRetryMax` | `3` |
+| `BILI_REPLAY_RETRY_BASE_MS` | `network.replayRetryBaseMs` | `1500` |
+| `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset (no steering) |
+| `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | `5000` |
+| `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | `30000` |
+| `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | `3600000` |
+| `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | `15000` |
+| `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | `30000` |
+| `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | `300000` |
+| `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | `55000` |
+| `BILI_MITM_HANDSHAKE_TIMEOUT_MS` | `mitm.handshakeTimeoutMs` | `10000` |
+| `BILI_PERSIST` | `persist.enabled` | `true` |
+| `BILI_PERSIST_ZSTD` | `persist.zstd` | `false` |
+| `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | `500` |
+| `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | `16384` |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | `5` |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | `0` |
+| `BILI_MAX_SESSIONS` | `sessions.max` | `256` |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | `false` |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | `7` |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | `1000000` |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | `3600000` |
+| `BILI_UPDATE_REGISTRY` | `update.registry` | npm public registry |
+| `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | `180000` |
+| `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | `600000` |
+| `BILI_CODEX_COMPACT` | `codexCompact` | `"intercept"` |
+| `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | `50` |
+| `ACP_DUMP_BODY` | `diagnostics.dumpBody` | `false` |
+| `ACP_DUMP_REQ` | `diagnostics.dumpReq` | `true` |
+| `ACP_RAW_DUMP_DIR` | `diagnostics.rawDumpDir` | `<state dir>/raw` |
+| `BILI_DUMP_4XX` | `diagnostics.dump4xx` | `false` |
+| `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | `2097152` |
+| `ACP_RENDER_NONE` | `diagnostics.renderNone` | `false` |
+| `ACP_NO_INJECT_TOOL` | `diagnostics.noInjectTool` | `false` |
+| `ACP_NO_COMPRESS_PROMPT` | `diagnostics.noCompressPrompt` | `false` |
+| `ACP_COUNT_TOKENS_PASSTHROUGH` | `diagnostics.countTokensPassthrough` | `false` |
+| `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | `"tools"` |
+| `ACP_KEEP_RESPONSE_ID` | `compat.keepResponseId` | `false` |
+| `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | `false` |
+| `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | `0` |
+| `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | `16777216` |
+
 | Variable | Effect |
 |----------|--------|
 | `ACP_DEBUG` | Set to `1` for verbose logging (same as `"debug": true`). |
@@ -848,7 +1027,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_FORK_ADOPTION` | Set `1` to turn ON fork block-adoption (#629): when an anonymous (prefix-affinity) client forks its history mid-conversation (edit-and-resend / regenerate an earlier turn), the new session inherits the parent's compression blocks whose source content is fully present in the forked request — instead of restarting with zero compression state and re-folding the shared prefix from scratch. Default is OFF. Identified resume-forks are NOT governed by this switch — they adopt blocks together with `BILI_RESUME_INHERITANCE` (#1834). `"forkAdoption": true` in the config file does the same; the env var wins. The adoptable inventory is logged on every anonymous fork even while disabled, so you can size the win before flipping it on. |
 | `BILI_RESUME_INHERITANCE` | Set `0` to turn OFF resume inheritance (ON by default) (#1486): when an identified client (sends its own session id, e.g. Claude Code's `x-claude-code-session-id`) resumes a conversation under a NEW session id while replaying the full transcript (`cc --resume` forks a fresh UUID), bili matches the incoming history byte-exactly against that client's tracked chains (≥8 messages, append-only tracking) and, on the resumed session's first request, inherits the parent's ref assignments — stale model citations then resolve to their ORIGINAL messages instead of mis-hitting renumbered ones — adopts the fully-present compression blocks (together with this inheritance, #1834: losing them on resume meant the folded originals came back on the wire and the upstream request ballooned; the old `forkAdoption` co-gate now applies only to anonymous forks, #629), and records the `derivedFrom` lineage. The parent is never modified and fresh messages number above the parent's ref space. A resume must strictly EXTEND the parent's history — an equal-depth byte-exact replay under another id is a duplicate, not a resume. Anonymous sessions are unaffected (they keep their own pfa-* world, #309). `"resumeInheritance": false` in the config file does the same; the env var wins. |
 | `BILI_STABLE_SYSTEM_ANCHOR` | Set `1` to enable stable-system anchoring (#1085) — a **best-effort wire-layer fallback** for prefix caching: the root fix belongs client-side (the client owns its history and decides how to present instruction changes), this only stops the proxy from letting a changed head invalidate the whole cached prefix. **Plain-proxy mode only**: plugin-mode agents (`x-bili-plugin`) own their context management and are never anchored, so clients that already inject cache-friendly updates (e.g. claude-code-style system reminders) are not double-processed. When enabled, bili remembers each session's first-seen head system/instructions block and keeps re-sending those exact bytes even when the client's system prompt later changes. A **localized** change (a file-style edit sharing ≥70% of lines with the version in effect so far) appends a trailing `[System context update] …` user note carrying a compact line diff (`-` removed / `+` added; each note composes sequentially onto the previous one). A **non-localized** change (structural reshuffle, tool-def churn, timestamped banners, heads over 400 lines) is adopted outright — one deliberate cache miss beats appending noise that would mislead the model about its instructions. Churn guard: more than 8 accumulated notes likewise replace the anchor with the newest text and clear the log. The anchor and note log persist with the session and survive compression/compaction (session metadata, not kernel state). Known residual limitation: client-placed `cache_control` breakpoints may still misalign after a head swap. Excluded from anchoring: title-gen micro-requests (OpenAI/Google), Responses compaction-trigger requests, auto-mode classifier requests. Clients implementing their own variant (stable prompt + in-history updates) get zero extra injection — such updates pass through as ordinary history. Default is OFF. `"stableSystemAnchor": true` in the config file does the same; the env var wins. |
-| `BILI_NO_CACHE_CONTROL` | Set `1` to disable bili's Anthropic-lane `cache_control` breakpoint stamping (#1637, shipped in #1639). On by default: Anthropic-style upstreams cache only what is explicitly breakpointed (max 4 per request, counted across system + tools + message blocks combined), so bili marks the system block plus up to 3 cumulative message marks — a marked message stays marked (byte-stable prefix), marks die only by folding, and the last 3 stable messages carry the advancing frontier. Any client-set `cache_control` (message blocks, tools entries) suppresses bili's stamps entirely — client-managed caching wins. Marks persist with the session. This switch is the escape hatch for upstreams that reject the field or relays with their own breakpoint policy. Plain-proxy Anthropic lane only; OpenAI/Responses lanes cache implicitly and are never stamped. Env-only; no config-file key. |
+| `BILI_NO_CACHE_CONTROL` | Set `1` to disable bili's Anthropic-lane `cache_control` breakpoint stamping (#1637, shipped in #1639). On by default: Anthropic-style upstreams cache only what is explicitly breakpointed (max 4 per request, counted across system + tools + message blocks combined), so bili marks the system block plus up to 3 cumulative message marks — a marked message stays marked (byte-stable prefix), marks die only by folding, and the last 3 stable messages carry the advancing frontier. Any client-set `cache_control` (message blocks, tools entries) suppresses bili's stamps entirely — client-managed caching wins. Marks persist with the session. This switch is the escape hatch for upstreams that reject the field or relays with their own breakpoint policy. Plain-proxy Anthropic lane only; OpenAI/Responses lanes cache implicitly and are never stamped. Config-file twin: [`compat.noCacheControl`](#compat) — the env var wins. |
 | `BILI_CHAIN_CONTENT` | Set `1` to turn ON the ACP-artifact / `<bili-chain …/>` checkpoint **body-content** detection of bili→bili chain awareness (#1086/#1421): when an inbound request carries compression artifacts (render tags / historical `acp_status`+`search_context` tool calls) or a digest-bearing checkpoint in its BODY but neither the `x-bili-hop` header nor local compression state for its session, bili records an advisory observation and/or applies first-processor-wins passthrough. **Default is OFF** (#1683 follow-up): by default ONLY the `x-bili-hop` header drives chain recognition, because scanning the request BODY can false-positive on CCR/file-introduced text and model-echoed tags that look like real markers. Enable it only for the narrow multi-bili relay case where an intermediate box strips `x-bili-hop` and you accept that false-positive risk. `"chainContentDetection": true` in the config file does the same; the env var wins. The `x-bili-hop` signal itself is unaffected by this switch. |
 | `BILI_CHAIN_STAMP` | Set `1` to turn ON egress emission of the **model-visible** `<bili-chain …/>` chain-integrity checkpoint carrier (#1683, default OFF): when enabled, every request THIS instance actually processes leaves with a digest-bearing stamp so a downstream bili applies first-processor-wins even when the `x-bili-hop` header was stripped in transit (#1421). The carrier lands in a slot the terminal model also reads (a trailing `user` message on OpenAI/Responses, a trailing text part on Anthropic/Google), so models treat it as phantom user input and burn tokens commenting on it — which is why it is off by default. Enable it only for the narrow multi-bili relay case where `x-bili-hop` is stripped by an intermediate box and the digest-verified body-stamp is the sole guard against double-processing. Independent of `BILI_CHAIN_CONTENT` (inbound body-detection is also default OFF) and of the `x-bili-hop` passthrough, which works either way. `"chainEgressStamp": true` in the config file does the same; the env var wins. |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | Maximum future skew (ms) tolerated when validating a chain checkpoint's `issued-at` timestamp (#1395 step 2): a checkpoint stamped more than this far into the future is judged `stale` (replay / clock skew) even when its digest verifies. Default `120000` (2 min); non-numeric or non-positive values fall back to the default. Step 2 is shadow-only — these knobs tune verdict logging, never forwarding. |
