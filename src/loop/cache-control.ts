@@ -28,7 +28,7 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
  * from the client's messages, present on system blocks, or on tools entries —
  * the 4-breakpoint budget counts all three) suppresses our stamps entirely
  * (pass no marks / return the system unchanged).
-  * BILI_NO_CACHE_CONTROL / compat.noCacheControl disables everything.
+ * BILI_NO_CACHE_CONTROL / compat.noCacheControl disables everything.
  */
 
 const MESSAGE_MARK_CAP = 3;
