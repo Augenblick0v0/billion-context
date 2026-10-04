@@ -176,11 +176,11 @@ describe("createV1ServerHooks", () => {
     const origin = "http://127.0.0.1:19199";
 
     function makeDeps() {
-        const forwarded: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+        const forwarded: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }> = [];
         return {
             z: fakeZ,
-            forward: async (o: string, conversationId: string, tool: string, args: unknown) => {
-                forwarded.push({ conversationId, tool, args });
+            forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => {
+                forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
                 assert.equal(o, origin);
                 return `panel:${tool}`;
             },
@@ -211,7 +211,7 @@ describe("createV1ServerHooks", () => {
         assert.ok(compress);
         const out = await compress.execute({ range: "m1-m2" }, { sessionID: "ses_1" });
         assert.equal(out, "panel:compress");
-        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" } }]);
+        assert.deepEqual(deps.forwarded, [{ conversationId: "ses_1", tool: "compress", args: { range: "m1-m2" }, nativeCaller: true }]);
     });
 
     it("degrades to proxy mode (no headers, no tools) when zod is unavailable", async () => {
@@ -347,13 +347,13 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
     it("routes tools, headers, command and transforms per session lane", async () => {
         const events: string[] = [];
         const legacy = fakeLegacyModule(events);
-        const forwarded: { sid: string; tool: string; args: unknown }[] = [];
+        const forwarded: { sid: string; tool: string; args: unknown; nativeCaller?: boolean }[] = [];
         const hooks = createV1ServerHooks(() => "http://127.0.0.1:19999", {}, {
             z: fakeZ,
             legacy,
             isLegacy: (sid) => sid === "ses_legacy",
-            forward: async (_o, sid, tool, args) => {
-                forwarded.push({ sid, tool, args });
+            forward: async (_o, sid, tool, args, nativeCaller?: boolean) => {
+                forwarded.push({ sid, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
                 return "proxied";
             },
             log: () => {},
@@ -366,7 +366,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
         // new session: forwarded to the proxy
         const r2 = await hooks.tool?.compress.execute({ content: [] }, { sessionID: "ses_new" });
         assert.equal(r2, "proxied");
-        assert.deepEqual(forwarded, [{ sid: "ses_new", tool: "compress", args: { content: [] } }]);
+        assert.deepEqual(forwarded, [{ sid: "ses_new", tool: "compress", args: { content: [] }, nativeCaller: true }]);
 
         // headers: legacy bypasses, new stamps plugin mode
         const h1: Record<string, string> = {};
