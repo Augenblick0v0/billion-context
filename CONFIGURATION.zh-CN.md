@@ -1013,6 +1013,8 @@
 | `BILI_UPDATE_REGISTRY` | 自动更新与 `bili update` 使用的 npm registry base URL 覆盖（默认 `https://registry.npmjs.org`）。仅供 hermetic 测试指向回环 registry（`ACP_TEST_REGISTRY` e2e 套件自带的 verdaccio 实例）；生产环境请勿设置（#1153）。 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | 自动更新检查周期（毫秒，默认 `180000` 即 3 分钟；≤ 0 的值被忽略，回退默认）。hermetic e2e 套件用它缩短周期，避免等待完整间隔（#1153）。 |
 | `BILI_MODEL_INFO_RETRY_MS` | dsh 原生模型窗口解析失败（或解析结果不带窗口）后的重试冷却（毫秒，#1812/#1836）：匹配的缓存条目没有 context window 时不视为最终结果 —— 不再让整个进程生命周期 latching 成无 header 状态，而是该冷却过期后由下一个请求触发重新解析。默认 `30000`；非数字或负值回退 `30000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
+| `BILI_DSH_RETRY_INTERVAL_MS` | dsh 原生插件工具注册重试的退避冷却（毫秒，#2082）：manifest 拉取或工具注册瞬时失败后，下一次重试不早于该冷却发生。默认 `10000`；非数字或非正值回退 `10000`。测试钩子 —— dsh-native 单元测试用它缩短冷却、避免真实等待；生产环境保持 unset。 |
+| `BILI_DSH_RECOVERY_INTERVAL_MS` | dsh 原生插件独立恢复定时器的间隔（毫秒，#2082）：工具处于 down 状态时，即使零模型流量也持续驱动注册重试 —— 正是模型已放弃缺失工具、其他路径都不会再触发重试的场景。默认跟随 `BILI_DSH_RETRY_INTERVAL_MS`（`10000`）。测试钩子 —— NODE_TEST_CONTEXT 下除非显式设置本变量，否则定时器永不启动；生产环境保持 unset。 |
 | `BILI_ADVISORY_CHECK` | 设为 `0` 禁用严重缺陷公告监视器（#1481）。默认开启 —— 它独立于 `ACP_AUTO_UPDATE` 运行，确保关闭了自动更新的安装也能被强制移出已知缺陷版本范围。fail-open：公告源不可达/格式错误只告警，绝不阻断模型流量。文件配置键：`advisoryCheck`。 |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖。默认：已配置 registry（感知 `BILI_UPDATE_REGISTRY`）上的伴生包 `billion-context-advisories`。文件配置键：`advisoryUrl`。 |
 | `BILI_RELEASE_NOTES_CHECK` | 设为 `0` 禁用发版说明可见性监视器（#1870）。默认开启 —— 纯可见性，且默认静默（#1977）：拉取伴生发版说明文档，仅当待更新跨度内含 `critical` 级条目时，才在 `acp_status` 与 `/acp` 面板提示「CRITICAL 更新已就绪待重启」（磁盘版本新于运行版本）或「存在 critical 更新」；routine/recommended 级发版永不上屏。绝不安装、绝不重启；fail-open。文件配置键：`releaseNotesCheck`。 |

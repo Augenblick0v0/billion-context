@@ -85,6 +85,9 @@ import {
     stopProxyGuarded,
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
+    codexRunModePinned,
+    codexSupportsNoDaemon,
+    buildWindowsCommandLine,
     resolveClaudeBudgetEnv,
     resolveQoderBudgetEnv,
     buildQoderEnv,
@@ -1052,6 +1055,29 @@ function makeFakeChild(pid: number): SpawnChild {
             handlers.set(event, list);
         },
     };
+}
+
+// #679/#1867 test seam: inverse of planClientSpawn's comspec wrapping — splits
+// the single `comspec /d /s /c "<line>"` arg back into tokens (quote-aware;
+// quoteWinToken only quotes whitespace-bearing tokens, so this round-trips it).
+function splitWindowsCommandLine(line: string): string[] {
+    const tokens: string[] = [];
+    let cur = "";
+    let quoted = false;
+    for (const ch of line) {
+        if (ch === '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && /\s/.test(ch)) {
+            if (cur !== "") tokens.push(cur);
+            cur = "";
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur !== "") tokens.push(cur);
+    return tokens;
 }
 
 test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded", async () => {
@@ -4185,6 +4211,230 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].some((a) => a.startsWith("model_context_window=")), JSON.stringify(clientArgsSeen[0]));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
+test("codexRunModePinned: detects user-pinned run mode (#1867)", () => {
+    assert.equal(codexRunModePinned([]), false);
+    assert.equal(codexRunModePinned(["-c", "model_context_window=400000"]), false);
+    assert.equal(codexRunModePinned(["resume", "abc"]), false);
+    assert.equal(codexRunModePinned(["--no-daemon"]), true);
+    assert.equal(codexRunModePinned(["--remote", "ws://127.0.0.1:9"]), true);
+    assert.equal(codexRunModePinned(["--remote=ws://127.0.0.1:9"]), true);
+});
+
+test("splitWindowsCommandLine: round-trips buildWindowsCommandLine quoting (#679/#1867)", () => {
+    // helper contract: the inner line, i.e. the comspec arg minus its outer quote pair
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\temp\\fake-codex.cmd", ["--no-daemon", "-c", "model_context_window=400000"]).slice(1, -1)),
+        ["C:\\temp\\fake-codex.cmd", "--no-daemon", "-c", "model_context_window=400000"],
+    );
+    assert.deepEqual(
+        splitWindowsCommandLine(buildWindowsCommandLine("C:\\Users\\Some User\\temp\\fake-codex.cmd", ["--remote", "ws://127.0.0.1:9"]).slice(1, -1)),
+        ["C:\\Users\\Some User\\temp\\fake-codex.cmd", "--remote", "ws://127.0.0.1:9"],
+    );
+});
+
+test("codexSupportsNoDaemon: probes --help output, fails soft (#1867)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-"));
+    const isWin = process.platform === "win32";
+    const helpWithFlag = isWin
+        ? "@echo Options:\r\n@echo   --no-daemon\r\n@echo       Run without the shared background server\r\n"
+        : "#!/bin/sh\necho \"Options:\"\necho \"  --no-daemon\"\necho \"      Run without the shared background server\"\n";
+    const helpWithoutFlag = isWin
+        ? "@echo Options:\r\n@echo   --profile <NAME>\r\n"
+        : "#!/bin/sh\necho \"Options:\"\necho \"  --profile <NAME>\"\n";
+    const mk = (name: string, body: string): string => {
+        const p = path.join(dir, name + (isWin ? ".cmd" : ""));
+        fs.writeFileSync(p, body);
+        if (!isWin) fs.chmodSync(p, 0o755);
+        return p;
+    };
+    try {
+        assert.equal(codexSupportsNoDaemon(mk("new-codex", helpWithFlag), []), true);
+        assert.equal(codexSupportsNoDaemon(mk("old-codex", helpWithoutFlag), []), false);
+        assert.equal(codexSupportsNoDaemon(mk("dead-codex", isWin ? "@exit /b 3\r\n" : "#!/bin/sh\nexit 3\n"), []), false);
+        assert.equal(codexSupportsNoDaemon(path.join(dir, "missing-codex" + (isWin ? ".cmd" : "")), []), false);
+        // cached per command path
+        const again = mk("new-codex-2", helpWithFlag);
+        assert.equal(codexSupportsNoDaemon(again, []), true);
+        fs.writeFileSync(again, helpWithoutFlag);
+        if (!isWin) fs.chmodSync(again, 0o755);
+        assert.equal(codexSupportsNoDaemon(again, []), true);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("runLaunch codex: --no-daemon pinned when supported, escape hatches honored (#1867)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-run-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const isWin = process.platform === "win32";
+    const fakeCodex = path.join(home, isWin ? "fake-codex.cmd" : "fake-codex");
+    fs.writeFileSync(fakeCodex, isWin ? "@echo Options:\r\n@echo   --no-daemon\r\n@echo       Run without the shared background server\r\n" : "#!/bin/sh\necho \"Options:\"\necho \"  --no-daemon\"\necho \"      Run without the shared background server\"\n");
+    if (!isWin) fs.chmodSync(fakeCodex, 0o755);
+    process.env.BILI_CLIENT_BIN = fakeCodex;
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\n');
+
+    const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    const launch = (clientArgs: string[]) =>
+        runLaunch(
+            { client: "codex", clientArgs, overrides: {} },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+
+    try {
+        // fresh launch → #321 budget args AND explicit embedded pin
+        await launch([]);
+        assert.equal(clientArgsSeen.length, 1);
+        let args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(args.includes("model_context_window=400000") && args.includes("model_auto_compact_token_limit=400000"), JSON.stringify(args));
+
+        // user self-aligned window (no budget injection) → still pinned: without this
+        // the session would silently attach to an external daemon and bypass bili
+        fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\nmodel_context_window = 1000000\n');
+        clientArgsSeen.length = 0;
+        await launch([]);
+        args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(!args.some((a) => a.startsWith("model_context_window=")), JSON.stringify(args));
+
+        // unresolvable model (no budget injection) → still pinned
+        fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "totally-unknown-model"\n');
+        clientArgsSeen.length = 0;
+        await launch([]);
+        args = clientArgsSeen[0];
+        assert.ok(args.includes("--no-daemon"), JSON.stringify(args));
+
+        // user already passed --no-daemon → not duplicated
+        clientArgsSeen.length = 0;
+        await launch(["--no-daemon"]);
+        args = clientArgsSeen[0];
+        assert.equal(args.filter((a) => a === "--no-daemon").length, 1, JSON.stringify(args));
+
+        // user passed --remote → no injection (codex hard-errors the combo)
+        clientArgsSeen.length = 0;
+        await launch(["--remote", "ws://127.0.0.1:9"]);
+        args = clientArgsSeen[0];
+        assert.ok(!args.includes("--no-daemon"), JSON.stringify(args));
+        assert.ok(args.includes("--remote"), JSON.stringify(args));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
+test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-old-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const isWin = process.platform === "win32";
+    const fakeCodex = path.join(home, isWin ? "old-codex.cmd" : "old-codex");
+    fs.writeFileSync(fakeCodex, isWin ? "@echo Options:\r\n@echo   --profile <NAME>\r\n" : "#!/bin/sh\necho \"Options:\"\necho \"  --profile <NAME>\"\n");
+    if (!isWin) fs.chmodSync(fakeCodex, 0o755);
+    process.env.BILI_CLIENT_BIN = fakeCodex;
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), "");
+
+    const clientArgsSeen: string[][] = [];
+    const fakeBase = path.basename(fakeCodex);
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        // #679: runClient plans the spawn before calling us — on win32 a .cmd
+        // fake arrives as `comspec /d /s /c "<line>"`, so the client path sits
+        // inside one arg instead of being cmd itself.
+        const wrappedLine = cmd !== fakeCodex
+            ? args.find((a): a is string => typeof a === "string" && a.includes(fakeBase))
+            : undefined;
+        if (cmd !== fakeCodex && wrappedLine === undefined) return makeFakeChild(42422);
+        const clientArgs = wrappedLine === undefined
+            ? [...args]
+            : splitWindowsCommandLine(wrappedLine.slice(1, -1)).slice(1);
+        clientArgsSeen.push(clientArgs);
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "codex", clientArgs: [], overrides: {} },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("--no-daemon"), JSON.stringify(clientArgsSeen[0]));
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;

@@ -30,7 +30,7 @@ type RegisteredTool = {
     execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
 };
 
-function mockBiliHandler(): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(counters: { manifestRequests: number }, manifestDelayMs = 0): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -41,8 +41,15 @@ function mockBiliHandler(): (req: http.IncomingMessage, res: http.ServerResponse
     return (req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            counters.manifestRequests += 1;
+            const respond = () => {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
+            };
+            // a slow manifest widens the fetch window so a re-activation can
+            // land while a registration is still in flight
+            if (manifestDelayMs > 0) setTimeout(respond, manifestDelayMs);
+            else respond();
             return;
         }
         res.writeHead(404);
@@ -50,28 +57,30 @@ function mockBiliHandler(): (req: http.IncomingMessage, res: http.ServerResponse
     };
 }
 
-async function startMockProxy(): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler());
+async function startMockProxy(manifestDelayMs = 0): Promise<{ origin: string; close: () => void; manifestRequests: () => number }> {
+    const counters = { manifestRequests: 0 };
+    const server = http.createServer(mockBiliHandler(counters, manifestDelayMs));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
-            resolve({ origin: `http://127.0.0.1:${addr.port}`, close: () => server.close() });
+            resolve({ origin: `http://127.0.0.1:${addr.port}`, close: () => server.close(), manifestRequests: () => counters.manifestRequests });
         });
     });
 }
 
 type HostCtx = Parameters<typeof apply>[0];
 
-function mockCtx(opts: { registerThrows?: () => boolean } = {}) {
+const INACTIVE_CONTEXT_ERROR = 'cannot get required service "tools" in inactive context';
+
+function mockCtx(opts: { registerError?: () => Error | undefined } = {}) {
     const tools: RegisteredTool[] = [];
     const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
     let initiator: { session?: { id?: unknown } } | undefined = undefined;
     return {
         tools: {
             register: (t: RegisteredTool) => {
-                if (opts.registerThrows?.()) {
-                    throw new Error('cannot get required service "tools" in inactive context');
-                }
+                const err = opts.registerError?.();
+                if (err !== undefined) throw err;
                 tools.push(t);
             },
         },
@@ -163,7 +172,7 @@ test("#2082 apply() clears register.dead: a re-activated context recovers after 
             // phase 1: the context is inactive during teardown — registration
             // throws cordis's inactive-context error and the register dies
             let tearing = true;
-            const ctx1 = mockCtx({ registerThrows: () => tearing });
+            const ctx1 = mockCtx({ registerError: () => (tearing ? new Error(INACTIVE_CONTEXT_ERROR) : undefined) });
             apply(ctx1);
             await new Promise((r) => setTimeout(r, 50));
             assert.equal(ctx1.registeredTools.length, 0);
@@ -178,6 +187,93 @@ test("#2082 apply() clears register.dead: a re-activated context recovers after 
             assert.equal(ctx2.registeredTools[0].name, "compress");
             // headers are stamped again — plugin mode is back
             await waitFor(() => _stateHeadersForTest()?.("http://example.test/v1/messages") !== undefined, "headers return after re-activation");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#2082 recovery timer retries through the LATEST context after re-activation — a stale capture would re-poison dead", async () => {
+    const proxy = await startMockProxy();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2082-staletimer-"));
+    const savedInterval = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
+    const savedRetry = process.env.BILI_DSH_RETRY_INTERVAL_MS;
+    process.env.BILI_DSH_RECOVERY_INTERVAL_MS = "20";
+    process.env.BILI_DSH_RETRY_INTERVAL_MS = "20";
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+
+            // phase 1: ctx1 fails with a TRANSIENT error (not inactive-context)
+            // — the register stays alive (!dead), tools stay down, and the
+            // recovery timer is armed while ctx1 is still the current context.
+            let mode1: "transient" | "inactive" = "transient";
+            let attempts1 = 0;
+            const ctx1 = mockCtx({
+                registerError: () => {
+                    attempts1 += 1;
+                    return mode1 === "transient" ? new Error("transient manifest registration failure") : new Error(INACTIVE_CONTEXT_ERROR);
+                },
+            });
+            apply(ctx1);
+            maybeRetryForTest(ctx1);
+            await waitFor(() => attempts1 >= 1, "first transient registration attempt");
+
+            // phase 2: dsh deactivates ctx1 and re-activates the plugin with
+            // ctx2. ctx2's own first attempt also fails transiently, so once
+            // its back-off expires the ONLY remaining driver is the recovery
+            // timer — it must retry through ctx2, not the stale ctx1 capture
+            // (registering into the deactivated ctx1 throws inactive-context
+            // and re-poisons dead, leaving the tools down until dsh restarts).
+            mode1 = "inactive";
+            let attempts2 = 0;
+            const ctx2 = mockCtx({
+                registerError: () => {
+                    attempts2 += 1;
+                    return attempts2 === 1 ? new Error("transient manifest registration failure") : undefined;
+                },
+            });
+            apply(ctx2);
+            await waitFor(() => ctx2.registeredTools.length === 1, "timer-driven registration through the LATEST context");
+            assert.equal(ctx2.registeredTools[0].name, "compress");
+            assert.ok(attempts2 >= 2, `expected ctx2's first attempt to fail and a retry to land (got ${attempts2} attempts)`);
+            assert.equal(ctx1.registeredTools.length, 0, "nothing registered into the deactivated context");
+        });
+    } finally {
+        for (const [k, v] of [["BILI_DSH_RECOVERY_INTERVAL_MS", savedInterval], ["BILI_DSH_RETRY_INTERVAL_MS", savedRetry]] as const) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#2082 an in-flight registration lands on the LATEST context after a mid-fetch re-activation", async () => {
+    const proxy = await startMockProxy(300);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2082-inflight-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+
+            // ctx1 starts a registration whose manifest fetch is still in
+            // flight when dsh deactivates it and re-activates the plugin with
+            // ctx2 — the single-flight landing must target ctx2, not the stale
+            // ctx1 capture (which would die on inactive-context and poison
+            // dead before ctx2 ever gets its tools).
+            let deactivated1 = false;
+            const ctx1 = mockCtx({ registerError: () => (deactivated1 ? new Error(INACTIVE_CONTEXT_ERROR) : undefined) });
+            apply(ctx1);
+            await waitFor(() => proxy.manifestRequests() >= 1, "manifest fetch in flight");
+            deactivated1 = true;
+            const ctx2 = mockCtx();
+            apply(ctx2);
+            await waitFor(() => ctx2.registeredTools.length === 1, "in-flight registration landing on the re-activated context");
+            assert.equal(ctx2.registeredTools[0].name, "compress");
+            assert.equal(ctx1.registeredTools.length, 0, "nothing registered into the deactivated context");
         });
     } finally {
         proxy.close();
