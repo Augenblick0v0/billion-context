@@ -935,6 +935,8 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 "baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
+**OpenCode 注意。**这是 OpenCode 的**无插件**路径。若在此类配置之上还装了原生插件,运行时每会话警告一次并附修复指引(去前缀或卸插件);请求本身继续走纯代理路径。三条互斥的 OpenCode 接入路径见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#opencode)。
+
 **Codex（API key 模式）** —— 编辑 `~/.codex/config.toml`，改 provider 的 `base_url`：
 
 ```toml

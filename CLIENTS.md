@@ -418,6 +418,8 @@ on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
 | Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
 | Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
 
+These paths are **mutually exclusive** — each one owns routing of the same requests, so exactly one may be active per host instance. A hand-written `/bili/` provider baseURL is the pure-proxy path's marker; writing it while the native plugin is installed is a **conflicting configuration** (#1958): the runtime warns once per session (deduplicated per origin) with a fix-it guide — remove the prefix or remove the plugin — and the requests stay on the plain-proxy path they encode (no plugin session markers). The supported exception is an explicit pin of the **same** origin — `BILLION_CONTEXT_PROXY` pointing at the proxy the URLs already ride — which stays silent.
+
 ### Launcher — `bili opencode`
 
 HTTPS rides cert-MITM, HTTP a temp `opencode.json` clone with `/bili/`
@@ -518,6 +520,9 @@ Point the provider baseURL at the proxy like any other client:
 
 Note: 2.0 AI-SDK providers require an `apiKey` field even for local
 endpoints that never check it — set any non-empty value.
+
+This path means **no plugin**: if the native plugin is also installed, the
+runtime warns once per session — pick one path per provider (#1958).
 
 ### Status: `/acp` and `acp_status`
 
