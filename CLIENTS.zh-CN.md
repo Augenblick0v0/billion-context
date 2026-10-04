@@ -89,7 +89,7 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 | `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
 | 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
 
-安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。
+安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。自 #2024 起,shell 还会消费 codex >=0.160 在每次 MCP `tools/call` 上盖的真实线程 id(`_meta.threadId`;其 `sessionId` 是一次性的运行 id,被忽略):严格校验、仅逐调用生效(绝不写回共享绑定,故共享同一 shell 的主/子代理线程互不覆盖),并作为宿主盖章的调用方标记给代理 —— 因此它压过陈旧的烘焙 `BILI_CONVERSATION_ID`。这正是 Code Mode 能工作的原因:那里的内部压缩调用从不作为独立的上游请求出现,也没有出站 witness 可供路由。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 

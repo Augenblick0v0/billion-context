@@ -331,7 +331,14 @@ proxy never strands a dead URL, and the shell simply attaches to whatever is
 alive. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
-(#760).
+(#760). Since #2024 the shell also consumes the real thread id codex >=0.160
+stamps on every MCP `tools/call` (`_meta.threadId`; its `sessionId` is a
+transient run id and is ignored): it is strictly validated, applied per-call
+only (never written back to the shared binding, so main/sub-agent threads
+sharing one shell cannot clobber each other), and flagged to the proxy as a
+host-stamped caller — so it outranks a stale baked-in `BILI_CONVERSATION_ID`.
+That is what makes Code Mode work, where the inner compress call never appears
+as an independent upstream request and there is no outbound witness to route by.
 
 **Responses native chaining (a caveat).** bili compresses by replaying the full
 `input`, so it cannot follow OpenAI's native `previous_response_id` chaining: a

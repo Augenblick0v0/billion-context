@@ -113,7 +113,21 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined): Promise<string> {
+// #2024: codex >=0.160 stamps the REAL thread id on every tools/call via
+// _meta.threadId (codex-rs core/src/mcp_tool_call.rs with_mcp_tool_call_ids_meta);
+// its sessionId is a transient run id and is deliberately NOT consumed. Strictly
+// validated: a non-empty string after trim only — anything else (missing, wrong
+// type, blank) is treated as ABSENT so malformed metadata can never shadow the
+// legacy env/meta/per-call channels.
+function nativeThreadIdOf(meta: unknown): string | undefined {
+    if (!meta || typeof meta !== "object") return undefined;
+    const v = (meta as { threadId?: unknown }).threadId;
+    if (typeof v !== "string") return undefined;
+    const t = v.trim();
+    return t.length > 0 ? t : undefined;
+}
+
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<string> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
@@ -121,7 +135,8 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId: effectiveConversationId, tool, args }),
+                // #2024: flag set only for host-stamped _meta.threadId ids — legacy calls omit it.
+                body: JSON.stringify({ conversationId: effectiveConversationId, ...(nativeCaller ? { nativeCaller: true } : {}), tool, args }),
                 signal: AbortSignal.timeout(timeoutMs),
             });
         } catch (err) {
@@ -174,7 +189,7 @@ async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string } };
+        _meta?: { ui?: { sessionId?: string }; threadId?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -255,26 +270,41 @@ async function handleMessage(msg: {
             // proxy printed in its notes ("your bili conversation id: …").
             // Overrides the default binding (env/meta); stripped before
             // forwarding since the proxy routes on the body-level field.
+            // #2024: codex stamps the real thread id on EVERY tools/call as
+            // _meta.threadId — strictly validated, per-call only (never written
+            // back to the global binding, so main/sub-agent threads sharing one
+            // shim process cannot clobber each other), and flagged to the proxy
+            // as nativeCaller so it routes authoritatively (rung 0). It wins over
+            // the stale BILI_CONVERSATION_ID baked into the generated MCP config.
             // #841 exception: search_context's conversation_id doubles as a
-            // cross-session READ-ONLY search target. When a default binding
-            // exists, keep the param in args (the proxy resolves the target
-            // session itself, incl. non-resident ones from disk) and never
-            // re-route the call away from the caller's binding — routing to
-            // another session would mutate that session's mode/lastSeen. With
-            // no default binding, perCall stays the routing fallback and is
-            // stripped, exactly as before.
+            // cross-session READ-ONLY search target. With EITHER a default
+            // binding OR a native caller present, keep the param in args (the
+            // proxy resolves the target session itself, incl. non-resident ones
+            // from disk) and never re-route the call away from the caller — for a
+            // native caller the thread id is the routing key, so the arg can no
+            // longer be mistaken for the caller. With neither, perCall stays the
+            // routing fallback and is stripped, exactly as before.
+            const nativeThreadId = nativeThreadIdOf(params._meta);
+            const hasDefaultBinding = typeof conversationId === "string" && conversationId.length > 0;
             const perCallRaw = rawArgs.conversation_id;
             const perCall = typeof perCallRaw === "string" ? perCallRaw.trim() : "";
-            const keepForSearch = tool === "search_context" && perCall.length > 0 && typeof conversationId === "string" && conversationId.length > 0;
+            const keepForSearch = tool === "search_context" && perCall.length > 0 && (hasDefaultBinding || nativeThreadId !== undefined);
             const args = { ...rawArgs };
             if (!keepForSearch) delete args.conversation_id;
-            const routeOverride = keepForSearch ? undefined : perCall || undefined;
+            let routeOverride: string | undefined;
+            let nativeCaller = false;
+            if (nativeThreadId !== undefined) {
+                routeOverride = nativeThreadId;
+                nativeCaller = true;
+            } else {
+                routeOverride = keepForSearch ? undefined : perCall || undefined;
+            }
             // #1685: with no binding and no per-call id, forward anyway — the
             // proxy routes the id-less POST itself (outbound tool_use witness,
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride);
+                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeCaller);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC

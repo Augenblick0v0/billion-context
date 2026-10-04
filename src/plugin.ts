@@ -913,17 +913,26 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; nativeCaller?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; nativeCaller?: unknown };
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
         return;
     }
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    // #2024: host-stamped per-call thread id (codex _meta.threadId via the MCP
+    // shim). A boolean flag meaning "the conversationId above was minted by the
+    // HOST, not transcribed by the model or echoed from a stale env binding" —
+    // the only origin allowed to outrank an outbound witness. Old shims never
+    // set it, so every unmarked call keeps the exact #1685 ladder below.
+    const nativeCaller = parsed.nativeCaller === true;
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
     // #1685 zero-injection routing ladder for id-less tool POSTs:
+    //   0. nativeCaller (#2024) — host-stamped thread id: authoritative, wins
+    //      over a conflicting unique witness; an unresolvable native id fails
+    //      loudly with no witness rescue and no sibling adoption.
     //   1. outbound witness — this proxy streamed the very tool_use being
     //      answered; a unique hit names the session (the free-text summary is
     //      a unique anchor). Wins over a body id when they disagree.
@@ -935,8 +944,24 @@ export async function handlePluginTool(
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
-    let routedBy: "witness" | "body" | "arb" = "body";
-    if (witnessIds.size === 1) {
+    let routedBy: "native" | "witness" | "body" | "arb" = "body";
+    if (nativeCaller) {
+        // rung 0 (#2024): the host minted this id, so it is authoritative —
+        // resolve it directly and let it beat a conflicting unique witness (a
+        // collision, not truth). No witness rescue / no single-active adoption
+        // below: an unresolvable native id falls through to the loud 404 +
+        // #1158 diagnostic.
+        ({ session, entry } = resolveConversation(conversationId));
+        if (session) {
+            routedBy = "native";
+            if (witnessIds.size === 1) {
+                const [wit] = [...witnessIds];
+                if (wit !== session.id) {
+                    deps.log("warn", `[plugin] tool "${tool}" nativeCaller "${conversationId}" conflicts with unique outbound witness ${wit} — routing by the host-stamped thread id (#2024)`);
+                }
+            }
+        }
+    } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];
         session = peekSession(wit);
         if (session) {
@@ -952,7 +977,7 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": its (name, arguments) was witnessed in ${witnessIds.size} sessions and the request carries no conversationId — refuse to guess. Re-send with a conversationId, or bind the MCP shim (CLAUDE_CODE_SESSION_ID / BILI_CONVERSATION_ID).` }));
         return;
     }
-    if (!session && !conversationId) {
+    if (!session && !conversationId && !nativeCaller) {
         const now = Date.now();
         let fresh = 0;
         let bestCid: string | undefined;
@@ -975,7 +1000,7 @@ export async function handlePluginTool(
             return;
         }
     }
-    if (!session) {
+    if (!session && !nativeCaller) {
         ({ session, entry } = resolveConversation(conversationId));
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
