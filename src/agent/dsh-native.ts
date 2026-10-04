@@ -726,6 +726,21 @@ export function apply(ctx: PluginContext): void {
     // switch, a settings toggle) poisons register.dead for the whole process
     // lifetime: every later maybeRetry() returns immediately and the bili
     // tools never come back until dsh restarts.
+    // #2101: a re-activation ALSO invalidates a SUCCESSFUL registration.
+    // Registrations die with their context: the tools registered into the
+    // previous activation are disposed when that context deactivates, but
+    // register.toolsReady keeps its stale stamp — and every
+    // registerTools()/maybeRetry() early-returns on it, so the new context
+    // never gets the bili tools (the #2082 symptom reached from the success
+    // ordering: a settings toggle, a profile switch or a plugin reload
+    // AFTER a healthy boot loses the tools until dsh restarts). Clear the
+    // stale stamp so the retry loop re-registers into the live context;
+    // retryAt goes with it (#1783: a fresh activation must not stand behind
+    // a stale back-off wall).
+    if (register.toolsReady && activeCtx !== undefined && activeCtx !== ctx) {
+        register.toolsReady = false;
+        register.retryAt = 0;
+    }
     register.dead = false;
     activeCtx = ctx;
 
