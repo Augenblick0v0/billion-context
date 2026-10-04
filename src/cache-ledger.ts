@@ -124,9 +124,11 @@ export interface CacheLedger {
         nbInput: number;
         seamSuspects: number;
         seamMissed: number;
-        /** #1592 follow-up: misses whose current body was byte-stable vs the
-         *  previous request — the upstream simply did not serve its cache
-         *  (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
+        /** #1592 follow-up: misses with no client-side prefix break — the current
+         *  body is byte-stable vs the previous request, or the previous message
+         *  list comes back byte-identical as a prefix with only tail messages
+         *  appended (#2059). Either way the upstream simply did not serve its
+         *  cache (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
         /** #1592 follow-up: misses right after the client rewound history
