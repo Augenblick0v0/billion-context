@@ -237,7 +237,19 @@ function findButton(node: unknown): ElementNode | undefined {
     return undefined;
 }
 
-test("#1590: client bundle registers the settings.section entry bili (wrapper id, require purity, both render branches)", async () => {
+function findTag(node: unknown, type: string): ElementNode | undefined {
+    if (node !== null && typeof node === "object") {
+        const el = node as ElementNode;
+        if (el.type === type) return el;
+        for (const child of el.children ?? []) {
+            const hit = findTag(child, type);
+            if (hit !== undefined) return hit;
+        }
+    }
+    return undefined;
+}
+
+test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
     const { build } = await import("esbuild");
     // Reuse tsup.config.ts as the single source of truth for the wrapper
     // banner/footer and externals so the test cannot drift from the shipped
@@ -313,13 +325,13 @@ test("#1590: client bundle registers the settings.section entry bili (wrapper id
     assert.deepEqual(Array.from(face.inject), ["slots", "locale"]);
     assert.equal(typeof face.apply, "function");
 
-    const runApply = (): { options: Record<string, unknown>; component: () => unknown; zh: Record<string, string>; en: Record<string, string> } => {
+    type Entry = { options: Record<string, unknown>; component: () => unknown };
+    const runApply = (): { slots: string[]; bySlot: Map<string, Entry>; zh: Record<string, string>; en: Record<string, string> } => {
         const effects: Array<() => void> = [];
         const dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }> = {};
-        let slot: string | undefined;
-        let provide: (() => void) | undefined;
-        let options: Record<string, unknown> | undefined;
-        let component: (() => unknown) | undefined;
+        const slots: string[] = [];
+        const bySlot = new Map<string, Entry>();
+        let current: string | undefined;
         face.apply({
             effect: (fn: () => void, _label?: string) => effects.push(fn),
             locale: {
@@ -330,37 +342,46 @@ test("#1590: client bundle registers the settings.section entry bili (wrapper id
             },
             slots: {
                 inject: (name: string, p: () => void) => {
-                    slot = name;
-                    provide = p;
+                    slots.push(name);
+                    current = name;
+                    p();
                 },
                 register: (opts: Record<string, unknown>, comp: () => unknown) => {
-                    options = opts;
-                    component = comp;
+                    // Hook indices restart on every render (React matches hooks
+                    // by position within a single render), so wrap the entry.
+                    bySlot.set(current!, { options: opts, component: (): unknown => { hookIndex = 0; return comp(); } });
                 },
             },
         });
         for (const eff of effects) eff();
-        assert.equal(slot, "settings.section");
-        provide!();
-        assert.ok(options !== undefined && component !== undefined && dicts["bili"] !== undefined);
-        // Hook indices restart on every render (React matches hooks by
-        // position within a single render), so wrap the entry point.
-        return { options: options!, component: (): unknown => { hookIndex = 0; return component!(); }, zh: dicts["bili"].zh, en: dicts["bili"].en };
+        assert.deepEqual(slots, ["settings.section", "plugins.bundle.config"]);
+        assert.equal(bySlot.size, 2);
+        assert.ok(dicts["bili"] !== undefined);
+        return { slots, bySlot, zh: dicts["bili"].zh, en: dicts["bili"].en };
     };
 
     sandbox.__BILI__ = { origin: "http://127.0.0.1:8787" };
     const withOrigin = runApply();
-    assert.equal(withOrigin.options.name, "settings.section");
-    assert.equal(withOrigin.options.id, "bili");
-    assert.equal(withOrigin.options.order, 100);
-    assert.equal(withOrigin.options.locale, "bili");
-    assert.equal(typeof withOrigin.options.label, "function");
-    assert.equal((withOrigin.options.label as () => string)(), "bili设置");
+    const settings = withOrigin.bySlot.get("settings.section")!;
+    assert.equal(settings.options.name, "settings.section");
+    assert.equal(settings.options.id, "bili");
+    assert.equal(settings.options.order, 100);
+    assert.equal(settings.options.locale, "bili");
+    assert.equal(typeof settings.options.label, "function");
+    assert.equal((settings.options.label as () => string)(), "bili设置");
+    const bundle = withOrigin.bySlot.get("plugins.bundle.config")!;
+    assert.equal(bundle.options.name, "plugins.bundle.config");
+    assert.equal(bundle.options.key, "billion-context");
+    assert.equal(bundle.options.locale, "bili");
+    // Keyed slot: the host matches the key against its own package name — no
+    // list-slot fields may ride along.
+    assert.deepEqual(Object.keys(bundle.options).sort(), ["key", "locale", "name"]);
     assert.deepEqual(Object.keys(withOrigin.zh).sort(), Object.keys(withOrigin.en).sort());
     calls.length = 0;
     resetHooks();
-    const tree = withOrigin.component() as ElementNode;
+    const tree = settings.component() as ElementNode;
     assert.equal(tree.type, "div");
+    assert.notEqual(findTag(tree, "h3"), undefined, "the settings section keeps its own title");
     const button = findButton(tree);
     assert.ok(button !== undefined, "origin present renders the open button");
     assert.equal(typeof button.props?.onClick, "function");
@@ -372,18 +393,41 @@ test("#1590: client bundle registers the settings.section entry bili (wrapper id
     (button.props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
 
+    // #2125: the bundle panel reuses the probe/button/hint but drops the title
+    // — the plugin detail page draws it.
+    calls.length = 0;
+    resetHooks();
+    const btree = bundle.component() as ElementNode;
+    assert.equal(btree.type, "div");
+    assert.equal(findTag(btree, "h3"), undefined, "the bundle panel does not repeat the page title");
+    const bButton = findButton(btree);
+    assert.ok(bButton !== undefined, "origin present renders the open button in the bundle panel");
+    assert.equal(typeof bButton.props?.onClick, "function");
+    const btexts: string[] = [];
+    collectText(btree, btexts);
+    assert.ok(btexts.some((x) => x.includes("http://127.0.0.1:8787")), `bundle button label carries the origin: ${JSON.stringify(btexts)}`);
+    opened.length = 0;
+    (bButton.props!.onClick as () => void)();
+    assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
+
     delete sandbox.__BILI__;
     const degraded = runApply();
     calls.length = 0;
     resetHooks();
-    const degTree = degraded.component() as ElementNode;
+    const degTree = degraded.bySlot.get("settings.section")!.component() as ElementNode;
     assert.equal(findButton(degTree), undefined);
     const degTexts: string[] = [];
     collectText(degTree, degTexts);
     assert.ok(degTexts.some((t) => t.includes("/acp")), `degraded hint points at /acp: ${JSON.stringify(degTexts)}`);
+    resetHooks();
+    const degBundleTree = degraded.bySlot.get("plugins.bundle.config")!.component() as ElementNode;
+    assert.equal(findButton(degBundleTree), undefined, "the bundle panel degrades like the settings section");
+    const degBundleTexts: string[] = [];
+    collectText(degBundleTree, degBundleTexts);
+    assert.ok(degBundleTexts.some((t) => t.includes("/acp")), "the bundle degraded hint points at /acp");
 });
 
-test("#1809: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent", async () => {
+test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots)", async () => {
     const { build } = await import("esbuild");
     const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
         entry: Record<string, string>;
@@ -409,7 +453,7 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
     const code = result.outputFiles![0].text;
 
     type Face = { inject: string[]; apply: (ctx: unknown) => void };
-    const mount = (extra: Record<string, unknown>): { component: () => unknown; resetHooks: () => void; runCleanups: () => void } => {
+    const mount = (extra: Record<string, unknown>, slotName = "settings.section"): { component: () => unknown; resetHooks: () => void; runCleanups: () => void } => {
         const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
         const sandbox: Record<string, unknown> = {};
         sandbox.window = { __ModuleLoader__: { load: (reg: (typeof registrations)[number]) => registrations.push(reg) } };
@@ -444,7 +488,8 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
         };
         const face = registrations[0].factory(requireStub) as Face;
         const dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }> = {};
-        let component: (() => unknown) | undefined;
+        const components = new Map<string, () => unknown>();
+        let current: string | undefined;
         face.apply({
             effect: (fn: () => void) => fn(),
             locale: {
@@ -454,14 +499,17 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
                 bind: (ns: string) => (key: string) => dicts[ns]?.zh?.[key] ?? key,
             },
             slots: {
-                inject: (_name: string, p: () => void) => p(),
+                inject: (name: string, p: () => void) => {
+                    current = name;
+                    p();
+                },
                 register: (_opts: Record<string, unknown>, comp: () => unknown) => {
-                    component = comp;
+                    components.set(current!, comp);
                 },
             },
         });
-        assert.ok(component !== undefined);
-        const bound = component;
+        assert.ok(components.has(slotName), `slot ${slotName} must be registered`);
+        const bound = components.get(slotName)!;
         return {
             // Hook indices restart on every render (React semantics).
             component: (): unknown => { hookIndex = 0; return bound(); },
@@ -522,4 +570,40 @@ test("#1809: client polls /bili/origin while unresolved — upgrades on success,
         m.runCleanups();
         assert.ok(cleared >= 1, "pending retry timers are cancelled on unmount");
     }
+
+    {
+        // #2125: the bundle panel runs the same probe wiring through its own
+        // registration.
+        const opened: string[] = [];
+        const m = mount(
+            {
+                open: (url: string) => opened.push(url),
+                fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) }),
+                setTimeout,
+                clearTimeout,
+            },
+            "plugins.bundle.config",
+        );
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        assert.equal(findButton(first), undefined);
+        await tick();
+        const second = m.component() as ElementNode;
+        const button = findButton(second);
+        assert.ok(button !== undefined, "the bundle panel upgrades on a resolved origin");
+        (button.props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
+        m.runCleanups();
+    }
+});
+
+test("#2125: the manifest declares no dsh.client.inject (pre-0.2 dsh compat)", () => {
+    // dsh < 0.2.x cannot resolve "@deepseek-ai/dsh-client-ui-plugin-manager" and its
+    // client-module scanner stalls the whole web UI on an unknown inject target.
+    // dsh >= 0.2.0-rc.x ships the slot host inside dsh-web-app, so no injection is
+    // required — re-adding it would freeze older clients into an endless spinner.
+    const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+        dsh?: { client?: { inject?: unknown } };
+    };
+    assert.equal(pkg.dsh?.client?.inject ?? null, null, "dsh.client.inject would break pre-0.2 dsh clients");
 });
