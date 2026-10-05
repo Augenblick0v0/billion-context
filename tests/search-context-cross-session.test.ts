@@ -118,9 +118,9 @@ test("#841 omitted or own conversation_id → current-session behavior unchanged
     _resetSessionsForTest();
     const session = makeSession("pfa-current");
     const core = compressInto(session);
-    const direct = executeSearchContext({ query: "auth token" }, core, session.state);
-    const outOmitted = executeSearchContextTarget({ query: "auth token" }, core, "pfa-current", session.state);
-    const outOwn = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-current" }, core, "pfa-current", session.state);
+    const direct = executeSearchContext({ query: "auth token" }, core, session.state).text;
+    const outOmitted = executeSearchContextTarget({ query: "auth token" }, core, "pfa-current", session.state).text;
+    const outOwn = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-current" }, core, "pfa-current", session.state).text;
     assert.equal(outOmitted, direct);
     assert.equal(outOwn, direct);
     assert.ok(!outOmitted.includes("in session"), "no foreign scope on current-session search");
@@ -131,10 +131,10 @@ test("#1125 literal \"current\" (any case) resolves to the current session", () 
     _resetSessionsForTest();
     const session = makeSession("pfa-real-id");
     const core = compressInto(session);
-    const direct = executeSearchContext({ query: "auth token" }, core, session.state);
-    const outLower = executeSearchContextTarget({ query: "auth token", conversation_id: "current" }, core, "pfa-real-id", session.state);
-    const outUpper = executeSearchContextTarget({ query: "auth token", conversation_id: "Current" }, core, "pfa-real-id", session.state);
-    const outMixed = executeSearchContextTarget({ query: "auth token", conversation_id: "cUrReNt" }, core, "pfa-real-id", session.state);
+    const direct = executeSearchContext({ query: "auth token" }, core, session.state).text;
+    const outLower = executeSearchContextTarget({ query: "auth token", conversation_id: "current" }, core, "pfa-real-id", session.state).text;
+    const outUpper = executeSearchContextTarget({ query: "auth token", conversation_id: "Current" }, core, "pfa-real-id", session.state).text;
+    const outMixed = executeSearchContextTarget({ query: "auth token", conversation_id: "cUrReNt" }, core, "pfa-real-id", session.state).text;
     assert.equal(outLower, direct, "'current' must equal direct current-session execution");
     assert.equal(outUpper, direct, "'Current' must equal direct current-session execution");
     assert.equal(outMixed, direct, "'cUrReNt' must equal direct current-session execution");
@@ -148,8 +148,8 @@ test("#841 self-reference via canonical alias keeps current-session semantics", 
     const session = getSession("client-conv-1");
     const core = compressInto(session);
     const canonical = `pfa-${createHash("sha256").update(`legacy:${session.id}`).digest("hex").slice(0, 16)}`;
-    const direct = executeSearchContext({ query: "auth token" }, core, session.state);
-    const outAlias = executeSearchContextTarget({ query: "auth token", conversation_id: canonical }, core, session.id, session.state);
+    const direct = executeSearchContext({ query: "auth token" }, core, session.state).text;
+    const outAlias = executeSearchContextTarget({ query: "auth token", conversation_id: canonical }, core, session.id, session.state).text;
     assert.equal(outAlias, direct, "canonical alias of the current session must behave exactly like omitting conversation_id");
     assert.ok(!outAlias.includes("historical"), "self-search must not carry the historical-session note");
 });
@@ -157,15 +157,15 @@ test("#841 self-reference via canonical alias keeps current-session semantics", 
 test("#841 unknown conversation_id → FAILED with id echoed", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
-    const out = executeSearchContextTarget({ query: "auth", conversation_id: "pfa-nope" }, createCore(), "pfa-current", createInitialState());
+    const out = executeSearchContextTarget({ query: "auth", conversation_id: "pfa-nope" }, createCore(), "pfa-current", createInitialState()).text;
     assert.equal(out, '[search_context FAILED: unknown session "pfa-nope"]');
 });
 
 test("#841 foreign no-match and empty-state strings carry session scope", () => {
     const s1 = makeSession("s1");
     const core = compressInto(s1);
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old"), /^\[No blocks matched "zzz-no-such-topic" in session pfa-old\]$/);
-    assert.equal(executeSearchContext({ query: "anything" }, createCore(), createInitialState(), "pfa-old"), "[No compressed blocks exist yet in session pfa-old — nothing to search.]");
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old").text, /^\[No blocks matched "zzz-no-such-topic" in session pfa-old\]$/);
+    assert.equal(executeSearchContext({ query: "anything" }, createCore(), createInitialState(), "pfa-old").text, "[No compressed blocks exist yet in session pfa-old — nothing to search.]");
 });
 
 test("#841 resident historical session served from memory without disk", () => {
@@ -173,7 +173,7 @@ test("#841 resident historical session served from memory without disk", () => {
     _resetSessionsForTest();
     const old = getSession("pfa-resident");
     const core = compressInto(old);
-    const out = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-resident" }, core, "pfa-other", makeSession("pfa-other").state);
+    const out = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-resident" }, core, "pfa-other", makeSession("pfa-other").state).text;
     assert.match(out, /^Found \d+ block\(s\) for "auth token" in session pfa-resident:/);
     assert.ok(out.includes("Read-only search of historical session pfa-resident"));
     assert.ok(out.includes("bili export pfa-resident [--full]"));
@@ -200,7 +200,7 @@ test("#841 cold-loaded historical session: read-only, file untouched, no save sc
         const before = allFiles.map((f) => readFileSync(f, "utf8"));
 
         const cur = makeSession("pfa-new");
-        const out = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-old" }, createCore(), "pfa-new", cur.state);
+        const out = executeSearchContextTarget({ query: "auth token", conversation_id: "pfa-old" }, createCore(), "pfa-new", cur.state).text;
         assert.match(out, /^Found \d+ block\(s\) for "auth token" in session pfa-old:/);
         assert.ok(out.includes("(T"), "tier present");
         assert.ok(out.includes("auth token exchange"), "summary preview present");

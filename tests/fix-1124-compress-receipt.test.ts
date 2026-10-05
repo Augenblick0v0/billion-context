@@ -51,7 +51,7 @@ test("#1124: sub-floor conversation gets a conclusive verdict, not retry advice"
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi there"]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes("Total compressible content too small"), `kernel reason preserved: ${out}`);
     assert.ok(out.includes("do not retry compress or call acp_status/search_context"), `conclusive verdict present: ${out}`);
@@ -61,7 +61,7 @@ test("#1124: verdict only when NO range can succeed; a viable larger range keeps
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi"], ["user", "x".repeat(6000)]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes("Combine more messages"), `generic advice kept: ${out}`);
     assert.ok(!out.includes("do not retry compress"), `no conclusive verdict while a range could succeed: ${out}`);
@@ -72,7 +72,7 @@ test("#1124: minCompressRange 0 keeps legacy behavior (tiny compress is not size
     const ctx = makeCtx();
     ctx.config.compress.minCompressRange = 0;
     seedTurn(ctx, [["user", "hello"], ["assistant", "hi there"]]);
-    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: LONG_SUMMARY }] }), ctx).text;
     assert.ok(!out.includes("Total compressible content too small"), out);
     assert.ok(!out.includes("do not retry compress"), out);
 });

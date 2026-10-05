@@ -165,7 +165,7 @@ test("executeRetrieve: hit returns the framed original IN the tool result (GHSA 
     adoptContentStore(session, turnWith(ccrConfig()).contentStore);
     const ref = Object.keys(session.contentStore!.byRef)[0]!;
 
-    const out = executeRetrieve({ ref }, session);
+    const out = executeRetrieve({ ref }, session).text;
     assert.match(out, new RegExp(`acp-retrieved #${ref}`), "framed as untrusted data");
     assert.ok(out.includes(BIG_TEXT.slice(0, 80)), "the tool result itself carries the full original");
     assert.equal(session.stats.retrieveCalls, 1);
@@ -174,13 +174,13 @@ test("executeRetrieve: hit returns the framed original IN the tool result (GHSA 
     assert.equal(session.pendingRetrievals.length, 0, "nothing queued — the injection channel is gone");
     assert.equal(drainPendingRetrievals(session).length, 0);
 
-    const miss = executeRetrieve({ ref: "m99999" }, session);
+    const miss = executeRetrieve({ ref: "m99999" }, session).text;
     assert.match(miss, /not found/);
     assert.equal(session.stats.retrieveMisses, 1);
     assert.equal(session.stats.retrieveCalls, 2);
     assert.equal(drainPendingRetrievals(session).length, 0, "a miss queues nothing");
     // malformed arg is a miss, not a crash
-    assert.match(executeRetrieve({}, session), /ref/);
+    assert.match(executeRetrieve({}, session).text, /ref/);
     assert.equal(session.stats.retrieveMisses, 2);
 });
 
@@ -376,7 +376,7 @@ test("#1343 proxy lane: drain still settles legacy carriers (delivered); a v2 re
     assert.equal(session.stats.retrieveDropped, 0);
     assert.equal(drainPendingRetrievals(session).length, 0);
     // v2: a fresh retrieve is delivered by the tool result alone — no drain needed
-    const out = executeRetrieve({ ref }, session);
+    const out = executeRetrieve({ ref }, session).text;
     assert.ok(out.includes(BIG_TEXT.slice(0, 80)), "v2 tool result carries the original");
     assert.equal(session.stats.retrieveDelivered, 2, "inline retrieve counts as delivered immediately");
     assert.equal(session.pendingRetrievals.length, 0, "v2 retrieve queues nothing");

@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { defaultPrompts } from "./prompts.js";
 import type { Prompts } from "./prompts.js";
+import { orderedRefPair } from "./refs.js";
 
 export type NudgeVoice = "gentle" | "emergency";
 
@@ -191,17 +192,21 @@ export function formatRanges(
   const userNote = (n: number): string =>
     n > 0 ? ` · ${n} user msg${n > 1 ? "s" : ""}` : "";
   const lines = merged.map((e) => {
+    // Direction is notational (resolveBoundaries swaps reversed pairs), so
+    // print endpoint labels ascending: non-monotonic-ref spans must not read
+    // as malformed ranges (#2168, #1001).
+    const [lo, hi] = orderedRefPair(e.startRef, e.endRef);
     const suffix =
       e.dangerous && e.compressibleTokens > 0
         ? "  ⚠️ NOT recommended unless you are certain."
         : "";
     if (e.protectedTokens > 0 && e.compressibleTokens === 0) {
-      return `  ${e.startRef}–${e.endRef}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED: ${e.protectedTools.join(", ")} — not compressible]${suffix}`;
+      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED: ${e.protectedTools.join(", ")} — not compressible]${suffix}`;
     }
     if (e.protectedTokens > 0 && e.compressibleTokens > 0) {
-      return `  ${e.startRef}–${e.endRef}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected: ${e.protectedTools.join(", ")}]${userNote(e.userMsgs)}${suffix}`;
+      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected: ${e.protectedTools.join(", ")}]${userNote(e.userMsgs)}${suffix}`;
     }
-    return `  ${e.startRef}–${e.endRef}  ${e.count} msgs  ${formatK(e.tokens)} [tool ${e.toolPct}% | text ${e.textPct}%]${userNote(e.userMsgs)}${suffix}`;
+    return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [tool ${e.toolPct}% | text ${e.textPct}%]${userNote(e.userMsgs)}${suffix}`;
   });
   return `Compressible ranges (${merged.length}, oldest first):\n${lines.join("\n")}`;
 }

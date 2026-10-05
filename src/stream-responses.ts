@@ -36,7 +36,7 @@ export function rewriteResponsesJsonResponse(body: unknown, ctx: RewriteCtx): un
     for (const item of b.output) {
         if (item.type === "function_call" && item.name === COMPRESS_TOOL_NAME) {
             converted = true;
-            noteParts.push(applyRanges(parseCompressInput(String(item.arguments ?? "")), ctx));
+            noteParts.push(applyRanges(parseCompressInput(String(item.arguments ?? "")), ctx).text);
         } else {
             if (item.type === "function_call") sawReal = true;
             keep.push(item);

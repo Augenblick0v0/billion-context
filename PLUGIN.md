@@ -88,10 +88,10 @@ Execute a tool against the conversation's compression state.
 Response:
 
 ```json
-{ "ok": true, "tool": "compress", "conversationId": "...", "result": "[Compressed m00001–m00042 → 1 block(s), ~1742 tokens saved.]" }
+{ "ok": true, "tool": "compress", "conversationId": "...", "outcome": "applied", "blocksCreated": 1, "result": "[Compressed m00001–m00042 → 1 block(s), ~1742 tokens saved.]" }
 ```
 
-Return `result` verbatim as the native tool result content.
+Return `result` verbatim as the native tool result content. `ok` reflects transport + execution only (it stays `true` when the kernel refuses a fold range — the refusal receipt then sits in `result`). The machine-readable business outcome rides in the additive `outcome` field (#1875): for `compress` it is `applied` / `partial` / `refused` plus `blocksCreated`; for every other tool `success` / `failure`. Older proxies omit both fields; the #1192 disabled-note answer stays exactly `{ ok: true, result }`.
 
 Notes:
 

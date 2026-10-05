@@ -75,13 +75,13 @@ import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
-import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
@@ -152,7 +152,7 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
+import { hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -475,7 +475,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
     // phase-2 shell); the Responses codec is the first (and currently only)
     // entry. Unclaimed upgrades still fall through to the 426 contract below.
-    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec]);
+    const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec], (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined);
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -1368,7 +1368,7 @@ async function handle(
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
-    if (req.method === "GET" && req.url === "/__bili/sessions") return sendWebSessions(res);
+    if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
@@ -1412,6 +1412,13 @@ async function handle(
             }
             opts.passthrough = fresh.passthrough;
             opts.passthroughSource = fresh.passthroughSource;
+            if (fresh.allowDshCompaction !== opts.allowDshCompaction) {
+                log(
+                    fresh.allowDshCompaction ? "warn" : "info",
+                    `[dsh-compaction] ${fresh.allowDshCompaction ? "dsh native compaction ALLOWED via web config — landed checkpoints durably shadow the raw history (#2028)" : "dsh native compaction interception restored via web config (#2028)"}`,
+                );
+            }
+            opts.allowDshCompaction = fresh.allowDshCompaction;
             opts.proxy = fresh.proxy;
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
@@ -1635,6 +1642,8 @@ async function handle(
                 selfPort: req.socket.localPort ?? undefined,
                 clientLoopback: isLoopbackAddress(req.socket.remoteAddress),
                 allowlist: tunnelAllowlistFromEnv(),
+                // #2124: delegate hostname classification when egress leaves via an upstream proxy (same per-destination decision buildForwardTarget uses below).
+                egressProxied: resolveProxyDecision(opts.routes, opts.proxy, route.rewrittenUrl ?? route.upstream, opts.proxyFallback).proxy !== undefined,
             });
             if (!verdict.ok) {
                 log("warn", `[tunnel] denied ${maskUrlsInText(route.upstream)}: ${verdict.message}`);
@@ -2170,6 +2179,37 @@ async function handle(
                   clientProvided: !!convHeader,
               }
             : undefined;
+        // #2156: a request that will ride the #388 side passthrough further
+        // down must NEVER participate in persona namespace resolution.
+        // subagentNamespace's first-seen-system anchor is mutable process
+        // state: whichever request arrives first under an identity claims the
+        // raw key. A side request carries kernel-no-touch status, yet anchoring
+        // it lets its utility system claim the raw key and fork every real
+        // main turn onto `|sub:<fp>` — the host-stamped bare id then finds
+        // zero refs and compress fails permanently (this issue). Side requests
+        // therefore resolve VERBATIM: they neither read nor write the anchor
+        // and share the main session key per the #388 contract (before the
+        // fix, once any main turn had anchored, they instead rode junk
+        // `|sub:<fp(side)>` sessions). Mirrors the #388 lane condition below
+        // minus publicForkPrefix, which needs the session resolved AFTER this
+        // point: a public-fork child arrives under a FRESH childConversationId
+        // where first-seen anchoring returns the raw key anyway, so omitting
+        // the veto cannot move any key. Under an ALREADY-anchored fork child
+        // the verbatim key is still correct BECAUSE the lane below diverts
+        // intent-certain side requests to the passthrough even under fork
+        // receipts (kernel-no-touch, #388) — the two gates move together.
+        // detectAcpArtifacts stays last — it
+        // re-encodes the whole history and must only run for the all-bili
+        // subset (same short-circuit discipline as the demotedSide gate below;
+        // proxy-mode traffic never reaches it because the plugin header gate
+        // fails first).
+        const sideAgent = pluginRequestAgentHeader(req.headers);
+        const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
+            && (isSideRequest(parsed, sideAgent)
+                || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
+                    && req.headers["x-bili-ws-lane"] === undefined
+                    && hasLeakedBiliToolsOnly(parsed)
+                    && detectAcpArtifacts(bodyBuffer, parsed) === null));
         // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
         // conversation id on every model request of a session, INCLUDING the
         // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
@@ -2204,11 +2244,11 @@ async function handle(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : dshPersona
+                  : dshPersona && !sideRequestLike
                     ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? (dshPersona
+              ? (dshPersona && !sideRequestLike
                     ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -2239,11 +2279,13 @@ async function handle(
                      // conversation evolved (upgrade / plugin / AGENTS.md),
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
-                     ? subagentNamespace(
-                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                           (parsed as ResponsesRequestBody).instructions,
-                       )
-                     : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
+                      ? (!sideRequestLike
+                          ? subagentNamespace(
+                                responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                                (parsed as ResponsesRequestBody).instructions,
+                            )
+                          : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
+                      : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
         // this request onto a suffixed session key (kernel anchor mismatch).
         // Used by the recordPluginSession branch below so the fork records
@@ -2774,13 +2816,14 @@ async function handle(
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
         // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
-        // state untouched. Unconditional by design — auto pressure, overflow
-        // recovery, and manual /compact share one envelope, and a landed
-        // checkpoint durably shadows the raw history (irreversible), while every
-        // cost of refusing is dsh-side, caught, and recoverable. Runs before the
-        // #388 side-request lane: the compaction call is a full-budget request,
-        // so only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
+        // state untouched. Active by default, explicitly opt-out-able (#2028) —
+        // auto pressure, overflow recovery, and manual /compact share one
+        // envelope, and a landed checkpoint durably shadows the raw history
+        // (irreversible), while every cost of refusing is dsh-side, caught, and
+        // recoverable; allowDshCompaction lifts the refusal for users who accept
+        // that trade. Runs before the #388 side-request lane: the compaction
+        // call is a full-budget request, so only this guard can catch it.
+        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
             if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
@@ -2802,7 +2845,29 @@ async function handle(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
-        if (!countTokens && !responsesCompact && protocol !== null && !publicForkPrefix && (demotedSide || isSideRequest(parsed, requestAgent))) {
+        const sideIntent = isSideRequest(parsed, requestAgent);
+        // #388/#2157 follow-up: side requests must not touch kernel state under
+        // a public-fork receipt either. The receipt's first-request 409
+        // discipline above has already accepted this request (inherited prefix
+        // matched, or the child has live traffic), and a side request reads
+        // none of the kernel state fork adoption maintains — so the historical
+        // !publicForkPrefix veto here only had the effect of running
+        // full-history-replaying side calls (dsh title-gen under a forked
+        // conversation: the host resends the ENTIRE current history plus the
+        // title instruction, so the prefix always matches) through the FULL
+        // pipeline on the fork child's MAIN session: junk turns into the
+        // snapshot, usage-baseline pollution (#1916 class), stats inflation.
+        // With #2157's verbatim sideRequestLike keying this became a live
+        // regression (pre-#2157 the same request forked onto an isolated
+        // `|sub:<fp>` junk session — ugly but clean); diverting it here
+        // restores the #388 kernel-no-touch contract for fork children too.
+        // demotedSide keeps its own !publicForkPrefix veto deliberately: the
+        // all-bili-tools leak shape is heuristic, and a fork child's early
+        // mainline turns (raw inherited prefix, no artifacts yet, no agent
+        // header) can false-positive it — only intent-certain side
+        // identification (declared side agent, or a tool-less tiny budget)
+        // diverts under a receipt.
+        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || sideIntent)) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -5908,6 +5973,11 @@ async function preflightCompressIfNeeded(
         stopHold = beginPreflightHold(res, prepared, log);
     }, preflightHoldGraceMs());
     holdTimer.unref();
+    // #2133: compress.streamSummary (same three-level cascade as this request's
+    // own reqConfig resolution) forces SSE summarization — the error-driven
+    // learn path can't see gateway timeouts (524/503), so operators behind such
+    // gateways need a deterministic escape hatch.
+    const forceStreamSummary = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === true;
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -5929,6 +5999,7 @@ async function preflightCompressIfNeeded(
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
                 upstreamOrigin: currentOrigin,
+                forceStreamSummary,
             },
             prepared.originalMessages,
         );
@@ -6403,7 +6474,10 @@ async function forward(
         prepared.session.stats.contextEstimateCalibrated = scaledText !== est.textOverhead;
         prepared.session.stats.contextTokens = est.upperBound;
         prepared.session.stats.contextTokensSource = "estimate";
-        noteForwardedBody(prepared.session, sentBody);
+        // #2131: exact message count for seam forensics (sentParsed is the one
+        // shared parse above — Responses carries "input", Google native "contents").
+        const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers));
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
@@ -6760,11 +6834,13 @@ async function forward(
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
             // first post-fold rejection left strictReasoningEcho unset — #651 kept
             // dropping reasoning and every following turn split again.
-            if (upstream.status === 400 && /reasoning_content/i.test(errBody.toString("utf8"))) {
+            // #2169: match BOTH field spellings — the chat wire says
+            // reasoning_content, DeepSeek's Responses wire says reasoning_text.
+            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errBody.toString("utf8"))) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
-                    log("warn", `[${s.id}] upstream 400 mentions reasoning_content — learned strictReasoningEcho for this session (#684/#762); reasoning-drop disabled`);
+                    log("warn", `[${s.id}] upstream 400 mentions a reasoning echo field — learned strictReasoningEcho for this session (#684/#762/#2169); reasoning-drop disabled`);
                 }
             }
         }
@@ -7422,13 +7498,50 @@ async function resolveFakeCompletion(
     return buffer;
 }
 
-/** Derive a short human-readable title from the first user text message.
- *  Used so the web UI can show "Fix auth bug" instead of an opaque hash. */
-function deriveTitle(messages: CoreMessage[]): string | undefined {
+// Host-injected contextual user fragments: machine-generated context sent as
+// USER-role messages ahead of the first real question (codex: AGENTS.md
+// instructions, environment context). Using one as the session title locks the
+// title to launch boilerplate forever (#2118). Evidence-permitlist mirroring
+// codex's own type_markers (openai/codex codex-rs/context-fragments/src/fragment.rs
+// matches_marked_text: trimmed text starts with open AND ends with close, ASCII
+// case-insensitive) — extend only with source evidence, never keyword filters.
+const CONTEXTUAL_USER_FRAGMENT_MARKERS: ReadonlyArray<readonly [string, string]> = [
+    ["# AGENTS.md instructions", "</INSTRUCTIONS>"],
+    ["<environment_context>", "</environment_context>"],
+];
+
+function asciiCI(hay: string, needle: string): boolean {
+    if (hay.length !== needle.length) return false;
+    for (let i = 0; i < hay.length; i++) {
+        const h = hay.charCodeAt(i);
+        const n = needle.charCodeAt(i);
+        if (h === n) continue;
+        const hl = h >= 65 && h <= 90 ? h + 32 : h;
+        const nl = n >= 65 && n <= 90 ? n + 32 : n;
+        if (hl !== nl) return false;
+    }
+    return true;
+}
+
+export function isContextualUserFragment(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    return CONTEXTUAL_USER_FRAGMENT_MARKERS.some(([open, close]) =>
+        asciiCI(t.slice(0, open.length), open) && asciiCI(t.slice(t.length - close.length), close));
+}
+
+/** Derive a short human-readable title from the first real user text message.
+ *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
+ *  Contextual fragments (#2118) are skipped — if no real question has arrived
+ *  yet, no title is set and derivation retries on later requests. */
+export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
-        const clean = (m.text ?? "").replace(/\s+/g, " ").trim();
-        if (clean) return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
+        const raw = m.text ?? "";
+        if (!raw.trim()) continue;
+        if (isContextualUserFragment(raw)) continue;
+        const clean = raw.replace(/\s+/g, " ").trim();
+        return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
     return undefined;
 }
@@ -7476,7 +7589,7 @@ function sendCacheReport(res: http.ServerResponse, url: string): void {
     res.writeHead(200, { "content-type": "application/json" });
     // Same markdown the acp_cache MCP tool emits (handleAcpCache = formatCacheReport),
     // so web copy/download matches /acp-cache output exactly.
-    res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: handleAcpCache(s, { detail: "full" }) })) }, null, 2));
+    res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: handleAcpCache(s, { detail: "full" }).text })) }, null, 2));
 }
 
 // #1206: orphan reaping was silent — blocks deactivated because their source
@@ -7511,6 +7624,7 @@ function sendStats(res: http.ServerResponse): void {
     const all = listSessions();
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
+        const ks = readKeySwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -7528,6 +7642,8 @@ function sendStats(res: http.ServerResponse): void {
             lastModel: typeof s.metadata.lastModel === "string" ? s.metadata.lastModel : undefined,
             modelSwitches: sw?.count ?? 0,
             switchMissedTokens: sw?.missedTokens ?? 0,
+            keySwitches: ks?.count ?? 0,
+            keySwitchMissedTokens: ks?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
@@ -7538,6 +7654,16 @@ function sendStats(res: http.ServerResponse): void {
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+}
+
+/** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
+ *  computed once and shared so the two surfaces cannot drift apart again (that
+ *  divergence is what left the web banner dead: overview never carried the field).
+ *  null when no advisory is active; otherwise the active entry plus targetFailed
+ *  (pinned target unresolvable on the registry → banner falls back to @latest). */
+function currentAdvisoryPayload() {
+    const adv = getAdvisoryState();
+    return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
 }
 
 /** Stale-install state for the web UI badge (#811): whether the on-disk
@@ -7552,9 +7678,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const adv = getAdvisoryState();
-    const advisory = adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -7565,7 +7689,15 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     } catch {
         // fs hiccup: report running state only, never fail the overview endpoint
     }
-    const overview = await buildOverview();
+    let overview;
+    try {
+        overview = await buildOverview();
+    } catch (error) {
+        loggerLog("error", `[acp-web] overview failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         overview,
@@ -7573,6 +7705,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         diskVersion,
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
+        advisory: currentAdvisoryPayload(),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
@@ -7581,10 +7714,31 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     }, null, 2));
 }
 
-async function sendWebSessions(res: http.ServerResponse): Promise<void> {
-    const sessions = await buildSessionList();
+/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
+ *  server-side filtered paging. Without params the response shape is unchanged
+ *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
+    let body: Record<string, unknown>;
+    try {
+        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+            const rawSize = Number(u.searchParams.get("pageSize"));
+            const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
+            const rawPage = Number(u.searchParams.get("page"));
+            const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+        } else {
+            const sessions = await buildSessionList();
+            body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };
+        }
+    } catch (error) {
+        loggerLog("error", `[acp-web] sessions list failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, hiddenEmpty: hiddenEmptyCount() }, null, 2));
+    res.end(JSON.stringify(body, null, 2));
 }
 
 /** #1426 web UI run-log viewer: tail of the rotated logger files (bili.log.old

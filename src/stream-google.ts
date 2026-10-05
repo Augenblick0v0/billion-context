@@ -26,7 +26,7 @@ export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unkno
         if (fc && typeof fc.name === "string" && isProxyToolFor(fc.name, ctx.session, ctx.config)) {
             converted = true;
             const args = fc.args !== null && typeof fc.args === "object" ? (fc.args as Record<string, unknown>) : {};
-            noteParts.push(executeProxyTool(fc.name, args, ctx, typeof fc.id === "string" ? fc.id : undefined));
+            noteParts.push(executeProxyTool(fc.name, args, ctx, typeof fc.id === "string" ? fc.id : undefined).text);
             continue;
         }
         if (fc) sawReal = true;

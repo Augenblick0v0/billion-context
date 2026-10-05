@@ -473,7 +473,12 @@ export interface ContextBest {
     at?: number;
 }
 
-export function displayContextBest(session: Session): ContextBest | null {
+// #2117 x #1937: minimal structural param — web list rows build from bounded
+// summary sources (sessions-data.ts) that carry no full Session object.
+export function displayContextBest(session: {
+    stats: Pick<Session["stats"], "contextTokens" | "contextTokensSource" | "lastUsageGradeTokens" | "lastInputTokensSource" | "contextEstimateTokens" | "contextEstimateCalibrated">;
+    metadata?: Record<string, unknown>;
+}): ContextBest | null {
     const st = session.stats;
     if (st.contextTokensSource === "usage" && st.contextTokens > 0) {
         const at = typeof session.metadata?.contextTokensAt === "number" ? session.metadata.contextTokensAt : undefined;

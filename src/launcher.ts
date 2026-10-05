@@ -146,9 +146,9 @@ export {
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -721,6 +721,29 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "antigravity") {
+        // #2115: Antigravity's model channel runs inside the closed Go
+        // language_server, which honors the undocumented CLOUD_CODE_URL env
+        // override (verified in the v2.19.1 binary: "Overriding
+        // CloudCodeServerURL via CLOUD_CODE_URL environment variable"). The
+        // stock endpoint is cloudcode-pa.googleapis.com; bili recognizes the
+        // wire by path (:streamGenerateContent et al. → google adapter). A
+        // user-exported CLOUD_CODE_URL is a relay: wrap IT instead of the
+        // stock endpoint (claude semantics). Fallback if Google removes the
+        // knob: cert-MITM (the server honors HTTPS_PROXY, no pinning) — see
+        // CLIENTS.md (Gemini family section).
+        const raw = nonEmpty(config.antigravity?.baseUrl) ? config.antigravity!.baseUrl! : "https://cloudcode-pa.googleapis.com";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CLOUD_CODE_URL")) {
+                rewriteKeys.add("CLOUD_CODE_URL");
+                httpRewrites.push({ key: "CLOUD_CODE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // Antigravity falls back to its own default endpoint).
+        }
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
@@ -1149,6 +1172,23 @@ export function buildQwenEnv(origin: string, caPath: string, baseEnv: NodeJS.Pro
     };
 }
 
+/** #2115: CLOUD_CODE_URL points language_server straight at the loopback
+ *  proxy; no proxy/CA env needed (the override IS the route). */
+export function buildAntigravityEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
+    if (r) env.CLOUD_CODE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
+    if (hr) env.CLOUD_CODE_URL = hr.realUpstream;
+    return env;
+}
+
 /**
  * #653: qoder's auto-compact window is a single env knob —
  * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
@@ -1253,12 +1293,14 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). kimi is excluded as well: its
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
-  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
-  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
-  *  copilot/amp/goose are excluded likewise: closed or unverified MCP
-  *  surfaces, v1 runs pure wire mode (#1049). */
+ *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
+ *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
+ *  copilot/amp/goose are excluded likewise: closed or unverified MCP
+ *  surfaces, v1 runs pure wire mode (#1049). antigravity is excluded too
+ *  (#2115): its model channel is a closed Go binary with no MCP-injection
+ *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -4162,6 +4204,25 @@ export function resolveClientCommand(
         }
         return { command: binBase, prefixArgs: [] };
     }
+    if (client === "antigravity") {
+        // #2115: the CLI binary is named `agy` (Gemini CLI successor), not
+        // `antigravity`; install.sh places it at ~/.local/bin/agy (Windows:
+        // %LOCALAPPDATA%\agy\bin\agy.exe).
+        const resolved = resolveOnPath("agy", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        const base = process.platform === "win32"
+            ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "agy", "bin", "agy")
+            : path.join(os.homedir(), ".local", "bin", "agy");
+        for (const ext of process.platform === "win32" ? [".exe", ""] : [""]) {
+            const candidate = base + ext;
+            try {
+                if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
+            } catch {
+                // Unreadable candidate: fall through to the next extension.
+            }
+        }
+        return { command: base, prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -4612,6 +4673,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // whitelisted for the proxy's CA. NODE_EXTRA_CA_CERTS is additive, so
         // the plain root CA suffices.
         env = buildQwenEnv(origin, resolveCaCertPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "antigravity") {
+        // #2115: CLOUD_CODE_URL points language_server straight at the loopback
+        // proxy (undocumented override verified in the v2.19.1 binary); no
+        // proxy/CA env needed. Fallback if Google removes the knob: cert-MITM
+        // (the server honors HTTPS_PROXY, no pinning) — CLIENTS.md.
+        env = buildAntigravityEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
+        if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
+            console.error(
+                "bili: no routable antigravity upstream found (unparseable CLOUD_CODE_URL?) — traffic will NOT go through the proxy.",
+            );
+        }
     } else if (base === "aider") {
         // #1048: cert-MITM like jcode/kimi — aider's Python stack (litellm →
         // httpx, plus requests) honors standard proxy envs for all outbound

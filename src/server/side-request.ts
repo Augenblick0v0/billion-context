@@ -92,7 +92,11 @@ function biliToolNamesIn(parsed: Record<string, unknown>): string[] | null {
  *  starved tool-carrying request is the death-spiral rescue path —
  *  restoreOutputBudget must run so the model regains the output room to emit
  *  compress — so such requests stay main turns even when every tool is bili's. */
-export function stripLeakedBiliTools(parsed: unknown): boolean {
+/** #2156: READ-ONLY structural twin of stripLeakedBiliTools — same verdict,
+ *  no mutation. Lets callers (the persona-anchor bypass in server.ts) ask
+ *  "would this request be demoted via #1897?" before any decision point that
+ *  must not pay the mutation or re-run the check. */
+export function hasLeakedBiliToolsOnly(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const p = parsed as Record<string, unknown>;
     const names = biliToolNamesIn(p);
@@ -102,7 +106,12 @@ export function stripLeakedBiliTools(parsed: unknown): boolean {
         const raw = readOutputBudget(p, field);
         if (typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS) return false;
     }
-    delete p.tools;
+    return true;
+}
+
+export function stripLeakedBiliTools(parsed: unknown): boolean {
+    if (!hasLeakedBiliToolsOnly(parsed)) return false;
+    delete (parsed as Record<string, unknown>).tools;
     return true;
 }
 
