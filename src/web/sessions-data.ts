@@ -270,13 +270,30 @@ function liveCoveredPaths(dir: string): Set<string> {
  *  new/changed files (mtime OR size moved) are decoded, one at a time with a
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
- *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI). */
+ *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
+ *  EXCEPT a MISSING dir with no snapshot yet: that is the legitimate
+ *  "no data" state (fresh install / persistence never used) → empty index,
+ *  mirroring session-gc's empty-result handling (#2152 CI: fresh runner had
+ *  no sessions dir yet and /__bili/overview answered 500). A dir that VANISHES
+ *  after a snapshot exists keeps serving the stale one (#1937). */
 async function refreshIndex(): Promise<void> {
     if (scanInFlight) return scanInFlight;
     const run = (async () => {
         const store = getDiskStore();
         const dir = store.dir;
-        const files = await walkSessionFiles(dir);
+        let files: Array<{ abs: string; mtimeMs: number; size: number }>;
+        try {
+            files = await walkSessionFiles(dir);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            if (byFile) return; // vanished dir: keep serving the last known index (#1937)
+            // Never had one: nothing persisted yet (dir is created lazily on first
+            // save, persist.ts). Fresh installs must see an empty list, not a 500
+            // (#2152 CI) — the old reject-loudly pin conflated "absent" with
+            // "misconfigured"; the trace now lives here, once per process.
+            log("warn", `[acp-web] sessions dir ${dir} does not exist yet — serving empty index`);
+            files = [];
+        }
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
         const covered = liveCoveredPaths(dir);

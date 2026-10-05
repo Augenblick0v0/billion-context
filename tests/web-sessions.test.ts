@@ -649,7 +649,7 @@ withSessionsDir("#1937 review: .tmp- mid-name (host label) stays indexed — ker
     assert.ok(det && det.id === "host-tmp", "detail resolves the same file instead of 404ing");
 });
 
-withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir rejects loudly", async (dir) => {
+withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir without snapshot → empty (#2152)", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -662,7 +662,8 @@ withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir rejects 
 
     process.env.BILI_SESSIONS_DIR = path.join(dir, "gone-subdir");
     _resetDiskCacheForTest();
-    await assert.rejects(buildSessionList(), "no prior snapshot → reject (→ HTTP 500), never silent empty");
+    const empty = await buildSessionList();
+    assert.deepEqual(empty, [], "no prior snapshot → empty index (#2152), loudness moves to the warn log");
 });
 
 withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", async (dir) => {
