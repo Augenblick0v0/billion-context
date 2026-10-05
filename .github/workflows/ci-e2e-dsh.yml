@@ -39,9 +39,11 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      # The suites run through tsx directly (same loader as `npm test`) — no
-      # build needed; kept un-built deliberately so src/ drift can't hide
-      # behind a stale dist/.
+      # tsx resolves `acp-kernel` to its built dist (kernel/ is a workspace
+      # package) — same prerequisite as the main test matrix.
+      - name: Build kernel
+        run: npm --prefix kernel run build
+
       - name: Run dsh plugin lane suites (sequential — concurrent runs flake on shared XDG dirs)
         run: |
           set -euo pipefail
