@@ -20,6 +20,8 @@ The executor accepts immutable task text, instructions and optional read-only re
 
 ## Final Acceptance Scope
 
+The internal `executeBatch` operation shares one monotonic deadline across queueing, all ranges and every fallback attempt. Results remain in input order; `finished` means every range was evaluated, not that every range succeeded. Cancellation or deadline stops later ranges and retains earlier results for an eventual caller to validate and commit. This operation does not commit folds or renew the timeout per range.
+
 - An opt-in configuration-page section manages custom summary targets and ordered backups. Its public schema and secret storage require explicit repository-owner approval before implementation.
 - Active `compress`, preflight, MCP/official thin-plugin execution and supported native-compaction summary generators use the common external service when enabled. A preflight-only implementation is not final delivery.
 - The original main model continues its normal task after a successful fold; non-summary requests and the disabled mode preserve existing behavior.

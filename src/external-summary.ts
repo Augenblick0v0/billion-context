@@ -24,6 +24,10 @@ export type ExternalSummaryResult =
     | { status: "failed"; reason: "invalid_plan" | "exhausted"; attempts: SummaryAttempt[] }
     | { status: "cancelled" | "deadline"; attempts: SummaryAttempt[] };
 
+export type ExternalSummaryBatchResult =
+    | { status: "finished" | "cancelled" | "deadline"; results: ExternalSummaryResult[] }
+    | { status: "failed"; reason: "invalid_plan"; results: [] };
+
 type AttemptResult = { kind: "value"; value: string } | { kind: "error" } | { kind: "aborted" };
 type Release = () => void;
 interface Waiter {
@@ -34,6 +38,12 @@ interface Waiter {
 
 function positiveInteger(value: number): boolean {
     return Number.isSafeInteger(value) && value > 0;
+}
+
+function validBudget(budget: SummaryBudget): boolean {
+    return positiveInteger(budget.totalTimeoutMs) && budget.totalTimeoutMs <= 2_147_483_647
+        && positiveInteger(budget.targetTimeoutMs) && budget.targetTimeoutMs <= 2_147_483_647
+        && positiveInteger(budget.maxSummaryBytes);
 }
 
 function awaitAttempt(operation: Promise<AttemptResult>, signal: AbortSignal): Promise<AttemptResult> {
@@ -58,12 +68,39 @@ export class ExternalSummaryExecutor {
     }
 
     async execute(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryResult> {
+        return this.executeUntil(work, candidates, budget, signal);
+    }
+
+    async executeBatch(work: readonly SummaryWork[], candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
+        const results: ExternalSummaryResult[] = [];
+        if (signal?.aborted) return { status: "cancelled", results };
+        const limits = { ...budget };
+        if (!validBudget(limits) || work.length === 0 || candidates.length === 0
+            || candidates.some((target) => typeof target.summarize !== "function")) {
+            return { status: "failed", reason: "invalid_plan", results: [] };
+        }
+        const deadline = performance.now() + limits.totalTimeoutMs;
+        const requests = work.map((request) => Object.freeze({ ...request }));
+        const targets = [...candidates];
+        for (const request of requests) {
+            if (signal?.aborted) return { status: "cancelled", results };
+            if (performance.now() >= deadline) return { status: "deadline", results };
+            const result = await this.executeUntil(request, targets, limits, signal, deadline);
+            results.push(result);
+            if (signal?.aborted) return { status: "cancelled", results };
+            if (result.status === "cancelled" || result.status === "deadline") {
+                return { status: result.status, results };
+            }
+            if (performance.now() >= deadline) return { status: "deadline", results };
+        }
+        return { status: "finished", results };
+    }
+
+    private async executeUntil(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal, sharedDeadline?: number): Promise<ExternalSummaryResult> {
         const attempts: SummaryAttempt[] = [];
         if (signal?.aborted) return { status: "cancelled", attempts };
         const limits = { ...budget };
-        if (!positiveInteger(limits.totalTimeoutMs) || limits.totalTimeoutMs > 2_147_483_647
-            || !positiveInteger(limits.targetTimeoutMs) || limits.targetTimeoutMs > 2_147_483_647
-            || !positiveInteger(limits.maxSummaryBytes) || !work.content.trim() || !work.instructions.trim()
+        if (!validBudget(limits) || !work.content.trim() || !work.instructions.trim()
             || candidates.length === 0 || candidates.some((target) => typeof target.summarize !== "function")) {
             return { status: "failed", reason: "invalid_plan", attempts };
         }
@@ -73,8 +110,8 @@ export class ExternalSummaryExecutor {
         const cancel = () => overall.abort();
         signal?.addEventListener("abort", cancel, { once: true });
         if (signal?.aborted) cancel();
-        const deadline = performance.now() + limits.totalTimeoutMs;
-        const totalTimer = setTimeout(cancel, limits.totalTimeoutMs);
+        const deadline = Math.min(performance.now() + limits.totalTimeoutMs, sharedDeadline ?? Infinity);
+        const totalTimer = setTimeout(cancel, Math.max(0, deadline - performance.now()));
         const stopped = (): ExternalSummaryResult => ({ status: signal?.aborted ? "cancelled" : "deadline", attempts });
         try {
             for (const [targetIndex, target] of targets.entries()) {
