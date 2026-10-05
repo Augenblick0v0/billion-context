@@ -203,8 +203,17 @@ export interface SeamEvent {
 
 const SEAM_BODY_CAP = 512 * 1024;
 const SEAM_EVENTS_CAP = 8;
-const seamLastSent = new WeakMap<Session, string>();
-const seamLastSettled = new WeakMap<Session, string>();
+
+/** #2131: stored body PLUS exact outbound message count. A body clipped at
+ *  SEAM_BODY_CAP parses to zero messages, so count-based classification needs
+ *  the count captured at the send chokepoint where the full body is in hand.
+ *  `null` = unknown (wire shape without a message array). */
+interface SeamSlot {
+    str: string;
+    msgs: number | null;
+}
+const seamLastSent = new WeakMap<Session, SeamSlot>();
+const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
 export interface ContextObservation {
@@ -244,9 +253,14 @@ export function noteClientAbort(session: Session): void {
 
 /** Record the body of the upstream round that is about to be sent. Called at
  *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
- *  the next settleUsageReport pairs it with the usage report it produced. */
-export function noteForwardedBody(session: Session, body: string): void {
-    seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
+ *  the next settleUsageReport pairs it with the usage report it produced.
+ *  `msgs` is the exact outbound message count (#2131); when omitted and the
+ *  stored payload is byte-identical to a previously noted one (the non-streaming
+ *  settle re-noting the same wireBody), the earlier count is kept. */
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null): void {
+    const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
+    const prior = seamLastSent.get(session);
+    seamLastSent.set(session, { str, msgs: msgs ?? (prior && prior.str === str ? prior.msgs : null) });
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -362,18 +376,40 @@ function detectSeam(session: Session, led: CacheLedger): void {
     const agg = led.agg;
     const cur = seamLastSent.get(session);
     const prev = seamLastSettled.get(session);
+    let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
-        const f = seamLcp(prev, cur);
-        if (f.curMsgs < f.prevMsgs) {
-            // Client reverted/trimmed history: the miss is the sanctioned
-            // one-time re-bill of the retained prefix (or the gap's TTL).
+        f = seamLcp(prev.str, cur.str);
+        // #2131: a body stored at full length is readable; one clipped at
+        // SEAM_BODY_CAP parses to zero messages, so parse-derived arms below
+        // only decide pairs where that side is under the cap.
+        const prevCapped = prev.str.length >= SEAM_BODY_CAP;
+        const curCapped = cur.str.length >= SEAM_BODY_CAP;
+        // Client reverted/trimmed history: the miss is the sanctioned
+        // one-time re-bill of the retained prefix (or the gap's TTL). Only
+        // trust the parsed counts when BOTH sides are fully stored — a side
+        // clipped at SEAM_BODY_CAP parses to zero messages and would fake a
+        // shrink (or hide one); those pairs go to the #2131 byte/count arms.
+        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.curMsgs < f.prevMsgs) {
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
         }
-        if (f.lcpBytes >= cur.length) {
+        if (cur.str.length < prev.str.length && f.lcpBytes >= cur.str.length - 4) {
+            // #2131: the WHOLE current payload survives inside the previous
+            // one — a JSON array only diverges from its own longer superstring
+            // in the closing-bracket region (the 4-byte tolerance), so this is
+            // a sanctioned client-side trim/fold re-bill of the retained prefix,
+            // NOT a provider miss. Must run before the byte-stable arm, which
+            // would otherwise read "all of cur survives" and book it provider-side.
+            agg.rewinds += 1;
+            agg.rewindMissed += line.tr;
+            return;
+        }
+        if (f.lcpBytes >= cur.str.length) {
             // Wire was byte-stable against the previous request — the
-            // upstream simply did not serve its cache. Provider-side.
+            // upstream simply did not serve its cache. Provider-side. Above
+            // the cap this covers the identical-recorded-head case: anything
+            // past SEAM_BODY_CAP is beyond recorded evidence either way.
             agg.providerSideMisses += 1;
             agg.providerSideMissed += line.tr;
             return;
@@ -387,11 +423,28 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // uncapped: one truncated at SEAM_BODY_CAP parses to zero messages and
         // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
         // an empty prior list out.
-        if (prev.length < SEAM_BODY_CAP && cur.length < SEAM_BODY_CAP && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
+        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
             agg.providerSideMisses += 1;
             agg.providerSideMissed += line.tr;
             return;
         }
+        if (prev.str.length < cur.str.length && f.lcpBytes >= prev.str.length - 4) {
+            // #2131: the WHOLE previous payload survives inside the longer
+            // current one (JSON appends diverge only in the previous body's
+            // closing-bracket region — the 4-byte tolerance). Under the cap the
+            // #2059 arm above already decided clean appends, so reaching here
+            // means a clipped side was involved and the parsed counts are blind;
+            // the exact counts captured at send time must prove pure tail
+            // growth. Without them the pair is indistinguishable from a real
+            // break and falls through to suspect.
+            if (prev.msgs !== null && cur.msgs !== null && cur.msgs > prev.msgs) {
+                agg.providerSideMisses += 1;
+                agg.providerSideMissed += line.tr;
+                return;
+            }
+        }
+        // No decisive byte/count shape (visible break in the recorded region,
+        // or capped evidence without exact counts): suspect.
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -400,8 +453,8 @@ function detectSeam(session: Session, led: CacheLedger): void {
         led.seamEvents.shift();
     }
     if (cur !== undefined && prev !== undefined) {
-        const f = seamLcp(prev, cur);
-        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...f };
+        const forensics = f ?? seamLcp(prev.str, cur.str);
+        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs };
         (led.seamEvents ?? (led.seamEvents = [])).push(ev);
         if (agg.seamSuspects === 1) {
             loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
@@ -1041,7 +1094,7 @@ function formatSeam(r: BiliCacheReport): string {
     }
     if (r.seam.providerSide.count > 0) {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's entire message list is byte-for-byte a prefix of this request (any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
