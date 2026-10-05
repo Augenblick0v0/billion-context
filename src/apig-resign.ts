@@ -29,19 +29,22 @@ import { configFile, stateDir } from "./paths.js";
  * pre-#1884 behavior) and the server-side guard stays silent.
  *
  * A signed request that cannot be re-signed (no credential resolvable for
- * its scheme) is REFUSED by default — 403 with an actionable message — for
- * EVERY scheme, built-in or not (#2090 plan A, owner ruling): bili's
- * contract is "installed = compressed, or the user explicitly knows a link
- * runs uncompressed" — a silent direct-forward violates it because the
- * bypass is invisible in every channel the end user actually watches. The
- * explicit opt-in IS the acknowledgment: resign["<scheme>"].passthrough /
- * BILI_RESIGN_PASSTHROUGH=1 forwards byte-untouched WITHOUT compression and
- * says so in the message, log, and web UI. Refusals are remembered
- * (recordSignedRefusal → stateDir()/resign-pending.json) so every bili
- * startup lists still-unresolved schemes next to the listen banner until
- * they are configured away. resign["<scheme>"].enabled=false / BILI_RESIGN=0
- * un-deploy the branch entirely (pre-#1884 rewrite behavior — upstream may
- * reject the rewritten bodies; that choice also clears the reminder).
+ * its scheme) is REFUSED — 403 naming the scheme — per the owner's
+ * binary-contract ruling (#2090): a signed request has exactly two legal
+ * outcomes, RE-SIGNED+COMPRESSED or REFUSED; there is NO unsigned
+ * pass-through mode, because letting a signed body through un-compressed
+ * hides the bypass from the user. The sole exception is the pre-existing
+ * #1884 escape hatch on the BUILT-IN scheme itself
+ * (resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH=1): its
+ * refusal has a user-side fix (provide the credential), so opting into
+ * uncompressed forwarding there is a real decision. For every OTHER scheme
+ * passthrough settings are INERT and the request always refuses. Refusals
+ * are remembered (recordSignedRefusal → stateDir()/resign-pending.json) so
+ * every bili startup lists still-unresolved schemes next to the listen
+ * banner until bili ships their re-signer. resign["<scheme>"].enabled=false
+ * / BILI_RESIGN=0 un-deploy the branch entirely (pre-#1884 rewrite behavior
+ * — upstream may reject the rewritten bodies; that choice also clears the
+ * reminder).
  *
  * Credential refresh is intentionally NOT ported: the plugin refreshes its
  * own credentials; when they expire, the upstream 401 is visible and the
@@ -124,11 +127,19 @@ export interface SignedRefusal {
 
 /** The 403 payload returned when a body-covering signature cannot be re-signed.
  *  Protocol-native shapes (anthropic/openai wire) so real clients surface the
- *  message instead of choking on it. */
+ *  message instead of choking on it.
+ *  #2090 owner ruling ("either compress or refuse"): the pass-through outcome
+ *  exists ONLY for the built-in scheme (its refusal has a user-side fix —
+ *  provide the credential — so #1884 shipped the passthrough escape hatch).
+ *  Non-built-in schemes have NO pass-through mode at all: they stay refused
+ *  until bili ships a re-signer for them, and the message says so instead of
+ *  offering a config that would not work. */
 export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"): SignedRefusal {
     const known = KNOWN_SIGNATURE_SCHEMES[scheme];
     const schemeName = known ? `${scheme} (${known.label}, ${known.source})` : scheme;
-    const message = `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available for this scheme. The link WORKS WITHOUT COMPRESSION if you opt in explicitly — that opt-in is the acknowledgment that this link runs uncompressed: add {"resign":{"${scheme}":{"passthrough":true}}} to the config file (${configFile()}) or set env BILI_RESIGN_PASSTHROUGH=1, then restart bili; the bili web UI (/__bili/, Configuration → Signed upstreams) lists this scheme too. Alternatively restore pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 — the body is then rewritten and the upstream may reject it. Built-in scheme only: providing a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service) makes bili re-sign instead of refusing.`;
+    const message = scheme === APIG_RESIGN_SCHEME
+        ? `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available for this scheme. The link WORKS WITHOUT COMPRESSION if you opt in explicitly — that opt-in is the acknowledgment that this link runs uncompressed: add {"resign":{"${scheme}":{"passthrough":true}}} to the config file (${configFile()}) or set env BILI_RESIGN_PASSTHROUGH=1, then restart bili; the bili web UI (/__bili/, Configuration → Signed upstreams) lists this scheme too. Alternatively restore pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 — the body is then rewritten and the upstream may reject it. Providing a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service) makes bili re-sign instead of refusing.`
+        : `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 SignatureDoesNotMatch). bili has no re-signer for this scheme yet, and by design signed requests are either RE-SIGNED+COMPRESSED or REFUSED — there is no unsigned pass-through mode, so NO configuration can make this link work (passthrough settings do not apply to this scheme). It stays unavailable until bili ships re-signing support for it. Restoring pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 is possible, but the upstream will reject the rewritten body.`;
     if (protocol === "anthropic") {
         return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
     }
@@ -403,18 +414,22 @@ export function readPendingRefusals(): Record<string, ResignPendingEntry> {
 }
 
 /** Schemes whose refusal is still UNRESOLVED under the current settings —
- *  drives the startup banner and the web UI card. An entry resolves when the
- *  user made an explicit decision for its scheme: passthrough opted in (the
- *  link runs uncompressed BY CHOICE) or the branch un-deployed
- *  (enabled=false / BILI_RESIGN=0 — they accept upstream rejecting rewritten
- *  bodies). Global env decisions resolve everything up front. */
+ *  drives the startup banner and the web UI card. An entry resolves ONLY when
+ *  the branch is un-deployed (enabled=false / BILI_RESIGN=0 — the user accepts
+ *  the upstream rejecting rewritten bodies) or, for the BUILT-IN scheme only,
+ *  when its passthrough is opted in (the pre-existing #1884 escape hatch, file
+ *  or BILI_RESIGN_PASSTHROUGH). Non-built-in schemes NEVER resolve via
+ *  passthrough (#2090 owner ruling: signed requests are re-signed+compressed
+ *  or refused — no unsigned pass-through); they stay listed until bili ships
+ *  their re-signer. */
 export function unresolvedRefusals(env: NodeJS.ProcessEnv = process.env): Record<string, ResignPendingEntry> {
     if (env.BILI_RESIGN === "0") return {};
-    if (env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true") return {};
     const out: Record<string, ResignPendingEntry> = {};
     for (const [scheme, entry] of Object.entries(readPendingRefusalsRaw())) {
         const settings = resolveResignSettings(env, {}, scheme);
-        if (settings.passthrough || !settings.enabled) continue;
+        if (!settings.enabled) continue;
+        const builtinPassthrough = scheme === APIG_RESIGN_SCHEME && (settings.passthrough || env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true");
+        if (builtinPassthrough) continue;
         out[scheme] = entry;
     }
     return out;

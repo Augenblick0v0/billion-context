@@ -716,29 +716,28 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
-        // #1884/#2090 plan A: a body-covering signature cannot survive a
-        // rewrite — routing these through the proxy un-armed makes the
-        // upstream reject every request with 401 (APIG.0301 body hash
-        // mismatch / SigV4 SignatureDoesNotMatch). When the host can supply
-        // the signing credential (dsh credential service, built-in scheme
-        // only), the request tunnels WITH a re-sign arm: bili re-signs every
-        // egress body it produces. Without a credential the request is
-        // REFUSED locally by default for EVERY scheme — 403 with an
-        // actionable message naming the exact config opt-in (#2090 owner
-        // ruling: bili's contract is "installed = compressed, or the user
-        // explicitly knows a link runs uncompressed"; a silent direct-forward
-        // hides the bypass from every channel the end user watches). The
-        // explicit passthrough opt-in IS the acknowledgment: byte-untouched,
-        // no compression, loudly logged. Refusals are remembered
-        // (recordSignedRefusal) so bili startups keep listing unresolved
-        // schemes until they are configured away.
-        // Passthrough/refusal are decided PER SCHEME — the lookup key is the
-        // request's own signature scheme, so opting one signature into
-        // verbatim forwarding never opens another (config
-        // `resign["<scheme>"].passthrough`, env BILI_RESIGN_PASSTHROUGH wins;
-        // BILI_RESIGN=0 or `resign["<scheme>"].enabled=false` un-deploy the
-        // branch — signed bodies fall through to the normal takeover path,
-        // pre-#1884 behavior — and clear the scheme's refusal memory).
+        // #1884/#2090 plan A + owner binary-contract ruling ("要么一定压缩，
+        // 或者一定拒绝"): a body-covering signature cannot survive a rewrite —
+        // routing these through the proxy un-armed makes the upstream reject
+        // every request with 401 (APIG.0301 body hash mismatch / SigV4
+        // SignatureDoesNotMatch). A signed request therefore has exactly TWO
+        // legal outcomes here: re-signed+compressed (host supplies the
+        // credential — dsh credential service, built-in scheme only — and the
+        // request tunnels WITH a re-sign arm) or REFUSED locally (403 naming
+        // the scheme). There is NO unsigned pass-through outcome: letting a
+        // signed body through un-compressed would hide the bypass from the
+        // user, which is exactly what the ruling forbids. The sole exception
+        // is the pre-existing #1884 escape hatch on the BUILT-IN scheme itself
+        // (resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH) —
+        // its refusal has a user-side fix (provide the credential), so an
+        // explicit opt-in there is a real decision, not a cop-out; for every
+        // OTHER scheme passthrough settings are INERT and the request is
+        // always refused. Refusals are remembered (recordSignedRefusal) so
+        // bili startups keep listing unresolved schemes until bili ships
+        // their re-signer. BILI_RESIGN=0 or `resign["<scheme>"].enabled=false`
+        // un-deploy the branch entirely (pre-#1884 behavior: signed bodies
+        // ride the normal takeover path) and clear the scheme's refusal
+        // memory.
         let resignExtra: Record<string, string> | undefined;
         const signedScheme = bodySignedSchemeOf(input, init);
         if (signedScheme !== undefined) {
@@ -755,14 +754,15 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     }
                 }
                 if (cred === undefined) {
-                    if (!resignPassthroughEnabled(undefined, signedScheme)) {
+                    const builtinPassthrough = signedScheme === APIG_RESIGN_SCHEME && resignPassthroughEnabled(undefined, signedScheme);
+                    if (!builtinPassthrough) {
                         state.onDispatch?.(url, "refused");
                         recordSignedRefusal(signedScheme, url);
                         const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
                         return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
                     }
                     clearSignedRefusal(signedScheme);
-                    noteSignedDirect(url, signedScheme, "passthrough opt-in — byte-untouched, no compression");
+                    noteSignedDirect(url, signedScheme, "built-in passthrough opt-in (#1884) — byte-untouched, no compression");
                     state.onDispatch?.(url, "direct");
                     return send(input, init);
                 }

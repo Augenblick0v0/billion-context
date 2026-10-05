@@ -408,7 +408,7 @@ test("#1884 intercept: BILI_RESIGN=0 → signed branch un-deployed, normal takeo
     });
 });
 
-test("#2090 intercept: non-built-in scheme (AWS4) → REFUSED by default with an actionable message (plan A)", async () => {
+test("#2090 intercept: non-built-in scheme (AWS4) → REFUSED, and passthrough settings are INERT (binary contract)", async () => {
     const dispatches: string[] = [];
     const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
     const { sink, result } = await withIntercept(state, async (fetch) =>
@@ -417,18 +417,32 @@ test("#2090 intercept: non-built-in scheme (AWS4) → REFUSED by default with an
             headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
             body: "{}",
         }));
-    assert.equal(sink.length, 0, "plan A: un-re-signable signatures are refused locally, never rewritten into an upstream 401");
+    assert.equal(sink.length, 0, "binary contract: un-re-signable signatures are refused locally, never rewritten into an upstream 401");
     assert.equal(result.status, 403);
     assert.equal(result.headers.get("x-bili-resign"), "unavailable");
     const payload = JSON.parse(await result.text()) as { error: { code: string; message: string } };
     assert.equal(payload.error.code, "bili_resign_unavailable");
     assert.match(payload.error.message, /aws4-hmac-sha256/, "names the offending scheme");
-    assert.match(payload.error.message, /"passthrough":\s*true/, "carries the exact opt-in snippet");
-    assert.match(payload.error.message, /BILI_RESIGN_PASSTHROUGH=1/, "offers the env alternative");
+    assert.doesNotMatch(payload.error.message, /"passthrough":\s*true/, "no pass-through snippet offered — it would not work for this scheme");
+    assert.match(payload.error.message, /no re-signer/i, "says the link waits for bili to ship the re-signer");
     assert.deepEqual(dispatches, ["refused"]);
+    // the global env knob is INERT for non-built-in schemes — it only ever resolved the built-in (#1884 hatch)
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const dispatches2: string[] = [];
+        const state2 = armedState({ onDispatch: (_u, action) => dispatches2.push(action) });
+        const { sink: sink2, result: result2 } = await withIntercept(state2, async (fetch) =>
+            fetch("http://127.0.0.1:9199/v1/chat/completions", {
+                method: "POST",
+                headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
+                body: "{}",
+            }));
+        assert.equal(sink2.length, 0, "BILI_RESIGN_PASSTHROUGH=1 does NOT open non-built-in schemes");
+        assert.equal(result2.status, 403);
+        assert.deepEqual(dispatches2, ["refused"]);
+    });
 });
 
-test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED by default; explicit passthrough opt-in → byte-untouched direct", async () => {
+test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED; passthrough config is INERT for this scheme (binary contract)", async () => {
     // i) default: local 403 naming the scheme, and the refusal is remembered
     {
         const dispatches: string[] = [];
@@ -448,7 +462,8 @@ test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED by default
         assert.equal(pendingMap()["x-ofm-signature"]?.count, 1, "refusal remembered for the startup reminder");
         assert.equal(pendingMap()["x-ofm-signature"]?.origin, "http://127.0.0.1:9199");
     }
-    // ii) explicit opt-in (the acknowledgment that this link runs uncompressed) → direct, bytes intact
+    // ii) the pre-#2090 workaround (resign["x-ofm-signature"].passthrough=true) is INERT —
+    // owner ruling: signed requests are re-signed+compressed or refused, never passed through
     {
         const dispatches: string[] = [];
         const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
@@ -459,15 +474,12 @@ test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED by default
                     headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
                     body: JSON.stringify({ model: "eac-1", messages: [{ role: "user", content: "hi" }] }),
                 })));
-        assert.equal(sink.length, 1, "opt-in forwards, not refuses or rewrites");
-        assert.equal(result.status, 200);
-        assert.equal(sink[0].url, "http://127.0.0.1:9199/eac/v1/chat/completions", "original URL, never rewritten through the proxy");
-        assert.equal(sink[0].headers["x-ofm-signature"], "deadbeef", "signature header untouched");
-        assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined, "no arm marker on a direct send");
-        assert.deepEqual(dispatches, ["direct"]);
+        assert.equal(sink.length, 0, "passthrough config does NOT open non-built-in schemes");
+        assert.equal(result.status, 403);
+        assert.deepEqual(dispatches, ["refused"]);
     }
-    // iii) the opt-in resolves the reminder — the pending record is cleared
-    assert.equal(pendingMap()["x-ofm-signature"], undefined, "passthrough branch clears the pending record");
+    // iii) the reminder stays until bili ships the re-signer — the inert opt-in does not clear it
+    assert.ok(pendingMap()["x-ofm-signature"], "inert passthrough leaves the pending record in place");
 });
 
 test("#2090 intercept: resign.<scheme>.enabled=false un-deploys the branch (pre-resign rewrite path restored)", async () => {
@@ -497,31 +509,37 @@ test("#2090 refusal memory: record / clear / unresolved filter", async () => {
     assert.equal(again.origin, "http://127.0.0.1:9199", "origin parsed from the URL");
     assert.ok(Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "recorded + unconfigured → unresolved");
     await withConfigFile({ resign: { "x-ofm-signature": { passthrough: true } } }, async () => {
-        assert.ok(!Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "explicit opt-in resolves the reminder");
+        assert.ok(Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "passthrough is INERT for non-built-in schemes — the reminder stays (binary-contract ruling)");
     });
     await withConfigFile({ resign: { "x-ofm-signature": { enabled: false } } }, async () => {
         assert.ok(!Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "un-deployed branch resolves the reminder");
     });
+    recordSignedRefusal(APIG_RESIGN_SCHEME, "http://127.0.0.1:9199/v1/messages");
     await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
-        assert.deepEqual(unresolvedRefusals(), {}, "global env passthrough resolves everything");
+        const keys = Object.keys(unresolvedRefusals());
+        assert.ok(!keys.includes(APIG_RESIGN_SCHEME), "global env passthrough resolves the BUILT-IN scheme (#1884 escape hatch)");
+        assert.ok(keys.includes("x-ofm-signature"), "...but NOT non-built-in schemes — they wait for the re-signer");
     });
+    clearSignedRefusal(APIG_RESIGN_SCHEME);
     await withEnv({ BILI_RESIGN: "0" }, async () => {
         assert.deepEqual(unresolvedRefusals(), {}, "BILI_RESIGN=0 un-deploys everything");
     });
 });
 
-test("#1884 intercept: passthrough is pinned per scheme — an aws4 file block opts in aws4 only", async () => {
+test("#2090 intercept: passthrough blocks are INERT for non-built-in schemes — an aws4 block opens nothing", async () => {
     await withConfigFile({ resign: { "aws4-hmac-sha256": { passthrough: true } } }, async () => {
-        // aws4-signed traffic tunnels verbatim under its own block (key = the wire scheme token, lowercased)
+        // binary contract: even under its OWN block, aws4 traffic is refused (only the built-in scheme has a pass-through outcome)
         await withEnv({ BILI_RESIGN_PASSTHROUGH: undefined }, async () => {
-            const { sink } = await withIntercept(armedState(), async (fetch) =>
+            const dispatches: string[] = [];
+            const { sink, result } = await withIntercept(armedState({ onDispatch: (_u, action) => dispatches.push(action) }), async (fetch) =>
                 fetch("http://127.0.0.1:9199/v1/chat/completions", {
                     method: "POST",
                     headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
                     body: "{}",
                 }));
-            assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "aws4 block opts aws4 into verbatim forwarding");
-            assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
+            assert.equal(sink.length, 0, "a passthrough block for a non-built-in scheme opens nothing");
+            assert.equal(result.status, 403);
+            assert.deepEqual(dispatches, ["refused"]);
         });
         // sdk-hmac-sha256 stays at the default refusal — the aws4 block never leaks across schemes
         const cred = encodeApigCredential({ ak: "ak", sk: "sk", token: "" });
@@ -730,7 +748,7 @@ function startRecordingUpstream(): Promise<{ server: http.Server; port: number; 
     });
 }
 
-test("e2e #2090: x-ofm-signature through /bili/ → REFUSED by default; explicit opt-in → byte-untouched", async () => {
+test("e2e #2090: x-ofm-signature through /bili/ → REFUSED; level-2 passthrough is INERT (binary contract)", async () => {
     // i) no config, no env → local 403 with the actionable message; upstream never sees the request
     {
         const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
@@ -747,7 +765,8 @@ test("e2e #2090: x-ofm-signature through /bili/ → REFUSED by default; explicit
             assert.equal(r.status, 403, "plan A default: refuse locally instead of rewriting into an upstream 401");
             assert.equal(payload.error.code, "bili_resign_unavailable");
             assert.match(payload.error.message, /x-ofm-signature/, "names the offending scheme");
-            assert.match(payload.error.message, /"passthrough":\s*true/, "carries the exact opt-in snippet");
+            assert.doesNotMatch(payload.error.message, /"passthrough":\s*true/, "no pass-through snippet offered for this scheme");
+            assert.match(payload.error.message, /no re-signer/i, "the fix is bili shipping the re-signer, not user config");
             assert.equal(calls.length, 0, "nothing hit the wire");
         } finally {
             proxy.close();
@@ -756,7 +775,7 @@ test("e2e #2090: x-ofm-signature through /bili/ → REFUSED by default; explicit
             upstream.closeAllConnections?.();
         }
     }
-    // ii) level-2 provider opt-in → the same request goes out byte-for-byte
+    // ii) level-2 provider opt-in is INERT too — the same request is still refused
     {
         const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
         const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { "x-ofm-signature": { passthrough: true } } });
@@ -768,10 +787,9 @@ test("e2e #2090: x-ofm-signature through /bili/ → REFUSED by default; explicit
                 headers: { "content-type": "application/json", "x-ofm-signature": sha256Hex(bodyStr) },
                 body: bodyStr,
             });
-            assert.equal(r.status, 200, `opt-in forwards byte-untouched so the upstream signature stays valid: ${await r.text()}`);
-            assert.equal(calls.length, 1);
-            assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
-            assert.equal(String(calls[0].headers["x-ofm-signature"]), sha256Hex(bodyStr), "signature header preserved");
+            const rBody = await r.text();
+            assert.equal(r.status, 403, `a level-2 passthrough block cannot open a non-built-in scheme: ${rBody}`);
+            assert.equal(calls.length, 0, "nothing hit the wire");
         } finally {
             proxy.close();
             (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
@@ -792,7 +810,7 @@ test("e2e #2090: GET /__bili/resign reports schemes, pending refusals, and the u
         assert.match(String(r.headers.get("content-type")), /application\/json/);
         const data = (await r.json()) as {
             builtinScheme: string;
-            schemes: Record<string, { known?: { label: string }; builtIn: boolean; enabled: boolean; passthrough: boolean }>;
+            schemes: Record<string, { known?: { label: string }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }>;
             pending: Record<string, { count: number }>;
             unresolved: string[];
         };
@@ -800,6 +818,8 @@ test("e2e #2090: GET /__bili/resign reports schemes, pending refusals, and the u
         assert.equal(data.schemes["sdk-hmac-sha256"].builtIn, true);
         assert.ok(data.schemes["sdk-hmac-sha256"].known?.label, "registry label present for the built-in");
         assert.equal(data.schemes["x-ofm-signature"].builtIn, false);
+        assert.equal(data.schemes["sdk-hmac-sha256"].passthroughApplies, true, "only the built-in scheme has a pass-through outcome");
+        assert.equal(data.schemes["x-ofm-signature"].passthroughApplies, false, "no config can pass a non-built-in scheme through (#2090 binary contract)");
         assert.ok(data.pending["x-ofm-signature"] && data.pending["x-ofm-signature"].count >= 1);
         assert.ok(data.pending["aws4-hmac-sha256"] && data.pending["aws4-hmac-sha256"].count >= 1);
         assert.ok(data.unresolved.includes("x-ofm-signature"), "recorded + unconfigured → unresolved");

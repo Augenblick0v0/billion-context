@@ -899,8 +899,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 log(
                     "warn",
                     `[resign] ${entries.length} signed request scheme(s) were refused earlier and remain UNRESOLVED: ${list}. ` +
-                        "They will keep failing until configured. To make them WORK WITHOUT COMPRESSION (the explicit opt-in acknowledges no compression on that link): add {\"resign\":{\"<scheme>\":{\"passthrough\":true}}} to " +
-                        `${configFile()} or set BILI_RESIGN_PASSTHROUGH=1, then restart bili. Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). ` +
+                        "Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them — no configuration can pass a signed body through unsigned. Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). " +
                         "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
                 );
             }
@@ -3354,15 +3353,21 @@ async function handle(
                 !resignArmable &&
                 guardResign.enabled
             ) {
-                if (guardResign.passthrough) {
+                // #2090 owner ruling ("compress or refuse"): the only
+                // pass-through outcome left is the pre-existing #1884 escape
+                // hatch on the BUILT-IN scheme itself; every other scheme is
+                // ALWAYS refused — its refusal has no user-side fix yet, only
+                // bili shipping the re-signer. Passthrough settings are inert
+                // for those schemes.
+                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough) {
                     clearSignedRefusal(guardScheme);
-                    log("warn", `[signed-passthrough] request carries a ${guardScheme} body-covering signature without a working re-sign arm — forwarding byte-untouched, no compression (explicit opt-in via resign["${guardScheme}"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed, #2090)`);
+                    log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
                 recordSignedRefusal(guardScheme, upstreamOrigin);
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign["${guardScheme}"].passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding WITHOUT COMPRESSION, or provide a signing credential (#1884). Remembered — bili will keep reminding at startup until configured.`);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing per the compress-or-refuse contract (${guardScheme === APIG_RESIGN_SCHEME ? "provide a signing credential to make bili re-sign, #1884" : "no re-signer exists for this scheme yet — it stays refused until bili ships one; passthrough settings do not apply"}). Remembered — bili will keep reminding at startup.`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
@@ -7709,10 +7714,10 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
 // plus the remembered refusals and which of them are still unresolved.
 function sendResignStatus(res: http.ServerResponse): void {
     const names = new Set<string>([...Object.keys(KNOWN_SIGNATURE_SCHEMES), ...Object.keys(readPendingRefusals())]);
-    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean }; builtIn: boolean; enabled: boolean; passthrough: boolean }> = {};
+    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }> = {};
     for (const name of [...names].sort()) {
         const st = resolveResignSettings(process.env, undefined, name);
-        schemes[name] = { known: KNOWN_SIGNATURE_SCHEMES[name], builtIn: name === APIG_RESIGN_SCHEME, enabled: st.enabled, passthrough: st.passthrough };
+        schemes[name] = { known: KNOWN_SIGNATURE_SCHEMES[name], builtIn: name === APIG_RESIGN_SCHEME, enabled: st.enabled, passthrough: st.passthrough, passthroughApplies: name === APIG_RESIGN_SCHEME };
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

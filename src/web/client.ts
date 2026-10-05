@@ -1360,8 +1360,10 @@ export const WEB_CLIENT = `(function () {
         }
     }
     // #2090 plan A: read-only "Signed upstreams" card — every known/observed
-    // signature scheme with its effective policy, remembered refusals, and a
-    // copy-ready passthrough snippet per refused scheme.
+    // signature scheme with its effective policy, remembered refusals, and —
+    // for the BUILT-IN scheme only — a copy-ready passthrough snippet (other
+    // schemes show an awaiting-re-signer hint: no config can pass them
+    // through, #2090 owner ruling).
     async function loadResign() {
         const box = $("resign-body");
         if (!box) return;
@@ -1391,8 +1393,9 @@ export const WEB_CLIENT = `(function () {
             row.appendChild(label);
             const badge = document.createElement("span");
             badge.className = "badge ";
-            badge.textContent = !s.enabled ? t("cfg.resign_disabled") : s.passthrough ? t("cfg.resign_passthrough") : t("cfg.resign_refusing");
-            badge.classList.add(s.passthrough ? "ok" : s.enabled ? "warn" : "disk");
+            const effectivePassthrough = Boolean(s.builtIn && s.passthrough);
+            badge.textContent = !s.enabled ? t("cfg.resign_disabled") : effectivePassthrough ? t("cfg.resign_passthrough") : t("cfg.resign_refusing");
+            badge.classList.add(effectivePassthrough ? "ok" : s.enabled ? "warn" : "disk");
             row.appendChild(badge);
             const entry = pending[name];
             if (entry && typeof entry === "object") {
@@ -1400,15 +1403,22 @@ export const WEB_CLIENT = `(function () {
                 meta.className = "dim small";
                 meta.textContent = t("cfg.resign_row", { origin: entry.origin || "—", count: entry.count ?? 1, firstSeen: String(entry.firstSeen ?? "").slice(0, 10) });
                 row.appendChild(meta);
-                if (s.enabled && !s.passthrough) {
-                    const btn = document.createElement("button");
-                    btn.className = "btn sm copy-btn";
-                    btn.setAttribute("data-copy", JSON.stringify({ resign: { [name]: { passthrough: true } } }, null, 0));
-                    btn.setAttribute("title", t("cfg.resign_copy_hint"));
-                    const sp = document.createElement("span");
-                    sp.textContent = t("common.copy");
-                    btn.appendChild(sp);
-                    row.appendChild(btn);
+                if (s.enabled && !effectivePassthrough) {
+                    if (s.builtIn) {
+                        const btn = document.createElement("button");
+                        btn.className = "btn sm copy-btn";
+                        btn.setAttribute("data-copy", JSON.stringify({ resign: { [name]: { passthrough: true } } }, null, 0));
+                        btn.setAttribute("title", t("cfg.resign_copy_hint"));
+                        const sp = document.createElement("span");
+                        sp.textContent = t("common.copy");
+                        btn.appendChild(sp);
+                        row.appendChild(btn);
+                    } else {
+                        const hint = document.createElement("span");
+                        hint.className = "dim small";
+                        hint.textContent = t("cfg.resign_awaiting");
+                        row.appendChild(hint);
+                    }
                 }
             }
             box.appendChild(row);

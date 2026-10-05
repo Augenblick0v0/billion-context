@@ -990,7 +990,7 @@ export function apply(ctx: PluginContext): void {
         signedUrlSeen.add(key);
         const line = scheme === APIG_RESIGN_SCHEME
             ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or byte-untouched direct with passthrough configured)`
-            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing locally by default with an actionable message (set resign["${scheme}"].passthrough to forward byte-untouched WITHOUT compression, #2090)`;
+            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing per the compress-or-refuse contract (no unsigned pass-through — the link stays unavailable until bili ships a re-signer for it, #2090)`;
         console.error(line);
         persistClientEvent(line);
     };
@@ -1003,7 +1003,7 @@ export function apply(ctx: PluginContext): void {
         const entries = Object.entries(unresolved);
         if (entries.length > 0) {
             const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
-            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. They will keep failing until configured — add {"resign":{"<scheme>":{"passthrough":true}}} to the bili config file (or BILI_RESIGN_PASSTHROUGH=1) to forward them byte-untouched WITHOUT COMPRESSION; see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.`;
+            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them (no configuration passes a signed body through unsigned); see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.`;
             console.warn(line);
             persistClientEvent(line);
         }
