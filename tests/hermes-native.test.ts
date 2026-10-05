@@ -418,7 +418,8 @@ function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { o
     fs.writeFileSync(driver, DRIVER);
     const r = spawnSync(PY!, [driver, scenario, base], {
         encoding: "utf8",
-        timeout: 60_000,
+        // #2216: 60s was blown on loaded CI runners (observed 60561ms); 120s = heavy-subprocess lane convention.
+        timeout: 120_000,
         maxBuffer: 4 * 1024 * 1024,
         env: { ...process.env, BC_PLUGIN_SRC: HERMES_SRC_DIR, BC_NODE: process.execPath, ...extraEnv },
     });
