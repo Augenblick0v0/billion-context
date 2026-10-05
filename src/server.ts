@@ -2299,6 +2299,20 @@ async function handle(
               ? (anthropicIdentity?.value ?? anthropicSignal)
               : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
+        // #2170 measure 4: stamp sessions deliberately namespaced onto a
+        // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
+        // fork reviews, codex/claude-over-Responses instructions personas —
+        // so the split-session canary can tell a DESIGNED split from the
+        // #2165 drift shape (see splitSessionWarnings in src/session.ts).
+        // personaForked covers the anthropic/openai wires; the responses wire
+        // needs its own check (codexTurn keys verbatim and must not count).
+        const designNamespaced = personaForked
+            || (protocol === "responses"
+                && codexTurn === undefined
+                && instructionsFingerprintApplies(req.headers)
+                && !sideRequestLike
+                && responsesIdentity !== undefined
+                && conversation !== responsesIdentity.value);
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2435,6 +2449,7 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
             acquireInFlight(session);
@@ -2935,11 +2950,16 @@ async function handle(
             return;
         }
         // #2170 measure 4 (runtime canary): every legitimately side-shaped
-        // request returned inside the lane above. If a side-intent or demoted
-        // request reaches the full pipeline anyway, the lane contract is broken
-        // (the #2157/#2164 regression class: side traffic touching kernel state).
-        // Count it on the session and say it loudly — today this is unreachable.
-        if (sideIntent || demotedSide) {
+        // LANE-ELIGIBLE request returned inside the lane above. count_tokens,
+        // /responses/compact and session-less (protocol-less) requests are
+        // deliberately NOT lane-eligible — they route to their own handling
+        // below, so they are excluded here (ework review finding B). If a
+        // lane-eligible side-intent or demoted request reaches the full
+        // pipeline anyway, the lane contract is broken (the #2157/#2164
+        // regression class: side traffic touching kernel state). Count it on
+        // the session and say it loudly — with the pure resolveSideLane()
+        // this is unreachable by construction; any future drift trips it.
+        if (!countTokens && !responsesCompact && protocol !== null && (sideIntent || demotedSide)) {
             session.metadata.sideEffectLeaks = (typeof session.metadata.sideEffectLeaks === "number" ? session.metadata.sideEffectLeaks : 0) + 1;
             log("warn", `[${session.id}] SIDE-EFFECT LEAK (#2170 canary): ${sideLane.reason} request entered the full pipeline — expected the #388 side passthrough; kernel state pollution likely (cf. #2156/#2164)`);
         }
@@ -7648,7 +7668,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
     for (const w of splitWarnings) {
         if (!splitWarnedBases.has(w.base)) {
             splitWarnedBases.add(w.base);
-            loggerLog("warn", `split-session canary (#2170): conversation ${w.base} is live under multiple session keys — ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. That is the #2165 failure shape (stolen anchor / never-compressing fork); report it if unexpected.`);
+            loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
     res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));

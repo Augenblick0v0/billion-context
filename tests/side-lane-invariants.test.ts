@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
-import { _resetSessionsForTest, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
+import { _resetSessionsForTest, listSessions, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 
@@ -158,21 +158,55 @@ test("(B) main/side interleavings converge to the main-only baseline (ordering i
     }
 });
 
-test("(C) splitSessionWarnings fires only on a live same-base split (#2165 shape)", () => {
+test("(C) splitSessionWarnings: design persona forks excluded, drift shapes fire (#2165 shape)", () => {
     const now = 1_000_000;
-    const mk = (id: string, requests: number, ageMs: number): Session => ({ id, lastSeen: now - ageMs, createdAt: now - ageMs - 1000, stats: { requests }, metadata: {} } as unknown as Session);
-    const mkSub = (base: string, sub: string, requests: number, ageMs: number) => mk(`${base}|sub:${sub}`, requests, ageMs);
-    // live split: raw id + fork, both carried traffic, both fresh
-    const warnings = splitSessionWarnings([mk("A", 3, 60_000), mkSub("A", "fp1", 5, 60_000)], now);
-    assert.equal(warnings.length, 1);
-    assert.equal(warnings[0].base, "A");
-    assert.equal(warnings[0].sessions.length, 2);
+    const mk = (id: string, requests: number, ageMs: number, persona = false): Session => ({ id, lastSeen: now - ageMs, createdAt: now - ageMs - 1000, stats: { requests }, metadata: persona ? { personaNamespace: true } : {} } as unknown as Session);
+    const mkSub = (base: string, sub: string, requests: number, ageMs: number, persona = false) => mk(`${base}|sub:${sub}`, requests, ageMs, persona);
+    // drift split: raw id + unmarked fork, both carried traffic, both fresh → warns
+    const drift = splitSessionWarnings([mk("A", 3, 60_000), mkSub("A", "fp1", 5, 60_000)], now);
+    assert.equal(drift.length, 1);
+    assert.equal(drift[0].base, "A");
+    assert.equal(drift[0].sessions.length, 2);
+    // #2165's exact reported shape: traffic-less raw twin + LIVE fork → warns
+    // (the raw twin held the anchor/compressions while the fork carried turns)
+    assert.equal(splitSessionWarnings([mk("A", 0, 60_000), mkSub("A", "fp1", 5, 60_000)], now).length, 1, "empty raw + live unmarked fork is the #2165 shape");
     // single session: never warns
     assert.equal(splitSessionWarnings([mk("B", 3, 60_000)], now).length, 0);
-    // split but the raw twin never carried traffic (#2165's A had requests=0 counts... A had old traffic; the empty twin must NOT warn)
-    assert.equal(splitSessionWarnings([mk("C", 0, 60_000), mkSub("C", "fp1", 5, 60_000)], now).length, 0, "a traffic-less twin is an idle leftover, not a live split");
+    // design persona fork (marked): NEVER warns, whatever the traffic mix
+    assert.equal(splitSessionWarnings([mk("P", 3, 60_000), mkSub("P", "fp", 5, 60_000, true)], now).length, 0, "a persona-marked child is a designed split (#970/#1916)");
+    assert.equal(splitSessionWarnings([mk("P", 0, 60_000), mkSub("P", "fp", 5, 60_000, true)], now).length, 0);
     // split but stale (older than the freshness window)
     assert.equal(splitSessionWarnings([mk("D", 3, SPLIT_CANARY_FRESH_MS + 1), mkSub("D", "fp1", 5, 60_000)], now).length, 0, "stale twins are history, not a live split");
+    // fully idle group (nothing ever carried traffic)
+    assert.equal(splitSessionWarnings([mk("I", 0, 60_000), mkSub("I", "fp", 0, 60_000)], now).length, 0, "an idle pair never carried traffic — not a live split");
     // unrelated sessions never group together
     assert.equal(splitSessionWarnings([mk("E", 3, 1_000), mkSub("F", "x", 3, 1_000)], now).length, 0);
+    // mixed: one marked + one UNMARKED child beside the raw → the unmarked pair still warns
+    const mixed = splitSessionWarnings([mk("M", 3, 60_000), mkSub("M", "design", 9, 60_000, true), mkSub("M", "drift", 1, 60_000)], now);
+    assert.equal(mixed.length, 1, "a marked sibling must not hide a drifting twin");
+    assert.ok(!mixed[0].sessions.some((s) => s.id.includes("design")), "the marked child itself stays out of the warning");
+});
+
+test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary", async () => {
+    const h = await harness();
+    try {
+        const conv = "persona";
+        // main turn anchors the raw key
+        await h.dshSend(conv, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        // dsh auto-review classifyRisk shape: same conversation id, fixed
+        // REVIEW_POLICY system, full-budget model turn (NOT a side request —
+        // budget 300, no tools, no side agent) → keyed by design onto
+        // `|sub:<fp>` (#1916/#1307/#1314) and rides the main pipeline there.
+        await h.dshSend(conv, [mainMsg(0), { role: "user", content: "REVIEW: tool call risk assessment" }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        const all = listSessions();
+        const kids = all.filter((s) => s.id.startsWith(conv + "|") || s.id.includes(conv + "|sub:"));
+        assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
+        assert.ok((kids[0].stats?.requests ?? 0) >= 1, "the review turn rode the child's main pipeline");
+        assert.equal(kids[0].metadata.personaNamespace, true, "the child is stamped as a designed split");
+        assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
+        const status = (await h.request("/__bili/status")).body as { splitSessions?: unknown[] };
+        assert.deepEqual(status.splitSessions, [], "/__bili/status stays clean for design persona forks");
+    } finally {
+        await h.close();
+    }
 });

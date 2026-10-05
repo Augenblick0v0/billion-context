@@ -648,9 +648,18 @@ export function listSessions(): Session[] {
 // conversation's traffic split across BOTH the raw id and a `|sub:` fork,
 // both live at once (the raw session steals the compressions / anchor while
 // the fork carries the real turns). Surface any such split on /__bili/status
-// so an operator sees it without digging through logs. A base only warns when
-// it has ≥2 sessions that each carried traffic (requests>0) AND were seen
-// within the freshness window — idle leftovers from forks/adoption don't fire.
+// so an operator sees it without digging through logs.
+//
+// Design splits are excluded: sessions namespaced onto `|sub:` ON PURPOSE —
+// #970 claude subagent conversations and #1916/#1307/#1314 dsh persona-fork
+// reviews — carry session.metadata.personaNamespace = true (stamped at
+// request time in server.ts) and never count toward a warning; without this
+// every active Auto-tier dsh conversation (review fork beside main turns)
+// would cry wolf. What remains actionable: ≥2 fresh sessions on one base
+// where ≥1 carried traffic (requests>0) and ≥1 is an UNMARKED `|sub:` child.
+// The #2165 report itself was "empty raw twin + live fork", so a traffic-less
+// raw twin does NOT disqualify a warning — only the stale (>freshness window)
+// and the fully idle (nothing ever carried traffic) groups stay silent.
 export interface SplitSessionWarning {
     base: string;
     sessions: { id: string; requests: number; lastSeen: number }[];
@@ -659,6 +668,7 @@ export const SPLIT_CANARY_FRESH_MS = 10 * 60 * 1000;
 export function splitSessionWarnings(sessions: Session[], now: number = Date.now()): SplitSessionWarning[] {
     const byBase = new Map<string, Session[]>();
     for (const s of sessions) {
+        if (s.metadata?.personaNamespace === true) continue; // designed split (#970/#1916)
         const base = s.id.split("|sub:")[0];
         const arr = byBase.get(base);
         if (arr) arr.push(s); else byBase.set(base, [s]);
@@ -666,9 +676,11 @@ export function splitSessionWarnings(sessions: Session[], now: number = Date.now
     const out: SplitSessionWarning[] = [];
     for (const [base, group] of byBase) {
         if (group.length < 2) continue;
-        const live = group.filter((s) => (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) < SPLIT_CANARY_FRESH_MS);
-        if (live.length >= 2) {
-            out.push({ base, sessions: live.map((s) => ({ id: s.id, requests: s.stats?.requests ?? 0, lastSeen: s.lastSeen ?? 0 })) });
+        const fresh = group.filter((s) => now - (s.lastSeen ?? 0) < SPLIT_CANARY_FRESH_MS);
+        const anyTraffic = fresh.some((s) => (s.stats?.requests ?? 0) > 0);
+        const anyChild = fresh.some((s) => s.id.includes("|sub:"));
+        if (fresh.length >= 2 && anyTraffic && anyChild) {
+            out.push({ base, sessions: fresh.map((s) => ({ id: s.id, requests: s.stats?.requests ?? 0, lastSeen: s.lastSeen ?? 0 })) });
         }
     }
     return out;
