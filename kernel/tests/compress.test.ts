@@ -407,7 +407,7 @@ test("search finds keywords occurring fewer than three times in a summary (#2158
       blockId: "b2",
       runId: "r1",
       tier: 1,
-      summary: "recorded probe alphaone and unique-marker-2026 独特中文短语甲乙丙 once each",
+      summary: "recorded probe alphaone, unique-marker-2026 独特中文短语甲乙丙 and review_github_issues.py once each",
       directMessageIds: [],
       effectiveMessageIds: [],
       directBlockIds: [],
@@ -423,6 +423,8 @@ test("search finds keywords occurring fewer than three times in a summary (#2158
   assert.deepEqual(core.search("unique-marker-2026", state).map((b) => b.blockId), ["b2"]);
   assert.deepEqual(core.search("alphaone", state).map((b) => b.blockId), ["b2"]);
   assert.deepEqual(core.search("独特中文短语甲乙丙", state).map((b) => b.blockId), ["b2"]);
+  // The exact reported shape: a real filename occurring once in the summary.
+  assert.deepEqual(core.search("review_github_issues.py", state).map((b) => b.blockId), ["b2"]);
   // Topic matches still outrank summary-only matches.
   assert.deepEqual(core.search("preflight", state).map((b) => b.blockId), ["b1"]);
   // Zero lexical overlap still returns nothing.
