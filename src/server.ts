@@ -7464,7 +7464,7 @@ function sendCacheReport(res: http.ServerResponse, url: string): void {
     res.writeHead(200, { "content-type": "application/json" });
     // Same markdown the acp_cache MCP tool emits (handleAcpCache = formatCacheReport),
     // so web copy/download matches /acp-cache output exactly.
-    res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: handleAcpCache(s, { detail: "full" }) })) }, null, 2));
+    res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: handleAcpCache(s, { detail: "full" }).text })) }, null, 2));
 }
 
 // #1206: orphan reaping was silent — blocks deactivated because their source

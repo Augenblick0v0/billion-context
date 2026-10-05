@@ -1282,9 +1282,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 };
                 const creditBefore = deps.session.stats.compressCreditTokens;
                 const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
-                if (applied.startsWith("[Compression FAILED")) {
-                    deps.log("warn", `[preflight] ${applied}`);
-                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
+                if (applied.outcome === "refused") {
+                    deps.log("warn", `[preflight] ${applied.text}`);
+                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
                     skipSet.add(skipKey);
                     break;
                 }

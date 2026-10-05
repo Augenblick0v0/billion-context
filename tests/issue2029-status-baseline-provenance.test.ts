@@ -107,7 +107,7 @@ test("#2029: acp_status nudge recompute feeds the provenance-aware baseline", ()
         assert.deepStrictEqual(ctx.seen, [sc.expected], `${sc.name}: tokenCount handed to the kernel`);
         assert.equal(snap(ctx.session.stats), statsBefore, `${sc.name}: stats must stay read-only`);
         assert.equal(snap(ctx.session.state), stateBefore, `${sc.name}: state must stay read-only`);
-        const nudgeLine = out.split("\n").find((l) => l.startsWith("Nudge:"));
+        const nudgeLine = out.text.split("\n").find((l) => l.startsWith("Nudge:"));
         assert.ok(nudgeLine, `${sc.name}: nudge line rendered`);
         if (sc.emergencyPct) {
             assert.ok(nudgeLine.includes("EMERGENCY") && nudgeLine.includes(sc.emergencyPct),

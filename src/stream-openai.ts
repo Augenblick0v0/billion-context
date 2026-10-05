@@ -22,7 +22,7 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
         for (const tc of toolCalls) {
             if (tc.function?.name === COMPRESS_TOOL_NAME) {
                 converted = true;
-                noteParts.push(applyRanges(parseCompressInput(tc.function?.arguments ?? ""), ctx));
+                noteParts.push(applyRanges(parseCompressInput(tc.function?.arguments ?? ""), ctx).text);
             } else {
                 sawReal = true;
                 keepToolCalls.push(tc);

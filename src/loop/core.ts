@@ -23,6 +23,7 @@ import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName }
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
+import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { classifyUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
@@ -273,7 +274,7 @@ export function executeProxyTool(
     ctx: LoopCtx,
     callId?: string,
     rawArguments?: string,
-): string {
+): ProxyToolResult {
     if (toolName === "compress") {
         // #1502: on strict-JSON.parse failure the caller passes the raw argument
         // string here — the kernel's lenient parser salvages fence/trailing-
@@ -306,7 +307,7 @@ export function executeProxyTool(
     if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
         return executeImageFull(args, ctx.session, ctx.config, callId);
     }
-    return `[Unknown proxy tool: ${toolName}]`;
+    return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
 
 function recordUsage(
@@ -820,14 +821,14 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId, rawArgs));
-                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature });
                     if (ctx.visibilityMarkers !== false) {
-                        const markerKey = `${call.name}\u0000${result}`;
+                        const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result);
+                            yield adapter.emitMarker(call.name, result.text);
                         }
                     }
                 } else {

@@ -47,7 +47,7 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
 }
 
 function runApply(ctx: Ctx, args: unknown): string {
-    return applyRanges(parseCompressInput(args), ctx);
+    return applyRanges(parseCompressInput(args), ctx).text;
 }
 
 test("#1387: success with remaining ranges appends the fresh range list (pi #420)", () => {

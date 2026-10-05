@@ -20,6 +20,7 @@ import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -118,17 +119,17 @@ function hasRangeArgs(args: Record<string, unknown>): boolean {
 export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
-): string {
+): ProxyToolResult {
     const rawBlockId = args.blockId;
     if (typeof rawBlockId !== "string" || rawBlockId.length === 0) {
-        return "[decompress FAILED: blockId is required]";
+        return toolFail("[decompress FAILED: blockId is required]");
     }
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
     if (!block) return resolveDerivedDecompress(args, ctx, blockId);
     const archived = preCompactionArchiveOf(ctx.session);
     if (archived[blockId] !== undefined) {
-        return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
+        return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`);
     }
     // #1712: blank/whitespace range fields mean "unspecified" — hosts and models
     // emit "" for optional fields, and treating that as a range request produced
@@ -166,7 +167,7 @@ export function resolveDecompress(
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
     const toFileOut = toFilePointer(args, ctx, header, body);
-    if (toFileOut !== null) return toFileOut;
+    if (toFileOut !== null) return toolOk(toFileOut);
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
     const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {
@@ -175,9 +176,9 @@ export function resolveDecompress(
             writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
-            return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
+            return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
         } catch (e) {
-            return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+            return toolOk(`${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`);
         }
     }
     // #398/#403 + #1294 P2 wiring (dedup of #1316 × #1298): a successful INLINE
@@ -190,7 +191,7 @@ export function resolveDecompress(
     // lives in a temp file, not the conversation). Range restores
     // (startId/endId) return partial content and never reach here; inactive
     // blocks can never refold.
-    if (!block.active) return `${header}\n${body}`;
+    if (!block.active) return toolOk(`${header}\n${body}`);
     // The kernel result is idempotent — a repeat restore recomputes the same
     // span, so the hint stays byte-identical across repeats (old contract:
     // repeat decompress returns identical content). Only the FIRST restore
@@ -201,7 +202,7 @@ export function resolveDecompress(
         markDirty(ctx.session);
         ctx.log(`[acp-decompress-inline] ${blockId}: flagged restoredInline${marked.result?.restoredStartRef ? ` (${marked.result.restoredStartRef}–${marked.result.restoredEndRef})` : ""}`);
     }
-    return `${header}\n${body}\n\n${refoldHint(blockId, marked.result)}`;
+    return toolOk(`${header}\n${body}\n\n${refoldHint(blockId, marked.result)}`);
 }
 
 // #1294 P2: close the loop on an inline restore — kernel K2 updates the
@@ -260,10 +261,10 @@ export function coveredRefSpan(state: CompressionState, block: CompressionBlock)
 // channel: ack now, full text queued as a request-only injection (same id/role
 // shape as acp_retrieve injections, structurally excluded from fold space),
 // never cached in blockContents. Gated on CCR being armed for the session.
-function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): string {
+function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): ProxyToolResult {
     const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
     const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
-    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]";
+    if (!startRaw || !endRaw) return toolFail("[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]");
     if (!ccrEnabled(ctx.session)) {
         // Range restore needs the CCR content store; a CCR-off session has none.
         // In plugin mode the model cannot enable CCR itself (it lives in the
@@ -272,21 +273,21 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         // cannot change (#1207 review F3). Give it the working call instead:
         // whole-block restore with just blockId (#1712).
         if (typeof ctx.session.metadata.pluginAgent === "string") {
-            return `[decompress FAILED: range restore (startId/endId) requires CCR, which this plugin-mode session does not have — omit startId/endId and restore the whole block: {"blockId":"${block.blockId}"}]`;
+            return toolFail(`[decompress FAILED: range restore (startId/endId) requires CCR, which this plugin-mode session does not have — omit startId/endId and restore the whole block: {"blockId":"${block.blockId}"}]`);
         }
-        return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
+        return toolFail("[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]");
     }
     const sb = parseBoundary(startRaw);
     const eb = parseBoundary(endRaw);
     if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
-        return `[decompress FAILED: startId/endId must be mNNNNN message refs (got "${startRaw}", "${endRaw}") — block ids (bN) are not valid here]`;
+        return toolFail(`[decompress FAILED: startId/endId must be mNNNNN message refs (got "${startRaw}", "${endRaw}") — block ids (bN) are not valid here]`);
     }
-    if (sb.numericId > eb.numericId) return `[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`;
+    if (sb.numericId > eb.numericId) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
     const state = ctx.session.state;
     const cov = coveredMessages(state, block);
-    if (!cov) return `[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`;
+    if (!cov) return toolFail(`[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`);
     const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
-    if (pickedSet.size === 0) return `[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`;
+    if (pickedSet.size === 0) return toolFail(`[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`);
     const parts: string[] = [];
     let restoredFromStore = 0;
     // [#1283] Per-ref source selection supersedes the all-or-nothing fallback
@@ -317,7 +318,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${m.text ?? ""}` : `[${m.role}]\n${m.text ?? ""}`);
     }
     if (parts.length === 0) {
-        return `[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`;
+        return toolFail(`[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`);
     }
     const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
     let injText: string;
@@ -353,7 +354,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     }
     markDirty(ctx.session);
     ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s)${restoredFromStore ? ` (${restoredFromStore} from content store)` : ""} via ephemeral injection`);
-    return `[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`;
+    return toolOk(`[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`);
 }
 
 
@@ -449,15 +450,15 @@ function resolveDerivedDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
     blockId: string,
-): string {
+): ProxyToolResult {
     for (const anc of derivedAncestorSessions(ctx.session)) {
         const block = ctx.core.decompress(blockId, anc.state);
         if (!block) continue;
         if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
-            return `[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`;
+            return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`);
         }
         if (hasRangeArgs(args)) {
-            return `[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`;
+            return toolFail(`[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`);
         }
         const full = args.full === true;
         const cached = anc.blockContents.get(blockId);
@@ -465,9 +466,9 @@ function resolveDerivedDecompress(
         const body = view?.text || block.summary;
         const count = view?.count ?? 0;
         const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;
-        return `${header}\n${body}`;
+        return toolOk(`${header}\n${body}`);
     }
-    return `[Block ${blockId} not found]`;
+    return toolFail(`[Block ${blockId} not found]`);
 }
 
 /** Extract the current plan state from the in-context message view: the LAST
@@ -567,9 +568,9 @@ export function executeSearchContext(
     state: CompressionState,
     foreignSessionId?: string,
     plan?: SearchPlanOpts,
-): string {
+): ProxyToolResult {
     const query = typeof args.query === "string" ? args.query : "";
-    if (query.length === 0) return "[search_context FAILED: query is required]";
+    if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
     const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
     const pool = core.search(query, state);
@@ -587,8 +588,9 @@ export function executeSearchContext(
     }
     const blocks = ranked.slice(0, limit);
     if (blocks.length === 0) {
-        if (!state.blocks.some((b) => b.active)) return `[No compressed blocks exist yet${scope} — nothing to search.]`;
-        return `[No blocks matched "${query}"${scope}]`;
+        // #1875: an empty result is a valid answer to a query, not a failure.
+        if (!state.blocks.some((b) => b.active)) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
+        return toolOk(`[No blocks matched "${query}"${scope}]`);
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
@@ -608,7 +610,7 @@ export function executeSearchContext(
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
-    return `Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`;
+    return toolOk(`Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`);
 }
 
 // #841: resolve a requested session id to its compression state without
@@ -626,7 +628,7 @@ export function executeSearchContextTarget(
     sessionId: string,
     state: CompressionState,
     ctx?: { messages: CoreMessage[]; config: Config; session: Session; log: (msg: string) => void },
-): string {
+): ProxyToolResult {
     const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
     // #1336: plan-aware re-ranking applies to OWN-session searches only —
     // foreign lookups stay read-only lexical (no other session's plan state).
@@ -640,7 +642,7 @@ export function executeSearchContextTarget(
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".
-        if (local.startsWith("[No compressed blocks exist yet") || local.startsWith('[No blocks matched "')) {
+        if (local.text.startsWith("[No compressed blocks exist yet") || local.text.startsWith('[No blocks matched "')) {
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
@@ -656,6 +658,6 @@ export function executeSearchContextTarget(
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
     if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan);
     const foreign = resolveForeignSessionState(requested);
-    if (!foreign) return `[search_context FAILED: unknown session "${requested}"]`;
+    if (!foreign) return toolFail(`[search_context FAILED: unknown session "${requested}"]`);
     return executeSearchContext(args, core, foreign, requested);
 }
