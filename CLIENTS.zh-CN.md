@@ -147,6 +147,31 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 该车道已经过端到端实证(`tests/e2e/e2e-pi-codex-ws.test.ts`,真实 pi 对确定性 mock 上游经真实代理):显式 websocket 与 auto 路由、升级握手上 stamp 与 `session-id` == 会话 ID 一致、compress/decompress 往返并反映到后续请求、`previous_response_id` 展开、上游拒绝行为、显式 sse 回归守卫,以及两个并发子代理式会话共享一个代理互不串扰。
 
+### 子代理(pi-subagents)— native 安装覆盖(#2185)
+
+pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**。#2185 之前,native 安装(`bili plugin install pi` / `pi install npm:billion-context`)下 bili 扩展并不能可靠地加载进这些子会话:
+
+- **前台 child** 在进程内运行且 ambient 扩展发现关闭(`noExtensions: true`)→ bili 扩展根本不加载;其流量只是借父进程的全局 fetch patch 到达代理,因此每个 child 被记成**匿名 proxy 模式 `pfa-*` 会话**:压缩成立,但没有具名 `x-bili-plugin-conversation` 身份、没有父会话血统,ACP 工具只以代理侧 wire 注入的形式存在;
+- **后台 async run** 派生独立 runner,其 child *可能*经 ambient 发现加载扩展——默认配置下靠运气生效,而 agent 定义一旦显式设置 `extensions`(哪怕是 `[]`)或 `denyExtensions`,或遇到 pi-subagents 版本漂移 / npm store 同步问题,就**静默回归直连**(代理侧零可见性)。
+
+**修法。** pi 扩展在 session_start 时向 pi-subagents 的全局 required-child-extension registry 自注册(对 `globalThis[Symbol.for("pi-subagents.required-child-extensions.v1")]` 做特征探测)。注册条目使 bili 成为**该父会话派生的每个 child 的必需扩展**;必需扩展经 `additionalExtensionPaths` 注入,pi 会把它载入 `cliEnabledExtensions` 桶——**即使 `noExtensions: true` 也加载**——所以下面每一格都是确定性加载。注册按父会话粒度,session_shutdown 时释放;同会话已有条目时让位(先写者胜)。刻意**不设置** `requireForAllRunners`:非 pi 的 runner 放置保持现状,而不是被拒绝。registry 不存在或形状不符(新旧 pi-subagents 版本漂移)时,扩展降级回修复前行为并记一次日志。kill switch `BILLION_CONTEXT_PLUGIN=0` / `BILI_NATIVE_PI=0` 同样会抑制注册。不引入任何新配置面。
+
+修复后矩阵(pi 0.83.6 + pi-subagents 0.76.0 实机验证,HTTP 传输;WS 行依据 #2073 记录,无实机格):
+
+| 格子 | 修复前 | 修复后 |
+|---|---|---|
+| native × 前台 × 默认配置 | 匿名 `pfa-*` proxy 模式;ACP 工具仅靠代理 wire 注入 | **具名 child-sid plugin 模式会话**;ACP 工具首个请求起本地注册;压缩记在 child 自己的 id 下 |
+| native × 后台 × 默认配置 | ambient 运气——settings packages 恰好加载时才是具名 plugin 模式 | 同上,但现在是确定性的(child launch-resolved extensions 里 `required: ["bili"]`) |
+| native × 后台 × agent 定义 `extensions: []` / `denyExtensions` | **静默直连**——代理零可见性、无压缩 | 确定性必需路径加载;具名 plugin 会话。(若运行时能力上限硬性拒绝扩展,pi-subagents 0.76.0 会让 child 启动大声失败——fail-fast 而非静默) |
+| launcher 模式(`bili pi`)× 后台 | child 继承 provider rewrite(#535),但 bili 加载同样靠 ambient 运气 | 注册生效(刻意**不受** `BILI_PROVIDER_REWRITES` 门控);父与子均为具名会话,经继承的 rewrite 路由 |
+| 任意 × 纯 WS 传输 | 不在范围——见上方 WS 缺口 | 不变:客户端侧 WS 拦截仍 owner-gated(#2073) |
+
+值得知道的注意事项:
+
+- **限制性 `tools:` 白名单会滤掉 ACP 工具。** frontmatter `tools:` 列表未包含 ACP 工具名的 agent 定义(如内建 `scout` 只列了 `read`/`bash`/…),child 里不会出现这些工具——尽管会话是具名的、压缩也成立。修复前的前台 child 恰好靠代理 wire 注入绕过了白名单拿到工具——所以这类 agent 升级后可用的工具变少了。恢复方式:省略 `tools:` 字段,或补上 `compress,decompress,search_context,acp_status,acp_cache`。该过滤是 pi-subagents 的既有行为,不是本修复引入的回归。
+- **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
+- **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
+
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
 部分客户端(VS Code 系 IDE:CodeBuddy、Cursor、Windsurf……)只提供一个 HTTP **代理**设置(`http.proxy`、`codingcopilot.httpProxyURL` 等),没有可改写的模型 base-URL。这类客户端不走普通的 `/bili/…` 请求,而是把 `CONNECT <模型域名>:443` 发给代理。只有当模型域名在 bili 的 **MITM 白名单**里时这条路径才会被解密;否则 bili 只做盲隧道(不透明转发),永远看不到——也就无法压缩——模型请求(#897)。
