@@ -60,6 +60,12 @@ export interface WebSessionSummary {
     modelSwitches?: number;
     /** Σ stable-prefix tokens re-billed right after a model switch (#1535). */
     switchMissedTokens?: number;
+    /** #2131: relay account rotations — outbound credential fingerprint changes
+     *  between consecutive samples (key pool behind a stable URL). */
+    keySwitches?: number;
+    /** #2131: Σ stable-prefix tokens re-billed after a key switch (cold cache
+     *  on the rotated account). */
+    keySwitchMissedTokens?: number;
     /** Σ (S−σ)×requestsAfter across ledger folds — input tokens not billed thanks to
      *  compression (acp-kernel EconomicsSummary.grossSaved semantics). */
     grossSaved?: number;
@@ -198,7 +204,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
     // Per-field MAX (the sources overlap, never sum). Read-only on purpose:
     // getCacheLedger() would bootstrap/mutate session.metadata instead.
     const led = s.metadata["cacheLedger"] as {
-        agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number; switches?: number; switchMissed?: number };
+        agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number; switches?: number; switchMissed?: number; keySwitches?: number; keySwitchMissed?: number };
         folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }>;
     } | undefined;
     const agg = led;
@@ -267,6 +273,9 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
             : {}),
         ...(typeof agg?.agg?.switches === "number" && agg.agg.switches > 0
             ? { modelSwitches: agg.agg.switches, switchMissedTokens: agg?.agg?.switchMissed ?? 0 }
+            : {}),
+        ...(typeof agg?.agg?.keySwitches === "number" && agg.agg.keySwitches > 0
+            ? { keySwitches: agg.agg.keySwitches, keySwitchMissedTokens: agg?.agg?.keySwitchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
     };
