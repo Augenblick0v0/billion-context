@@ -149,10 +149,13 @@ test("#2204 whole-block toFile write failure → outcome:failure, labeled partia
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-wf-"));
     try {
         // A regular file where a directory must be created → mkdir throws
-        // deterministically (ENOTDIR/EEXIST) on every platform.
+        // deterministically (ENOTDIR/EEXIST) on every platform. endRef=6 folds
+        // 4 refs (the kernel's recent-zone trims the span tail) → body ≈ 8.3K:
+        // past the 4000-char preview cap (partial label) yet under the 10000
+        // auto-tmpdir gate, so the no-toFile retry restores INLINE.
         const blocker = path.join(scratch, "blocker");
         fs.writeFileSync(blocker, "x");
-        const { ctx, session, blockId } = foldBlock("wf", 8);
+        const { ctx, session, blockId } = foldBlock("wf", 6);
         const before = session.stats.wholeBlockRestores ?? 0;
         const out = resolveDecompress({ blockId, toFile: path.join(blocker, "nested", "out.txt") }, ctx);
         assert.equal(out.outcome, "failure", "a write failure must carry the failure outcome (#2204)");
@@ -172,15 +175,19 @@ test("#2204 whole-block toFile write failure → outcome:failure, labeled partia
     }
 });
 
-test("#2204 whole-block toFile write failure with a small body labels the preview as FULL, not partial", () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-wfs-"));
+test("#2204 range toFile write failure with a small span labels the preview as FULL, not partial", () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2204-rwfs-"));
     try {
         const blocker = path.join(scratch, "blocker");
         fs.writeFileSync(blocker, "x");
-        const { ctx, blockId } = foldBlock("wfs", 4, 150);
-        const out = resolveDecompress({ blockId, toFile: path.join(blocker, "out.txt") }, ctx);
+        // Whole-block bodies always clear the kernel's 5000-char min-compress
+        // threshold, so only a sub-block RANGE span can land under the 4000
+        // preview cap. One message ≈ 2K chars → "full content follows".
+        const f = foldCcr();
+        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
+        const out = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00002", toFile: path.join(blocker, "span.txt") }, ctx);
         assert.equal(out.outcome, "failure");
-        assert.match(out.text, /full content follows/, "body under the preview cap is not called partial");
+        assert.match(out.text, /full content follows/, "span under the preview cap is not called partial");
         assert.doesNotMatch(out.text, /partial content follows/);
     } finally {
         rmrf(scratch);
@@ -250,18 +257,21 @@ test("#2204 endpoint: a failed export answers ok:true + outcome:failure (and suc
     const config = defaultConfig(200_000) as Config;
     const session = getSession(`t2204-ep-${Math.random().toString(36).slice(2)}`);
     const msgs: CoreMessage[] = [];
-    for (let i = 0; i < 12; i++) {
+    // The kernel's recent-zone trims the span tail and its min-compress
+    // threshold (5000 chars) applies to what SURVIVES the trim — endRef=6 at
+    // ~2K chars/message folds 4 refs ≈ 8.3K, clearing both gates.
+    for (let i = 0; i < 14; i++) {
         msgs.push({
             id: `h_${i}`,
             role: i % 2 === 0 ? "user" : "assistant",
             contentType: "text",
-            text: `\x3cacp tokens="2K" type="text"\x3em${pad(i + 1)}\x3c/acp\x3e\nEndpoint detail ${i}. ${"y".repeat(300)}`,
+            text: `\x3cacp tokens="2K" type="text"\x3em${pad(i + 1)}\x3c/acp\x3e\nEndpoint detail ${i}. ${"y".repeat(2000)}`,
         });
     }
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
     session.state = turn.state;
     const ctx = { core, config, messages: turn.messages, session, log: () => {} };
-    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00004", summary: "Endpoint span: initial setup and baseline notes for messages 0-3." }] }), ctx);
+    applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00006", summary: "Endpoint span: initial setup and baseline notes for messages 0-5." }] }), ctx);
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
 
     const deps: PluginToolDeps = { core, config: defaultConfig(400_000), log: () => {} };
