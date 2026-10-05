@@ -1138,13 +1138,15 @@ export async function* runCompressLoop(
                 // a thinking session is the split-turn signature — remember it
                 // on the session so #651's reasoning-drop never fires here
                 // again (kernel gate prevents the split; this closes the loop).
+                // #2169: match BOTH field spellings — the chat wire says
+                // reasoning_content, DeepSeek's Responses wire says reasoning_text.
                 if (
                     e.status === 400 &&
-                    /reasoning_content/i.test(e.body) &&
+                    /reasoning_(?:content|text)/i.test(e.body) &&
                     ctx.session.metadata.strictReasoningEcho !== true
                 ) {
                     ctx.session.metadata.strictReasoningEcho = true;
-                    ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
+                    ctx.log(`[acp-loop] 400 mentions a reasoning echo field — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684/#2169)`);
                     loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
                 }
                 // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).

@@ -341,6 +341,115 @@ describe("#1479 responses-wire strict-echo repair", () => {
     });
 });
 
+describe("#2169 responses-wire blank reasoning content sanitize", () => {
+    const BLANK_PARTS = [{ type: "reasoning_text", text: " " }];
+
+    it("enabled: clears whitespace-only content, keeps every other key, no mutation of the input item", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [{ type: "summary_text", text: "" }] };
+        const input = [
+            { type: "message", role: "user", content: "u" },
+            blank,
+            { type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" },
+        ];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal(out.length, input.length);
+        const r = out[1]!;
+        assert.notEqual(r, blank);
+        assert.equal(r.type, "reasoning");
+        assert.equal(r.id, "rs-blank");
+        assert.equal("content" in r, false);
+        assert.deepEqual(r.summary, [{ type: "summary_text", text: "" }]);
+        assert.equal("content" in blank, true, "input item must not be mutated in place");
+        assert.equal(out[0], input[0]);
+        assert.equal(out[2], input[2]);
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+        assert.match(c.lines[0]!, /\(#2169\)/);
+    });
+
+    it("enabled: multiple whitespace parts all blank → cleared once per item", () => {
+        const two = { type: "reasoning", id: "rs-2", content: [{ type: "reasoning_text", text: " " }, { type: "reasoning_text", text: "\t\n" }] };
+        const input = [two];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal("content" in out[0]!, false);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+    });
+
+    it("enabled: non-blank content stays byte-exact (same reference, no log)", () => {
+        const real = { type: "reasoning", id: "rs-1", content: [{ type: "reasoning_text", text: "encrypted blob" }], summary: [{ type: "summary_text", text: "s" }] };
+        const input = [real];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("enabled: mixed parts (one with real text) stay untouched", () => {
+        const mixed = { type: "reasoning", id: "rs-mix", content: [{ type: "reasoning_text", text: " " }, { type: "reasoning_text", text: "real" }] };
+        const input = [mixed];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("enabled: unknown part shapes stay untouched (empty array / missing text / non-string text / foreign part type / null)", () => {
+        for (const content of [
+            [],
+            [{ type: "reasoning_text" }],
+            [{ type: "reasoning_text", text: 42 }],
+            [{ type: "other_part", text: "x" }],
+            [null],
+        ]) {
+            const input = [{ type: "reasoning", id: "rs-x", content, summary: [] }];
+            const c = collector();
+            assert.equal(normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1"), input, JSON.stringify(content));
+            assert.equal(c.lines.length, 0);
+        }
+    });
+
+    it("disabled: blank content passes through untouched", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS };
+        const input = [blank];
+        const c = collector();
+        assert.equal(normalizeStrictEchoResponsesInput(input as never, false, c.log, "s1"), input);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("combined: orphaned run (later turn) + blank-content item (earlier turn) → both repairs, both logs, order preserved", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [{ type: "summary_text", text: "" }] };
+        const input = [
+            { type: "message", role: "user", content: "u" },
+            blank,
+            { type: "message", role: "assistant", content: "a" },
+            { type: "message", role: "user", content: "u2" },
+            { type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" },
+        ];
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.equal(out.length, input.length + 1);
+        assert.equal("content" in out[1]!, false, "blank item sanitized at its position");
+        const fcIdx = out.findIndex((it) => it.type === "function_call");
+        assert.deepEqual(out[fcIdx - 1], { type: "reasoning", summary: [{ type: "summary_text", text: "" }] });
+        assert.equal(c.lines.length, 2);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 1 item\(s\)/);
+        assert.match(c.lines[1]!, /injected 1 blank reasoning item\(s\)/);
+    });
+
+    it("normalizeStrictEchoBody: Responses body carrying a blank-content item is sanitized", () => {
+        const blank = { type: "reasoning", id: "rs-blank", content: BLANK_PARTS, summary: [] };
+        const body = { model: "m", input: [blank] };
+        const c = collector();
+        const out = normalizeStrictEchoBody(body, true, c.log, "s1");
+        assert.notEqual(out, body);
+        const outInput = out.input as Record<string, unknown>[];
+        assert.equal("content" in outInput[0]!, false);
+        assert.equal("content" in blank, true, "no mutation of the inbound body");
+    });
+});
+
 describe("#762 sentinel precision: presence, not emptiness", () => {
     const tc = (id: string) => [{ id, type: "function" as const, function: { name: "f", arguments: "{}" } }];
 
