@@ -187,6 +187,14 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         if (resolved === undefined) return { ok: false, code: "unresolvable", message: `cannot resolve tunnel destination ${host}` };
         ips = resolved;
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
+        // #2143: mDNS names (.local / single-label) answer with an unreachable
+        // fe80:: AAAA beside the routable A record. A bare fe80:: has no zone
+        // scope, so it can never be a connect target — safe to drop ONLY when a
+        // non-link-local answer coexists; a pure link-local answer keeps its
+        // hard deny in Layer 2. Hostname path only; IP literals skip this.
+        if (ips.some((ip) => classifyIp(ip) === "linkLocal") && ips.some((ip) => classifyIp(ip) !== "linkLocal")) {
+            ips = ips.filter((ip) => classifyIp(ip) !== "linkLocal");
+        }
     }
     // Layer 1: the proxy itself — the /__bili/ management plane must never be
     // reachable through the tunnel, from any client. 0.0.0.0/:: as a
