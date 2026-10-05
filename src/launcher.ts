@@ -731,7 +731,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // user-exported CLOUD_CODE_URL is a relay: wrap IT instead of the
         // stock endpoint (claude semantics). Fallback if Google removes the
         // knob: cert-MITM (the server honors HTTPS_PROXY, no pinning) — see
-        // CONFIGURATION.md.
+        // CLIENTS.md (Gemini family section).
         const raw = nonEmpty(config.antigravity?.baseUrl) ? config.antigravity!.baseUrl! : "https://cloudcode-pa.googleapis.com";
         const real = unwrapUpstream(raw);
         try {
@@ -4677,7 +4677,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #2115: CLOUD_CODE_URL points language_server straight at the loopback
         // proxy (undocumented override verified in the v2.19.1 binary); no
         // proxy/CA env needed. Fallback if Google removes the knob: cert-MITM
-        // (the server honors HTTPS_PROXY, no pinning) — CONFIGURATION.md.
+        // (the server honors HTTPS_PROXY, no pinning) — CLIENTS.md.
         env = buildAntigravityEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
         if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
             console.error(
