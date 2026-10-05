@@ -81,7 +81,7 @@ import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, est
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
-import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
@@ -1370,7 +1370,7 @@ async function handle(
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
-    if (req.method === "GET" && req.url === "/__bili/sessions") return sendWebSessions(res);
+    if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
@@ -7622,6 +7622,16 @@ function sendStats(res: http.ServerResponse): void {
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
+/** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
+ *  computed once and shared so the two surfaces cannot drift apart again (that
+ *  divergence is what left the web banner dead: overview never carried the field).
+ *  null when no advisory is active; otherwise the active entry plus targetFailed
+ *  (pinned target unresolvable on the registry → banner falls back to @latest). */
+function currentAdvisoryPayload() {
+    const adv = getAdvisoryState();
+    return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
+}
+
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
@@ -7634,8 +7644,6 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const adv = getAdvisoryState();
-    const advisory = adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
     const splitWarnings = splitSessionWarnings(listSessions());
     for (const w of splitWarnings) {
         if (!splitWarnedBases.has(w.base)) {
@@ -7643,7 +7651,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} is live under multiple session keys — ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. That is the #2165 failure shape (stolen anchor / never-compressing fork); report it if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory, inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -7654,7 +7662,15 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     } catch {
         // fs hiccup: report running state only, never fail the overview endpoint
     }
-    const overview = await buildOverview();
+    let overview;
+    try {
+        overview = await buildOverview();
+    } catch (error) {
+        loggerLog("error", `[acp-web] overview failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         overview,
@@ -7662,6 +7678,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         diskVersion,
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
+        advisory: currentAdvisoryPayload(),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
@@ -7670,10 +7687,31 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     }, null, 2));
 }
 
-async function sendWebSessions(res: http.ServerResponse): Promise<void> {
-    const sessions = await buildSessionList();
+/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
+ *  server-side filtered paging. Without params the response shape is unchanged
+ *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
+    let body: Record<string, unknown>;
+    try {
+        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+            const rawSize = Number(u.searchParams.get("pageSize"));
+            const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
+            const rawPage = Number(u.searchParams.get("page"));
+            const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+        } else {
+            const sessions = await buildSessionList();
+            body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };
+        }
+    } catch (error) {
+        loggerLog("error", `[acp-web] sessions list failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, hiddenEmpty: hiddenEmptyCount() }, null, 2));
+    res.end(JSON.stringify(body, null, 2));
 }
 
 /** #1426 web UI run-log viewer: tail of the rotated logger files (bili.log.old
