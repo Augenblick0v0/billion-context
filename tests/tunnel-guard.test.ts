@@ -203,6 +203,57 @@ test("checkTunnelDestination: default ports by scheme", async () => {
     assert.equal(httpsNoPort.code, "linkLocal", "scheme-default 443 still classified");
 });
 
+// #2124: proxied egress delegates hostname classification to the upstream proxy —
+// the destination is resolved REMOTELY via CONNECT, so a polluted/unreachable
+// local resolver must not hard-deny valid public names. IP literals and
+// direct-egress hostnames keep full local classification (unchanged).
+
+test("checkTunnelDestination: proxied egress delegates an unresolvable hostname to the proxy (#2124)", async () => {
+    const dead: ResolveHost = async () => { throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }); };
+    for (const clientLoopback of [true, false]) {
+        const v = await checkTunnelDestination("https://chatgpt.com/backend-api/codex/models", {
+            selfPort: 8787, clientLoopback, allowlist: [], localIps, resolveHost: dead, egressProxied: true,
+        });
+        assert.equal(v.ok, true, "a dead local resolver must not veto a proxied destination");
+    }
+});
+
+test("checkTunnelDestination: proxied egress skips local classification even for a private-resolving name (#2124)", async () => {
+    // Direct mode would deny this for a remote client (privateRemote); in proxied
+    // mode the PROXY decides where the name lands, so bili must not classify it
+    // against its own (possibly polluted) resolver.
+    const v = await checkTunnelDestination("https://relay.example/v1", {
+        selfPort: 8787, clientLoopback: false, allowlist: [], localIps,
+        resolveHost: stubResolve({ "relay.example": ["10.9.9.9"] }), egressProxied: true,
+    });
+    assert.equal(v.ok, true, "hostname classification is delegated, not done locally");
+});
+
+test("checkTunnelDestination: proxied egress STILL enforces IP-literal self/metadata/private (#2124)", async () => {
+    // Literals need no DNS; these layers are unaffected by egressProxied.
+    const selfV = await checkTunnelDestination("http://127.0.0.1:8787/__bili/config", { selfPort: 8787, clientLoopback: false, allowlist: [], localIps, egressProxied: true });
+    assert.equal(selfV.ok, false);
+    assert.equal(selfV.code, "self", "self check holds for literals even in proxied mode");
+    const metaV = await checkTunnelDestination("http://169.254.169.254/latest/meta-data/", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps, egressProxied: true });
+    assert.equal(metaV.ok, false);
+    assert.equal(metaV.code, "linkLocal", "metadata check holds for literals even in proxied mode");
+    const privV = await checkTunnelDestination("http://192.168.1.9:9000/v1", { selfPort: 8787, clientLoopback: false, allowlist: [], localIps, egressProxied: true });
+    assert.equal(privV.ok, false);
+    assert.equal(privV.code, "privateRemote", "literal private stays denied for remote clients even in proxied mode");
+});
+
+test("checkTunnelDestination: unresolvable surfaces the raw resolver code + remediation hint (#2124)", async () => {
+    const v = await checkTunnelDestination("https://no-such-host.invalid/v1", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps, resolveBackoffMs: 1,
+        resolveHost: async () => { throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" }); },
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "unresolvable");
+    assert.match(v.message, /\(EAI_AGAIN\)/, "raw resolver error code is surfaced");
+    assert.match(v.message, /local name resolution failed/, "diagnostic hint points at a poisoned/unreachable resolver");
+    assert.match(v.message, /upstream proxy/, "hint offers the proxy remediation");
+});
+
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {
     assert.deepEqual(tunnelAllowlistFromEnv({ BILI_TUNNEL_ALLOWED_HOSTS: "127.0.0.1:8199, LANRELAY.EXAMPLE , ,10.0.0.5" }), ["127.0.0.1:8199", "lanrelay.example", "10.0.0.5"]);
     assert.deepEqual(tunnelAllowlistFromEnv({}), []);

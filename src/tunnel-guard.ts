@@ -145,6 +145,15 @@ export interface TunnelCheckContext {
     localIps?: () => Set<string>;
     /** Backoff between admission-resolution retries (default RESOLVE_BACKOFF_MS). */
     resolveBackoffMs?: number;
+    /**
+     * #2124: this destination's egress leaves through an upstream proxy, which
+     * resolves it REMOTELY (CONNECT \x3chost\x3e:\x3cport\x3e) — bili never sees the IP, so
+     * classifying a hostname against the local resolver measured the wrong object
+     * and a polluted/unreachable resolver hard-denied valid public destinations.
+     * Hostnames are then delegated to the proxy (no local classification); IP
+     * literals and direct-egress hostnames are unaffected.
+     */
+    egressProxied?: boolean;
 }
 
 export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
@@ -168,6 +177,14 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     const literal = parseIpLiteral(host);
     if (literal) {
         ips = [normalizeIpLiteral(literal)];
+    } else if (ctx.egressProxied) {
+        // #2124: egress leaves through an upstream proxy, which resolves the
+        // destination REMOTELY (CONNECT \x3chost\x3e:\x3cport\x3e) — bili never sees the IP, so
+        // local-resolver classification measured the wrong object and hard-denied
+        // valid public names under a polluted/unreachable resolver. Delegate to the
+        // proxy; the x-bili-tunnel marker + management-plane rejection still blocks
+        // reaching the proxy's own /__bili/ plane.
+        return { ok: true };
     } else {
         // #1686: bounded retry — a transiently unreachable DNS server must not
         // masquerade as a dead name. Only throws are retried; an empty answer
@@ -175,16 +192,23 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         const resolve = ctx.resolveHost ?? dnsResolveHost;
         const backoff = ctx.resolveBackoffMs ?? RESOLVE_BACKOFF_MS;
         let resolved: string[] | undefined;
+        let lastErrCode: string | undefined;
         for (let attempt = 1; attempt <= RESOLVE_MAX_ATTEMPTS; attempt++) {
             try {
                 resolved = await resolve(host);
                 break;
-            } catch {
+            } catch (err) {
+                const code = (err as { code?: string } | null)?.code;
+                if (code) lastErrCode = code;
                 if (attempt === RESOLVE_MAX_ATTEMPTS) break;
                 await new Promise<void>((r) => setTimeout(r, backoff));
             }
         }
-        if (resolved === undefined) return { ok: false, code: "unresolvable", message: `cannot resolve tunnel destination ${host}` };
+        if (resolved === undefined) return {
+            ok: false,
+            code: "unresolvable",
+            message: `cannot resolve tunnel destination ${host}${lastErrCode ? ` (${lastErrCode})` : ""}: local name resolution failed — the local resolver may be unreachable or taken over by another DNS service (VPN/MagicDNS); route egress through an upstream proxy to have the destination resolved remotely`,
+        };
         ips = resolved;
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
     }
