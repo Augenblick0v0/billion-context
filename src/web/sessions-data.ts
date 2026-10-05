@@ -7,6 +7,8 @@ import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
+import { dataDir } from "../paths.js";
+import { statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 
@@ -249,17 +251,45 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
+/** #2180: a top-level ENOENT means "pristine" — a fresh install where the data
+ *  root was never created, so no session file can exist anywhere — only when
+ *  the DEFAULT layout is in effect: BILI_SESSIONS_DIR unset AND the XDG data
+ *  root itself absent. An explicit override pointing nowhere, or a data root
+ *  that exists without its sessions subdir, stays loud (#1937): silence there
+ *  would hide a moved/misconfigured path while real sessions sit elsewhere. */
+function isPristineSessionsRoot(error: unknown): boolean {
+    if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
+    if (process.env.BILI_SESSIONS_DIR) return false;
+    try {
+        statSync(dataDir());
+        return false;
+    } catch (e) {
+        return (e as NodeJS.ErrnoException).code === "ENOENT";
+    }
+}
+
 /** Single-flight index refresh. Steady-state cost is one stat per file; only
  *  new/changed files (mtime OR size moved) are decoded, one at a time with a
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
- *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI). */
+ *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
+ *  except a pristine default layout (#2180), which resolves to an EMPTY index
+ *  instead of failing. */
 async function refreshIndex(): Promise<void> {
     if (scanInFlight) return scanInFlight;
     const run = (async () => {
         const store = getDiskStore();
         const dir = store.dir;
-        const files = await walkSessionFiles(dir);
+        let files: Array<{ abs: string; mtimeMs: number; size: number }>;
+        try {
+            files = await walkSessionFiles(dir);
+        } catch (error) {
+            if (!isPristineSessionsRoot(error)) throw error;
+            byFile = new Map<string, DiskEntry>();
+            byId = new Map<string, string>();
+            log("info", `[acp-web] sessions dir ${dir} not created yet (fresh install) — serving empty index (#2180)`);
+            return;
+        }
         const prev = byFile ?? new Map<string, DiskEntry>();
         const next = new Map<string, DiskEntry>();
         const covered = liveCoveredPaths(dir);
