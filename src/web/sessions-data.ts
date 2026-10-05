@@ -1,3 +1,4 @@
+import { orderedRefPair } from "acp-kernel";
 import { listSessions, type Session } from "../session.js";
 import { conflictEventsOf } from "../conflict-watch.js";
 import { SessionStore } from "../persist.js";
@@ -444,16 +445,25 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
         handoffHtml: markdownToHtml(handoffMd),
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
-        blockDetails: session.state.blocks.map((b) => ({
-            blockId: b.blockId,
-            tier: b.tier,
-            ...(b.topic !== undefined ? { topic: b.topic } : {}),
-            summary: b.summary,
-            compressedTokens: b.compressedTokens,
-            createdAt: b.createdAt,
-            ...(b.startRef !== undefined ? { startRef: b.startRef } : {}),
-            ...(b.endRef !== undefined ? { endRef: b.endRef } : {}),
-            active: b.active,
-        })),
+        blockDetails: session.state.blocks.map((b) => {
+            // Display data: canonicalize to ascending labels so non-monotonic-
+            // ref spans don't render reversed in the UI (#2168).
+            const span =
+                b.startRef !== undefined && b.endRef !== undefined
+                    ? orderedRefPair(b.startRef, b.endRef)
+                    : null;
+            return {
+                blockId: b.blockId,
+                tier: b.tier,
+                ...(b.topic !== undefined ? { topic: b.topic } : {}),
+                summary: b.summary,
+                compressedTokens: b.compressedTokens,
+                createdAt: b.createdAt,
+                ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+                ...(span === null && b.startRef !== undefined ? { startRef: b.startRef } : {}),
+                ...(span === null && b.endRef !== undefined ? { endRef: b.endRef } : {}),
+                active: b.active,
+            };
+        }),
     };
 }
