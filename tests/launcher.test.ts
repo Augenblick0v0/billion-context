@@ -2714,15 +2714,31 @@ test("buildCodexArgs: httpsRewrites emit -c key=raw upstream (unwrapped, for cer
     ]);
 });
 
-test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", () => {
+test("buildCodexArgs: #2197 extra args first, then -c rewrites (last-wins: bili's substitution must beat a user -c on the same key)", () => {
     const rewrites: HttpRewrite[] = [
         { key: "k1", realUpstream: "u1" },
         { key: "k2", realUpstream: "u2" },
     ];
     assert.deepEqual(buildCodexArgs("http://h:p", rewrites, [], ["--extra"]), [
+        "--extra",
         "-c", "k1=http://h:p/bili/u1",
         "-c", "k2=http://h:p/bili/u2",
-        "--extra",
+    ]);
+});
+
+test("buildCodexArgs: #2197 user -c on a rewritten key is clobbered by the appended bili rewrite", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.e2e.base_url", realUpstream: "http://127.0.0.1:9/" },
+    ];
+    const out = buildCodexArgs(
+        "http://127.0.0.1:41355",
+        rewrites,
+        [],
+        ["-c", "model_providers.e2e.base_url=http://user-picked.local/v1"],
+    );
+    assert.deepEqual(out, [
+        "-c", "model_providers.e2e.base_url=http://user-picked.local/v1",
+        "-c", `model_providers.e2e.base_url=${wrapUpstream("http://127.0.0.1:41355", "http://127.0.0.1:9/")}`,
     ]);
 });
 

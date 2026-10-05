@@ -63,7 +63,7 @@ import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
@@ -957,14 +957,19 @@ export function buildCodexArgs(
     httpsRewrites: HttpRewrite[],
     extra: string[],
 ): string[] {
-    const args: string[] = [];
+    // #2197: codex applies repeated -c left-to-right, LAST WINS (verified
+    // 0.147.0), so the transport substitution must come AFTER the user's own
+    // argv — otherwise a user `-c <same key>` silently wins and the request
+    // bypasses the proxy. The TARGET itself is already chosen from the merged
+    // effective view (profile + CLI overrides), so appending never hides a
+    // user-selected endpoint behind a stale one.
+    const args = [...extra];
     for (const r of httpRewrites) {
         args.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
     }
     for (const r of httpsRewrites) {
         args.push("-c", `${r.key}=${r.realUpstream}`);
     }
-    args.push(...extra);
     return args;
 }
 
@@ -4434,6 +4439,25 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     }
     const config = loadClientConfig(discoveryEnv, process.cwd());
+    if (base === "codex") {
+        // #2197: codex resolves providers from base config + -p profile file
+        // overlay + -c/-m CLI overrides; discovery, budget alignment and the
+        // MCP/flat-tool decision must all use that merged view or a
+        // profile-only provider bypasses the proxy entirely. Same CODEX_HOME
+        // resolution loadClientConfig used above. Fail BEFORE the proxy is
+        // spawned (a refusal after ensureProxyRunning leaks a detached child).
+        const eff = resolveCodexEffectiveView(resolveCodexHome(discoveryEnv), config.codex ?? { providers: {} }, params.clientArgs);
+        if (eff.fatal) {
+            console.error(`bili: ${eff.fatal}`);
+            process.exit(2);
+        }
+        if (eff.profileMissing) {
+            console.error(`bili: codex profile "${eff.profile}" has no ${resolveCodexHome(discoveryEnv)}/${eff.profile}.config.toml — codex runs on the base config only, so routing follows the base config too.`);
+        } else if (eff.profile) {
+            console.error(`bili: codex profile "${eff.profile}" loaded — route discovery uses the merged base+profile+CLI view.`);
+        }
+        config.codex = eff.config;
+    }
     let routes = discoverRoutes(base, config);
     if (base === "aider") {
         // #1048: the CLI channel (--openai-api-base / --set-env) outranks env

@@ -683,6 +683,206 @@ export function readCodexConfig(codexHome: string): CodexConfig {
     return parseCodexToml(text);
 }
 
+/** #2197: the effective codex config view for ONE launch — base `config.toml`,
+ *  then the `-p/--profile <name>` file overlay (`$CODEX_HOME/<name>.config.toml`),
+ *  then CLI `-c/--config key=value` / `-m/--model` overrides: codex's own
+ *  precedence (verified against codex-cli 0.147.0 with marker upstreams —
+ *  profile-only providers take over all model traffic; a later -c beats both
+ *  profile and base; repeated -c on one key: last wins; 0.160.0's --help
+ *  confirms the same overlay semantics). Every launcher routing/budget decision
+ *  must use this view — discovery reading only the base file is exactly the
+ *  bypass this interface removes. */
+export interface CodexEffectiveView {
+    config: CodexConfig;
+    /** The selected profile name (-p/--profile), for diagnostics. */
+    profile?: string;
+    /** -p named a profile whose file does not exist — codex itself continues
+     *  on the base config alone (verified 0.147), so the view is base-only and
+     *  the caller surfaces a visible notice instead of guessing. */
+    profileMissing?: boolean;
+    /** Fatal problem (invalid profile name / malformed profile TOML): codex
+     *  itself refuses to start in that state, so the caller must fail loudly
+     *  before spawning anything. */
+    fatal?: string;
+}
+
+/** Strip one pair of matching surrounding quotes from a TOML-ish value. */
+function unquoteTomlValue(raw: string): string {
+    const t = raw.trim();
+    if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+        return t.slice(1, -1);
+    }
+    return t;
+}
+
+/** Extract the profile selected by -p/--profile from raw client args (last
+ *  occurrence wins). A value starting with "-" is a flag, not a name — ignored. */
+export function extractCodexProfile(args: readonly string[]): string | undefined {
+    let profile: string | undefined;
+    for (let i = 0; i < args.length; i += 1) {
+        const a = args[i]!;
+        if (a === "-p" || a === "--profile") {
+            const v = args[i + 1];
+            if (v !== undefined && !v.startsWith("-")) { profile = v; i += 1; }
+        } else if (a.startsWith("--profile=")) {
+            const v = a.slice("--profile=".length);
+            if (v.length > 0 && !v.startsWith("-")) profile = v;
+        }
+    }
+    return profile;
+}
+
+/** Apply codex CLI overrides onto a fresh view. Only the keys bili needs for
+ *  routing/budget decisions are recognized; arbitrary other dotted keys are
+ *  ignored (codex accepts any of them). Repeated occurrences apply left to
+ *  right — last wins (codex's verified behavior). A `-c`/`--config` token is
+ *  only consumed when its next arg actually looks like `key=value`, so a
+ *  positional prompt word is never swallowed. */
+export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
+    const out: CodexConfig = { providers: {} };
+    let model: string | undefined;
+    let provider: string | undefined;
+    let openaiBaseUrl: string | undefined;
+    let contextWindow: number | undefined;
+    let autoCompactLimit: number | undefined;
+    let maxOutput: number | undefined;
+    const asNumber = (raw: string): number | undefined => {
+        const n = Number(unquoteTomlValue(raw));
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    const applyKv = (kv: string | undefined): void => {
+        if (!kv) return;
+        const eq = kv.indexOf("=");
+        if (eq <= 0) return;
+        const key = kv.slice(0, eq).trim();
+        const val = unquoteTomlValue(kv.slice(eq + 1));
+        if (key === "model") model = val;
+        else if (key === "model_provider") provider = val;
+        else if (key === "openai_base_url") openaiBaseUrl = val;
+        else if (key === "model_context_window") contextWindow = asNumber(val);
+        else if (key === "model_auto_compact_token_limit") autoCompactLimit = asNumber(val);
+        else if (key === "model_max_output_tokens") maxOutput = asNumber(val);
+        else {
+            const mp = /^model_providers\.(.+)\.base_url$/.exec(key);
+            if (mp) {
+                const id = unquoteTomlValue(mp[1]!);
+                out.providers[id] = { ...(out.providers[id] ?? {}), baseUrl: val };
+            }
+        }
+    };
+    for (let i = 0; i < args.length; i += 1) {
+        const a = args[i]!;
+        if (a === "-m" || a === "--model") {
+            const v = args[i + 1];
+            if (v !== undefined && !v.startsWith("-")) { model = unquoteTomlValue(v); i += 1; }
+        } else if (a.startsWith("--model=")) {
+            model = unquoteTomlValue(a.slice("--model=".length));
+        } else if (a === "-c" || a === "--config") {
+            const v = args[i + 1];
+            if (v !== undefined && v.includes("=") && !v.startsWith("-")) { applyKv(v); i += 1; }
+        } else if (a.startsWith("--config=")) {
+            applyKv(a.slice("--config=".length));
+        }
+    }
+    if (model !== undefined) out.model = model;
+    if (provider !== undefined) out.modelProvider = provider;
+    if (openaiBaseUrl !== undefined) out.openaiBaseUrl = openaiBaseUrl;
+    if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (autoCompactLimit !== undefined) out.autoCompactLimit = autoCompactLimit;
+    if (maxOutput !== undefined) out.maxOutput = maxOutput;
+    return out;
+}
+
+/** Merge two codex views: overlay wins per key (scalar override; providers
+ *  merge by name, overlay baseUrl beating base). modelWindows is rebuilt from
+ *  the merged model/window/maxOutput pair so budget alignment sees the final
+ *  values (#321 semantics preserved across layers). */
+export function mergeCodexViews(base: CodexConfig, overlay: CodexConfig): CodexConfig {
+    const providers: Record<string, CodexProvider> = {};
+    for (const [name, prov] of Object.entries(base.providers ?? {})) providers[name] = { ...prov };
+    for (const [name, prov] of Object.entries(overlay.providers ?? {})) {
+        providers[name] = { ...(providers[name] ?? {}), ...prov };
+    }
+    const model = overlay.model ?? base.model;
+    const contextWindow = overlay.contextWindow ?? base.contextWindow;
+    const maxOutput = overlay.maxOutput ?? base.maxOutput;
+    const out: CodexConfig = { providers };
+    if (overlay.modelProvider !== undefined || base.modelProvider !== undefined) out.modelProvider = overlay.modelProvider ?? base.modelProvider;
+    if (overlay.openaiBaseUrl !== undefined || base.openaiBaseUrl !== undefined) out.openaiBaseUrl = overlay.openaiBaseUrl ?? base.openaiBaseUrl;
+    if (model !== undefined) out.model = model;
+    if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (overlay.autoCompactLimit !== undefined || base.autoCompactLimit !== undefined) out.autoCompactLimit = overlay.autoCompactLimit ?? base.autoCompactLimit;
+    if (maxOutput !== undefined) out.maxOutput = maxOutput;
+    const win = toModelWindow(model, contextWindow, maxOutput);
+    if (win) out.modelWindows = [win];
+    return out;
+}
+
+/** Structural sanity check for a codex TOML file (base or profile): every
+ *  non-blank non-comment line must be a table header, an array-of-tables
+ *  header, or `key = …`. Multi-line strings ("""…""" / '''…''') are tracked so
+ *  their bodies do not false-positive. Returns a human-readable problem or
+ *  null. Deliberately NOT a full TOML parser — it only distinguishes
+ *  "structurally broken" (where codex itself hard-fails, verified 0.147) from
+ *  "valid TOML without fields bili reads" (which must pass silently). */
+export function codexTomlProblem(text: string): string | null {
+    let multiline: string | null = null;
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i]!.trim();
+        if (multiline) {
+            if (line.includes(multiline)) multiline = null;
+            continue;
+        }
+        if (!line || line.startsWith("#")) continue;
+        let opened: string | null = null;
+        for (const d of ['"""', "'''"]) {
+            let count = 0;
+            let idx = line.indexOf(d);
+            while (idx !== -1) { count += 1; idx = line.indexOf(d, idx + d.length); }
+            if (count % 2 === 1) { opened = d; break; }
+        }
+        if (opened) { multiline = opened; continue; }
+        if (/^\[[^\[\]]+\]$/.test(line) || /^\[\[[^\[\]]+\]\]$/.test(line)) continue;
+        if (/^[\w"'][\w."'-]*(\.[\w"'][\w."'-]*)*\s*=/.test(line)) continue;
+        return `line ${i + 1}: unrecognized structure (${line.slice(0, 60)})`;
+    }
+    return null;
+}
+
+/** Build the effective view for one launch (see CodexEffectiveView). Reads
+ *  only — the user's config.toml / profile files are never modified. */
+export function resolveCodexEffectiveView(codexHome: string, base: CodexConfig, clientArgs: readonly string[]): CodexEffectiveView {
+    const profile = extractCodexProfile(clientArgs);
+    const view: CodexEffectiveView = { config: base };
+    if (profile !== undefined) {
+        view.profile = profile;
+        // A profile is a FILE STEM under CODEX_HOME — reject anything with
+        // separators/dots-runs before it can escape the home dir.
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(profile)) {
+            view.fatal = `invalid codex profile name "${profile}" — -p takes a plain file stem under $CODEX_HOME (<name>.config.toml)`;
+            return view;
+        }
+        const file = path.join(codexHome, `${profile}.config.toml`);
+        let text: string | undefined;
+        try {
+            text = fs.readFileSync(file, "utf8");
+        } catch {
+            view.profileMissing = true;
+        }
+        if (text !== undefined) {
+            const problem = codexTomlProblem(text);
+            if (problem) {
+                view.fatal = `codex profile "${profile}" (${file}) is not structurally valid TOML — ${problem}; codex itself refuses to start with a malformed profile`;
+                return view;
+            }
+            view.config = mergeCodexViews(view.config, parseCodexToml(text));
+        }
+    }
+    view.config = mergeCodexViews(view.config, parseCodexCliOverrides(clientArgs));
+    return view;
+}
+
 /** Built-in managed (OAuth-logged-in) model API hosts — absent from
  *  config.toml entirely, so the launcher falls back to them when the user
  *  declares no provider/model endpoints at all (qoder/trae precedent). */
