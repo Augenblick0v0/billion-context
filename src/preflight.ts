@@ -19,6 +19,7 @@ import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration } from "./util.js";
+import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -108,6 +109,8 @@ export interface PreflightDeps {
     upstreamOrigin?: string;
     /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
     forceStreamSummary?: boolean;
+    /** One external-summary deadline shared by every range/chunk in this invocation. */
+    externalSummary?: ConfiguredSummaryPlan;
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -680,6 +683,13 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     const system =
         buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
+    if (deps.externalSummary) {
+        const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
+            maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
+        const result = batch.results[0];
+        return result?.status === "success" ? { summary: result.summary }
+            : { unusable: "configured external summary candidates failed or exceeded their budget", transient: false };
+    }
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
     // the session metadata). #663: likewise, per URL+model, upstreams that
@@ -881,6 +891,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
+    deps = { ...deps, externalSummary: deps.externalSummary ?? configuredSummaryPlan() };
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.

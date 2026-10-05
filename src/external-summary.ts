@@ -2,6 +2,8 @@ export interface SummaryWork {
     readonly content: string;
     readonly instructions: string;
     readonly reference?: string;
+    readonly minSummaryChars?: number;
+    readonly maxSummaryChars?: number;
 }
 
 export interface SummaryCandidate {
@@ -152,7 +154,9 @@ export class ExternalSummaryExecutor {
                 } else if (result.kind === "error") {
                     attempts.push({ targetIndex, outcome: "error" });
                 } else if (typeof result.value !== "string" || !result.value.trim()
-                    || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes) {
+                    || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
+                    || result.value.trim().length < (request.minSummaryChars ?? 1)
+                    || ((request.maxSummaryChars ?? 0) > 0 && result.value.trim().length > request.maxSummaryChars!)) {
                     attempts.push({ targetIndex, outcome: "invalid_summary" });
                 } else {
                     attempts.push({ targetIndex, outcome: "success" });

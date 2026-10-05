@@ -12,6 +12,7 @@ import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
+import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -131,6 +132,8 @@ export type ModelEntry = {
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
 export type CompressSettings = {
+    /** Global-only external summary chain. Not supported in provider/model overrides. */
+    externalSummary?: ExternalSummarySettings;
     /** Effective context window used by the compression engine — this is the
      *  model's context size. It is the **denominator** the kernel uses for its
      *  usage ratio (`usage = tokens / modelContextLimit`); it is NOT a
@@ -1787,6 +1790,9 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     if (v && typeof v === "object" && !Array.isArray(v)) {
         const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
         const route: ProviderRoute = { models: obj.models };
+        if (obj.compress?.externalSummary !== undefined || Object.values(obj.models ?? {}).some((model) => model?.compress?.externalSummary !== undefined)) {
+            throw new Error("externalSummary is global-only; configure compress.externalSummary at the file root");
+        }
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
@@ -1847,6 +1853,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
+    if (obj.externalSummary !== undefined) {
+        try { out.externalSummary = parseExternalSummarySettings(obj.externalSummary); }
+        catch { return undefined; }
+    }
     const numberOrPercent = (value: unknown): value is number | string =>
         typeof value === "number" && Number.isFinite(value)
         || (typeof value === "string" && /^\d+(\.\d+)?%$/.test(value.trim()));

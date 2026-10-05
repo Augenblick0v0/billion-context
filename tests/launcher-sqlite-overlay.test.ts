@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { prepareCodexHome, refreshOverlayHome, isSqliteMain, finalizeCodexHome, SQLITE_ORIGIN_FILE } from "../src/launcher.js";
+import { supportsFileSymlink } from "./platform-capabilities.ts";
 
 const crequire = createRequire(import.meta.url);
 
@@ -263,6 +264,10 @@ test("overlay writes stay private until exit; divergent sides both survive", (t)
 test("legacy symlinked main is replaced by a private copy; sidecars quarantined", (t) => {
     if (!sqliteCtor) {
         t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    if (!supportsFileSymlink()) {
+        t.skip("file symlinks require Developer Mode or SeCreateSymbolicLinkPrivilege on this Windows host");
         return;
     }
     const root = mkRoot();
@@ -599,6 +604,10 @@ test("a directory named like a db is mirrored, not copied as a db set (#1919)", 
 test("relative legacy symlink to the real main is migrated too (#1919)", (t) => {
     if (!sqliteCtor) {
         t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    if (!supportsFileSymlink()) {
+        t.skip("file symlinks require Developer Mode or SeCreateSymbolicLinkPrivilege on this Windows host");
         return;
     }
     const root = mkRoot();

@@ -996,6 +996,35 @@
 
 压缩行为由 `compress` 块控制，它可以出现在三个层级。它们按**逐字段、最深层胜出**的方式合并：在更深层设置的字段会覆盖上层同名字段，但更深层*未设置*的字段**永远不会**清除上层已设置的值。换言之，子级按字段覆盖父级 —— 它绝不是整体替换对象。
 
+### 共享外部摘要服务
+
+可选的全局 `compress.externalSummary` 会把压缩摘要交给一个或多个独立配置的模型。只有 `enabled` 为 `true` 时才启用；启用后按顺序调用目标，目标失败或返回不可用摘要时继续使用下一个目标。摘要请求不会复用主请求的 provider、模型或认证信息。启用该功能后，压缩工具中的 `summary` 变为可选的、非权威提示；代理仍保留原文可恢复，只提交通过校验的外部摘要。
+
+```json
+{
+  "compress": {
+    "externalSummary": {
+      "enabled": true,
+      "targets": [
+        {
+          "name": "dedicated",
+          "protocol": "responses",
+          "url": "https://summary.example/v1/responses",
+          "model": "summary-model",
+          "credentialRef": "env:SUMMARY_API_KEY",
+          "contextWindow": 128000,
+          "outputTokens": 8192,
+          "stream": false
+        }
+      ],
+      "budget": { "totalTimeoutMs": 50000, "targetTimeoutMs": 25000, "maxSummaryBytes": 65536 }
+    }
+  }
+}
+```
+
+最多支持 16 个目标。端点必须使用 HTTPS，本机开发时允许回环地址的 HTTP；嵌入式凭据、代理递归路径和任意查询参数都会被拒绝。凭据可以引用 `env:NAME` 或 `secret:NAME`。`secret:` 值独立保存在主 JSON 配置之外的私有 `billion-context.json.summary-credentials.json` 文件中，配置 API 不会返回值。在 Windows 上应使用仅管理员可访问的 ACL 保护该文件及其父目录；发现 `.lock` 残留时，确认没有代理进程正在写入后再手动删除。所有目标和所有压缩入口共享总时限；请求取消或会话状态变化时，已生成的结果会被丢弃，不会折叠历史。
+
 三个层级，从最宽泛到最具体：
 
 1. **全局（Global）** —— 顶层 `"compress": { … }` 键。应用于每个请求。这是唯一会生效 `injectTool` / `injectNudge` 开关的层级。

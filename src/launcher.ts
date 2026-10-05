@@ -2389,14 +2389,14 @@ export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrite
             if (st.isSymbolicLink()) {
                 if (fs.readlinkSync(link) !== target) {
                     fs.rmSync(link);
-                    fs.symlinkSync(target, link);
+                    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
                 }
             } else {
                 return undefined;
             }
         } catch {
             try {
-                fs.symlinkSync(target, link);
+                fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
             } catch {
                 return undefined;
             }

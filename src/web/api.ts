@@ -17,6 +17,8 @@ import {
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
+import { SummaryCredentialStore } from "../external-summary-credentials.js";
+import { parseExternalSummarySettings } from "../external-summary-settings.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -83,6 +85,21 @@ function atomicWriteConfig(config: ConfigShape): void {
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
     const config = readConfig();
+    const rawCompress = config.compress && typeof config.compress === "object" ? config.compress as Record<string, unknown> : undefined;
+    const credentialStatus: Record<string, boolean> = {};
+    let hideInvalidSummary = false;
+    if (rawCompress?.externalSummary !== undefined) {
+        try {
+            const summary = parseExternalSummarySettings(rawCompress.externalSummary);
+            const store = new SummaryCredentialStore();
+            for (const target of summary.targets) credentialStatus[target.credentialRef] = store.configured(target.credentialRef);
+        } catch {
+            // A manually edited invalid block can contain inline credentials.
+            // Never echo that block through either structured or raw config GET.
+            config.compress = { ...rawCompress, externalSummary: { invalid: true } };
+            hideInvalidSummary = true;
+        }
+    }
     const parseError = configParseError();
     if (parseError) log("warn", `[acp-web] ${parseError} — showing empty view; PUT is blocked until fixed`);
     res.writeHead(200, { "content-type": "application/json" });
@@ -92,11 +109,25 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
+        externalSummaryCredentials: credentialStatus,
         passthrough: passthroughState(process.env),
         allowDshCompaction: allowDshCompactionState(process.env),
-        ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
+        ...(existsSync(configFile()) ? { raw: hideInvalidSummary ? JSON.stringify(config, null, 2) : readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
+}
+
+export async function handleSummaryCredentialPut(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return sendError(res, 400, "expected credential object");
+    const body = raw as Record<string, unknown>;
+    if (Object.keys(body).some((key) => key !== "name" && key !== "key") || typeof body.name !== "string"
+        || (body.key !== null && typeof body.key !== "string")) return sendError(res, 400, "expected name and key (null deletes)");
+    try {
+        new SummaryCredentialStore().set(body.name, body.key as string | null);
+    } catch { return sendError(res, 400, "could not save credential; check the name, key and private store permissions"); }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, configured: body.key !== null }));
 }
 
 export async function handleConfigPut(

@@ -51,6 +51,7 @@ import {
 import type { CompressPromptSections, Prompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
+import { externalSummaryEnabled, EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
 
 export {
     COMPRESS_TOOL_NAME,
@@ -461,5 +462,5 @@ const SUMMARY_BUDGET_NOTE =
  *  Unconditional (like withMarkerIntegrityNote): the cap always exists, so the
  *  guidance must be present whenever compression is possible. */
 export function withSummaryBudgetNote(text: string): string {
-    return text + SUMMARY_BUDGET_NOTE;
+    return text + SUMMARY_BUDGET_NOTE + (externalSummaryEnabled() ? EXTERNAL_SUMMARY_NOTE : "");
 }
