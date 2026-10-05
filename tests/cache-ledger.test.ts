@@ -139,7 +139,7 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     for (let i = 0; i < inc.folds.length; i++) {
         const a = inc.folds[i]!;
         const b = batch.folds[i]!;
-        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack"] as const) {
+        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack", "cadenceOk"] as const) {
             assert.deepEqual(a[key], b[key], `fold ${i} ${key}: incremental ${String(a[key])} !== batch ${String(b[key])}`);
         }
     }
@@ -157,10 +157,15 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     assert.equal(f1.T, 0);
     assert.ok(Math.abs(f1.breakevenTurns! - 2.5008976660682225) < 1e-9);
     assert.equal(f1.paidBack, true);
+    assert.equal(f1.cadenceOk, true);
     assert.equal(f1.savedSoFar, (12140 - 1000) * 3);
     const f2 = inc.folds.find((f) => f.seq === 2)!;
     assert.equal(f2.turnsToNextFold, null);
-    assert.equal(f2.paidBack, null);
+    // #2044: the last fold is now evaluable on the full post-fold window —
+    // zero post-fold requests against a positive n* is NOT PAID BACK (yet),
+    // no longer unobserved; cadenceOk stays null with no next fold.
+    assert.equal(f2.paidBack, false);
+    assert.equal(f2.cadenceOk, null);
     assert.equal(f2.requestsAfter, 0);
     assert.equal(inc.totals.balanced, true);
 });
