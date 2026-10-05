@@ -75,7 +75,7 @@ import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
@@ -6357,7 +6357,7 @@ async function forward(
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null);
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers));
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
@@ -7502,6 +7502,7 @@ function sendStats(res: http.ServerResponse): void {
     const all = listSessions();
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
+        const ks = readKeySwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
@@ -7519,6 +7520,8 @@ function sendStats(res: http.ServerResponse): void {
             lastModel: typeof s.metadata.lastModel === "string" ? s.metadata.lastModel : undefined,
             modelSwitches: sw?.count ?? 0,
             switchMissedTokens: sw?.missedTokens ?? 0,
+            keySwitches: ks?.count ?? 0,
+            keySwitchMissedTokens: ks?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.

@@ -309,7 +309,12 @@ prefix is re-billed on the next request — each switch's unexplained residual
 (its `ttl` bucket minus new content) is charged to the switch instead of
 masquerading as TTL expiry; per-event `from → to`, hit %, and attributed
 tokens are listed (`full` lists every event, the summary the last 8), and
-the web sessions table gains a matching model-switch column.
+the web sessions table gains a matching model-switch column. Since #2131 the
+same machinery fingerprints the outbound credential (a 12-hex sha256 of the
+`authorization`/`x-api-key`-family headers — the raw key is never stored) and
+attributes a **key switch** — the relay behind a stable URL rotated to a
+different account — in a dedicated `KEY SWITCHES` section, a `key switch:`
+line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column.
 HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
 land in the log file for deep dives.
 

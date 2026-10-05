@@ -198,12 +198,18 @@ export const WEB_CLIENT = `(function () {
         return '<td class="num"><span class="hitc" title="' + escapeHtml(t("ses.drop_ph")) + '">(' + parts.join("/") + ")</span></td>";
     }
     // MODEL SWITCHES column (#1535): mid-session model changes re-bill the stable prefix;
-    // shows count · dropped tokens, honest dash when none.
+    // shows count · dropped tokens, honest dash when none. #2131: appends 🔑 key
+    // switches (relay account rotation) when observed — rare but cache-fatal.
     function switchTd(s) {
-        if (!s.modelSwitches) return '<td class="num dim">' + t("common.none") + "</td>";
-        const tip = escapeHtml(t("ses.th_switches_tip"));
-        if (!s.switchMissedTokens) return '<td class="num" title="' + tip + '">' + s.modelSwitches + "</td>";
-        return '<td class="num" title="' + tip + '">' + s.modelSwitches + " · " + fmtW(s.switchMissedTokens) + "</td>";
+        const modelPart = s.modelSwitches
+            ? s.modelSwitches + (!s.switchMissedTokens ? "" : " · " + fmtW(s.switchMissedTokens))
+            : "";
+        const keyPart = s.keySwitches
+            ? '<span title="' + escapeHtml(t("ses.th_keyswitches_tip")) + '">🔑' + s.keySwitches + (!s.keySwitchMissedTokens ? "" : " · " + fmtW(s.keySwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart].filter(Boolean);
+        return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
     function sessionRow(s, compact) {
@@ -856,6 +862,18 @@ export const WEB_CLIENT = `(function () {
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2131: key switch events (relay account rotation) — fingerprints only,
+        // raw credentials never leave the ledger.
+        const keySw = ledger.keySwitches;
+        if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
+            const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>key</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+            keySw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");
         }

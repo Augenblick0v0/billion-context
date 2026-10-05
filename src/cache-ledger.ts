@@ -74,6 +74,12 @@ interface LedgerLine {
     proto?: string;
     /** #1536: LLM endpoint origin of this request — part of the target identity. */
     up?: string;
+    /** #2131: outbound credential fingerprint of this request
+     *  ("sha256:<12 hex>" of authorization/x-api-key/… — the raw key is
+     *  NEVER stored). A URL-granular upstream identity cannot see relay
+     *  key-pool rotation; the fingerprint can. Sparse: omitted when no
+     *  header capture happened on this lane. */
+    kp?: string;
     /** #1592-family seam detector: 1 iff this sample's unexplained residual
      *  tripped the mid-history-break suspicion (no fold/switch/restart
      *  attribution AND a large ttlRepay). Sparse: omitted unless set. */
@@ -89,6 +95,9 @@ interface LedgerLine {
     pw?: 1;
     /** #1536: 1 iff `up` differs from the previous sample's KNOWN origin. */
     uw?: 1;
+    /** #2131: 1 iff `kp` differs from the previous sample's KNOWN credential
+     *  fingerprint — relay account rotation behind a stable URL. */
+    kw?: 1;
     /** #1536: 1 on the first KNOWN sample under a NEW daemon boot (#499 restart/refork). */
     rs?: 1;
     /** #1536: 1 when the provider reported NO cache tokens — unmeasurable, quarantined out of closure totals. */
@@ -100,7 +109,7 @@ interface LedgerLine {
     nb?: 1;
     /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
      *  never more than one); omitted when unattributed or unmeasured. */
-    cause?: "restart" | "model" | "wire" | "upstream";
+    cause?: "restart" | "model" | "key" | "wire" | "upstream";
     /** #2131: SHA-256 hex of this request's exact outbound body — the per-call
      *  byte-identity proof; sparse: omitted when no body was captured. */
     bd?: string;
@@ -138,6 +147,13 @@ export interface CacheLedger {
         tr: number;
         switches: number;
         switchMissed: number;
+        /** #2131: relay account rotations — the outbound credential
+         *  fingerprint changed between consecutive samples (same URL can
+         *  hide a key pool behind it). Counted independently of the model/
+         *  wire/upstream dimensions; charged only when `key` wins the
+         *  attribution partition. */
+        keySwitches: number;
+        keySwitchMissed: number;
         wireSwitches: number;
         wireSwitchMissed: number;
         upstreamSwitches: number;
@@ -183,9 +199,13 @@ export interface CacheLedger {
     lastKnownModel?: string;
     lastKnownProto?: string;
     lastKnownUp?: string;
+    /** #2131: last measured outbound credential fingerprint ("sha256:<12hex>").
+     *  Absent until the first sample that captured one — unknown never flags. */
+    lastKnownKey?: string;
     invModel?: { seq: number; at: number; from: string | null; to: string };
     invWire?: { seq: number; at: number; from: string | null; to: string };
     invUp?: { seq: number; at: number; from: string | null; to: string };
+    invKey?: { seq: number; at: number; from: string | null; to: string };
 }
 
 const LEDGER_KEY = "cacheLedger";
@@ -250,6 +270,10 @@ interface SeamSlot {
     msgs: number | null;
     digest: string;
     full: string | null;
+    /** #2131: credential fingerprint of the headers that carried THIS body out.
+     *  Preserved across byte-identical re-notes (the non-streaming settle
+     *  re-notes the same wireBody without headers in hand). */
+    keyFp?: string;
 }
 const seamLastSent = new WeakMap<Session, SeamSlot>();
 const seamLastSettled = new WeakMap<Session, SeamSlot>();
@@ -290,13 +314,35 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+/** #2131: stable fingerprint of the outbound credential — the ONLY form the
+ *  key is ever persisted in (raw secrets never reach the ledger, logs or the
+ *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
+ *  returns undefined when the lane sent no recognized credential header. */
+export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
+    if (!headers) return undefined;
+    let cred: string | undefined;
+    for (const [name, value] of Object.entries(headers)) {
+        const n = name.toLowerCase();
+        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+            // Strip the auth-scheme envelope so "Bearer X" (authorization) and
+            // a bare "X" (x-api-key) hash to the SAME credential identity.
+            const v = value.trim().replace(/^Bearer\s+/i, "").trim();
+            if (v !== "") { cred = v; break; }
+        }
+    }
+    if (cred === undefined) return undefined;
+    return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
+}
+
 /** Record the body of the upstream round that is about to be sent. Called at
  *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
  *  the next settleUsageReport pairs it with the usage report it produced.
  *  `msgs` is the exact outbound message count (#2131); when omitted and the
  *  stored payload is byte-identical to a previously noted one (the non-streaming
- *  settle re-noting the same wireBody), the earlier count is kept. */
-export function noteForwardedBody(session: Session, body: string, msgs?: number | null): void {
+ *  settle re-noting the same wireBody), the earlier count is kept. `keyFp` is
+ *  the outbound credential fingerprint (#2131) — likewise inherited from the
+ *  prior slot on a byte-identical re-note without a fresh capture. */
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string): void {
     const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
     // #2131: hash the FULL body — the capped head alone cannot tell two payloads
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
@@ -310,6 +356,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         msgs: msgs ?? (samePayload ? prior.msgs : null),
         digest,
         full: body.length <= BODY_FULL_CAP ? body : samePayload ? prior.full : null,
+        keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
     });
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
@@ -532,7 +579,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         // in place so later arithmetic never sees undefined.
         const g = existing.agg;
         for (const key of [
-            "switches", "switchMissed", "wireSwitches", "wireSwitchMissed",
+            "switches", "switchMissed", "keySwitches", "keySwitchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
@@ -554,7 +601,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, keySwitches: 0, keySwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -609,7 +656,7 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
  *  billed prefix as an unexplained ttlRepay residual (#1536). */
 export function recordCacheSample(
     session: Session,
-    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string },
 ): void {
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
@@ -664,12 +711,17 @@ export function recordCacheSample(
         : undefined;
     const proto = typeof s.protocol === "string" && s.protocol !== "" ? s.protocol : undefined;
     const up = typeof s.upstream === "string" && s.upstream !== "" ? s.upstream : undefined;
+    // #2131: credential fingerprint — the fourth identity component. Same
+    // never-flags-on-unknown rule: a lane without header capture must not
+    // fabricate switch events.
+    const key = typeof s.keyFp === "string" && s.keyFp !== "" ? s.keyFp : undefined;
     // #1847: detect a dimension change against the last KNOWN value, not the immediately-previous
     // line — an unmeasured (null-cache) request at the switch boundary must not swallow the flag,
     // or the following measured cold re-bill lands unattributed. Unknown samples never advance it.
     const modelSwitched = known && model !== undefined && led.lastKnownModel !== undefined && model !== led.lastKnownModel;
     const wireSwitched = known && proto !== undefined && led.lastKnownProto !== undefined && proto !== led.lastKnownProto;
     const upstreamSwitched = known && up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp;
+    const keySwitched = known && key !== undefined && led.lastKnownKey !== undefined && key !== led.lastKnownKey;
     // #499: first KNOWN sample under a fresh daemon boot with prior history →
     // proxy-restart / re-fork boundary (upstream KV dropped during downtime).
     const restarted = known && led.lines.length > 0 && led.lastBoot !== undefined && led.lastBoot !== BOOT_ID;
@@ -700,12 +752,17 @@ export function recordCacheSample(
         inv !== undefined && !isWarm && seq - inv.seq <= SWITCH_COLD_ROUNDS;
     // A fresh change on THIS line outranks any prior-line continuation; among fresh changes use the fixed
     // priority; with none, fall to the highest-priority dimension whose cold window is still open.
-    const cause: "restart" | "model" | "wire" | "upstream" | null =
+    // #2131: `key` sits between model and wire — a rotated account on the same
+    // URL/model is more specific than a wire change and produces the same
+    // full-cold re-bill a model change does.
+    const cause: "restart" | "model" | "key" | "wire" | "upstream" | null =
         restarted ? "restart"
             : modelSwitched ? "model"
+            : keySwitched ? "key"
             : wireSwitched ? "wire"
             : upstreamSwitched ? "upstream"
             : contWithin(led.invModel) ? "model"
+            : contWithin(led.invKey) ? "key"
             : contWithin(led.invWire) ? "wire"
             : contWithin(led.invUp) ? "upstream"
             : null;
@@ -724,9 +781,11 @@ export function recordCacheSample(
         model,
         proto,
         up,
+        kp: key,
         sw: modelSwitched ? 1 : undefined,
         pw: wireSwitched ? 1 : undefined,
         uw: upstreamSwitched ? 1 : undefined,
+        kw: keySwitched ? 1 : undefined,
         rs: restarted ? 1 : undefined,
         unk: known ? undefined : 1,
         nb: noBaseline ? 1 : undefined,
@@ -751,10 +810,12 @@ export function recordCacheSample(
     // of attribution, preserving the full from→to log. Token buckets charge EXACTLY the primary cause so
     // the per-cause breakdown partitions the residual instead of overlapping it across dimensions.
     if (modelSwitched) agg.switches += 1;
+    if (keySwitched) agg.keySwitches += 1;
     if (wireSwitched) agg.wireSwitches += 1;
     if (upstreamSwitched) agg.upstreamSwitches += 1;
     if (restarted) agg.restartDrops += 1;
     if (cause === "model") agg.switchMissed += dec.ttlRepay;
+    else if (cause === "key") agg.keySwitchMissed += dec.ttlRepay;
     else if (cause === "wire") agg.wireSwitchMissed += dec.ttlRepay;
     else if (cause === "upstream") agg.upstreamSwitchMissed += dec.ttlRepay;
     else if (cause === "restart") agg.restartDropMissed += dec.ttlRepay;
@@ -765,17 +826,21 @@ export function recordCacheSample(
         led.invModel = undefined;
         led.invWire = undefined;
         led.invUp = undefined;
+        led.invKey = undefined;
     } else {
         if (led.invModel && seq - led.invModel.seq > SWITCH_COLD_ROUNDS) led.invModel = undefined;
         if (led.invWire && seq - led.invWire.seq > SWITCH_COLD_ROUNDS) led.invWire = undefined;
         if (led.invUp && seq - led.invUp.seq > SWITCH_COLD_ROUNDS) led.invUp = undefined;
+        if (led.invKey && seq - led.invKey.seq > SWITCH_COLD_ROUNDS) led.invKey = undefined;
     }
     if (modelSwitched) led.invModel = { seq, at: s.at, from: led.lastKnownModel ?? null, to: model! };
     if (wireSwitched) led.invWire = { seq, at: s.at, from: led.lastKnownProto ?? null, to: proto! };
     if (upstreamSwitched) led.invUp = { seq, at: s.at, from: led.lastKnownUp ?? null, to: up! };
+    if (keySwitched) led.invKey = { seq, at: s.at, from: led.lastKnownKey ?? null, to: key! };
     if (model !== undefined) led.lastKnownModel = model;
     if (proto !== undefined) led.lastKnownProto = proto;
     if (up !== undefined) led.lastKnownUp = up;
+    if (key !== undefined) led.lastKnownKey = key;
     if (noBaseline) {
         agg.nbSamples += 1;
         agg.nbInput += s.input;
@@ -887,8 +952,12 @@ export function settleUsageReport(
         session.stats.cachedTokens += s.reportedCached;
         session.stats.cacheSamples += 1;
     }
+    // #2131: the credential fingerprint captured at the send chokepoint rides
+    // the seam slot — read it BEFORE recordCacheSample so the line it pushes
+    // already carries the identity (kp/kw) without a second slot lookup.
+    const curKeyFp = seamLastSent.get(session)?.keyFp;
     const led = getCacheLedger(session);
-    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream });
+    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp });
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
@@ -968,6 +1037,7 @@ export interface ModelSwitchStats {
 
 export interface InvalidationTokenBreakdown {
     model: number;
+    key: number;
     wire: number;
     upstream: number;
     restart: number;
@@ -1004,8 +1074,11 @@ export interface BodyStability {
 export interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string }>;
     modelSwitches: ModelSwitchStats;
+    /** #2131: relay account rotations (credential fingerprint changes) —
+     *  the identity a URL-granular upstream switch cannot see. */
+    keySwitches: ModelSwitchStats;
     wireSwitches: ModelSwitchStats;
     upstreamSwitches: ModelSwitchStats;
     restartDrops: ModelSwitchStats;
@@ -1054,7 +1127,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
-    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "wire" | "upstream"): ModelSwitchEvent[] => {
+    const switchEvents = (flag: (l: LedgerLine) => boolean, value: (l: LedgerLine | undefined) => string | undefined, dim: "model" | "key" | "wire" | "upstream"): ModelSwitchEvent[] => {
         const evs: ModelSwitchEvent[] = [];
         for (let i = 0; i < led.lines.length; i++) {
             const l = led.lines[i];
@@ -1091,6 +1164,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
     }
     const invalidation: InvalidationTokenBreakdown = {
         model: a.switchMissed,
+        key: a.keySwitchMissed,
         wire: a.wireSwitchMissed,
         upstream: a.upstreamSwitchMissed,
         restart: a.restartDropMissed,
@@ -1167,12 +1241,14 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             ttlRepay: l.tr,
             foldSeq: l.foldSeq,
             bodyDigest: l.bd,
+            keyFp: l.kp,
             bodyEqual: l.be,
             bodyLcp: l.bl,
             bodyClass: l.bs,
         })),
         linesOmitted: led.sampleSeq - led.lines.length,
         modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
+        keySwitches: { count: a.keySwitches, missedTokens: a.keySwitchMissed, events: switchEvents((l) => l.kw === 1 && l.kp !== undefined, (l) => l?.kp, "key") },
         wireSwitches: { count: a.wireSwitches, missedTokens: a.wireSwitchMissed, events: switchEvents((l) => l.pw === 1 && l.proto !== undefined, (l) => l?.proto, "wire") },
         upstreamSwitches: { count: a.upstreamSwitches, missedTokens: a.upstreamSwitchMissed, events: switchEvents((l) => l.uw === 1 && l.up !== undefined, (l) => l?.up, "upstream") },
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
@@ -1194,6 +1270,19 @@ export function readModelSwitchStats(session: Session): { count: number; missedT
     return {
         count: typeof led.agg?.switches === "number" ? led.agg.switches : 0,
         missedTokens: typeof led.agg?.switchMissed === "number" ? led.agg.switchMissed : 0,
+    };
+}
+
+/** #2131: read-only KEY switch stats for the web sessions table — same
+ *  no-bootstrap contract as readModelSwitchStats. */
+export function readKeySwitchStats(session: Session): { count: number; missedTokens: number } | null {
+    const raw = session.metadata?.[LEDGER_KEY];
+    if (!raw || typeof raw !== "object") return null;
+    const led = raw as CacheLedger;
+    if (led.v !== 1) return null;
+    return {
+        count: typeof led.agg?.keySwitches === "number" ? led.agg.keySwitches : 0,
+        missedTokens: typeof led.agg?.keySwitchMissed === "number" ? led.agg.keySwitchMissed : 0,
     };
 }
 
@@ -1219,6 +1308,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         const report = buildSessionCacheReport(session);
         const stabilityText = formatStability(report.stability);
         const tail = (base: string): string => base + (stabilityText ? "\n\n" + stabilityText : "") + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
+        // #2131: key switches get their own section only when observed — the
+        // common case (one account, no rotation) stays byte-identical.
+        const keyText = report.keySwitches.count > 0 ? "\n\n" + formatModelSwitches(report.keySwitches, detail, "KEY SWITCHES (relay account rotation)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -1226,9 +1318,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -1248,8 +1340,8 @@ function fmtTime(at: number): string {
 
 const SWITCH_LIST_CAP = 8;
 
-function formatModelSwitches(sw: ModelSwitchStats, detail: "summary" | "full"): string {
-    const out: string[] = ["MODEL SWITCHES"];
+function formatModelSwitches(sw: ModelSwitchStats, detail: "summary" | "full", title = "MODEL SWITCHES"): string {
+    const out: string[] = [title];
     if (sw.count === 0) {
         out.push("  none observed");
         return out.join("\n");
@@ -1299,11 +1391,12 @@ function formatSeam(r: BiliCacheReport): string {
 
 function formatInvalidation(r: BiliCacheReport): string {
     const b = r.invalidation;
-    const named = b.model + b.wire + b.upstream + b.restart;
+    const named = b.model + b.key + b.wire + b.upstream + b.restart;
     const total = named + b.remaining;
     const out: string[] = ["CACHE INVALIDATION"];
     out.push(`  stable-prefix re-bill by cause (mutually exclusive, sums to total): ${fmtTok(named)} tok charged · ${fmtTok(b.remaining)} tok unattributed (upstream TTL/eviction/wire rewrite)`);
     out.push(`    model switch:    ${fmtTok(b.model)} (${r.modelSwitches.count})`);
+    out.push(`    key switch:      ${fmtTok(b.key)} (${r.keySwitches.count}) — relay account rotation, fingerprinted headers never logged raw`);
     out.push(`    wire switch:     ${fmtTok(b.wire)} (${r.wireSwitches.count})`);
     out.push(`    upstream switch: ${fmtTok(b.upstream)} (${r.upstreamSwitches.count})`);
     out.push(`    restart/refork:  ${fmtTok(b.restart)} (${r.restartDrops.count})`);
@@ -1311,7 +1404,7 @@ function formatInvalidation(r: BiliCacheReport): string {
     // triage order would steer users to "③ bili bug". Name it explicitly as expected provider-side behavior.
     if (b.remaining > 0 && total > 0 && b.remaining / total >= 0.5) {
         const pct = Math.round((b.remaining / total) * 100);
-        const noCauseEver = r.modelSwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
+        const noCauseEver = r.modelSwitches.count === 0 && r.keySwitches.count === 0 && r.wireSwitches.count === 0 && r.upstreamSwitches.count === 0 && r.restartDrops.count === 0;
         out.push(noCauseEver
             ? `  ⚠ ${pct}% of your stable-prefix re-bill has no observable cause (no model/wire/upstream switch or restart seen) — expected provider-side behavior (cache TTL expiry / eviction / relay rotation), NOT a bili bug; if reproducible see #1195 coverage-mismatch`
             : `  ⚠ ${pct}% of your stable-prefix re-bill is unnameable provider-side behavior (cache TTL expiry / eviction / relay rotation) beyond the causes listed above`);
