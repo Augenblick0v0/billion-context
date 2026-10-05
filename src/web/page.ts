@@ -22,6 +22,7 @@ export function renderPage(origin: string, version: string): string {
 <div id="stale-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="dsh-channel-banner" class="banner warn" hidden></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">

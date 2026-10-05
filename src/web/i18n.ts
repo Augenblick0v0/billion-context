@@ -79,6 +79,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.pt_on": "Passthrough 已开启：所有请求原样转发，压缩关闭。来源：",
         "sys.pt_env": "ACP_PASSTHROUGH 环境变量（或 --passthrough 参数）",
         "sys.pt_file": "配置文件 passthrough: true",
+        "sys.dsh_channel.on": "dsh 插件通道更新持续失败",
+        "sys.dsh_channel.desc": "—— dsh profile 内的 billion-context 拷贝自动更新多次失败，相关 profile 将停留在旧版本。请修复/重装 dsh（其 CLI 可能已损坏），或将 BILI_DSH_BIN 指向可用的 dsh 可执行文件；bili 会按退避自动重试。",
         "conflict.on": "检测到压缩冲突",
         // #2102: the sentence is composed per kind family present — a ledger full of
         // client-native rewrites must not read as "third-party plugin" evidence.
@@ -416,6 +418,8 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "sys.pt_on": "Passthrough ON: all requests forwarded as-is, compression disabled. Source:",
         "sys.pt_env": "ACP_PASSTHROUGH env var (or --passthrough flag)",
         "sys.pt_file": "config file passthrough: true",
+        "sys.dsh_channel.on": "dsh plugin channel updates keep failing",
+        "sys.dsh_channel.desc": "— automatic updates of the billion-context copies inside dsh profiles have failed repeatedly; affected profiles stay frozen at their installed version. Repair/reinstall dsh (its CLI may be broken) or point BILI_DSH_BIN at a working dsh executable; bili retries automatically with backoff.",
         "conflict.on": "Compression conflict detected",
         // #2102: composed per kind family present — see the zh entry above.
         "conflict.found": ": traces of ",

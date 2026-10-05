@@ -303,13 +303,15 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 自动更新
 
-代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
+代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, dshChannel, inFlight, conflicts}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节;`dshChannel` 为持续失败的 dsh 官方通道刷新列表,健康时为空,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
 
 **插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。
 
 **自 v0.1.183 起,更新提示默认静默(#1977):**routine/recommended 版本不再在 `/acp` 面板脚注或 `acp_status` 中渲染更新行 —— 只有 `critical` 级别的版本会在那里显示(`CRITICAL UPDATE READY/AVAILABLE`)。检查"已安装未重启"版本的常设途径即上文所列的过期线索:Web UI 横幅、`/acp` 单行警告、以及 `GET /__bili/status`。刻意不设常驻提醒;严重缺陷公告通道(#1481)仍是唯一自动可见的严重路径。
 
 当安装反复失败(目录不可写或受宿主托管、网络错误等)时,自动更新不再每个 3 分钟周期都重复下载并重试。连续失败三次后,它按指数退避(5 分钟 → 10 → 20 …,上限 6 小时),打印一次性的可操作提示(修复权限 / npm prefix、以用户级重装,或用 `"autoUpdate": false` / `ACP_AUTO_UPDATE=0` 禁用),并在冷却期间不再为这次失败输出日志(不下载、不打重试行);一旦故障消除或目标版本变化即恢复(#1603)。
+
+同样的纪律现在也适用于 **dsh 官方通道的 profile 刷新** —— 即通过 `dsh plugin --profile <name> add …`(#2148)更新 dsh profile 包内 billion-context 拷贝的路径。当该命令针对同一 (profile、目标版本) 持续失败时 —— 例如 dsh 宿主安装本身已损坏、其 CLI 甚至无法启动 —— 连续失败按相同节奏退避(5 分钟 → …,上限 6 小时),而不是每 3 分钟盲目重启一个注定失败的进程;任何一次成功或目标版本变化都会重置计数。持续失败的通道会以常驻警告的形式出现在 `/acp` 面板、Web UI 横幅,以及 `GET /__bili/status` 的 `dshChannel` 字段中;日志诊断会提示你修复/重装 dsh(或将 `BILI_DSH_BIN` 指向可用的 dsh 可执行文件),而不是重跑同一条坏命令。注意:这只是抑制重试风暴并让冻结拷贝可见 —— 它无法解冻宿主通道已损坏的拷贝;修复 dsh 安装后自愈会自动恢复。
 
 ### 严重缺陷公告(强制更新)
 

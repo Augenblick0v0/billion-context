@@ -419,6 +419,20 @@ export const WEB_CLIENT = `(function () {
                 ab.innerHTML = "";
             }
         }
+        // #2148: dsh owner-channel backoff state (from /__bili/overview → dshChannel).
+        const db = $("dsh-channel-banner");
+        if (db) {
+            const fails = Array.isArray(d.dshChannel) ? d.dshChannel : [];
+            if (fails.length > 0) {
+                db.hidden = false;
+                db.classList.add("show");
+                db.innerHTML = '<strong>' + t("sys.dsh_channel.on") + '</strong> <span class="mono">' + escapeHtml(fails.map((f) => f.profile + "→" + f.targetVersion + " (" + f.attempts + "×)").join(", ")) + '</span> ' + t("sys.dsh_channel.desc");
+            } else {
+                db.hidden = true;
+                db.classList.remove("show");
+                db.innerHTML = "";
+            }
+        }
         // #1682: global upstream-connection alert banner — visible on every view,
         // one row per active alert (no stacking), dismiss per alert instance.
         latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];

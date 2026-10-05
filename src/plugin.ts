@@ -24,6 +24,7 @@ import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { dshChannelFailures } from "./dsh-channel.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
@@ -1274,6 +1275,13 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
+    }
+    // #2148: a dead dsh owner channel is instance-level state — same before-footer
+    // slot as the advisory, since native/plugin-lane users never read the proxy log.
+    const dshFails = dshChannelFailures();
+    if (dshFails.length > 0) {
+        const list = dshFails.map((f) => `${f.profile}→${f.targetVersion} (${f.attempts}×)`).join(", ");
+        preFooter.push(`⚠️ DSH UPDATE CHANNEL FAILING: ${list} — dsh profile copy(ies) stuck behind the registry; repair/reinstall the dsh host or point BILI_DSH_BIN at a working executable (bili retries with backoff). Live state: GET /__bili/status → dshChannel.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {

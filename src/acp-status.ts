@@ -14,6 +14,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { dshChannelFailures } from "./dsh-channel.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION } from "./version.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -148,6 +149,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
+    }
+    // #2148: same rationale as #1577 above — a dead dsh owner channel freezes
+    // profile copies silently; the /acp surface is where native-lane users look.
+    const dshFails = dshChannelFailures();
+    if (dshFails.length > 0) {
+        const list = dshFails.map((f) => `${f.profile}→${f.targetVersion} (${f.attempts}×)`).join(", ");
+        const firstErr = dshFails[0].lastError.replace(/\s+/g, " ").slice(0, 200);
+        extra.push("");
+        extra.push(`DSH UPDATE CHANNEL FAILING (instance-level): ${list} — dsh profile refresh(es) keep failing through dsh's plugin channel, so those profile copies stay frozen at their installed version. Repair/reinstall the dsh host (its CLI may be broken) or point BILI_DSH_BIN at a working executable; bili retries automatically with backoff. Last error: ${firstErr}. Live state: GET /__bili/status → dshChannel.`);
     }
     const upd = getUpdateVisibility(VERSION);
     if (upd.visible) {
