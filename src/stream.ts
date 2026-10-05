@@ -545,7 +545,25 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const hints = loopGuard === ""
                 ? `${beyond}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
-            return compressResult(`[Compression FAILED: ${errs}${revNote}${hints}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`, "refused", 0);
+            let receipt = `[Compression FAILED: ${errs}${revNote}${hints}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
+            // #2146: when every requested ref is provably stale-generation, the
+            // kernel's per-range error text hands those exact phantom numbers
+            // straight back into the client-persisted history — where the
+            // looping model reads them as unfinished work and slides further up
+            // the same ladder (incident log: m29971–m30020 → m30021–m30070 → …
+            // across hours). Scrub the requested endpoints from the model-
+            // visible receipt so that echo channel dies; the ctx.log line above
+            // keeps the real refs for the operator. Live refs are untouched:
+            // when the note fires, every requested ref exceeds the session's
+            // highest mapped ref, so no live snapshot number can collide.
+            if (beyond !== "") {
+                for (const rg of ranges) {
+                    for (const id of [rg.startRef, rg.endRef]) {
+                        receipt = receipt.split(id).join("[stale-ref]");
+                    }
+                }
+            }
+            return compressResult(receipt, "refused", 0);
         }
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);

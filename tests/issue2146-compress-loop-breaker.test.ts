@@ -149,3 +149,17 @@ test("#2146: loopTracking:false (preflight lane) never touches the model-facing 
     const tracked = applyRanges(parseCompressInput(compressArgs("m00001", "m00001")), ctx).text;
     assert.ok(!tracked.includes("CIRCUIT BREAKER"), "first tracked failure after the internal storm starts fresh");
 });
+
+test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failures keep them verbatim", () => {
+    const ctx = makeCtx(fixtureMessages());
+    const stale = applyRanges(parseCompressInput(compressArgs("m00010", "m00014")), ctx).text;
+    assert.ok(stale.startsWith("[Compression FAILED:"), `unknown refs fail (got: ${stale.slice(0, 120)})`);
+    assert.match(stale, /above this session's highest ref \(m00008\)/, "frontier diagnosis present");
+    assert.doesNotMatch(stale, /m00010|m00014/, "phantom endpoints are NOT echoed back into the client-persisted receipt");
+    assert.match(stale, /\[stale-ref\]/, "scrubbed marker takes their place");
+
+    const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
+    assert.ok(mixed.startsWith("[Compression FAILED:"), "still fails");
+    assert.ok(!mixed.includes("above this session's highest ref"), "note suppressed (start inside frontier)");
+    assert.match(mixed, /m00009/, "an in-frontier unknown endpoint stays verbatim — a real typo the model can correct");
+});
