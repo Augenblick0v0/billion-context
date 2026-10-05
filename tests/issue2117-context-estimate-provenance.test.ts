@@ -191,17 +191,22 @@ test("settleUsageReport B: a model switch starts a fresh ring and clears the old
     assert.equal(st.calibrationRing?.model, "gpt-x");
 });
 
-test("settleUsageReport B: a legacy ring without a model key restarts on the first known-model sample", () => {
+test("settleUsageReport B: a legacy ring without a model key continues and adopts the model (#2129)", () => {
     const s = makeSession();
     const st = s.stats;
-    // Pre-upgrade shape: factor + ring with no model dimension.
+    // Pre-upgrade / post-restart shape: published factor + ring with no model
+    // dimension (the load whitelist drops the model fields — #2141). The k̂ is
+    // still provenance-matched to the session's model and must survive the
+    // first known-model settle instead of being discarded-and-cleared.
     st.calibratedEstimate = 0.5;
     st.calibratedEstimateOrigin = "http://a";
     st.calibrationRing = { origin: "http://a", values: [0.5, 0.55] };
     pair(s, 10_000, "http://a", 5_000, "gpt-x");
-    assert.equal(st.calibratedEstimate, undefined, "legacy evidence must not blend with the new model's");
-    assert.deepEqual(st.calibrationRing?.values, [0.5]);
+    assert.ok((st.calibratedEstimate ?? 0) > 0, "missing model info must not invalidate a published k̂");
+    assert.ok(Math.abs((st.calibratedEstimate ?? 0) - ((0.5 + 0.55 + 0.5) / 3)) < 1e-9, `expected re-published mean, got ${st.calibratedEstimate}`);
+    assert.deepEqual(st.calibrationRing?.values, [0.5, 0.55, 0.5]);
     assert.equal(st.calibrationRing?.model, "gpt-x");
+    assert.equal(st.calibratedEstimateModel, "gpt-x");
 });
 
 test("settleUsageReport B: unknown model keeps the legacy behavior (ring continues)", () => {
@@ -214,10 +219,12 @@ test("settleUsageReport B: unknown model keeps the legacy behavior (ring continu
     assert.ok(Math.abs((st.calibratedEstimate ?? 0) - 0.525) < 1e-9);
     assert.equal(st.calibratedEstimateModel, undefined);
     assert.equal(st.calibrationRing?.model, undefined);
-    // A model-stamped sample arriving later restarts the ring.
+    // A model-stamped sample arriving later adopts the model on the existing
+    // ring — no discard (same missing-info discipline as the legacy case).
     pair(s, 10_000, "http://a", 5_000, "gpt-x");
-    assert.equal(st.calibratedEstimate, undefined);
+    assert.ok(Math.abs((st.calibratedEstimate ?? 0) - ((0.5 + 0.55 + 0.5) / 3)) < 1e-9);
     assert.equal(st.calibrationRing?.model, "gpt-x");
+    assert.equal(st.calibratedEstimateModel, "gpt-x");
 });
 
 test("resetSessionCompression drops the new provenance/display fields at the boundary", () => {
