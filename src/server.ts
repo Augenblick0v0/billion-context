@@ -7539,9 +7539,6 @@ function sendStats(res: http.ServerResponse): void {
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
-/** Stale-install state for the web UI badge (#811): whether the on-disk
- *  version is newer than the running process, plus the opt-in flag state and
- *  the live in-flight request count. */
 /** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
  *  computed once and shared so the two surfaces cannot drift apart again (that
  *  divergence is what left the web banner dead: overview never carried the field).
@@ -7552,6 +7549,9 @@ function currentAdvisoryPayload() {
     return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
 }
 
+/** Stale-install state for the web UI badge (#811): whether the on-disk
+ *  version is newer than the running process, plus the opt-in flag state and
+ *  the live in-flight request count. */
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
