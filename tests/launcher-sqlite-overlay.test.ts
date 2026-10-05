@@ -717,6 +717,26 @@ test("finalizeCodexHome: clean exit writes the run's db and files into a fresh r
     assert.deepEqual(rowsOf(path.join(ov2!, "state_5.sqlite")), [1, 2], "second launch sees the written-back rows (#1951)");
 });
 
+test("finalizeCodexHome: cold-start rollout paths remain readable after directory write-back (#1965)", (t) => {
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "real-bili");
+    fs.mkdirSync(real);
+    fs.mkdirSync(path.join(overlay, "sessions"), { recursive: true });
+    const rollout = path.join(overlay, "sessions", "s1.jsonl");
+    fs.writeFileSync(rollout, '{"id":1}\n');
+
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(real, overlay)));
+    assert.deepEqual(errs, []);
+    assert.equal(fs.readFileSync(path.join(real, "sessions", "s1.jsonl"), "utf8"), '{"id":1}\n');
+    assert.equal(fs.readFileSync(rollout, "utf8"), '{"id":1}\n', "absolute rollout paths recorded under the overlay must still resolve");
+    assert.ok(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), "the moved directory must become a shared link, not a stale copy");
+    fs.writeFileSync(path.join(real, "sessions", "s2.jsonl"), '{"id":2}\n');
+    assert.equal(fs.readFileSync(path.join(overlay, "sessions", "s2.jsonl"), "utf8"), '{"id":2}\n');
+    assert.ok(finalizeCodexHome(real, overlay), "subsequent finalization skips the shared directory");
+});
+
 test("finalizeCodexHome: existing db merges back silently and the next launch imports it (#1965)", (t) => {
     if (!sqliteCtor) {
         t.skip("node:sqlite unavailable on this Node");
