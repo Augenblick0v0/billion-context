@@ -15,7 +15,7 @@ import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.j
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
@@ -1727,6 +1727,12 @@ export async function pipePluginChatWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
+    // #2190: the filter released bytes that still carry echo-residue shape —
+    // the leak is now observable instead of silent. Log-only; the bytes were
+    // already decided by the state machine.
+    const onResidueWarn = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
     const onMarkerDrop = (snippet: string) => {
         sawStrippedEcho = true;
         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -1750,7 +1756,7 @@ export async function pipePluginChatWithStrip(
         const key = `${field}:${index}`;
         let s = streams.get(key);
         if (!s) {
-            s = { filter: composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            s = { filter: composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -2078,10 +2084,13 @@ export async function pipePluginChatWithStrip(
                 // leap ahead of a held tail.
                 if (v.length > 0) hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !anyPending()) {
                     if (v.length > 0) {
                         keptText = true;
                         proseAcc += v;
+                        // #2190: residue audit — bytes that bypassed the state
+                        // machine must be observable, not silent.
+                        if (containsEchoResidue(v)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${v.slice(0, 80).replace(/\n/g, " ")}`);
                     }
                     if (field === "content") visibleTextChars += v.length;
                     continue;
@@ -2185,8 +2194,12 @@ export async function pipePluginChatWithStrip(
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
-            if (raw.length > 0) proseAcc += raw;
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !anyPending()) {
+            if (raw.length > 0) {
+                proseAcc += raw;
+                // #2190: residue audit — see the twin above.
+                if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
+            }
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -2272,10 +2285,12 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
+                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !anyPending()) {
                     if (raw.length > 0) {
                         keptText = true;
                         proseAcc += raw;
+                        // #2190: residue audit — see the twin above.
+                        if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
                     }
                     if (field === "text") visibleTextChars += raw.length;
                     continue;
@@ -2548,13 +2563,17 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
+    // #2190: log-only residue audit — see the twin above.
+    const onResidueWarn = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
     const onBiliDrop = (snippet: string) => {
         loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
     };
     const tagFilter = composeStreamFilters(
         composeStreamFilters(
-            createTagEchoFilter(onTagDrop),
+            createTagEchoFilter(onTagDrop, onResidueWarn),
             createMarkerLineFilter((snippet) => {
                 loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
@@ -2793,7 +2812,7 @@ export async function pipePluginResponsesWithStrip(
             for (const k of ["item_id", "output_index", "summary_index"]) {
                 if (ev[k] !== undefined) meta[k] = ev[k];
             }
-            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createBiliArtifactFilter(onBiliDrop)), type, field, meta };
+            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn), createBiliArtifactFilter(onBiliDrop)), type, field, meta };
             argStreams.set(key, s);
         }
         return s;
@@ -2883,7 +2902,8 @@ export async function pipePluginResponsesWithStrip(
                     // The done is not visible text to the degenerate-turn retry below, so it
                     // is stripped and released directly.
                     if (type === "response.reasoning_summary_part.done") {
-                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
+                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr);
                         if (hadEcho) sawStrippedEcho = true;
                         const evOut = hadEcho ? stripResponsesText(ev) : ev;
                         proseAcc += responsesEventText(evOut);
@@ -2896,7 +2916,8 @@ export async function pipePluginResponsesWithStrip(
                         // retryEmptyTurn): releasing it earlier would hand the
                         // client the echo's own text exactly when the retry is
                         // about to replace it.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
+                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr);
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -2946,7 +2967,8 @@ export async function pipePluginResponsesWithStrip(
                         heldVisibleChars = 0;
                         // The completion frame itself closes the turn: strip it if it
                         // carries echoed text, rewrite retry ids onto the first attempt's.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
+                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr);
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -2967,10 +2989,12 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !tagFilter.pending()) {
+                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDegenerateRenderTag(delta) && !tagFilter.pending()) {
                             proseAcc += delta;
                             visibleTextChars += delta.length;
                             fastPathChars += delta.length;
+                            // #2190: residue audit — see the twin above.
+                            if (delta.length > 0 && containsEchoResidue(delta)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${delta.slice(0, 80).replace(/\n/g, " ")}`);
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -3005,8 +3029,10 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(v) && !mayStartBiliInternal(v) && !argAnyPending() && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !argAnyPending() && !tagFilter.pending()) {
                             proseAcc += v;
+                            // #2190: residue audit — see the twin above.
+                            if (v.length > 0 && containsEchoResidue(v)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${v.slice(0, 80).replace(/\n/g, " ")}`);
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -3204,7 +3230,8 @@ export async function pipePluginJson(
         // one full-body parse this path already does. Observe-only (#1039).
         if (session) recordJsonToolWitnesses(session.id, json, protocol);
     } catch { /* non-JSON body — forward verbatim */ }
-        if (json && (containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text))) {
+        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+        if (json && (containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsEchoResidue(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in

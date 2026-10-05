@@ -90,6 +90,14 @@ const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c
 const REF_LIKE = /^\s*m\d{4,}\s*$/;
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
+// #2190: a ref body closed by a DEGENERATE close name (any short word — the
+// drift set is open; the attested census alone has p/a/ap/apc/cap/ck/div/
+// warn/aph/ambient/apm). Whole-span strip only: the open must be a valid
+// acplike name and the body exactly one bare ref, so genuine HTML prose such
+// as "see </p>" or "<a>m1234 text</a>" is untouched. Runs BEFORE the lone
+// passes in stripAcpTags so the pair dies atomically instead of leaving the
+// ref behind.
+const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[a-zA-Z][a-zA-Z0-9]{0,15}>", "g");
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
 // ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
@@ -144,6 +152,25 @@ function looseCloseSpan(s: string): { start: number; end: number } | null {
 function looseCloseEnd(s: string): number {
     const span = looseCloseSpan(s);
     return span === null ? -1 : span.end;
+}
+// #2190: models imitate the CLOSE with arbitrary short words instead of an
+// acplike name — field census (session-A, 2026-10-05): ap/p/a/apc/cap/ck/div/
+// warn/aph/ambient/apm, an open set a whitelist cannot keep up with. Accepted
+// as a swallow terminator ONLY when the whole body since the opening is one
+// bare ref (the kernel's emit shape, #1720): ref-body + any short close is an
+// echo, never prose — a prose body stays indistinguishable from legitimate
+// markup and keeps the existing hold/budget/flush behavior. Strict >
+// termination, same discipline as looseCloseSpan (a partial close at the
+// buffer end is still undecidable and stays held).
+const DEGEN_CLOSE_NAME = /^[a-zA-Z][a-zA-Z0-9]{0,15}>/;
+function degenCloseAfterRef(s: string): { start: number; end: number } | null {
+    let idx = s.indexOf(CLOSE_HEAD);
+    while (idx >= 0) {
+        const m = DEGEN_CLOSE_NAME.exec(s.slice(idx + 2));
+        if (m && REF_LIKE.test(s.slice(0, idx))) return { start: idx, end: idx + 2 + m[0].length };
+        idx = s.indexOf(CLOSE_HEAD, idx + 1);
+    }
+    return null;
 }
 
 /** The span of one wrapped-turn imitation in `s`: where it starts, and the span
@@ -244,6 +271,7 @@ export function stripAcpTags(text: string): string {
     }
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
+        .replace(DEGEN_PAIR, "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
@@ -270,6 +298,16 @@ export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
 
+// #2190: post-audit shape check — a bare ref immediately followed by ANY close
+// tag is echo residue by construction (genuine prose never puts mNNNNN right
+// before </word>; the kernel wraps refs in tags, so a naked ref IS the leak).
+// Used where bytes bypassed or escaped the filter and must be logged, not
+// dropped: fast-path gate sites and filter release points.
+const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]/;
+export function containsEchoResidue(s: string): boolean {
+    return ECHO_RESIDUE.test(s);
+}
+
 // #468: some upstreams stream a model-imitated render tag in tokenizer-sized
 // fragments ("\x3cac", "p tokens", ...) so no single chunk ever trips
 // RENDER_TAG_DETECT. Per-chunk gates must also engage when the chunk contains
@@ -279,6 +317,19 @@ export function containsRenderTagText(s: string): boolean {
 // "\x3ca", "\x3cac", "\x3cacp ...attrs", "\x3c/acp ...") engage it.
 export function mayStartRenderTag(s: string): boolean {
     return RENDER_TAG_DETECT.test(s) || PARTIAL_TAIL.test(s);
+}
+
+// #2190: a BROADER ambiguous head, used by the streaming gate and the filter's
+// hold decision only. Degenerate imitations drift the name beyond the acplike
+// mutation set (the observed close census already proves free-form name drift),
+// so a head like \x3cck must engage the state machine or the rest of the tag
+// rides the fast path verbatim. Deliberately NOT folded into PARTIAL_TAIL /
+// mayStartRenderTag: isOrphanMarkupText (#1760) consumes those for
+// degenerate-turn accounting, where a prose tail such as "a<b" must stay
+// prose, not residue.
+const BROAD_TAG_HEAD_TAIL = new RegExp("\x3c\\/?[A-Za-z0-9]{0,16}$");
+export function mayStartDegenerateRenderTag(s: string): boolean {
+    return BROAD_TAG_HEAD_TAIL.test(s);
 }
 
 // #361: tool-call XML template fragments a model may echo from the context
@@ -523,7 +574,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void): TagEchoFilter {
     let held = "";
     let swallowUntilClose = false;
     let swallowed = "";
@@ -574,11 +625,27 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     buf = combined.slice(span.end);
                     continue;
                 }
+                if (swallowReleases) {
+                    // #2190: a degenerate close ends the span too. The body is
+                    // ref-shaped by construction (degenCloseAfterRef), so the
+                    // drop-whole rule applies unconditionally — wrapped mode
+                    // never reaches here (its payload may contain arbitrary
+                    // markup and must be discarded whole).
+                    const dspan = degenCloseAfterRef(combined);
+                    if (dspan !== null) {
+                        drop(combined.slice(0, dspan.end));
+                        swallowed = "";
+                        swallowUntilClose = false;
+                        buf = combined.slice(dspan.end);
+                        continue;
+                    }
+                }
                 if (combined.length > swallowLimit) {
                     swallowed = "";
                     if (swallowReleases) {
                         swallowUntilClose = false;
                         buf = combined;
+                        if (onResidueWarn && containsEchoResidue(combined)) onResidueWarn(combined);
                         continue;
                     }
                     // The span is an attested imitation's payload: discard it and
@@ -623,7 +690,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 continue;
             }
             if (!m) {
-                const t = PARTIAL_TAIL.exec(buf);
+                const t = PARTIAL_TAIL.exec(buf) ?? BROAD_TAG_HEAD_TAIL.exec(buf);
                 if (t) {
                     // A definite \x3c<name> opening is never prose — hold it far
                     // past HOLD_LIMIT (drop it past TAG_OPEN_CAP); a short
@@ -641,6 +708,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                         out += buf;
                     }
                 } else {
+                    if (onResidueWarn && containsEchoResidue(buf)) onResidueWarn(buf);
                     out += buf;
                 }
                 break;
@@ -732,6 +800,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     }
                 }
             }
+            if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
             return result;
         },
