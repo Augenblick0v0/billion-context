@@ -206,7 +206,14 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
         verdict: laneVerdict({ installed: presence.installed, targetMissing: missingTargets.length > 0, frozen: false, copyVersion: presence.copyVersion, registryVersion }),
     };
     if (row.verdict === "broken") row.reason = missingTargets.map((t) => `target missing: ${t}`).join("; ");
-    if (agent === "opencode" && presence.installed && presence.form === "npm") row.detail += "; copy managed by opencode's plugin manager (version not resolvable here)";
+    if (agent === "opencode" && presence.installed && presence.form === "npm") {
+        // #1234/#2199: the cache copy is bili-owned in place (self-updates via its
+        // own proxy) — show the actual load path + disk version when resolvable so
+        // the stale verdict below is honest, not "version not resolvable".
+        const cp = presence.copyVersion !== undefined ? ` v${presence.copyVersion}` : "";
+        const p = presence.targets[0] !== undefined ? ` (${presence.targets[0]})` : "";
+        row.detail += `; cache copy${p}${cp} is bili-owned and self-updates in place via its own proxy (#1234) — reload/restart OpenCode to activate a disk update`;
+    }
     return [row];
 }
 

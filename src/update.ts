@@ -445,6 +445,25 @@ function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.Proc
     });
 }
 
+/** #1234/#2199: true when `installDir` is the OpenCode v2 plugin-manager CACHE
+ *  copy of billion-context — under $XDG_CACHE_HOME/opencode (default
+ *  ~/.cache/opencode) at .../node_modules/billion-context. A bare
+ *  "billion-context" plugin entry is materialized into opencode's npm-cache-
+ *  shaped dir (~/.cache/opencode/npm/billion-context@<spec>/<ts>/node_modules/
+ *  billion-context) and updates ITSELF through its own running proxy's periodic
+ *  self-update; the host reloads/restarts to activate it. Such a copy is bili-
+ *  owned IN PLACE and must NOT be classified as host-managed. The data-home
+ *  plugin tree ($XDG_DATA_HOME/opencode) is a different tree and stays host-
+ *  managed (returned by the homes loop below). */
+function isOpencodeCacheBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
+    const xdgCache = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.trim().length > 0 ? env.XDG_CACHE_HOME : path.join(os.homedir(), ".cache");
+    const anchor = path.join(xdgCache, "opencode").split(path.sep).join("/");
+    return [installDir, real].some((dir) => {
+        const norm = dir.split(path.sep).join("/");
+        return norm.startsWith(anchor + "/") && norm.endsWith(`/node_modules/${DSH_PACKAGE}`);
+    });
+}
+
 export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = process.env): HostManagedInstall | undefined {
     let real = installDir;
     try {
@@ -453,6 +472,12 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
         // nonexistent or unreadable — evaluate the literal path
     }
     if (isDshDesktopBiliCopy(installDir, real, env)) return undefined;
+    // #1234/#2199: the opencode CACHE copy is bili-owned in place (self-updates
+    // via its own proxy) — recognized EXPLICITLY so the in-place exception does
+    // not depend on the cache path accidentally missing every host home below.
+    // Do NOT fold the cache path into `homes`: that would classify it host-
+    // managed and silently re-close the #1234 auto-update.
+    if (isOpencodeCacheBiliCopy(installDir, real, env)) return undefined;
     for (const dir of [installDir, real]) {
         if (dir.split(path.sep).some((seg) => seg === ".pnpm")) {
             return {
