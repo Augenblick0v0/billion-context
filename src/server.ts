@@ -50,7 +50,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -82,7 +82,7 @@ import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, est
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
-import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
@@ -153,7 +153,7 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -1271,6 +1271,8 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
 // #924: one-time-per-model log for the output-budget fallback (request carries
 // no budget → configured/registry max output) — same pattern as windowSourceLogged.
 const headroomFallbackLogged = new Set<string>();
+// #2170 split-session canary: one log line per conversation base per process.
+const splitWarnedBases = new Set<string>();
 
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
@@ -1369,7 +1371,7 @@ async function handle(
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
-    if (req.method === "GET" && req.url === "/__bili/sessions") return sendWebSessions(res);
+    if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
@@ -2304,6 +2306,20 @@ async function handle(
               ? (anthropicIdentity?.value ?? anthropicSignal)
               : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
+        // #2170 measure 4: stamp sessions deliberately namespaced onto a
+        // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
+        // fork reviews, codex/claude-over-Responses instructions personas —
+        // so the split-session canary can tell a DESIGNED split from the
+        // #2165 drift shape (see splitSessionWarnings in src/session.ts).
+        // personaForked covers the anthropic/openai wires; the responses wire
+        // needs its own check (codexTurn keys verbatim and must not count).
+        const designNamespaced = personaForked
+            || (protocol === "responses"
+                && codexTurn === undefined
+                && instructionsFingerprintApplies(req.headers)
+                && !sideRequestLike
+                && responsesIdentity !== undefined
+                && conversation !== responsesIdentity.value);
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2440,6 +2456,7 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
             acquireInFlight(session);
@@ -2797,9 +2814,12 @@ async function handle(
         // are identified by the #1699 persona header instead).
         const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
         const requestAgent = pluginRequestAgentHeader(req.headers);
+        // #2170 measure 1: the gate conjuncts live in side-request.ts as the
+        // pure, truth-table-tested demoteGate(); the two request-body effects
+        // stay here and stay lazy — detectAcpArtifacts only runs when the cheap
+        // gate holds, the strip only when the artifact scan came back clean.
         // Explicit main intent and a verified public-fork prefix each veto heuristic demotion.
-        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
-            && requestAgent !== "main" && !wsLaneEnvelope && !publicForkPrefix
+        const demotedSide = demoteGate({ countTokens, responsesCompact, protocol, pluginMode, requestAgent, wsLaneEnvelope, publicForkPrefix })
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
@@ -2875,7 +2895,10 @@ async function handle(
         // header) can false-positive it — only intent-certain side
         // identification (declared side agent, or a tool-less tiny budget)
         // diverts under a receipt.
-        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || sideIntent)) {
+        // #2170 measure 1: the decision itself is resolveSideLane() (pure,
+        // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent });
+        if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2906,7 +2929,7 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            const sideReason = demotedSide ? "leaked bili tools stripped (#1897)" : requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`;
+            const sideReason = sideLane.reason;
             log("info", `[${session.id}] side request (${sideReason}) → passthrough + tag strip only, kernel state untouched`);
             // #1897: a demoted request was mutated (tools stripped) — re-serialize
             // the parsed body so the leak is actually gone from the wire.
@@ -2933,6 +2956,20 @@ async function handle(
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
+        }
+        // #2170 measure 4 (runtime canary): every legitimately side-shaped
+        // LANE-ELIGIBLE request returned inside the lane above. count_tokens,
+        // /responses/compact and session-less (protocol-less) requests are
+        // deliberately NOT lane-eligible — they route to their own handling
+        // below, so they are excluded here (ework review finding B). If a
+        // lane-eligible side-intent or demoted request reaches the full
+        // pipeline anyway, the lane contract is broken (the #2157/#2164
+        // regression class: side traffic touching kernel state). Count it on
+        // the session and say it loudly — with the pure resolveSideLane()
+        // this is unreachable by construction; any future drift trips it.
+        if (!countTokens && !responsesCompact && protocol !== null && (sideIntent || demotedSide)) {
+            session.metadata.sideEffectLeaks = (typeof session.metadata.sideEffectLeaks === "number" ? session.metadata.sideEffectLeaks : 0) + 1;
+            log("warn", `[${session.id}] SIDE-EFFECT LEAK (#2170 canary): ${sideLane.reason} request entered the full pipeline — expected the #388 side passthrough; kernel state pollution likely (cf. #2156/#2164)`);
         }
         // #987: the window is NEVER learned from traffic — no self-heal read
         // here. Only the one-shot emergency shrink (armed on the overflow
@@ -6793,11 +6830,13 @@ async function forward(
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
             // first post-fold rejection left strictReasoningEcho unset — #651 kept
             // dropping reasoning and every following turn split again.
-            if (upstream.status === 400 && /reasoning_content/i.test(errBody.toString("utf8"))) {
+            // #2169: match BOTH field spellings — the chat wire says
+            // reasoning_content, DeepSeek's Responses wire says reasoning_text.
+            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errBody.toString("utf8"))) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
-                    log("warn", `[${s.id}] upstream 400 mentions reasoning_content — learned strictReasoningEcho for this session (#684/#762); reasoning-drop disabled`);
+                    log("warn", `[${s.id}] upstream 400 mentions a reasoning echo field — learned strictReasoningEcho for this session (#684/#762/#2169); reasoning-drop disabled`);
                 }
             }
         }
@@ -7613,6 +7652,16 @@ function sendStats(res: http.ServerResponse): void {
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
+/** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
+ *  computed once and shared so the two surfaces cannot drift apart again (that
+ *  divergence is what left the web banner dead: overview never carried the field).
+ *  null when no advisory is active; otherwise the active entry plus targetFailed
+ *  (pinned target unresolvable on the registry → banner falls back to @latest). */
+function currentAdvisoryPayload() {
+    const adv = getAdvisoryState();
+    return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
+}
+
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
@@ -7625,9 +7674,14 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const adv = getAdvisoryState();
-    const advisory = adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    const splitWarnings = splitSessionWarnings(listSessions());
+    for (const w of splitWarnings) {
+        if (!splitWarnedBases.has(w.base)) {
+            splitWarnedBases.add(w.base);
+            loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
+        }
+    }
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -7638,7 +7692,15 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     } catch {
         // fs hiccup: report running state only, never fail the overview endpoint
     }
-    const overview = await buildOverview();
+    let overview;
+    try {
+        overview = await buildOverview();
+    } catch (error) {
+        loggerLog("error", `[acp-web] overview failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         overview,
@@ -7646,6 +7708,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         diskVersion,
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
+        advisory: currentAdvisoryPayload(),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
@@ -7654,10 +7717,31 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     }, null, 2));
 }
 
-async function sendWebSessions(res: http.ServerResponse): Promise<void> {
-    const sessions = await buildSessionList();
+/** #1937: optional ?q= / ?page= / ?pageSize= (≤200) switch the endpoint to
+ *  server-side filtered paging. Without params the response shape is unchanged
+ *  ({sessions, hiddenEmpty} + additive total) so older UIs keep working. */
+async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
+    let body: Record<string, unknown>;
+    try {
+        if (u.searchParams.has("page") || u.searchParams.has("pageSize") || u.searchParams.has("q")) {
+            const rawSize = Number(u.searchParams.get("pageSize"));
+            const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
+            const rawPage = Number(u.searchParams.get("page"));
+            const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+            body = { ...(await buildSessionPage({ q: u.searchParams.get("q") ?? undefined, page, pageSize })), hiddenEmpty: hiddenEmptyCount() };
+        } else {
+            const sessions = await buildSessionList();
+            body = { sessions, hiddenEmpty: hiddenEmptyCount(), total: sessions.length };
+        }
+    } catch (error) {
+        loggerLog("error", `[acp-web] sessions list failed: ${String(error)}`);
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to load session data" }));
+        return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, hiddenEmpty: hiddenEmptyCount() }, null, 2));
+    res.end(JSON.stringify(body, null, 2));
 }
 
 /** #1426 web UI run-log viewer: tail of the rotated logger files (bili.log.old

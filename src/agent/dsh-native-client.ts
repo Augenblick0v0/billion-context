@@ -11,13 +11,19 @@
 // serves the live origin at GET /bili/origin on the dsh webserver; this
 // section polls that route while unresolved so the entry upgrades without a
 // reload or app restart. Neither source known ⇒ degrade to a hint instead of
-// a dead link.
+// a dead link. The same panel is mounted at two slots (#2125): settings.section
+// (always present — the launcher posture has no bundle page) and
+// plugins.bundle.config (keyed by package name; the plugin detail page renders
+// it only when this package is installed as a profile bundle and draws the
+// title itself, so that registration drops the h3).
 
 import { createElement, useEffect, useState } from "react";
 
 type Dict = Record<string, string>;
 
-type SlotOptions = { name: string; id: string; order: number; label: () => string; locale: string };
+type SlotOptions =
+    | { name: string; id: string; order: number; label: () => string; locale: string }
+    | { name: string; key: string; locale: string };
 
 type ClientContext = {
     effect: (fn: () => void | (() => void), label?: string) => void;
@@ -110,7 +116,7 @@ export function apply(ctx: ClientContext): void {
         "bili: dictionaries",
     );
     const t = ctx.locale.bind(NS);
-    const section = (): unknown => {
+    const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         useEffect(() => {
             if (origin !== undefined) return;
@@ -119,7 +125,7 @@ export function apply(ctx: ClientContext): void {
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-            createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")),
+            titled ? createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")) : null,
             origin === undefined
                 ? createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"))
                 : createElement(
@@ -147,6 +153,10 @@ export function apply(ctx: ClientContext): void {
     };
     ctx.slots.inject(
         "settings.section",
-        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, section),
+        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
+    );
+    ctx.slots.inject(
+        "plugins.bundle.config",
+        () => ctx.slots.register({ name: "plugins.bundle.config", key: "billion-context", locale: NS }, panel(false)),
     );
 }

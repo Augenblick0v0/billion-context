@@ -1,3 +1,4 @@
+import { orderedRefPair } from "./refs.js";
 import type {
   BlockSpan,
   CompressionBlock,
@@ -28,7 +29,10 @@ export function resolveBlockSpan(
     M_REF.test(block.startRef) &&
     M_REF.test(block.endRef)
   ) {
-    return { startRef: block.startRef, endRef: block.endRef };
+    // Stored specs keep the caller's direction; spans are display data, so
+    // canonicalize to ascending labels (#2168).
+    const [startRef, endRef] = orderedRefPair(block.startRef, block.endRef);
+    return { startRef, endRef };
   }
   const refs = block.effectiveMessageIds
     .map((id) => byRaw[id])
