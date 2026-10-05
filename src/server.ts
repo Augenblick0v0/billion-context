@@ -1412,6 +1412,13 @@ async function handle(
             }
             opts.passthrough = fresh.passthrough;
             opts.passthroughSource = fresh.passthroughSource;
+            if (fresh.allowDshCompaction !== opts.allowDshCompaction) {
+                log(
+                    fresh.allowDshCompaction ? "warn" : "info",
+                    `[dsh-compaction] ${fresh.allowDshCompaction ? "dsh native compaction ALLOWED via web config — landed checkpoints durably shadow the raw history (#2028)" : "dsh native compaction interception restored via web config (#2028)"}`,
+                );
+            }
+            opts.allowDshCompaction = fresh.allowDshCompaction;
             opts.proxy = fresh.proxy;
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
@@ -2776,13 +2783,14 @@ async function handle(
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
         // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
-        // state untouched. Unconditional by design — auto pressure, overflow
-        // recovery, and manual /compact share one envelope, and a landed
-        // checkpoint durably shadows the raw history (irreversible), while every
-        // cost of refusing is dsh-side, caught, and recoverable. Runs before the
-        // #388 side-request lane: the compaction call is a full-budget request,
-        // so only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
+        // state untouched. Active by default, explicitly opt-out-able (#2028) —
+        // auto pressure, overflow recovery, and manual /compact share one
+        // envelope, and a landed checkpoint durably shadows the raw history
+        // (irreversible), while every cost of refusing is dsh-side, caught, and
+        // recoverable; allowDshCompaction lifts the refusal for users who accept
+        // that trade. Runs before the #388 side-request lane: the compaction
+        // call is a full-budget request, so only this guard can catch it.
+        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
             if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);

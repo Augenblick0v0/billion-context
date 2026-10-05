@@ -4,12 +4,15 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
+    allowDshCompactionState,
+    normalizeLegacyAllowDshCompaction,
     parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
     rejectLegacyRoute,
     safeReadJson,
+    type DshFileSettings,
     type UpstreamProxyMode,
 } from "../config.js";
 import { log } from "../logger.js";
@@ -90,6 +93,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         passthrough: passthroughState(process.env),
+        allowDshCompaction: allowDshCompactionState(process.env),
         ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
@@ -116,8 +120,9 @@ export async function handleConfigPut(
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
+    const hasDsh = Object.prototype.hasOwnProperty.call(body, "dsh");
     const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough settings, or the full config file");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, dsh compaction settings, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
     // structured payload, then replace the ENTIRE config — preserving unknown keys such
     // as promptPack/ccr that per-field PUTs cannot touch.
@@ -127,7 +132,9 @@ export async function handleConfigPut(
         try {
             const p = JSON.parse(body.file);
             if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
-            next = p as ConfigShape;
+            const rec = p as Record<string, unknown>;
+            normalizeLegacyAllowDshCompaction(rec);
+            next = rec as ConfigShape;
         } catch (error) {
             return sendError(res, 400, `file is not valid JSON: ${String(error)}`);
         }
@@ -150,6 +157,12 @@ export async function handleConfigPut(
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
         if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
+        const fileDshFlag = ((next.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction;
+        if (fileDshFlag !== undefined && fileDshFlag !== null && typeof fileDshFlag !== "boolean") return sendError(res, 400, "dsh.allowDshCompaction must be a boolean");
+        if (fileDshFlag === true || fileDshFlag === false) {
+            const dshForced = allowDshCompactionState(process.env);
+            if (dshForced.source === "env" && fileDshFlag !== dshForced.enabled) return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+        }
         try {
             atomicWriteConfig(next);
             onChanged?.();
@@ -227,6 +240,23 @@ export async function handleConfigPut(
         }
     }
 
+    // #2028: same read/clear contract as passthrough (#405) — an env
+    // BILI_ALLOW_DSH_COMPACTION outranks the file on every reload, so a
+    // contradicting file write would be a silent no-op: refuse with the exact
+    // way out instead. A matching write or a clear (null) stays allowed.
+    if (hasDsh) {
+        const dshBody = (body.dsh ?? {}) as Partial<DshFileSettings>;
+        if (dshBody.allowDshCompaction !== null && dshBody.allowDshCompaction !== undefined && typeof dshBody.allowDshCompaction !== "boolean") {
+            return sendError(res, 400, "dsh.allowDshCompaction must be a boolean or null");
+        }
+        if (dshBody.allowDshCompaction === true || dshBody.allowDshCompaction === false) {
+            const dshState = allowDshCompactionState(process.env);
+            if (dshState.source === "env" && dshBody.allowDshCompaction !== dshState.enabled) {
+                return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
+            }
+        }
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = rawProviders;
     if (hasProxy) {
@@ -242,6 +272,16 @@ export async function handleConfigPut(
         if (body.passthrough === true) config.passthrough = true;
         else delete config.passthrough;
     }
+    if (hasDsh) {
+        const curDsh = (config.dsh ?? undefined) as Partial<DshFileSettings> | undefined;
+        if (((body.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction === true) {
+            config.dsh = { ...curDsh, allowDshCompaction: true };
+        } else if (curDsh) {
+            const rest: Partial<DshFileSettings> = { ...curDsh };
+            delete rest.allowDshCompaction;
+            config.dsh = Object.keys(rest).length > 0 ? rest : undefined;
+        }
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
@@ -253,6 +293,7 @@ export async function handleConfigPut(
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
     if (hasPassthrough) changed.push("passthrough");
+    if (hasDsh) changed.push("dsh compaction");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders && rawProviders ? Object.keys(rawProviders).length : undefined }));

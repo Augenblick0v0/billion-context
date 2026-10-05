@@ -161,6 +161,22 @@ export const WEB_CLIENT = `(function () {
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
     let latestAlerts = [];
 
+    function sortKeysDeep(x) {
+        if (Array.isArray(x)) return x.map(sortKeysDeep);
+        if (x !== null && typeof x === "object") { const o = {}; Object.keys(x).sort().forEach((k) => { o[k] = sortKeysDeep(x[k]); }); return o; }
+        return x;
+    }
+    function canonCfgText(s) {
+        try { return JSON.stringify(sortKeysDeep(JSON.parse(s))); } catch (e) { return "\u0000" + s; }
+    }
+    let cfgSavedSnap = null;
+    function refreshDirtyFlag() {
+        const el = $("cfg-file-edit");
+        const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
+        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+    }
+
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
         // shown underneath so rows stay identifiable. Disk-restored pool entries read as history,
@@ -1239,7 +1255,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
-            hydrateQuickConfig();
+            if (fe) cfgSavedSnap = fe.value;
+            hydrateQuickConfig(cfg);
+            refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
             ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
@@ -1263,7 +1281,7 @@ export const WEB_CLIENT = `(function () {
             toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
-    function hydrateQuickConfig() {
+    function hydrateQuickConfig(cfg) {
         const box = $("quick-fields");
         if (!box) return;
         box.innerHTML = "";
@@ -1292,6 +1310,8 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            dsgRow.inp.checked = Boolean(draft.dsh && draft.dsh.allowDshCompaction === true);
+            dsgWarnNote.hidden = !(draft.dsh && draft.dsh.allowDshCompaction === true);
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1325,6 +1345,7 @@ export const WEB_CLIENT = `(function () {
             if (fe) fe.value = JSON.stringify(draft, null, 2);
             quickBroken(false);
             syncAll();
+            refreshDirtyFlag();
         }
         function row(id, label) {
             const w = document.createElement("div");
@@ -1369,6 +1390,26 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
+        // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
+        const dsgEnvForced = Boolean(cfg.allowDshCompaction && cfg.allowDshCompaction.source === "env");
+        const dsgRow = row("quick-dsg", t("cfg.q_dsh_compact"));
+        if (!dsgEnvForced) qCtrls.push(dsgRow.inp);
+        const dsgWarnNote = document.createElement("div");
+        dsgWarnNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#9a6700";
+        dsgWarnNote.textContent = t("cfg.q_dsh_compact_warn");
+        dsgWarnNote.hidden = true;
+        box.appendChild(dsgWarnNote);
+        const dsgEnvNote = document.createElement("div");
+        dsgEnvNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
+        dsgEnvNote.hidden = true;
+        box.appendChild(dsgEnvNote);
+        dsgRow.inp.addEventListener("change", () => commit((d) => {
+            if (dsgRow.inp.checked) { if (!d.dsh || typeof d.dsh !== "object") d.dsh = {}; d.dsh.allowDshCompaction = true; }
+            else { if (d.dsh) { delete d.dsh.allowDshCompaction; if (Object.keys(d.dsh).length === 0) delete d.dsh; } }
+        }));
+        if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -1499,7 +1540,7 @@ export const WEB_CLIENT = `(function () {
         moreA.style.cssText = "font-size:12px;color:#0969da";
         moreA.textContent = t("cfg.q_more");
         box.appendChild(moreA);
-        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); refreshDirtyFlag(); });
         syncAll();
     }
     async function loadUpstream(cfg) {
