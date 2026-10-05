@@ -52,6 +52,16 @@ entries:
     desc_zh: "增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。"
     site_en: "Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens."
     site_zh: "增长门槛（默认 50000）：可折叠片段超出基线增长达到该 token 数才发提醒。"
+  - key: compress.streamSummary
+    type: boolean
+    default: "false (unset)"
+    group: compress
+    id: cw.ssm
+    render: compress-row
+    desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 \"stream required\" rejections and never arms on gateway timeouts."
+    desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 \"stream required\"，网关超时永远无法触发。"
+    site_en: "Force streaming (SSE) summarization from the first attempt — an escape hatch for upstreams behind gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the error-driven self-learn cannot detect."
+    site_zh: "强制摘要从首次起走流式（SSE）——用于上游在会掐断长非流式调用的网关之后（如 Cloudflare 524），错误自学习无法感知该场景。"
   - key: compress.preserveRecentMessages
     type: number
     default: "kernel ≈5"

@@ -5871,6 +5871,11 @@ async function preflightCompressIfNeeded(
         stopHold = beginPreflightHold(res, prepared, log);
     }, preflightHoldGraceMs());
     holdTimer.unref();
+    // #2133: compress.streamSummary (same three-level cascade as this request's
+    // own reqConfig resolution) forces SSE summarization — the error-driven
+    // learn path can't see gateway timeouts (524/503), so operators behind such
+    // gateways need a deterministic escape hatch.
+    const forceStreamSummary = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === true;
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -5892,6 +5897,7 @@ async function preflightCompressIfNeeded(
                 wireOverhead: overheadEstimate,
                 unknownBaseline,
                 upstreamOrigin: currentOrigin,
+                forceStreamSummary,
             },
             prepared.originalMessages,
         );
