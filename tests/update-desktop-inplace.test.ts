@@ -235,8 +235,8 @@ test("refreshDshProfileBundles skips the desktop profile without spawning the CL
     process.env.DSH_HOME = dshHome;
     const env = { ...process.env, BILI_DSH_BIN: path.join(root, "no-such-dsh-binary") };
     const { lines, log } = captureLog();
-    const refreshed = await refreshDshProfileBundles("2.0.0", log, env);
-    assert.equal(refreshed, 0);
+    const result = await refreshDshProfileBundles("2.0.0", log, env);
+    assert.deepEqual(result, { refreshed: 0, failed: 1 }); // web's CLI attempt fails (missing binary); desktop was never attempted
     assert.ok(!lines.some((l) => l.includes("profile desktop")), `must not attempt the CLI for desktop: ${lines.join(" | ")}`);
     // control: a non-desktop registry-pinned stale profile DID attempt the CLI,
     // proving this harness detects attempts — the desktop silence above is a skip,

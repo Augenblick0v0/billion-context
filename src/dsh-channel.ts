@@ -391,23 +391,25 @@ export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv =
  *  throws — a failed refresh degrades to the pre-fix behavior (stale profile
  *  copy until the next manual update), never to a broken update loop.
  *  Profiles pinned to a local source (link:/file:/git specs) are left alone.
- *  Returns the number of profiles actually refreshed (#1803: copies already
- *  at the target version are skipped, so callers must not assume every
- *  dependent profile re-ran). */
+ *  Returns { refreshed, failed }: how many profile bundles were refreshed and
+ *  how many attempts failed (#1803: copies already at the target version are
+ *  skipped, so callers must not assume every dependent profile re-ran; #2192:
+ *  the caller backs off on failed > 0). */
 export async function refreshDshProfileBundles(
     targetVersion: string,
     log: (level: "info" | "warn", msg: string) => void,
     env: NodeJS.ProcessEnv = process.env,
-): Promise<number> {
+): Promise<{ refreshed: number; failed: number }> {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
-        return 0; // dsh has never run on this machine — nothing to keep in step
+        return { refreshed: 0, failed: 0 }; // dsh has never run on this machine — nothing to keep in step
     }
     const targets = dirs.filter((dir) => dshProfileDependsOnBili(dir));
-    if (targets.length === 0) return 0;
+    if (targets.length === 0) return { refreshed: 0, failed: 0 };
     let refreshed = 0;
+    let failed = 0;
     for (const dir of targets) {
         const name = path.basename(dir);
         const spec = dshProfileDepSpec(dir);
@@ -427,6 +429,7 @@ export async function refreshDshProfileBundles(
             await runDshPluginAsync(["plugin", "--profile", name, "add", `${DSH_PACKAGE}@${targetVersion}`], env);
             refreshed += 1;
         } catch (err) {
+            failed += 1;
             const detail = err instanceof Error ? err.message : String(err);
             log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${detail} — manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`);
         }
@@ -434,5 +437,5 @@ export async function refreshDshProfileBundles(
     if (refreshed > 0) {
         log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }
-    return refreshed;
+    return { refreshed, failed };
 }

@@ -64,7 +64,28 @@ export function registryUrlFor(packageName: string, tag: string): string {
 // is process-lifetime, and the e2e suites set it in the child process env.
 export const CHECK_INTERVAL_MS = knobUpdateCheckIntervalMs();
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
+// #2192: host-managed instances (dsh profile copies, pi npm dir) throttle on a
+// SEPARATE marker. The machine-global .update-check is written by every bili
+// copy, so sharing one marker starves whichever instance has the slower
+// cadence whenever the faster one runs.
+const OWNER_THROTTLE_FILE = path.join(cacheDir(), ".owner-update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
+
+// #2192: owner-managed lanes are non-critical background housekeeping — they do
+// not need the global 3-min cadence, and a persistently failing lane used to
+// burn a full tarball download (desktop) or a CLI spawn per cycle forever.
+// Host-managed instances therefore throttle their own check at 30 min base +
+// up to 15 min jitter (jitter de-syncs fleets so a registry blip does not turn
+// into a synchronized retry storm). Deliberately a fixed constant, not a config
+// knob: no user-facing surface for a lane nobody tunes (Configuration Surface
+// Discipline); revisit only with explicit owner sign-off.
+export const OWNER_LANE_CHECK_BASE_MS = 30 * 60 * 1000;
+export const OWNER_LANE_CHECK_JITTER_MS = 15 * 60 * 1000;
+
+/** Pure interval decision for the owner-lane throttle — exported for tests. */
+export function ownerLaneIntervalMs(rand: () => number = Math.random): number {
+    return OWNER_LANE_CHECK_BASE_MS + Math.floor(rand() * OWNER_LANE_CHECK_JITTER_MS);
+}
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
 
 /** Age after which a lock is stealable even if kill(pid,0) says the holder is
@@ -105,12 +126,13 @@ export function _resetAdvisoryRefusalWarnsForTest(): void {
     advisoryRefusalWarnKeys.clear();
 }
 
-// THROTTLE_FILE is resolved once at module load, so every test in a process
-// shares one throttle state — non-forced checkForUpdate tests must reset it
-// or they inherit the previous test's "last checked" timestamp.
+// The throttle files are resolved once at module load, so every test in a
+// process shares one throttle state — non-forced checkForUpdate tests must
+// reset them or they inherit the previous test's "last checked" timestamp.
 export async function _resetUpdateThrottleForTest(): Promise<void> {
     firstCheckDone = false;
     await rm(THROTTLE_FILE, { force: true });
+    await rm(OWNER_THROTTLE_FILE, { force: true });
 }
 
 function warnAdvisoryOnce(advisoryId: string, message: string): void {
@@ -123,29 +145,57 @@ function warnAdvisoryOnce(advisoryId: string, message: string): void {
 // #1603: bounded retry for persistent install failures. Pre-fix, a failing
 // install (unwritable dir, host-managed lane) re-downloaded and re-failed every
 // 3-min cycle for days (124× over 12 days in the field) with no backoff or
-// remediation. Keyed on (installDir, targetVersion): consecutive failures grow
-// an exponential cooldown during which the check skips the download silently;
-// a success or a different key resets it. Backoff (not hard self-disable) keeps
-// the path self-healing if the dir becomes writable later.
+// remediation. Keyed on (installDir, targetVersion) for the global lane and on
+// owner:<lane>:<version> for the owner-managed lanes (#2192 — they used to
+// bypass this machinery entirely and retry, the desktop one re-downloading the
+// full tarball, every 3-min cycle forever): consecutive failures grow an
+// exponential cooldown during which the attempt is skipped silently; a success
+// resets its own key. Backoff (not hard self-disable) keeps the path
+// self-healing if the dir becomes writable / the layout repaired later.
 const BACKOFF_THRESHOLD = 3;
 const BACKOFF_BASE_MS = 5 * 60 * 1000;
 const BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
 
 interface InstallBackoff {
-    key: string;
     count: number;
     nextRetryAt: number;
 }
-let installBackoff: InstallBackoff | undefined;
+// #2192: one entry per key — the global lane and each owner lane carry
+// independent failure streaks, so a single shared slot could not serve them
+// (one lane's streak would mask or wipe another's).
+const installBackoffs = new Map<string, InstallBackoff>();
 const installBackoffRemediatedKeys = new Set<string>();
 
 export function _resetInstallBackoffForTest(): void {
-    installBackoff = undefined;
+    installBackoffs.clear();
     installBackoffRemediatedKeys.clear();
+}
+
+/** Test-only snapshot of the live backoff entries (key → streak state). */
+export function _installBackoffStateForTest(): Record<string, { count: number; nextRetryAt: number }> {
+    const out: Record<string, { count: number; nextRetryAt: number }> = {};
+    for (const [key, b] of installBackoffs) out[key] = { count: b.count, nextRetryAt: b.nextRetryAt };
+    return out;
 }
 
 function backoffKey(installDir: string | undefined, version: string): string {
     return `${installDir ?? "<unknown-install-dir>"}\u0000${version}`;
+}
+
+/** #2192: per-lane keys for the owner-managed update lanes. Version-scoped like
+ *  backoffKey, so a new release re-arms a backed-off lane automatically. */
+export function ownerLaneKey(lane: "dsh-desktop" | "dsh-profile" | "pi-npm", version: string): string {
+    return `owner:${lane}:${version}`;
+}
+
+function backoffInCooldown(key: string): boolean {
+    const b = installBackoffs.get(key);
+    return !!b && Date.now() < b.nextRetryAt;
+}
+
+function clearInstallBackoff(key: string): void {
+    installBackoffs.delete(key);
+    installBackoffRemediatedKeys.delete(key);
 }
 
 export function backoffMs(count: number): number {
@@ -179,24 +229,24 @@ function installDirNote(installDir: string | undefined): string {
     }
 }
 
-function recordInstallFailure(key: string, error: string, installDir: string | undefined): void {
-    const now = Date.now();
-    if (installBackoff?.key !== key) {
-        installBackoff = { key, count: 1, nextRetryAt: now };
-    } else {
-        installBackoff.count += 1;
-    }
-    const b = installBackoff;
+/** Record one failed attempt under `key`. `hint` overrides the generic
+ *  remediationHint on the escalation line — owner lanes pass their own manual
+ *  fix there (#2192); the global lane passes none and keeps today's wording. */
+function recordInstallFailure(key: string, error: string, installDir: string | undefined, hint?: string): void {
+    const b = installBackoffs.get(key) ?? { count: 0, nextRetryAt: 0 };
+    b.count += 1;
+    installBackoffs.set(key, b);
     const note = installDirNote(installDir);
     if (b.count < BACKOFF_THRESHOLD) {
         loggerLog("warn", `[update] install failed: ${error}${note}. Will retry next cycle.`);
         return;
     }
+    const now = Date.now();
     b.nextRetryAt = now + backoffMs(b.count);
     const waitMin = Math.round(backoffMs(b.count) / 60_000);
     if (!installBackoffRemediatedKeys.has(key)) {
         installBackoffRemediatedKeys.add(key);
-        loggerLog("warn", `[update] install keeps failing (${b.count}\u00d7 in a row): ${error}${note}. ${remediationHint(error)}. Backing off \u2014 next attempt in ~${waitMin}m.`);
+        loggerLog("warn", `[update] install keeps failing (${b.count}\u00d7 in a row): ${error}${note}. ${hint ?? remediationHint(error)}. Backing off \u2014 next attempt in ~${waitMin}m.`);
         return;
     }
     loggerLog("warn", `[update] install failed: ${error}${note}. Still failing \u2014 next attempt in ~${waitMin}m.`);
@@ -282,27 +332,27 @@ export function reportNotNewer(
     return true;
 }
 
-async function readLastCheck(): Promise<number> {
+async function readLastCheck(file: string): Promise<number> {
     try {
-        const data = await readFile(THROTTLE_FILE, "utf-8");
+        const data = await readFile(file, "utf-8");
         return parseInt(data.trim(), 10) || 0;
     } catch {
         return 0;
     }
 }
 
-async function writeLastCheck(ts: number): Promise<void> {
+async function writeLastCheck(file: string, ts: number): Promise<void> {
     try {
-        await mkdir(path.dirname(THROTTLE_FILE), { recursive: true });
-        await writeFile(THROTTLE_FILE, String(ts), "utf-8");
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, String(ts), "utf-8");
     } catch {
         // best-effort
     }
 }
 
-/** Last completed registry-check time (epoch ms) for diagnostics (#1235); undefined when never checked. */
+/** Last completed registry-check time (epoch ms) for diagnostics (#1235); undefined when never checked. Either throttle marker counts — market-only machines write the owner one (#2192). */
 export async function lastUpdateCheckTime(): Promise<number | undefined> {
-    const ts = await readLastCheck();
+    const ts = Math.max(await readLastCheck(THROTTLE_FILE), await readLastCheck(OWNER_THROTTLE_FILE));
     return ts > 0 ? ts : undefined;
 }
 
@@ -781,9 +831,35 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
  *  (`dsh plugin --profile <name> add billion-context@<v>`, the single-writer-
  *  safe owner) under the shared cross-process update lock. Registry-pinned
  *  profiles only — refreshDshProfileBundles leaves link:/file: pins alone, so
- *  dev lanes stay manual. Best-effort: never throws, never blocks the proxy;
- *  a failed refresh retries on the next check cycle (unlike the post-self-
- *  update trigger, which fires once per install event and never retries). */
+ *  dev lanes stay manual. Best-effort: never throws, never blocks the proxy.
+ *  #2192: a failed refresh records a strike under the shared #1603 backoff
+ *  (keyed owner:dsh-profile:<version>) instead of retrying every check cycle —
+ *  a backed-off lane is a silent no-op until the cooldown expires or a new
+ *  release re-arms it. */
+
+/** #2192: actionable hints surfaced on the escalation line when an owner lane
+ *  exhausts its strikes — each names that lane's manual fix instead of the
+ *  generic global-install advice. */
+const DESKTOP_LANE_HINT = "the dsh desktop profile layout is likely broken \u2014 recreate the desktop profile from dsh (or move DSH_HOME to a shorter path if pnpm virtual-store path limits are hit); retries resume automatically";
+const PROFILE_LANE_HINT = "run `dsh plugin --profile <name> add billion-context@<version>` from a shell where `dsh` resolves (or point BILI_DSH_BIN at dsh's executable)";
+const PI_LANE_HINT = `run \`pi update --extension ${PI_NPM_SPEC}\` from a shell where \`pi\` resolves (or point BILI_PI_BIN at pi's executable)`;
+
+/** #2192: drive the dsh profile-bundle refresh through the shared #1603
+ *  backoff keyed per lane+version. A stale-but-in-cooldown lane is a silent
+ *  no-op (no dsh CLI spawn); a run with any failed profile records a strike, a
+ *  clean run clears the key. Every driver site goes through here so streaks
+ *  stay consistent no matter which instance triggers the refresh. */
+async function runProfileBundlesRefresh(targetVersion: string, log: Logger, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+    const key = ownerLaneKey("dsh-profile", targetVersion);
+    if (backoffInCooldown(key)) return;
+    const res = await refreshDshProfileBundles(targetVersion, log, env);
+    if (res.failed > 0) {
+        recordInstallFailure(key, `${res.failed} dsh profile bundle(s) failed to refresh to ${targetVersion}`, undefined, PROFILE_LANE_HINT);
+    } else {
+        clearInstallBackoff(key);
+    }
+}
+
 export async function refreshDshProfileCopy(
     installDir: string,
     opts: UpdateOptions,
@@ -815,7 +891,7 @@ export async function refreshDshProfileCopy(
         return;
     }
     try {
-        await refreshDshProfileBundles(latest, log, env);
+        await runProfileBundlesRefresh(latest, log, env);
         await refreshDshDesktopCopy(latest, log, env);
     } finally {
         await lock.release();
@@ -830,7 +906,9 @@ export async function refreshDshProfileCopy(
  *  exact layout), keyed off the running user's DSH_HOME. Called alongside
  *  refreshDshProfileBundles at every driver site; all sites hold the shared
  *  update lock. Silent while the copy is missing, in step, or ahead; failures
- *  log and retry next cycle; never throws. */
+ *  log and back off through the owner-lane InstallBackoff (#2192 — this lane
+ *  re-downloads the tarball per attempt, so an unbacked retry loop burned
+ *  bandwidth every check cycle); never throws. */
 export async function refreshDshDesktopCopy(
     targetVersion: string,
     log: Logger = loggerLog,
@@ -838,27 +916,42 @@ export async function refreshDshDesktopCopy(
     resolveProxy?: (url: string) => string | undefined,
 ): Promise<void> {
     const flat = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE, "node_modules", DSH_PACKAGE);
+    const bkey = ownerLaneKey("dsh-desktop", targetVersion);
+    let diskVersion: string | undefined;
     try {
         try {
             await access(flat, constants.F_OK);
         } catch {
             return; // no desktop profile on this machine — nothing to keep in step
         }
-        const diskVersion = await readDiskVersion(flat);
+        diskVersion = await readDiskVersion(flat);
         if (!isVersionNewer(targetVersion, diskVersion ?? "0.0.0")) return; // in step or ahead — never downgrade
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);
+        recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
+        return;
+    }
+    if (backoffInCooldown(bkey)) return; // #2192: inside the backoff window — no registry call, no download
+    try {
         const doc = await fetchVersionDoc({ resolveProxy }, DSH_PACKAGE, targetVersion);
         if (!doc?.tarball) {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
+            recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE}: no dist.tarball for ${targetVersion} on the registry`, undefined, DESKTOP_LANE_HINT);
             return;
         }
         const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env, { bootSmoke: true });
         if (result.ok) {
+            clearInstallBackoff(bkey);
             log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it (the running app keeps the old code in memory; across the handoff bili tools may fail once until dsh restarts, #2082)`);
         } else {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed: ${result.error}; retrying next cycle`);
+            recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh to ${targetVersion} failed: ${result.error}`, undefined, DESKTOP_LANE_HINT);
         }
     } catch (err) {
-        log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${err instanceof Error ? err.message : String(err)}; leaving the copy untouched`);
+        const msg = err instanceof Error ? err.message : String(err);
+        log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);
+        recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
     }
 }
 
@@ -869,8 +962,8 @@ export async function refreshDshDesktopCopy(
  *  npm:billion-context` (pi's owner channel) on its periodic check when the
  *  registry has a newer version. Only the unpinned spec form self-refreshes;
  *  an explicit `@version` pin (or a missing settings entry) is left alone.
- *  Best-effort: never throws, never blocks the proxy; a failed refresh
- *  retries on the next check cycle. */
+ *  Best-effort: never throws, never blocks the proxy; a failed refresh backs
+ *  off through the owner-lane InstallBackoff (#2192). */
 export async function refreshPiNpmCopy(
     installDir: string,
     opts: UpdateOptions,
@@ -900,6 +993,7 @@ export async function refreshPiNpmCopy(
         log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    if (backoffInCooldown(ownerLaneKey("pi-npm", latest))) return; // #2192: inside the backoff window — no spawn
     log("info", `[update] pi npm copy is stale (${currentVersion} → ${latest}) — refreshing via pi's update channel`);
     const lock = await tryAcquireLock();
     if (!lock) {
@@ -908,10 +1002,12 @@ export async function refreshPiNpmCopy(
     }
     try {
         await runPiAsync(["update", "--extension", PI_NPM_SPEC], env);
+        clearInstallBackoff(ownerLaneKey("pi-npm", latest));
         log("info", `[update] pi npm copy refreshed to ${latest} — restart pi to load it`);
     } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         log("warn", `[update] pi npm copy refresh to ${latest} failed: ${detail} — manual fix: run \`pi update --extension ${PI_NPM_SPEC}\` from a shell where \`pi\` resolves (or point BILI_PI_BIN at pi's executable); retries next check cycle`);
+        recordInstallFailure(ownerLaneKey("pi-npm", latest), `pi npm copy refresh to ${latest} failed: ${detail}`, undefined, PI_LANE_HINT);
     } finally {
         await lock.release();
     }
@@ -984,7 +1080,7 @@ export async function convergeDshProfileBundles(
         return;
     }
     try {
-        await refreshDshProfileBundles(globalVersion, log, env);
+        await runProfileBundlesRefresh(globalVersion, log, env);
         await refreshDshDesktopCopy(globalVersion, log, env);
     } finally {
         await lock.release();
@@ -998,24 +1094,31 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     inFlight = true;
     try {
         const now = Date.now();
-        const lastCheck = await readLastCheck();
+        // #2192: resolve the install dir up front so the throttle marker and
+        // cadence are picked per lane — host-managed copies run their
+        // owner-channel refresh on their own slower interval (with jitter)
+        // instead of the global 3-min cadence.
+        const installDir = opts.installDir ?? await findInstallDir(opts.packageName);
+        const managed = installDir ? hostManagedInstall(installDir) : undefined;
+        const ownerLane = Boolean(managed && installDir);
+        const throttleFile = ownerLane ? OWNER_THROTTLE_FILE : THROTTLE_FILE;
+        const intervalMs = ownerLane ? ownerLaneIntervalMs() : CHECK_INTERVAL_MS;
+        const lastCheck = await readLastCheck(throttleFile);
         const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
-        if (!force && firstCheckDone && now - lastCheck < CHECK_INTERVAL_MS) {
-            const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
+        if (!force && firstCheckDone && now - lastCheck < intervalMs) {
+            const retryIn = ((intervalMs - (now - lastCheck)) / 1000 | 0);
             loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
         }
-        await writeLastCheck(now);
+        await writeLastCheck(throttleFile, now);
         firstCheckDone = true;
 
         if (!force && opts.advisoryActive?.()) {
             // The advisory watcher is working on this install dir: let its target
             // version win instead of racing it with "follow latest".
-            const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
-            const managed = dir ? hostManagedInstall(dir) : undefined;
-            if (managed && dir) {
+            if (managed && installDir) {
                 loggerLog("info", `[update] deferring to the advisory loop; ${managed.owner}-managed install keeps its owner-channel refresh (#991/#1196)`);
-                await refreshOwnerManagedCopies(dir, opts, process.env, loggerLog);
+                await refreshOwnerManagedCopies(installDir, opts, process.env, loggerLog);
                 return;
             }
             loggerLog("info", "[update] deferring to the advisory loop (an active critical-bug advisory owns this install)");
@@ -1027,7 +1130,6 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // clone (node dist/index.js start). An in-place tarball copy would
         // silently rewrite tracked files (the version pin, READMEs), so refuse
         // to self-update here instead of proceeding.
-        const installDir = opts.installDir ?? await findInstallDir(opts.packageName);
         if (installDir && await isGitWorkingTree(installDir)) {
             loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
             return;
@@ -1037,7 +1139,6 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // store, pi/opencode/dsh/kimi/omp trees), the copy must only be
         // updated through its owner — never overwritten in place by the
         // global self-updater.
-        const managed = installDir ? hostManagedInstall(installDir) : undefined;
         if (managed && installDir) {
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
             // #1196: a copy inside a host's own tree (dsh profile bundle, pi
@@ -1115,7 +1216,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
 
         const bkey = backoffKey(installDir, latest);
-        if (!force && installBackoff && installBackoff.key === bkey && Date.now() < installBackoff.nextRetryAt) {
+        if (!force && backoffInCooldown(bkey)) {
             return;
         }
 
@@ -1130,14 +1231,13 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         try {
             const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
-                installBackoff = undefined;
-                installBackoffRemediatedKeys.clear();
+                clearInstallBackoff(bkey);
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
                 // the old version next to the new global one (#953). Best-effort:
                 // never fails the update itself.
-                await refreshDshProfileBundles(latest, loggerLog);
+                await runProfileBundlesRefresh(latest, loggerLog);
                 await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
                 notifyStaleInstall(opts, latest);
             } else {
@@ -1626,7 +1726,7 @@ export async function forceInstallVersion(
         const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
         if (result.ok) {
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
-            await refreshDshProfileBundles(targetVersion, loggerLog);
+            await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);
             notifyStaleInstall(opts, targetVersion);
             return { ok: true };
