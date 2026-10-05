@@ -81,6 +81,8 @@ export function installWebSocketBridge(
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
     log: (level: string, message: string) => void,
     codecs: readonly WsBridgeCodec[],
+    /** #2124: whether a WS-upstream destination's egress leaves through an upstream proxy (its hostname is then resolved remotely by that proxy, not the local resolver). */
+    isEgressProxied?: (destinationUrl: string) => boolean,
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
     const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
     const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
@@ -118,7 +120,7 @@ export function installWebSocketBridge(
         // side requests are identified by the #1699 persona header instead).
         source.headers["x-bili-ws-lane"] = codec.name;
         void (async () => {
-            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv() });
+            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv(), egressProxied: isEgressProxied?.(upstream) });
             if (!verdict.ok) {
                 socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                 return;
