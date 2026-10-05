@@ -97,14 +97,16 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
-**WebSocket 缺口(#2073)。** WebSocket 连接从不经过 `globalThis.fetch`,所以 pi 的 WS 模型传输在握手成功时整体绕过原生拦截:
+**WebSocket 覆盖(#2073,#2111 实现)。** WebSocket 连接从不经过 `globalThis.fetch`,所以原生扩展在加载时(首个模型连接之前)同时包装 `globalThis.WebSocket`(pi 的 Node 分支每次调用都读全局,Bun 分支首次调用时缓存子类——两个运行时的安装时序都因此安全)。只重写受支持的 Codex Responses 模型连接——其余 WebSocket(devtools、第三方库、已路由 URL)原样通过:
 
 | Provider / 传输 | 状态 |
 |---|---|
 | 全部 HTTP provider | ✅ 覆盖 —— 具名 plugin-mode 会话 |
 | `openai-codex-responses`(ChatGPT backend-api),`transport: "sse"` | ✅ 覆盖 —— 与任何 HTTP provider 无异 |
-| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ❌ WS 成功期间绕过代理 —— ACP 工具照常注册、调用照常到达代理,但该会话没有任何模型请求到过代理,会话状态不存在。工具调用在路由阶段失败(`unknown plugin conversation` + `NO MODEL REQUESTS`,#1158 诊断)。#2072 落地前失败形态比「大声」更糟:*兄弟*子代理会话的过期 outbound witness 可能静默用别人的会话状态应答(#2063)—— 此类会话的状态面板在核对 bili.log 之前不可信 |
-| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(归入 #2073 跟踪) |
+| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ✅ 覆盖(#2111)—— 构造器 URL 被重写为 `<proxy-ws>/bili/<https-upstream>`(例:`wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`)。构造器参数、子协议、请求头全部保留,pi 在 SSE 上发的同一个 `session-id` 随升级握手到达,会话标识跨传输字节一致;子代理各用自己的会话 ID。`previous_response_id` 增量续传在该车道可用(代理先展开 delta 再进管线,回上游前再优化回 delta) |
+| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(不在 #2111 范围,归入 #2073 另行跟踪) |
+
+拦截带来一个拓扑后果:pi 的客户端握手现在指向本地代理(总是成功),因此*上游*拒绝 WS 握手会以流中传输失败的形式暴露,而不再触发 pi 的同轮 SSE 回退——该回退只在客户端握手失败时触发。下面的显式 `sse` 车道仍是确定性绕行手段。
 
 **Codex provider 的绕行办法。** 在 pi 配置里强制 SSE 车道(`~/.pi/agent/settings.json`;项目 `.pi/settings.json` 可覆盖):
 
@@ -114,7 +116,7 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 默认值 `"auto"` 先试 WS、握手失败才回退 SSE;旧布尔键 `"websockets": false` 会自动迁移。该键全局生效,但只有支持多传输的 provider(目前是 codex provider)消费它,纯 HTTP provider 不受影响。Windows + Pi 1.0.2 实机验证(#2063 owner 复现):显式 `sse` 携带正确会话 ID 进入 bili。
 
-已立项的修法(客户端侧 `globalThis.WebSocket` 拦截,#2073 中 owner-gated)是可行而非推测:pi 在 WS 升级握手上发送与 SSE 相同的 `session-id` 头(值 = pi 会话 ID),Node 内置 WebSocket 会转发构造器 `headers`(Node 22 实测),且代理侧已经会讲这条线 —— WS 桥按 `/bili/<upstream>/responses` 前缀形状准入、恰好以该 header 键控(`src/ws-bridge.ts`、`src/responses-ws.ts` `codexResponsesCodec`)。
+该车道已经过端到端实证(`tests/e2e/e2e-pi-codex-ws.test.ts`,真实 pi 对确定性 mock 上游经真实代理):显式 websocket 与 auto 路由、升级握手上 stamp 与 `session-id` == 会话 ID 一致、compress/decompress 往返并反映到后续请求、`previous_response_id` 展开、上游拒绝行为、显式 sse 回归守卫,以及两个并发子代理式会话共享一个代理互不串扰。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
