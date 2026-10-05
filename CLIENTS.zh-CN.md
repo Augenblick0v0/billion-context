@@ -91,6 +91,10 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
+### 运行模式:`bili codex` 钉死 embedded(#1867)
+
+自 ~0.156 起,Codex 可以附着到(或自动拉起)一台机器全局共享的后台 server,其模型流量用的是 **daemon 启动时**存在的环境变量,而不是会话启动时的。启动器的代理是会话级的(端口随进程消亡),所以长寿 daemon 没法安全地经它路由:若 codex 先于 bili env 启动,之后的 `bili codex` 会话会静默附着上去、**完全绕过压缩**;若 bili 先启动,幸存的 daemon 则一直指向死端口。因此启动器显式传 `--no-daemon` —— 先探测 `codex --help` 是否有该 flag(旧版本二进制原样启动),且仅当用户未自行钉死模式(`--no-daemon` 或 `--remote`)时。结果:确定性的 embedded 运行,无逐次启动的回退警告,无静默绕过。#321 的预算 `-c` 参数原样保留(embedded 模式同等生效)。想要共享后台 server 的话,直接跑原生 `codex` —— 没有压缩,但工具仍可通过 `bili plugin install codex` 使用。
+
 ## Pi(pi.dev coding agent)
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
