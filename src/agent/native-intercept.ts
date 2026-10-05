@@ -167,10 +167,9 @@ let warnedReanchor = false;
 const dispatchDepth = new AsyncLocalStorage<number>();
 let warnedReentry = false;
 
-// #2090: signed requests going direct (fail-open default for non-built-in
-// schemes, explicit passthrough otherwise) must be LOUD in host logs — the
-// pre-#2090 symptom was a silent 401 surfacing in another plugin's UI.
-// Once per URL, never per request.
+// #2090: the built-in-scheme passthrough opt-in (#1884 escape hatch) is the
+// only path where a signed request goes DIRECT — make it LOUD in host logs so
+// the user knows this link runs uncompressed. Once per URL, never per request.
 const signedDirectSeen = new Set<string>();
 function noteSignedDirect(url: string, scheme: string, why: string): void {
     let key = url.split("?")[0];
