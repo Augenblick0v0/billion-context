@@ -15,7 +15,7 @@
         "version": "0.1.185",
         "date": "2026-10-05",
         "tier": "critical",
-        "summary": "Severe dsh fix: background side requests (title generation etc.) could steal the main session's anchor and permanently break compression (#2156, #2160) — side traffic now rides a dedicated lane (#2157). Windows: bili no longer exits after a self-update (#2095). Restart dsh once. 丨 严重修复:dsh 后台侧请求(标题生成等)会抢占主会话锚点、永久破坏压缩(#2156、#2160),现已走独立通道(#2157);Windows 自更新后不再退出(#2095)。重启一次 dsh。"
+        "summary": "dsh: compression could silently stop — a background helper (e.g. title generation) hijacked the chat's memory anchor, so it never compressed again, eating context and tokens (#2156, #2160). Helpers are now isolated (#2157); Windows self-update no longer kills bili (#2095). 丨 修复 dsh 静默压缩失效:后台小任务(如生成标题)抢走「记忆锚点」,该会话从此无法压缩、上下文和 token 悄悄暴涨(#2156、#2160);现已隔离(#2157);Windows 自更新后不再退出(#2095)。重启一次 dsh。"
       },
       {
         "version": "0.1.184",
