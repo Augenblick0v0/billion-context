@@ -6355,8 +6355,8 @@ async function forward(
         prepared.session.stats.contextTokens = estimate;
         prepared.session.stats.contextTokensSource = "estimate";
         // #2131: exact message count for seam forensics (sentParsed is the one
-        // shared parse above — the Responses wire carries "input" instead).
-        const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input) : null;
+        // shared parse above — Responses carries "input", Google native "contents").
+        const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
         noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;

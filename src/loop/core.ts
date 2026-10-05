@@ -373,8 +373,10 @@ export async function* runCompressLoop(
         const wireObj = requestOptions.wireTransform ? requestOptions.wireTransform(body) : body;
         const wireBodyStr = JSON.stringify(wireObj);
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
-        const wireMsgs = Array.isArray(wireObj.messages) ? (wireObj.messages as unknown[]).length : null;
-        noteForwardedBody(ctx.session, wireBodyStr, wireMsgs);
+        // #2131 follow-up: the message array lives under `messages` (chat),
+        // `input` (Responses) or `contents` (Google) depending on wire shape.
+        const wireArr = [wireObj.messages, wireObj.input, wireObj.contents].find((v): v is unknown[] => Array.isArray(v));
+        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null);
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.
