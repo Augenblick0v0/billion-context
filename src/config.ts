@@ -259,6 +259,20 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** Force preflight summarization calls to use streaming (SSE) instead of
+     *  the default non-stream call (#2133). The error-driven self-learn flag
+     *  (`session.metadata.preflightStreamSummary`) only fires on a 400 whose
+     *  body says "stream … true" — a gateway that cuts long non-streaming
+     *  completions with a timeout status (Cloudflare's HTTP 524 is the
+     *  canonical case) never triggers it, so every summary round-trip fails
+     *  and preflight spins without folding until an operator hand-edits the
+     *  session file. Set this where such a gateway sits between bili and the
+     *  origin: every preflight summary call then streams from the first
+     *  attempt. Deepest level wins (global → provider → model), so it can be
+     *  scoped to just the affected route; unset = legacy behavior (non-stream
+     *  first, learn on 400). No-op on the Google wire (its summary calls are
+     *  always streamed via :streamGenerateContent). */
+    streamSummary?: boolean;
     /** Override the kernel's compression prompt text (compressPhilosophy /
      *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
@@ -1475,7 +1489,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile",
+    "reconcile", "streamSummary",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -1821,6 +1835,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("streamSummary" in obj) {
+        if (typeof obj.streamSummary !== "boolean") ok = false;
+        else out.streamSummary = obj.streamSummary;
     }
     if ("rules" in obj) {
         if (typeof obj.rules !== "boolean") ok = false;
