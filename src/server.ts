@@ -2194,7 +2194,11 @@ async function handle(
         // minus publicForkPrefix, which needs the session resolved AFTER this
         // point: a public-fork child arrives under a FRESH childConversationId
         // where first-seen anchoring returns the raw key anyway, so omitting
-        // the veto cannot move any key. detectAcpArtifacts stays last — it
+        // the veto cannot move any key. Under an ALREADY-anchored fork child
+        // the verbatim key is still correct BECAUSE the lane below diverts
+        // intent-certain side requests to the passthrough even under fork
+        // receipts (kernel-no-touch, #388) — the two gates move together.
+        // detectAcpArtifacts stays last — it
         // re-encodes the whole history and must only run for the all-bili
         // subset (same short-circuit discipline as the demotedSide gate below;
         // proxy-mode traffic never reaches it because the plugin header gate
@@ -2841,7 +2845,29 @@ async function handle(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
-        if (!countTokens && !responsesCompact && protocol !== null && !publicForkPrefix && (demotedSide || isSideRequest(parsed, requestAgent))) {
+        const sideIntent = isSideRequest(parsed, requestAgent);
+        // #388/#2157 follow-up: side requests must not touch kernel state under
+        // a public-fork receipt either. The receipt's first-request 409
+        // discipline above has already accepted this request (inherited prefix
+        // matched, or the child has live traffic), and a side request reads
+        // none of the kernel state fork adoption maintains — so the historical
+        // !publicForkPrefix veto here only had the effect of running
+        // full-history-replaying side calls (dsh title-gen under a forked
+        // conversation: the host resends the ENTIRE current history plus the
+        // title instruction, so the prefix always matches) through the FULL
+        // pipeline on the fork child's MAIN session: junk turns into the
+        // snapshot, usage-baseline pollution (#1916 class), stats inflation.
+        // With #2157's verbatim sideRequestLike keying this became a live
+        // regression (pre-#2157 the same request forked onto an isolated
+        // `|sub:<fp>` junk session — ugly but clean); diverting it here
+        // restores the #388 kernel-no-touch contract for fork children too.
+        // demotedSide keeps its own !publicForkPrefix veto deliberately: the
+        // all-bili-tools leak shape is heuristic, and a fork child's early
+        // mainline turns (raw inherited prefix, no artifacts yet, no agent
+        // header) can false-positive it — only intent-certain side
+        // identification (declared side agent, or a tool-less tiny budget)
+        // diverts under a receipt.
+        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || sideIntent)) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
