@@ -859,6 +859,39 @@ export const WEB_CLIENT = `(function () {
             });
             parts.push("</tbody></table></div></details>");
         }
+        // #2131: per-call body-stability proof (digest vs previous settled request).
+        // Defensive reads — servers predating #2131 carry no ledger.stability, and an
+        // unpaired shape (paired=0) must render nothing.
+        const stRaw = ledger.stability && typeof ledger.stability === "object" ? ledger.stability : null;
+        if (stRaw && (Number(stRaw.paired) || 0) > 0) {
+            const st = {
+                paired: Number(stRaw.paired) || 0,
+                equal: Number(stRaw.equal) || 0,
+                diverged: Number(stRaw.diverged) || 0,
+                head: Number(stRaw.head) || 0,
+                append: Number(stRaw.append) || 0,
+                mid: Number(stRaw.mid) || 0,
+                unknownOffset: Number(stRaw.unknownOffset) || 0,
+                sizeBuckets: Array.isArray(stRaw.sizeBuckets) ? stRaw.sizeBuckets : [],
+                gapSplit: stRaw.gapSplit && typeof stRaw.gapSplit === "object" ? stRaw.gapSplit : null,
+            };
+            const divParts = [];
+            if (st.equal > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_identical")) + " <b>" + st.equal + "</b></span>");
+            if (st.head > 0) divParts.push('<span style="color:#bf8700">' + escapeHtml(t("det.stab_head")) + " <b>" + st.head + "</b></span>");
+            if (st.append > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_append")) + " <b>" + st.append + "</b></span>");
+            if (st.mid > 0) divParts.push('<span style="color:#cf222e">' + escapeHtml(t("det.stab_mid")) + " <b>" + st.mid + "</b></span>");
+            if (st.unknownOffset > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_unknown")) + " <b>" + st.unknownOffset + "</b></span>");
+            let stabBody = '<div class="mono small" style="line-height:1.8">' + escapeHtml(t("det.stab_pairs", { n: st.paired })) + ": " + (st.diverged > 0 ? '<span style="color:' + (st.mid > 0 ? "#cf222e" : "inherit") + '">' + st.diverged + " ↓</span>" : "0") + (divParts.length ? " — " + divParts.join(" · ") : "") + "</div>";
+            const sb = st.sizeBuckets.filter((b) => b && (Number(b.n) || 0) >= 3);
+            if (sb.length >= 2) {
+                stabBody += '<div class="dim small mono" style="margin-top:4px">' + escapeHtml(t("det.stab_size")) + ": " + sb.map((b) => Math.round(((Number(b.lo) || 0) / 1000)) + "K=" + (Number(b.hitMedian) || 0).toFixed(0) + "%").join("  ") + "</div>";
+            }
+            if (st.gapSplit && st.gapSplit.lowHitMedGapMs != null && st.gapSplit.highHitMedGapMs != null) {
+                stabBody += '<div class="dim small mono" style="margin-top:4px">' + escapeHtml(t("det.stab_gap", { a: ((Number(st.gapSplit.lowHitMedGapMs) || 0) / 1000).toFixed(1), b: ((Number(st.gapSplit.highHitMedGapMs) || 0) / 1000).toFixed(1) })) + "</div>";
+            }
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.stab_tip")) + '"><b>' + escapeHtml(t("det.stab_title")) + "</b></summary>"
+                + '<div style="padding:4px 8px 10px">' + stabBody + "</div></details>");
+        }
         const tot = ledger.totals;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.cache_econ") + "</span>" + (tot ? (tot.balanced ? ' <span class="badge ok">' + t("det.ce_balanced") + "</span>" : ' <span class="badge warn">' + t("det.ce_unbalanced") + "</span>") : "") + '</div><div class="card-b">' + (d.ledger ? '<div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px"><button id="cacherpt-copy" class="btn sm">' + t("common.copy") + '</button><button id="cacherpt-dl" class="btn sm">' + t("det.report_dl") + "</button></div>" : ""));
         if (tot) {

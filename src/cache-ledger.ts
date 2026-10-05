@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
     computeFoldEconomics,
     decomposeSample,
     formatCacheReport,
     summarizeFoldEconomics,
     type CacheReport,
+    type CacheReportLine,
     type CacheTotals,
     type CompressionBlock,
     type FoldEvent,
@@ -31,6 +32,16 @@ const BOOT_ID = randomUUID();
 // the residual reverts to unattributed TTL — an old switch must never swallow later, unrelated churn.
 const SWITCH_COLD_ROUNDS = 4;
 const WARM_HIT_PCT = 85;
+
+// #2131: input-size bucket width for the hit-rate stratification diagnostic.
+const SIZE_BUCKET_TOK = 20000;
+
+function median(xs: number[]): number | null {
+    if (xs.length === 0) return null;
+    const s = [...xs].sort((x, y) => x - y);
+    const m = s.length >> 1;
+    return s.length % 2 === 1 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
+}
 
 interface LedgerFold {
     seq: number;
@@ -90,6 +101,23 @@ interface LedgerLine {
     /** #1847: the single primary cause this line's stable-prefix residual was charged to (a partition —
      *  never more than one); omitted when unattributed or unmeasured. */
     cause?: "restart" | "model" | "wire" | "upstream";
+    /** #2131: SHA-256 hex of this request's exact outbound body — the per-call
+     *  byte-identity proof; sparse: omitted when no body was captured. */
+    bd?: string;
+    /** #2131: 1 iff the outbound body was byte-identical to the PREVIOUS settled
+     *  request's body (e.g. a transport retry), 0 iff it diverged. Sparse:
+     *  omitted without a comparable predecessor. */
+    be?: 0 | 1;
+    /** #2131: first diverging byte offset when be=0 and both full bodies were
+     *  retained under BODY_FULL_CAP. Sparse. */
+    bl?: number;
+    /** #2131: divergence class of a be=0 pair — "head": change within the first
+     *  1 KiB (model/tools/sampling-params/system region → host-side parameter
+     *  change, not a history rewrite); "append": the whole shorter payload
+     *  survives ±64 closing-bracket bytes (pure tail growth/trim); "mid": a
+     *  mid-history rewrite; "unknown": bodies above BODY_FULL_CAP (inequality
+     *  proven by digest, offset unavailable). Sparse. */
+    bs?: "head" | "append" | "mid" | "unknown";
 }
 
 export interface CacheLedger {
@@ -203,8 +231,28 @@ export interface SeamEvent {
 
 const SEAM_BODY_CAP = 512 * 1024;
 const SEAM_EVENTS_CAP = 8;
-const seamLastSent = new WeakMap<Session, string>();
-const seamLastSettled = new WeakMap<Session, string>();
+
+// #2131 reachability: full-body retention cap for per-call body-stability
+// forensics. Bodies above it are digest-only — SHA-256 still proves byte
+// equality/inequality, the LCP offset just becomes unavailable. 8 MiB covers
+// multi-MiB plugin-mode sessions (the #2131 log ran ~3.3 MiB outbound).
+const BODY_FULL_CAP = 8 * 1024 * 1024;
+
+/** #2131: stored body PLUS exact outbound message count. A body clipped at
+ *  SEAM_BODY_CAP parses to zero messages, so count-based classification needs
+ *  the count captured at the send chokepoint where the full body is in hand.
+ *  `null` = unknown (wire shape without a message array). `digest` hashes the
+ *  FULL body (the capped head cannot distinguish two payloads sharing 512 KiB);
+ *  `full` keeps the whole payload while it fits BODY_FULL_CAP so divergent
+ *  pairs can report their first-diverging byte offset. */
+interface SeamSlot {
+    str: string;
+    msgs: number | null;
+    digest: string;
+    full: string | null;
+}
+const seamLastSent = new WeakMap<Session, SeamSlot>();
+const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
 export interface ContextObservation {
@@ -244,9 +292,25 @@ export function noteClientAbort(session: Session): void {
 
 /** Record the body of the upstream round that is about to be sent. Called at
  *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
- *  the next settleUsageReport pairs it with the usage report it produced. */
-export function noteForwardedBody(session: Session, body: string): void {
-    seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
+ *  the next settleUsageReport pairs it with the usage report it produced.
+ *  `msgs` is the exact outbound message count (#2131); when omitted and the
+ *  stored payload is byte-identical to a previously noted one (the non-streaming
+ *  settle re-noting the same wireBody), the earlier count is kept. */
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null): void {
+    const str = body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body;
+    // #2131: hash the FULL body — the capped head alone cannot tell two payloads
+    // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
+    // non-streaming settle path) reuses the prior slot's count/full instead of
+    // re-deriving them.
+    const digest = createHash("sha256").update(body, "utf8").digest("hex");
+    const prior = seamLastSent.get(session);
+    const samePayload = prior !== undefined && prior.digest === digest;
+    seamLastSent.set(session, {
+        str,
+        msgs: msgs ?? (samePayload ? prior.msgs : null),
+        digest,
+        full: body.length <= BODY_FULL_CAP ? body : samePayload ? prior.full : null,
+    });
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -340,6 +404,16 @@ function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; pr
     return { lcpBytes: lcp, msgIndex: i, prevMsgs: ma.length, curMsgs: mb.length };
 }
 
+// #2131: byte-LCP WITHOUT the JSON parse seamLcp does — the per-call stability
+// check runs on every settled pair and must stay cheap on multi-MiB bodies
+// (message-level detail belongs to detectSeam's forensics path only).
+function byteLcp(a: string, b: string): number {
+    let lcp = 0;
+    const n = Math.min(a.length, b.length);
+    while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
+    return lcp;
+}
+
 function detectSeam(session: Session, led: CacheLedger): void {
     const line = led.lines[led.lines.length - 1];
     if (!line || line.unk === 1 || line.missed <= 0) return;
@@ -362,18 +436,40 @@ function detectSeam(session: Session, led: CacheLedger): void {
     const agg = led.agg;
     const cur = seamLastSent.get(session);
     const prev = seamLastSettled.get(session);
+    let f: ReturnType<typeof seamLcp> | undefined;
     if (cur !== undefined && prev !== undefined) {
-        const f = seamLcp(prev, cur);
-        if (f.curMsgs < f.prevMsgs) {
-            // Client reverted/trimmed history: the miss is the sanctioned
-            // one-time re-bill of the retained prefix (or the gap's TTL).
+        f = seamLcp(prev.str, cur.str);
+        // #2131: a body stored at full length is readable; one clipped at
+        // SEAM_BODY_CAP parses to zero messages, so parse-derived arms below
+        // only decide pairs where that side is under the cap.
+        const prevCapped = prev.str.length >= SEAM_BODY_CAP;
+        const curCapped = cur.str.length >= SEAM_BODY_CAP;
+        // Client reverted/trimmed history: the miss is the sanctioned
+        // one-time re-bill of the retained prefix (or the gap's TTL). Only
+        // trust the parsed counts when BOTH sides are fully stored — a side
+        // clipped at SEAM_BODY_CAP parses to zero messages and would fake a
+        // shrink (or hide one); those pairs go to the #2131 byte/count arms.
+        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.curMsgs < f.prevMsgs) {
             agg.rewinds += 1;
             agg.rewindMissed += line.tr;
             return;
         }
-        if (f.lcpBytes >= cur.length) {
+        if (cur.str.length < prev.str.length && f.lcpBytes >= cur.str.length - 4) {
+            // #2131: the WHOLE current payload survives inside the previous
+            // one — a JSON array only diverges from its own longer superstring
+            // in the closing-bracket region (the 4-byte tolerance), so this is
+            // a sanctioned client-side trim/fold re-bill of the retained prefix,
+            // NOT a provider miss. Must run before the byte-stable arm, which
+            // would otherwise read "all of cur survives" and book it provider-side.
+            agg.rewinds += 1;
+            agg.rewindMissed += line.tr;
+            return;
+        }
+        if (f.lcpBytes >= cur.str.length) {
             // Wire was byte-stable against the previous request — the
-            // upstream simply did not serve its cache. Provider-side.
+            // upstream simply did not serve its cache. Provider-side. Above
+            // the cap this covers the identical-recorded-head case: anything
+            // past SEAM_BODY_CAP is beyond recorded evidence either way.
             agg.providerSideMisses += 1;
             agg.providerSideMissed += line.tr;
             return;
@@ -387,11 +483,28 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // uncapped: one truncated at SEAM_BODY_CAP parses to zero messages and
         // would fake the msgIndex == prevMsgs == 0 signature; prevMsgs > 0 keeps
         // an empty prior list out.
-        if (prev.length < SEAM_BODY_CAP && cur.length < SEAM_BODY_CAP && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
+        if (!prevCapped && !curCapped && f.prevMsgs > 0 && f.msgIndex === f.prevMsgs && f.curMsgs > f.prevMsgs) {
             agg.providerSideMisses += 1;
             agg.providerSideMissed += line.tr;
             return;
         }
+        if (prev.str.length < cur.str.length && f.lcpBytes >= prev.str.length - 4) {
+            // #2131: the WHOLE previous payload survives inside the longer
+            // current one (JSON appends diverge only in the previous body's
+            // closing-bracket region — the 4-byte tolerance). Under the cap the
+            // #2059 arm above already decided clean appends, so reaching here
+            // means a clipped side was involved and the parsed counts are blind;
+            // the exact counts captured at send time must prove pure tail
+            // growth. Without them the pair is indistinguishable from a real
+            // break and falls through to suspect.
+            if (prev.msgs !== null && cur.msgs !== null && cur.msgs > prev.msgs) {
+                agg.providerSideMisses += 1;
+                agg.providerSideMissed += line.tr;
+                return;
+            }
+        }
+        // No decisive byte/count shape (visible break in the recorded region,
+        // or capped evidence without exact counts): suspect.
     }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
@@ -400,8 +513,8 @@ function detectSeam(session: Session, led: CacheLedger): void {
         led.seamEvents.shift();
     }
     if (cur !== undefined && prev !== undefined) {
-        const f = seamLcp(prev, cur);
-        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...f };
+        const forensics = f ?? seamLcp(prev.str, cur.str);
+        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs };
         (led.seamEvents ?? (led.seamEvents = [])).push(ev);
         if (agg.seamSuspects === 1) {
             loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
@@ -774,7 +887,38 @@ export function settleUsageReport(
         session.stats.cachedTokens += s.reportedCached;
         session.stats.cacheSamples += 1;
     }
+    const led = getCacheLedger(session);
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream });
+    // #2131: per-call body-stability proof on the just-recorded line — the same
+    // pairing detectSeam uses (this request's forwarded body vs the previous
+    // settled one), so "prefix unchanged between calls" is stored data, not an
+    // interpretation. Digest equality decides; the LCP offset localizes where
+    // a divergence started when both full bodies were retained.
+    const curSlot = seamLastSent.get(session);
+    if (curSlot !== undefined) {
+        const curLine = led.lines[led.lines.length - 1];
+        if (curLine !== undefined) {
+            curLine.bd = curSlot.digest;
+            const prevSlot = seamLastSettled.get(session);
+            if (prevSlot !== undefined) {
+                if (curSlot.digest === prevSlot.digest) {
+                    curLine.be = 1;
+                } else {
+                    curLine.be = 0;
+                    if (curSlot.full !== null && prevSlot.full !== null) {
+                        const lcp = byteLcp(prevSlot.full, curSlot.full);
+                        curLine.bl = lcp;
+                        // Append/trim first: "the whole shorter payload survives"
+                        // is anchored to the END of the payload and stays true on
+                        // small bodies where the head threshold alone would lie.
+                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : "mid";
+                    } else {
+                        curLine.bs = "unknown";
+                    }
+                }
+            }
+        }
+    }
     // #1843 L1: the usage total is ground truth for what the route's vision
     // encoder actually billed — fold any captured image facts into the learned
     // per-route cost (no-op when the request carried no images or no capture).
@@ -782,7 +926,7 @@ export function settleUsageReport(
     // #1592-family seam forensics: pair this settle with the body that was
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
-    detectSeam(session, getCacheLedger(session));
+    detectSeam(session, led);
     const seamBody = seamLastSent.get(session);
     if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
     seamLastSent.delete(session);
@@ -832,7 +976,35 @@ export interface InvalidationTokenBreakdown {
     remaining: number;
 }
 
+/** #2131: per-call outbound body stability (SHA-256 compared against the
+ *  previous settled request) plus the hit-rate context checks that separate
+ *  provider-side cache behavior from bili-side rewrites. Computed at report
+ *  time from the unbounded line set; no new hot-path state. */
+export interface BodyStability {
+    /** Adjacent pairs where both bodies were captured (be defined). */
+    paired: number;
+    /** be=1: byte-identical resends (transport retries, re-requests). */
+    equal: number;
+    /** be=0: diverged; the four classes partition this count. */
+    diverged: number;
+    /** Divergence inside the first 1 KiB — host-side parameter region (model/tools/sampling/system), NOT a history rewrite. */
+    head: number;
+    /** Whole shorter payload survives ±64 closing-bracket bytes — pure tail growth/trim. */
+    append: number;
+    /** Mid-history byte change — the shape a real rewrite has. */
+    mid: number;
+    /** Diverged but offset unknown (bodies above BODY_FULL_CAP, digest-only mode). */
+    unknownOffset: number;
+    /** Median/min hit rate per 20K-token input-size bucket — flat across sizes argues against KV-pool capacity thrashing. */
+    sizeBuckets: Array<{ lo: number; hi: number; n: number; hitMedian: number; hitMin: number }>;
+    /** Median inter-request gap for low-hit (<80%) vs high-hit lines — comparable medians argue against TTL/gap expiry. */
+    gapSplit: { lowHitMedGapMs: number | null; highHitMedGapMs: number | null };
+}
+
 export interface BiliCacheReport extends CacheReport {
+    stability: BodyStability;
+    /** #2131: line set widened with the per-call body-stability fields. */
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown" }>;
     modelSwitches: ModelSwitchStats;
     wireSwitches: ModelSwitchStats;
     upstreamSwitches: ModelSwitchStats;
@@ -924,6 +1096,58 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         restart: a.restartDropMissed,
         remaining: Math.max(0, a.tr - a.attributedMissed),
     };
+    // #2131: per-call body-stability proof + hit-rate context checks (size
+    // stratification, gap split) — computed from the stored line flags.
+    let paired = 0;
+    let equal = 0;
+    let head = 0;
+    let append = 0;
+    let mid = 0;
+    let unknownOffset = 0;
+    for (const l of knownLines) {
+        if (l.be === undefined) continue;
+        paired += 1;
+        if (l.be === 1) { equal += 1; continue; }
+        if (l.bs === "head") head += 1;
+        else if (l.bs === "append") append += 1;
+        else if (l.bs === "mid") mid += 1;
+        else unknownOffset += 1;
+    }
+    const sizeBuckets: BodyStability["sizeBuckets"] = [];
+    {
+        const byLo = new Map<number, number[]>();
+        for (const l of knownLines) {
+            if (l.hitPct === null || l.input <= 0) continue;
+            const lo = Math.floor(l.input / SIZE_BUCKET_TOK) * SIZE_BUCKET_TOK;
+            const hits = byLo.get(lo);
+            if (hits) hits.push(l.hitPct);
+            else byLo.set(lo, [l.hitPct]);
+        }
+        for (const [lo, hits] of [...byLo.entries()].sort((x, y) => x[0] - y[0]).slice(0, 24)) {
+            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: Math.min(...hits) });
+        }
+    }
+    const lowGaps: number[] = [];
+    const highGaps: number[] = [];
+    for (let i = 1; i < led.lines.length; i++) {
+        const p = led.lines[i - 1];
+        const c = led.lines[i];
+        if (!p || !c || c.hitPct === null) continue;
+        const gap = c.at - p.at;
+        if (!(gap > 0)) continue;
+        (c.hitPct < 80 ? lowGaps : highGaps).push(gap);
+    }
+    const stability: BodyStability = {
+        paired,
+        equal,
+        diverged: paired - equal,
+        head,
+        append,
+        mid,
+        unknownOffset,
+        sizeBuckets,
+        gapSplit: { lowHitMedGapMs: median(lowGaps), highHitMedGapMs: median(highGaps) },
+    };
     return {
         generatedAt: Date.now(),
         profile: effective,
@@ -942,6 +1166,10 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             compRepay: l.cr,
             ttlRepay: l.tr,
             foldSeq: l.foldSeq,
+            bodyDigest: l.bd,
+            bodyEqual: l.be,
+            bodyLcp: l.bl,
+            bodyClass: l.bs,
         })),
         linesOmitted: led.sampleSeq - led.lines.length,
         modelSwitches: { count: a.switches, missedTokens: a.switchMissed, events: switchEvents((l) => l.sw === 1 && l.model !== undefined, (l) => l?.model, "model") },
@@ -951,6 +1179,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         unmeasured: { samples: a.unknownSamples, inputTokens: a.unknownInput },
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
+        stability,
         seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
     };
 }
@@ -968,10 +1197,28 @@ export function readModelSwitchStats(session: Session): { count: number; missedT
     };
 }
 
+function formatStability(st: BodyStability): string {
+    if (st.paired === 0) return "";
+    const out: string[] = ["BODY STABILITY (per-call outbound byte proof, vs previous settled request)"];
+    out.push(`  ${st.paired} pair(s): ${st.equal} byte-identical · ${st.diverged} diverged`);
+    out.push(`  divergence class: head <1KiB ${st.head} · tail-append ${st.append} · mid-history ${st.mid} · offset-unknown(capped) ${st.unknownOffset}`);
+    if (st.head > 0) out.push(`  ⚠ ${st.head} head-region divergence(s) — model/tools/sampling/system changed between calls (host-side parameter change, NOT a bili history rewrite)`);
+    if (st.mid > 0) out.push(`  ⚠ ${st.mid} mid-history divergence(s) — real prefix rewrites; inspect the seam events above`);
+    const sb = st.sizeBuckets.filter((b) => b.n >= 3);
+    if (sb.length >= 2) out.push("  hit% by input size (median): " + sb.map((b) => `${Math.round(b.lo / 1000)}K=${b.hitMedian}%`).join("  "));
+    const g = st.gapSplit;
+    if (g.lowHitMedGapMs !== null && g.highHitMedGapMs !== null) {
+        out.push(`  inter-request gap median: low-hit(<80%) ${(g.lowHitMedGapMs / 1000).toFixed(1)}s vs high-hit ${(g.highHitMedGapMs / 1000).toFixed(1)}s`);
+    }
+    return out.join("\n");
+}
+
 export function handleAcpCache(session: Session, args?: Record<string, unknown>): ProxyToolResult {
     try {
         const detail = args?.detail === "full" ? "full" : "summary";
         const report = buildSessionCacheReport(session);
+        const stabilityText = formatStability(report.stability);
+        const tail = (base: string): string => base + (stabilityText ? "\n\n" + stabilityText : "") + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -979,9 +1226,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : ""));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : ""));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -1041,7 +1288,7 @@ function formatSeam(r: BiliCacheReport): string {
     }
     if (r.seam.providerSide.count > 0) {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's entire message list is byte-for-byte a prefix of this request (any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
