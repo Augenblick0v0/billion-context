@@ -23,6 +23,7 @@ import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
+import { dshLanePolicyLines } from "./dsh-lane-policy.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -1287,6 +1288,12 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (webUrl !== undefined) {
         preFooter.push(`Web UI: ${webUrl}`);
     }
+    // #2090 lane exclusions: third-party dsh plugins whose lanes are never
+    // compressible — same human-only slot as the advisory, so the panel tells
+    // the user WHY a model is uncompressed instead of looking like a bili
+    // failure. The stripper anchors on the footer, so these lines stay out of
+    // the model context.
+    for (const line of dshLanePolicyLines()) preFooter.push(`\u26a0\ufe0f ${line}`);
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.

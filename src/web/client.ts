@@ -1429,6 +1429,42 @@ export const WEB_CLIENT = `(function () {
             el.textContent = t("cfg.resign_none");
             box.appendChild(el);
         }
+        // #2090 follow-up: never-compressed lanes from third-party dsh plugins —
+        // same endpoint, adjacent card, version-aware reason per install.
+        const laneBox = $("lanes-body");
+        if (laneBox) {
+            laneBox.innerHTML = "";
+            const lanes = Array.isArray(data.uncompressedLanes) ? data.uncompressedLanes : [];
+            if (lanes.length === 0) {
+                const el = document.createElement("div");
+                el.className = "dim small";
+                el.textContent = t("cfg.lanes_none");
+                laneBox.appendChild(el);
+            } else {
+                for (const lane of lanes) {
+                    if (!lane || typeof lane !== "object") continue;
+                    const row = document.createElement("div");
+                    row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+                    const label = document.createElement("span");
+                    label.className = "mono small";
+                    label.textContent = lane.packageName + "@" + lane.version;
+                    row.appendChild(label);
+                    const badge = document.createElement("span");
+                    badge.className = "badge warn";
+                    badge.textContent = t("cfg.lanes_badge");
+                    row.appendChild(badge);
+                    const meta = document.createElement("span");
+                    meta.className = "dim small";
+                    meta.textContent = t("cfg.lanes_row", { profile: lane.profile || "—" });
+                    row.appendChild(meta);
+                    laneBox.appendChild(row);
+                    const note = document.createElement("div");
+                    note.className = "dim small";
+                    note.textContent = String(lane.message ?? "");
+                    laneBox.appendChild(note);
+                }
+            }
+        }
     }
     function hydrateQuickConfig(cfg) {
         const box = $("quick-fields");

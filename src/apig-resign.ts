@@ -69,6 +69,9 @@ export interface KnownSignatureScheme {
     label: string;
     source: string;
     builtIn?: boolean;
+    /** Optional actionable hint appended to the refusal text — e.g. where the
+     *  scheme comes from and how to make the link usable again. */
+    hint?: string;
 }
 
 export const KNOWN_SIGNATURE_SCHEMES: Record<string, KnownSignatureScheme> = {
@@ -76,7 +79,11 @@ export const KNOWN_SIGNATURE_SCHEMES: Record<string, KnownSignatureScheme> = {
     "aws4-hmac-sha256": { label: "AWS SigV4 (AWS4-HMAC-SHA256)", source: "AWS SigV4" },
     "hmac-sha256": { label: "generic HMAC-SHA256 authorization", source: "#1884" },
     // dsh-our-free-model EAC channel: HMAC over `${timestamp}\n${METHOD}\n${path}\nsha256(body)`
-    "x-ofm-signature": { label: "dsh-our-free-model EAC gateway signature", source: "#2090" },
+    "x-ofm-signature": {
+        label: "dsh-our-free-model EAC gateway signature",
+        source: "#2090",
+        hint: "This scheme belongs to dsh-our-free-model's EAC lane (the key is sealed in the plugin's own vault, so bili can never re-sign it). Fix: upgrade the plugin to >=1.4.5 — its lane then bypasses bili entirely and stops failing; that lane is never compressed on any version (see CLIENTS.md → dsh lane exclusions).",
+    },
 };
 
 /** The minimal signing credential (subset of the plugin's CodeArtsCredential). */
@@ -139,7 +146,7 @@ export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"):
     const schemeName = known ? `${scheme} (${known.label}, ${known.source})` : scheme;
     const message = scheme === APIG_RESIGN_SCHEME
         ? `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available for this scheme. The link WORKS WITHOUT COMPRESSION if you opt in explicitly — that opt-in is the acknowledgment that this link runs uncompressed: add {"resign":{"${scheme}":{"passthrough":true}}} to the config file (${configFile()}) or set env BILI_RESIGN_PASSTHROUGH=1, then restart bili; the bili web UI (/__bili/, Configuration → Signed upstreams) lists this scheme too. Alternatively restore pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 — the body is then rewritten and the upstream may reject it. Providing a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service) makes bili re-sign instead of refusing.`
-        : `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 SignatureDoesNotMatch). bili has no re-signer for this scheme yet, and by design signed requests are either RE-SIGNED+COMPRESSED or REFUSED — there is no unsigned pass-through mode, so NO configuration can make this link work (passthrough settings do not apply to this scheme). It stays unavailable until bili ships re-signing support for it. Restoring pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 is possible, but the upstream will reject the rewritten body.`;
+        : `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 SignatureDoesNotMatch). bili has no re-signer for this scheme yet, and by design signed requests are either RE-SIGNED+COMPRESSED or REFUSED — there is no unsigned pass-through mode, so NO configuration can make this link work (passthrough settings do not apply to this scheme). It stays unavailable until bili ships re-signing support for it.${known?.hint ? ` ${known.hint}` : ""} Restoring pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 is possible, but the upstream will reject the rewritten body.`;
     if (protocol === "anthropic") {
         return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
     }

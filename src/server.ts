@@ -81,6 +81,7 @@ import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, est
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
+import { dshLanePolicyLines, scanDshLanePolicies } from "./dsh-lane-policy.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -903,6 +904,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
                 );
             }
+        }
+        // #2090 follow-up (owner ruling): lanes bili provably cannot compress
+        // (third-party dsh plugins) are announced at startup with the reason,
+        // so "why is this model uncompressed" has an answer in bili.log even
+        // before any status surface is opened.
+        for (const line of dshLanePolicyLines()) {
+            log("warn", `[lanes] never compressed: ${line}`);
         }
         // #1723: residual zone drift is now an exception, not the norm — a
         // lane'd launch landing ABOVE its preferred port means that port was
@@ -7706,7 +7714,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), uncompressedLanes: scanDshLanePolicies(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -7727,6 +7735,11 @@ function sendResignStatus(res: http.ServerResponse): void {
         schemes,
         pending: readPendingRefusals(),
         unresolved: Object.keys(unresolvedRefusals()),
+        // #2090 follow-up: third-party dsh plugin lanes that are never
+        // compressible regardless of resign settings — the web UI renders
+        // these next to the signed-upstream rows so the two "why is this
+        // link special" answers live in one card.
+        uncompressedLanes: scanDshLanePolicies(),
     }, null, 2));
 }
 

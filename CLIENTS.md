@@ -88,6 +88,22 @@ Two lanes, same plugin (#941):
    already-disabled host-plane row and the preset instance keeps
    auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
    boot in such profiles; ACP compression is unaffected.
+ - **Never-compressed third-party lanes (#2090):** dsh profiles are open to
+   third-party plugins, and some of them own model lanes that bili can
+   structurally never compress — either the request body is signed with the
+   plugin's own sealed key (no re-signer can exist, so the compress-or-refuse
+   contract refuses those requests) or the plugin deliberately transports
+   the lane through `node:http` so no fetch-level proxy sees it at all. bili
+   keeps a version-aware registry of these (`src/dsh-lane-policy.ts`, first
+   entry: `dsh-our-free-model`'s EAC lane — pre-1.4.5 copies get 403 refused
+   with an upgrade hint in the error text; >=1.4.5 bypasses bili by design
+   and is never compressed on any version). Detected installs are announced
+   with the reason on every human surface: the `/acp` panel footer, GET
+   `/__bili/status`, the web UI (Configuration -> Never-compressed
+   third-party lanes), the proxy startup log (`[lanes] never compressed:`),
+   and the dsh host's boot console. This is a detection-and-explain table,
+   not a blocklist: the lane is never blocked for being listed, and a plugin
+   that gains compressibility simply drops out of the registry.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like

@@ -43,6 +43,7 @@ import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { dshLanePolicyLines } from "../dsh-lane-policy.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -164,6 +165,8 @@ function trackChain<T>(p: Promise<T>): Promise<T> {
 // #1772: once-per-process — the web-profile compaction caveat is logged a
 // single time even though apply() may run again after context re-arming.
 let webProfileWarned = false;
+// #2090 follow-up: one lane-exclusion warning burst per host process.
+let lanePolicyWarned = false;
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
  *  once bound (attach synchronously, spawn after bootstrap), else the preset
@@ -744,6 +747,14 @@ export function apply(ctx: PluginContext): void {
     }
     register.dead = false;
     activeCtx = ctx;
+    // #2090 follow-up: once per host process, tell the dsh console which
+    // third-party plugin lanes are never compressed and why — desktop users
+    // read the app log, not bili.log, so the host side needs its own line.
+    if (!lanePolicyWarned) {
+        lanePolicyWarned = true;
+        for (const line of dshLanePolicyLines()) console.error(`bili: never-compressed lane detected — ${line}`);
+    }
+
 
     // #1590: the dsh web-profile settings panel shows a "bili设置" entry
     // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
@@ -1173,4 +1184,9 @@ export function _resetRoutedForTest(): void {
 /** Test hook (#1772): reset the once-per-process web-profile warning flag. */
 export function _resetWebProfileWarningForTest(): void {
     webProfileWarned = false;
+}
+
+/** Test hook (#2090 follow-up): reset the once-per-process lane-policy warning flag. */
+export function _resetLanePolicyWarnForTest(): void {
+    lanePolicyWarned = false;
 }

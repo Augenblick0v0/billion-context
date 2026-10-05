@@ -30,6 +30,7 @@ import {
     resignEnabled,
     resignPassthroughEnabled,
     signApigHeaders,
+    signedRefusal,
     type ApigCredential,
     unresolvedRefusals,
 } from "../src/apig-resign.ts";
@@ -1099,4 +1100,22 @@ test("e2e #1884: provider-level resign.enabled=false → guard off for that host
             upstream.closeAllConnections?.();
         }
     });
+});
+
+// #2090 follow-up: refusal text carries a per-scheme actionable hint where
+// one exists — the x-ofm-signature entry points at the plugin upgrade that
+// makes the lane usable again (its lane is never compressible on any
+// version; pre-1.4.5 it is refused under the compress-or-refuse contract).
+test("signedRefusal: x-ofm-signature message carries the plugin upgrade hint", () => {
+    const refusal = signedRefusal("x-ofm-signature", "openai");
+    const body = JSON.parse(refusal.body as string) as { error: { message: string } };
+    assert.equal(refusal.status, 403);
+    assert.match(body.error.message, /dsh-our-free-model/);
+    assert.match(body.error.message, />=1\.4\.5/);
+    assert.match(body.error.message, /never compressed/);
+    // schemes without a hint keep the exact previous text shape
+    const generic = signedRefusal("hmac-sha256", "openai");
+    const genericBody = JSON.parse(generic.body as string) as { error: { message: string } };
+    assert.doesNotMatch(genericBody.error.message, /upgrade the plugin/);
+    assert.match(genericBody.error.message, /It stays unavailable until bili ships re-signing support/);
 });
