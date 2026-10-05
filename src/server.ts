@@ -7542,6 +7542,16 @@ function sendStats(res: http.ServerResponse): void {
 /** Stale-install state for the web UI badge (#811): whether the on-disk
  *  version is newer than the running process, plus the opt-in flag state and
  *  the live in-flight request count. */
+/** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
+ *  computed once and shared so the two surfaces cannot drift apart again (that
+ *  divergence is what left the web banner dead: overview never carried the field).
+ *  null when no advisory is active; otherwise the active entry plus targetFailed
+ *  (pinned target unresolvable on the registry → banner falls back to @latest). */
+function currentAdvisoryPayload() {
+    const adv = getAdvisoryState();
+    return adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
+}
+
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
@@ -7551,9 +7561,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const adv = getAdvisoryState();
-    const advisory = adv.active ? { ...adv.active, targetFailed: cannotResolveTarget(adv.lastError) } : null;
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
@@ -7572,6 +7580,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         diskVersion,
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
+        advisory: currentAdvisoryPayload(),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
