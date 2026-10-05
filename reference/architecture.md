@@ -97,6 +97,7 @@ billion-context/
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
 │   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
+│   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)

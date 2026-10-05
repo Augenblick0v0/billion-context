@@ -8,6 +8,8 @@ Design discussion: [#2163](https://github.com/ranxianglei/billion-context/issues
 
 The executor accepts immutable task text, instructions and optional read-only reference text; an ordered list of injected asynchronous candidates; and explicit internal budgets. Wire protocols, authentication and range selection remain caller responsibilities. No provider request or fold occurs without a caller.
 
+`src/external-summary-http.ts` provides internal single-attempt HTTP candidates for Anthropic, OpenAI Chat, Responses and Google. It reuses the existing summary codecs; no existing preflight behavior is changed. An explicit resolved endpoint/model/header snapshot is used instead of main-request credentials. Reference data is carried separately from the selected content. Redirects, invalid UTF-8, excessive response bytes, missing completion markers, truncation and tool calls are rejected. SSE framing and completion are checked even when a relay changes the requested response format. HTTP and stream failures advance through the executor's existing target chain, with no independent retry loop. This adapter is also **not wired into production**; its tests use only local mock upstreams.
+
 ## Execution Contract
 
 - Each candidate is invoked at most once per operation, in order; the first valid result wins. Transport errors, empty output and excessive UTF-8 byte length advance to the next target. Byte-length validation is not semantic quality or token-window validation.

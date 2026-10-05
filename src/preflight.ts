@@ -322,7 +322,7 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
@@ -517,7 +517,7 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
     return out || terminalText;
 }
 
-function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
+export function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
     if (protocol === "anthropic") {
         const content = json.content;
         if (!Array.isArray(content)) return "";
