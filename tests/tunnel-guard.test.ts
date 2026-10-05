@@ -102,6 +102,61 @@ test("checkTunnelDestination: link-local/metadata always denied, incl. via DNS n
     assert.equal(byName.code, "linkLocal");
 });
 
+test("checkTunnelDestination: mixed link-local + routable hostname drops the fe80, keeps the rest (#2143)", async () => {
+    // The issue's exact shape: an mDNS name answering [fe80::…, 192.168.x.x].
+    const base = { selfPort: 8787, localIps };
+    const mdns = { "lanbox.local": ["fe80::abcd:ef01:2345:6789", "192.168.1.50"] };
+    const local = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: true, allowlist: [], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(local.ok, true, "a coexisting routable A record must not be vetoed by an unusable fe80");
+    const remote = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: false, allowlist: [], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(remote.ok, false);
+    assert.equal(remote.code, "privateRemote", "after dropping fe80 the surviving private answer takes its normal layer");
+    const allowed = await checkTunnelDestination("http://lanbox.local:8080/v1", {
+        ...base, clientLoopback: false, allowlist: ["lanbox.local"], resolveHost: stubResolve(mdns),
+    });
+    assert.equal(allowed.ok, true, "BILI_TUNNEL_ALLOWED_HOSTS applies to the surviving private record");
+    // fe80 + PUBLIC: the public record passes for any client (was wrongly denied before).
+    for (const clientLoopback of [true, false]) {
+        const pub = await checkTunnelDestination("https://box.example.com/v1", {
+            selfPort: 8787, clientLoopback, allowlist: [], localIps,
+            resolveHost: stubResolve({ "box.example.com": ["fe80::1", "93.184.216.34"] }),
+        });
+        assert.equal(pub.ok, true, "a public record coexisting with fe80 is reachable");
+    }
+});
+
+test("checkTunnelDestination: pure / metadata link-local answers stay hard-denied (#2143 guard intact)", async () => {
+    const singleFe80 = await checkTunnelDestination("http://v6only.local:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "v6only.local": ["fe80::abcd:ef01:2345:6789"] }),
+    });
+    assert.equal(singleFe80.ok, false, "a bare fe80 has no zone scope and is unreachable — keep the deny");
+    assert.equal(singleFe80.code, "linkLocal");
+    const allFe80 = await checkTunnelDestination("http://v6only.local:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "v6only.local": ["fe80::1", "fe80::2"] }),
+    });
+    assert.equal(allFe80.ok, false);
+    assert.equal(allFe80.code, "linkLocal", "an all-link-local answer has nothing routable coexisting");
+    // fe80 + cloud metadata: dropping the fe80 leaves 169.254.169.254 → still linkLocal.
+    const metaMix = await checkTunnelDestination("http://meta-mix.internal/latest/meta-data/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+        resolveHost: stubResolve({ "meta-mix.internal": ["fe80::1", "169.254.169.254"] }),
+    });
+    assert.equal(metaMix.ok, false);
+    assert.equal(metaMix.code, "linkLocal", "metadata survives the fe80 drop and stays blocked");
+    // IP-literal fe80 never reaches the hostname-only filter → still linkLocal.
+    const lit = await checkTunnelDestination("http://[fe80::1]:8080/", {
+        selfPort: 8787, clientLoopback: true, allowlist: [], localIps,
+    });
+    assert.equal(lit.ok, false);
+    assert.equal(lit.code, "linkLocal", "IP literals are untouched by the hostname-only filter");
+});
+
 test("checkTunnelDestination: private destinations — local allow, remote needs allowlist", async () => {
     const local = await checkTunnelDestination("http://127.0.0.1:8199/v1", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
     assert.equal(local.ok, true);
