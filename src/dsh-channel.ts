@@ -267,6 +267,16 @@ export function planDshSpawn(
     return { command: comspec, args: ["/d", "/s", "/c", line], windowsVerbatimArguments: true };
 }
 
+// #2148: stderr signatures of a BROKEN HOST INSTALLATION (its CLI cannot even
+// start — #2146 field repro: app.asar missing the host module). Distinct from
+// "the CLI ran and the command failed": re-running the same command cannot
+// succeed here, so callers must change their remediation text accordingly.
+const DSH_HOST_CLI_BROKEN_RE = /MODULE_NOT_FOUND|Cannot find module/i;
+
+export function dshHostCliBroken(stderrText: string): boolean {
+    return DSH_HOST_CLI_BROKEN_RE.test(stderrText);
+}
+
 function formatDshError(err: unknown, args: readonly string[]): Error {
     const e = err as { code?: string | number; status?: number; stderr?: string | Buffer; message?: string };
     if (e.code === "ENOENT") {
@@ -279,6 +289,9 @@ function formatDshError(err: unknown, args: readonly string[]): Error {
               ? decodeChildOutput(e.stderr).trim()
               : "";
     const detail = stderr || (typeof e.message === "string" && e.message.length > 0 ? e.message : `exit ${e.status ?? "?"}`);
+    if (dshHostCliBroken(stderr)) {
+        return new Error(`dsh ${args.join(" ")} failed: ${detail}\n— the dsh host installation itself appears broken (its CLI cannot even start); re-running that command cannot succeed`);
+    }
     return new Error(`dsh ${args.join(" ")} failed: ${detail}`);
 }
 
@@ -423,16 +436,131 @@ export async function refreshDshProfileBundles(
             continue;
         }
         if (installedProfileVersion(dir) === targetVersion) continue; // #1803: already in step
+        const key = refreshBackoffKey(name, targetVersion);
+        // #2148: persistent-failure backoff — while cooling down for this exact
+        // (profile, target) pair, skip silently (same policy as the global
+        // install backoff, #1603); the stuck state stays visible through
+        // dshChannelFailures() instead of repeating doomed spawns every cycle.
+        const pending = dshRefreshBackoffs.get(key);
+        if (pending && pending.count >= DSH_REFRESH_BACKOFF_THRESHOLD && Date.now() < pending.nextRetryAt) continue;
         try {
             await runDshPluginAsync(["plugin", "--profile", name, "add", `${DSH_PACKAGE}@${targetVersion}`], env);
             refreshed += 1;
+            dshRefreshBackoffs.delete(key);
+            dshRefreshRemediatedKeys.delete(key);
         } catch (err) {
-            const detail = err instanceof Error ? err.message : String(err);
-            log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${detail} — manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`);
+            recordDshRefreshFailure(key, name, targetVersion, err instanceof Error ? err.message : String(err), log);
         }
     }
     if (refreshed > 0) {
         log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }
     return refreshed;
+}
+
+// — persistent-failure backoff + visibility (#2148) ————————————————
+// Pre-fix, a dead owner channel (e.g. a dsh install whose CLI cannot start —
+// #2146 field repro) re-spawned and re-failed every 3-min check cycle forever
+// (~50× over ~3h), with no convergence detection and no user-visible signal.
+// Mirrors the global install backoff (#1603): consecutive failures per
+// (profile, targetVersion) grow an exponential cooldown during which the
+// refresh skips silently; a success or a new target version resets. Backoff,
+// not self-disable, keeps the lane self-healing once the host is repaired.
+
+const DSH_REFRESH_BACKOFF_THRESHOLD = 3;
+const DSH_REFRESH_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const DSH_REFRESH_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
+
+interface DshRefreshBackoff {
+    key: string;
+    count: number;
+    nextRetryAt: number;
+    lastError: string;
+}
+const dshRefreshBackoffs = new Map<string, DshRefreshBackoff>();
+const dshRefreshRemediatedKeys = new Set<string>();
+
+export function _resetDshRefreshBackoffForTest(): void {
+    dshRefreshBackoffs.clear();
+    dshRefreshRemediatedKeys.clear();
+}
+
+function refreshBackoffKey(name: string, targetVersion: string): string {
+    return `${name}\u0000${targetVersion}`;
+}
+
+/** Exponential shape identical to the global install backoff (#1603): base
+ *  delay after the threshold, doubling per extra failure, capped at 6h. */
+export function dshRefreshBackoffMs(count: number): number {
+    const exp = Math.max(0, count - DSH_REFRESH_BACKOFF_THRESHOLD);
+    return Math.min(DSH_REFRESH_BACKOFF_CAP_MS, DSH_REFRESH_BACKOFF_BASE_MS * 2 ** exp);
+}
+
+// A profile's active target moves forward with the registry (and a success
+// clears its entry) — entries for older versions of the same profile are
+// stale bookkeeping and would otherwise linger in the visibility list.
+function pruneStaleBackoffEntries(name: string, keepKey: string): void {
+    const prefix = `${name}\u0000`;
+    for (const k of [...dshRefreshBackoffs.keys()]) {
+        if (k !== keepKey && k.startsWith(prefix)) dshRefreshBackoffs.delete(k);
+    }
+    for (const k of [...dshRefreshRemediatedKeys]) {
+        if (k !== keepKey && k.startsWith(prefix)) dshRefreshRemediatedKeys.delete(k);
+    }
+}
+
+/** The remediation line appended to a failure warn. A broken host CLI (ENOENT
+ *  or the MODULE_NOT_FOUND family from #2148) must NOT be told to re-run the
+ *  same command from a better shell — that command cannot succeed anywhere
+ *  until the host itself is repaired. */
+function dshRefreshManualFix(name: string, targetVersion: string, errorText: string): string {
+    if (/CLI not found|host installation itself appears broken/i.test(errorText)) {
+        return "manual fix: repair or reinstall the dsh host (its CLI cannot run here), or point BILI_DSH_BIN at a working dsh executable — re-running that command cannot succeed";
+    }
+    return `manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`;
+}
+
+function recordDshRefreshFailure(key: string, name: string, targetVersion: string, error: string, log: (level: "info" | "warn", msg: string) => void): void {
+    const now = Date.now();
+    pruneStaleBackoffEntries(name, key);
+    const count = (dshRefreshBackoffs.get(key)?.count ?? 0) + 1;
+    let nextRetryAt = now;
+    let waitMin = 0;
+    if (count >= DSH_REFRESH_BACKOFF_THRESHOLD) {
+        waitMin = Math.round(dshRefreshBackoffMs(count) / 60_000);
+        nextRetryAt = now + dshRefreshBackoffMs(count);
+    }
+    dshRefreshBackoffs.set(key, { key, count, nextRetryAt, lastError: error });
+    if (count < DSH_REFRESH_BACKOFF_THRESHOLD) {
+        log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${error} — ${dshRefreshManualFix(name, targetVersion, error)}`);
+        return;
+    }
+    if (!dshRefreshRemediatedKeys.has(key)) {
+        dshRefreshRemediatedKeys.add(key);
+        log("warn", `[update] dsh profile ${name}: bundle refresh keeps failing (${count}\u00d7 in a row): ${error}. ${dshRefreshManualFix(name, targetVersion, error)}. Backing off \u2014 next attempt in ~${waitMin}m.`);
+        return;
+    }
+    log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${error}. Still failing \u2014 next attempt in ~${waitMin}m.`);
+}
+
+export type DshChannelFailure = {
+    profile: string;
+    targetVersion: string;
+    attempts: number;
+    lastError: string;
+    nextRetryAt: number;
+};
+
+/** Profiles whose owner-channel refresh has entered backoff (≥3 consecutive
+ *  failures) — consumed by /__bili/status, the /acp panel and the web banner
+ *  so a dead dsh channel is visible instead of log-only (#2148). Empty when
+ *  healthy or while only transiently failing. */
+export function dshChannelFailures(): DshChannelFailure[] {
+    const out: DshChannelFailure[] = [];
+    for (const b of dshRefreshBackoffs.values()) {
+        if (b.count < DSH_REFRESH_BACKOFF_THRESHOLD) continue;
+        const [profile, targetVersion] = b.key.split("\u0000");
+        out.push({ profile, targetVersion, attempts: b.count, lastError: b.lastError, nextRetryAt: b.nextRetryAt });
+    }
+    return out;
 }
