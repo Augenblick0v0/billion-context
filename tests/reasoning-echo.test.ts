@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
 import { modelIdOf, normalizeStrictEchoBody, normalizeStrictEchoResponsesInput } from "../src/strict-echo.js";
 import { dropCompressReasoning } from "../src/reasoning-drop.js";
@@ -447,6 +449,37 @@ describe("#2169 responses-wire blank reasoning content sanitize", () => {
         const outInput = out.input as Record<string, unknown>[];
         assert.equal("content" in outInput[0]!, false);
         assert.equal("content" in blank, true, "no mutation of the inbound body");
+    });
+
+    // Provenance: redacted real-world outbound body from #2169 (issue author's gist).
+    // All text except the 5 blank echoes below is length placeholders; order/types/call_ids unchanged.
+    it("redacted #2169 body (89 items): the 5 blank echoes are cleared, everything else stays byte-exact, no injection needed", () => {
+        const raw = readFileSync(fileURLToPath(new URL("./fixtures/responses-2169-redacted-input.json", import.meta.url)), "utf-8");
+        const input = JSON.parse(raw) as Record<string, unknown>[];
+        assert.equal(input.length, 89);
+        const BLANK_IDX = [30, 52, 64, 70, 86];
+        for (const i of BLANK_IDX) {
+            const content = (input[i]! as { content?: unknown }).content;
+            assert.ok(Array.isArray(content) && content.length > 0, `fixture item ${i} must start with whitespace content`);
+        }
+        const c = collector();
+        const out = normalizeStrictEchoResponsesInput(input as never, true, c.log, "s1");
+        assert.notEqual(out, input);
+        assert.equal(out.length, 89, "this body has no orphaned run → no #1479 injection");
+        for (const i of BLANK_IDX) {
+            const r = out[i]! as Record<string, unknown>;
+            assert.notEqual(r, input[i]!, `blank item ${i} replaced by a copy`);
+            assert.equal(r.type, "reasoning");
+            assert.equal("content" in r, false, `blank item ${i} content removed`);
+            assert.deepEqual(r.summary, [{ type: "summary_text", text: "" }]);
+            assert.equal("content" in (input[i]! as Record<string, unknown>), true, "inbound item unmutated");
+        }
+        for (let i = 0; i < input.length; i++) {
+            if (BLANK_IDX.includes(i)) continue;
+            assert.equal(out[i], input[i], `non-blank item ${i} stays the same reference`);
+        }
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /cleared whitespace-only reasoning content on 5 item\(s\)/);
     });
 });
 
