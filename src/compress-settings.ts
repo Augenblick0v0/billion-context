@@ -90,7 +90,7 @@ export function mergeCompress(
         imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
-stripImages: pick("stripImages"),
+        stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
         visibilityMarkers: pick("visibilityMarkers"),
         streamSummary: pick("streamSummary"),
