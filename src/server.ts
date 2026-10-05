@@ -118,7 +118,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -5594,13 +5594,33 @@ function outboundPayloadBreakdown(
  *  project from it (numbers identical to re-parsing the same string), null =
  *  caller already tried and failed → keep the prepared projection and skip the
  *  doomed re-parses inside the helpers (they return 0 on unparseable input). */
-export function outboundContextEstimate(
+/** #2117: both calibers of one outbound send, computed in ONE projection pass.
+ *  upperBound is the char-count upper bound (every character counts as one
+ *  token — never undershoots; the fail-closed decision/display caliber, and
+ *  the legacy outboundContextEstimate value). textOverhead is the billing
+ *  caliber preflight calibrates with k̂ (#1933 F1): CJK-aware
+ *  estimateCoreMessages + system/tools wire overhead. imageTokens is the
+ *  separate image term (learned per-route #1843/#1857), kept out of both so
+ *  callers can recombine per channel. */
+export interface OutboundContextEstimates {
+    upperBound: number;
+    textOverhead: number;
+    imageTokens: number;
+}
+
+/** #2078: `parsed` carries the caller's pre-parsed send body so forward() does
+ *  not pay a second full JSON.parse of the largest payload in flight per
+ *  request. Three states: undefined = parse here (legacy callers), object =
+ *  project from it (numbers identical to re-parsing the same string), null =
+ *  caller already tried and failed → keep the prepared projection and skip the
+ *  doomed re-parses inside the helpers (they return 0 on unparseable input). */
+export function outboundContextEstimates(
     prepared: Prepared,
     wireBody: string,
     opts: ProxyOptions,
     upstream: string,
     parsed?: Record<string, unknown> | null,
-): number {
+): OutboundContextEstimates {
     let msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const project = (value: unknown): void => {
         switch (prepared.protocol) {
@@ -5620,8 +5640,23 @@ export function outboundContextEstimate(
     } else {
         raw = "";
     }
-    return estimateCoreMessagesUpper(msgs) + estimateWireOverhead(prepared.protocol, raw)
-        + imageReserveFor(prepared.session, prepared.protocol, raw, opts, upstream);
+    const overhead = estimateWireOverhead(prepared.protocol, raw);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, raw, opts, upstream);
+    return {
+        upperBound: estimateCoreMessagesUpper(msgs) + overhead + imageTokens,
+        textOverhead: estimateCoreMessages(msgs) + overhead,
+        imageTokens,
+    };
+}
+
+export function outboundContextEstimate(
+    prepared: Prepared,
+    wireBody: string,
+    opts: ProxyOptions,
+    upstream: string,
+    parsed?: Record<string, unknown> | null,
+): number {
+    return outboundContextEstimates(prepared, wireBody, opts, upstream, parsed).upperBound;
 }
 
 async function preflightCompressIfNeeded(
@@ -5701,8 +5736,10 @@ async function preflightCompressIfNeeded(
     // factor k̂ learned from this session's own usage reports (local estimate ÷
     // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
     // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
-    // i.e. today's behavior.
-    const kFactor = session.stats.calibratedEstimate;
+    // i.e. today's behavior. #2117 B: the model dimension gates too — a factor
+    // learned on another model acts as absent here rather than deciding with a
+    // cross-model billing scale (currentCalibrationFactor).
+    const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
     const calibratedPayload = calibratedText + imageTokens;
@@ -6350,9 +6387,21 @@ async function forward(
             sentParsed = null;
         }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
-        const estimate = outboundContextEstimate(prepared, sentBody, opts, upstreamUrl, sentParsed);
-        prepared.session.stats.localInputEstimate = estimate;
-        prepared.session.stats.contextTokens = estimate;
+        const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
+        prepared.session.stats.localInputEstimate = est.upperBound;
+        // The char-count upper bound stays the published context value: it is
+        // the fail-closed caliber decision paths and legacy displays trust for
+        // never-reporting upstreams (#553/#728/#1493). #2117 additionally
+        // publishes the billing-caliber estimate of THIS send — preflight's own
+        // formula (CJK-aware text + wire overhead), k̂-scaled only where the
+        // factor's route+model provenance matches (#1933 F1 / #2117 B), plus
+        // the image reserve — so display surfaces can show a calibrated reading
+        // instead of the ~2–3.5× over-counting bound. Display-only field.
+        const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
+        const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
+        prepared.session.stats.contextEstimateTokens = Math.round(scaledText + est.imageTokens);
+        prepared.session.stats.contextEstimateCalibrated = scaledText !== est.textOverhead;
+        prepared.session.stats.contextTokens = est.upperBound;
         prepared.session.stats.contextTokensSource = "estimate";
         noteForwardedBody(prepared.session, sentBody);
     }

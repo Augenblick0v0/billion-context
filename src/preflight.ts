@@ -18,7 +18,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -871,7 +871,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // #1933 F1: capture k̂ once — it only mutates on usage settlement (outside
     // this invocation), while every fit judgment in this loop must stay on
     // one consistent scale with the gate that started it.
-    const kFactor = deps.session.stats.calibratedEstimate;
+    // #2117 B: model-provenance gate — a factor learned on another model acts
+    // as absent (raw estimate) rather than deciding with a cross-model scale.
+    const kFactor = currentCalibrationFactor(deps.session.stats, deps.session.metadata?.lastModel);
     const kOrigin = deps.session.stats.calibratedEstimateOrigin;
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };

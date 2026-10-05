@@ -741,8 +741,15 @@ export function settleUsageReport(
         const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
         if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
             const rawSample = s.total / pendingEst;
+            // #2117 B: the ring is keyed by route AND model — tokenizers bill
+            // differently across models, so a mid-session model switch starts a
+            // FRESH ring instead of blending two models' billing scales into one
+            // factor. Legacy rings without a model key restart on the first
+            // known-model sample (discard-and-relearn: ≤2 samples until the old
+            // factor's evidence can no longer publish).
+            const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
             let ring = session.stats.calibrationRing;
-            if (!ring || ring.origin !== settleOrigin) ring = { origin: settleOrigin, values: [] };
+            if (!ring || ring.origin !== settleOrigin || ring.model !== settleModel) ring = { origin: settleOrigin, model: settleModel, values: [] };
             if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
                 ring.values.push(rawSample);
                 if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
@@ -751,9 +758,11 @@ export function settleUsageReport(
                     const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
                     session.stats.calibratedEstimate = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimateOrigin = settleOrigin;
+                    session.stats.calibratedEstimateModel = settleModel;
                 } else {
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
+                    delete session.stats.calibratedEstimateModel;
                 }
             }
             session.stats.calibrationRing = ring;

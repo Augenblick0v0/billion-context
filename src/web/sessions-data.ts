@@ -1,4 +1,4 @@
-import { listSessions, type Session } from "../session.js";
+import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
 import { conflictEventsOf } from "../conflict-watch.js";
 import { SessionStore } from "../persist.js";
 import { renderHandoff } from "../export.js";
@@ -25,6 +25,12 @@ export interface WebSessionSummary {
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
     contextTokensSource?: "usage" | "estimate";
+    /** #2117: the honest best reading of "how full is this context right now",
+     *  picked by provenance (usage > calibrated estimate > char-count upper
+     *  bound). Display surfaces drive their main bar from this so one value
+     *  never mixes calibers; raw contextTokens stays for API compat + legacy
+     *  clients. Absent when nothing has been observed yet. */
+    contextBest?: ContextBest;
     tokensSaved: number;
     inputTokens: number;
     cachedTokens: number;
@@ -124,6 +130,17 @@ export interface WebSessionDetail extends WebSessionSummary {
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
+    /** #2117: char-count upper bound of the LAST outbound send (the fail-closed
+     *  caliber) — rendered beside the main bar as an explicit BOUND, never as a
+     *  reading; over-window here does not mean actually over-window. */
+    contextUpperTokens?: number;
+    /** #2117: route that measured the last usage-grade input (#1933 F2 provenance). */
+    lastInputTokensOrigin?: string;
+    /** #2117: wall-clock when the last usage-grade context value settled. */
+    contextMeasuredAt?: number;
+    /** #2117: the learned estimator calibration behind the displayed estimate —
+     *  k̂ plus its evidence (samples admitted on this route+model, spread). */
+    estimateCalibration?: { factor: number; origin?: string; model?: string; samples: number; spread: number };
     ledger: ReturnType<typeof buildSessionCacheReport> | null;
     /** Raw markdown of the handoff doc (handoffHtml rendered) — for the
      *  copy-markdown / download buttons. */
@@ -233,8 +250,10 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    const best = displayContextBest(s);
     return {
         id: s.id,
+        ...(best ? { contextBest: best } : {}),
         ...(s.meta.title ? { title: s.meta.title } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
@@ -439,6 +458,22 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
+        ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
+            ? { contextUpperTokens: session.stats.localInputEstimate } : {}),
+        ...(session.stats.lastInputTokensOrigin ? { lastInputTokensOrigin: session.stats.lastInputTokensOrigin } : {}),
+        ...(typeof session.metadata["contextTokensAt"] === "number" ? { contextMeasuredAt: session.metadata["contextTokensAt"] as number } : {}),
+        ...(typeof session.stats.calibratedEstimate === "number" && session.stats.calibratedEstimate > 0 && (session.stats.calibrationRing?.values.length ?? 0) > 0
+            ? (() => {
+                  const vals = session.stats.calibrationRing!.values;
+                  return { estimateCalibration: {
+                      factor: session.stats.calibratedEstimate,
+                      ...(session.stats.calibratedEstimateOrigin !== undefined ? { origin: session.stats.calibratedEstimateOrigin } : {}),
+                      ...(session.stats.calibratedEstimateModel !== undefined ? { model: session.stats.calibratedEstimateModel } : {}),
+                      samples: vals.length,
+                      spread: Math.max(...vals) / Math.min(...vals),
+                  } };
+              })()
+            : {}),
         ledger: buildSessionCacheReport(session),
         handoffMd,
         handoffHtml: markdownToHtml(handoffMd),
