@@ -86,7 +86,11 @@ const NAME = ACP_NAME_ALT;
 // Attrs are OPTIONAL: the kernel always emits them, but models imitate the
 // bare form <name>mNNNNN</name> (#1881) — whole-span strip must cover it or
 // the interior ref leaks as residue after the lone tags go.
-const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
+// #2176: the OPEN anchors legitimacy (strict acplike spelling); the model
+// degrades the CLOSE into an open set we cannot enumerate (observed </ap>,
+// </a>, </p>, </aph>, </ck>). Relax only the close side to any bounded
+// letter-name so a bare-ref span terminates even on a garbled close.
+const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c\\/[A-Za-z]{1,16}>");
 const REF_LIKE = /^\s*m\d{4,}\s*$/;
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
@@ -115,6 +119,10 @@ const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
+// #2176: a degraded close (</ap>, </p>, ...) — an open set we cannot enumerate.
+// Used ONLY as a bare-ref-gated fallback in the swallow path (see process());
+// never for wrapped-turn spans, so their inner markup is never cut early.
+const CLOSE_ANY_ANCHORED = /^[A-Za-z]{1,16}/;
 const HOLD_LIMIT = 128;
 // Hold cap for a definite unterminated opening tail — far beyond any real tag
 // opening; beyond this the tail is dropped instead of held or passed through.
@@ -131,11 +139,14 @@ const IMITATION_SWALLOW_CAP = 4096;
 /** Exclusive end index (past the terminating \x3e) of the first loose close
  *  tag in s, or -1. #673: the close name may be a typo variant; termination
  *  still requires the strict \x3e right after the name — malformed closes are
- *  LONE_CLOSE's job, not the swallow terminator's. */
-function looseCloseSpan(s: string): { start: number; end: number } | null {
+ *  LONE_CLOSE's job, not the swallow terminator's. `lenient` accepts any bounded
+ *  letter-name close (#2176 degraded closes) and is invoked ONLY as a bare-ref-
+ *  gated fallback in the swallow path, never for wrapped-turn spans. */
+function looseCloseSpan(s: string, lenient = false): { start: number; end: number } | null {
+    const anchored = lenient ? CLOSE_ANY_ANCHORED : CLOSE_NAME_ANCHORED;
     let idx = s.indexOf(CLOSE_HEAD);
     while (idx >= 0) {
-        const m = CLOSE_NAME_ANCHORED.exec(s.slice(idx + 2));
+        const m = anchored.exec(s.slice(idx + 2));
         if (m && s[idx + 2 + m[0].length] === ">") return { start: idx, end: idx + 2 + m[0].length + 1 };
         idx = s.indexOf(CLOSE_HEAD, idx + 1);
     }
@@ -556,7 +567,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
         for (;;) {
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
-                const span = looseCloseSpan(combined);
+                let span = looseCloseSpan(combined);
+                if (span === null) {
+                    // #2176: a degraded close (</ap>, </p>, ...) is invisible to the
+                    // strict matcher above. Honor it only when the swallowed body is a
+                    // bare ref — the echo shape — leaving wrapped-turn/prose bodies to
+                    // the strict path (a non-ref body must never terminate early at an
+                    // inner markup close such as </invoke>).
+                    const li = looseCloseSpan(combined, true);
+                    if (li !== null && REF_LIKE.test(combined.slice(0, li.start))) span = li;
+                }
                 if (span !== null) {
                     // Only a ref-shaped body is tag content (#1720): a prose
                     // body between paired tags is released and just the close
