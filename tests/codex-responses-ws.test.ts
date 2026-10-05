@@ -242,3 +242,47 @@ test("codex WS: non-streaming transport options are refused with a protocol erro
         assert.equal((error.error as { code: string }).code, "invalid_request");
     } finally { await f.close(); }
 });
+
+test("codex WS: stream_options delivery hints are admitted (codex 0.160.0 shape, #2126)", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.probe();
+        const events: Item[] = [];
+        const done = new Promise<Item[]>(resolve => {
+            f.peer.on("message", (raw: WebSocket.RawData) => { const event = JSON.parse(raw.toString()) as Item; events.push(event); if (event.type === "response.completed") resolve(events); });
+        });
+        // codex 0.147+ rides reasoning_summary_delivery on every response.create;
+        // the lane must admit it instead of refusing the whole frame.
+        f.peer.send(f.frame([user("stream-options-turn")], { stream_options: { reasoning_summary_delivery: "sequential_cutoff" } }));
+        const result = await done;
+        assert.equal(result.at(-1)?.type, "response.completed");
+        assert.ok(result.every(e => e.type !== "error"), JSON.stringify(result));
+        // Admitted through the ACP pipeline: probe row + one processed turn row, no error frame.
+        assert.equal(f.rows.length, 2);
+        assert.ok(JSON.stringify(f.rows[1].request.input).includes("stream-options-turn"));
+    } finally { await f.close(); }
+});
+
+test("codex WS: rejection names the offending transport option in the frame and log (#2126)", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        const done = new Promise<Item>(resolve => { f.peer.on("message", (raw: WebSocket.RawData) => { const event = JSON.parse(raw.toString()) as Item; if (event.type === "error") resolve(event); }); });
+        f.peer.send(f.frame([user("bg")], { background: true }));
+        const error = await done;
+        assert.equal(error.type, "error");
+        assert.equal((error.error as { code: string }).code, "invalid_request");
+        assert.match(String((error.error as Item).message), /background/);
+        // Poll, don't one-shot-read: the logger's file stream is async/buffered
+        // (#1971) and readFileSync right after the error frame raced loaded CI runners.
+        const want = /client rejected reason=invalid_request detail=.*background/;
+        const deadline = Date.now() + 5000;
+        let log = "";
+        for (;;) {
+            try { log = fs.readFileSync(f.logPath, "utf8"); } catch { /* open still in flight */ }
+            if (want.test(log)) break;
+            if (Date.now() >= deadline) break;
+            await new Promise(r => setTimeout(r, 20));
+        }
+        assert.match(log, want);
+    } finally { await f.close(); }
+});
