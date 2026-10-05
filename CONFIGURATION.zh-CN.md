@@ -506,6 +506,8 @@
 
   已知方案注册表与可观测性：bili 自带 `sdk-hmac-sha256`（内置，#1884）、`aws4-hmac-sha256`、`hmac-sha256`、`x-ofm-signature`（#2090）的名称标签与出处。**登记是一种承诺而非能力**：按二元契约，每个已登记方案最终都必须在 bili 里补上重签器 —— 在此之前该方案被响亮拒绝（web UI 标记为「等待重签器」）；尚未注册的新方案由形状检测兜底，同样拒绝、绝不静默改写。待处理拒收、各方案实时状态与未解决集合可在 web UI（`/__bili/` → 配置 → 签名上游（resign））查看，或读回环限定的 `GET /__bili/resign`。
 
+  内置（CodeArts）前置条件与临时缓解：`sdk-hmac-sha256` 的重签 arm 由 bili 自己的 dsh native lane 注入 —— 它遍历 `$DSH_HOME/jet-hub/state.json`（Windows 默认 `%USERPROFILE%\.dsh\jet-hub\state.json`）中 `provider: "codearts"` 且未 `enabled: false` 的账号，用宿主凭据服务（必须暴露给 native 插件）逐个解析账号的 `credentialRef`，取第一个能解析出 `{access_key_id, secret_access_key}` 的。如果你的宿主版本缺了其中任何一环（例如某个 DSH 构建不再注入凭据服务、或状态文件布局变更），所有签名请求都会被拒收为 `bili_resign_unavailable`——即使凭据本身有效；这是宿主侧缺口而非 bili 配置错误，最低 DSH 版本随宿主跟踪、不在此钉死。升级宿主之前，`BILI_RESIGN_PASSTHROUGH=1` 可让 codearts 链路字节原样直通（仅内置方案，不压缩）。注意拒收消息打印的配置路径与配置加载器读取用的是同一个函数计算出的精确解析路径，按报错里写的文件改总是对的。
+
   模型级开关刻意不在本块里 —— 见下面三级说明。
 
   ```jsonc
