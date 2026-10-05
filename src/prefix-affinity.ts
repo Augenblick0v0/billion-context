@@ -50,7 +50,6 @@ import { createHash } from "node:crypto";
 const MIN_CANONICAL_BYTES = 24;
 
 /** Upper bound on tracked chains (LRU-evicted, global — content is the
-/** Upper bound on tracked chains (LRU-evicted, global — content is the
  *  only key, so there are no per-credential buckets). Chains are PERMANENT
  *  (#1724): the product promise is month- to year-level single sessions, so
  *  validity never expires with time — a chain leaves the table only under
