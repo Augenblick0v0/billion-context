@@ -54,6 +54,7 @@ import {
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
+import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -4059,10 +4060,10 @@ async function abortLaunchOnBusyOverlay(handle: ProxyHandle, err: OverlayBusyErr
 
 /** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
  *  tokens get wrapped in double quotes, so a space-free launch produces a
- *  byte-identical line to the old shell:true form. A token containing an
- *  embedded double quote stays bare: cmd.exe has no escape mechanism for
- *  quotes, so wrapping would only change how it is mangled (today's behavior
- *  preserved). */
+ *  byte-identical line to the old shell:true form. Pure formatter: callers
+ *  must pre-validate their tokens through the #2196 safe-set guard
+ *  (winCmdUnsafeToken) — an embedded double quote stays bare here only
+ *  because such tokens never reach this path anymore. */
 export function quoteWinToken(token: string): string {
     if (!/\s/.test(token) || token.includes('"')) return token;
     return `"${token}"`;
@@ -4083,7 +4084,11 @@ export function buildWindowsCommandLine(cmd: string, args: readonly string[]): s
  *  extension) spawns directly and the OS quotes the executable and argv
  *  itself, spaces included. shell:true is never used anymore: no DEP0190, no
  *  cmd.exe re-splitting of spaced paths at their first space (which truncated
- *  both the command and its args). */
+ *  both the command and its args).
+ *  #2196: the comspec form re-feeds user argv into cmd.exe's LINE parser,
+ *  which has no escape mechanism — so before building the line, every token
+ *  (command included) must pass the safe-set guard; unsafe tokens throw with
+ *  an actionable error instead of being mangled or interpreted silently. */
 export function planClientSpawn(
     cmd: string,
     args: readonly string[],
@@ -4095,6 +4100,15 @@ export function planClientSpawn(
     const base = cmd.slice(Math.max(cmd.lastIndexOf("/"), cmd.lastIndexOf("\\")) + 1);
     const needsCmd = lower.endsWith(".cmd") || lower.endsWith(".bat") || !path.extname(base);
     if (!needsCmd) return { command: cmd, args: [...args] };
+    const tokens = [cmd, ...args];
+    tokens.forEach((token, i) => {
+        const reason = winCmdUnsafeToken(token);
+        if (reason) throw winCmdRefusalError(
+            i === 0 ? "resolved command" : `argument #${i - 1}`,
+            reason,
+            "Set BILI_CLIENT_BIN to the native executable (e.g. the real codex.exe) or to a script entry run under node, or reword the argument.",
+        );
+    });
     const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
     return {
         command: comspec,
@@ -4146,9 +4160,82 @@ export function isOnPath(name: string, env: NodeJS.ProcessEnv): boolean {
     return resolveOnPath(name, env) !== undefined;
 }
 
+/** #2196: given a resolved codex .cmd/.bat shim, locate the official npm
+ *  package's JS entry when this is a trusted npm install layout: the shim sits
+ *  beside <dir>/node_modules/@openai/codex whose package.json is named
+ *  "@openai/codex" and declares a resolvable "codex" bin entry, AND the shim
+ *  text references that package (npm-generated shims always do; a hand-written
+ *  codex.cmd placed beside an unrelated tree must not hijack the launch).
+ *  Running that entry under Node reproduces exactly what the shim does — its
+ *  vendor-binary lookup, env init, signal forwarding — while Node's own
+ *  CreateProcess argv encoding carries user arguments verbatim instead of
+ *  cmd.exe mangling them (#2196). Returns undefined for any other layout
+ *  (yarn-classic .bin trees, pnpm store shims without the local node_modules
+ *  link, ...): those keep the legacy cmd path under the safe-set guard. */
+export function resolveCodexOfficialJsEntry(shimPath: string): string | undefined {
+    const pkgDir = path.join(path.dirname(shimPath), "node_modules", "@openai", "codex");
+    let pkgJson: unknown;
+    try {
+        pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+    } catch {
+        return undefined;
+    }
+    if (!pkgJson || typeof pkgJson !== "object") return undefined;
+    const meta = pkgJson as { name?: unknown; bin?: unknown };
+    if (meta.name !== "@openai/codex") return undefined;
+    let rel: string | undefined;
+    if (typeof meta.bin === "string") rel = meta.bin;
+    else if (meta.bin && typeof meta.bin === "object" && !Array.isArray(meta.bin)) {
+        const v = (meta.bin as Record<string, unknown>)["codex"];
+        if (typeof v === "string") rel = v;
+    }
+    if (!rel) return undefined;
+    const entry = path.resolve(pkgDir, rel);
+    try {
+        if (!fs.statSync(entry).isFile()) return undefined;
+    } catch {
+        return undefined;
+    }
+    try {
+        const shimText = fs.readFileSync(shimPath, "utf8").slice(0, 65536);
+        if (!shimText.includes("@openai\\codex") && !shimText.includes("@openai/codex")) return undefined;
+    } catch {
+        return undefined;
+    }
+    return entry;
+}
+
+/** #2196: Windows-only codex resolution that never routes through cmd.exe's
+ *  line parser when it can be avoided: per PATH directory the native
+ *  codex.exe wins over codex.cmd/codex.bat (earliest directory still wins
+ *  overall), and a .cmd/.bat hit is upgraded to `node <official bin/codex.js>`
+ *  whenever the trusted npm layout is present. Returns undefined when no
+ *  codex.{exe,cmd,bat} exists anywhere — the caller falls through to the
+ *  generic resolution (which also covers the extensionless case). */
+function resolveCodexWin32(env: NodeJS.ProcessEnv): { command: string; prefixArgs: string[] } | undefined {
+    const p = env.PATH;
+    if (!p) return undefined;
+    for (const dir of p.split(path.delimiter)) {
+        if (!dir) continue;
+        for (const ext of [".exe", ".cmd", ".bat"]) {
+            const f = path.join(dir, "codex" + ext);
+            try {
+                if (fs.existsSync(f) && fs.statSync(f).isFile()) {
+                    if (ext === ".exe") return { command: f, prefixArgs: [] };
+                    const entry = resolveCodexOfficialJsEntry(f);
+                    if (entry) return { command: process.execPath, prefixArgs: [entry] };
+                    return { command: f, prefixArgs: [] };
+                }
+            } catch {}
+        }
+    }
+    return undefined;
+}
+
 export function resolveClientCommand(
     client: ClientName,
     env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform = process.platform,
 ): { command: string; prefixArgs: string[] } {
     const binOverride = env.BILI_CLIENT_BIN?.trim();
     if (binOverride) {
@@ -4222,6 +4309,17 @@ export function resolveClientCommand(
             }
         }
         return { command: base, prefixArgs: [] };
+    }
+    if (client === "codex" && platform === "win32") {
+        // #2196: the default npm install is a codex.cmd shim whose %*
+        // forwarding re-parses every user argument through cmd.exe (embedded
+        // quotes split tokens, %VAR% expands, &|<>^() execute). Prefer forms
+        // that never enter that parser; a leftover .cmd/.bat only reaches
+        // cmd.exe when neither exists — where the safe-set guard in
+        // planClientSpawn then refuses argv it cannot carry verbatim instead
+        // of corrupting it silently.
+        const win32Hit = resolveCodexWin32(env);
+        if (win32Hit) return win32Hit;
     }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
@@ -4756,7 +4854,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             if (!codexRunModePinned(params.clientArgs)) {
-                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env);
+                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
                 if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
                     clientArgs = ["--no-daemon", ...clientArgs];
                     console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
@@ -4867,7 +4965,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     }
 
-    const { command, prefixArgs } = resolveClientCommand(base, process.env);
+    const { command, prefixArgs } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
     const effectiveClientArgs = piTestArgs(params.client, clientArgs);
     let code = 0;
     try {

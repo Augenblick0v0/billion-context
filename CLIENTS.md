@@ -365,6 +365,46 @@ The #321 budget `-c` args are kept verbatim (embedded mode honors them
 identically). If you want the shared background server, run native `codex`
 directly — no compression, but tools still work via `bili plugin install codex`.
 
+### Windows launch path: user argv never re-enters cmd.exe (#2196)
+
+On Windows the default npm install puts a `codex.cmd` shim on PATH, and its
+`%*` forwarding re-parses every user argument through cmd.exe's LINE parser —
+which has no escape mechanism: embedded double quotes split tokens
+(`Please say "hello world" exactly` arrived as four arguments), `%VAR%`
+expands, `&|<>^()` act as command operators, and empty arguments vanish.
+Plain spaced prompts survived, which is why the #679 space-truncation fix did
+not expose it. #2196 makes the launcher refuse to feed user argv into that
+parser:
+
+- **Resolution order (win32 only):** within each PATH directory the native
+  `codex.exe` wins over `codex.cmd`/`codex.bat` (earliest directory still wins
+  overall); a `.cmd`/`.bat` hit is upgraded to `node <official bin/codex.js>`
+  when it sits beside a trusted npm layout — `<dir>/node_modules/@openai/codex`
+  whose package.json is named `@openai/codex` with a resolvable `"codex"` bin
+  entry, AND shim text referencing that package (a hand-written `codex.cmd`
+  placed beside an unrelated tree must not hijack the launch). Running the
+  official wrapper under Node reproduces exactly what the shim does — vendor
+  binary lookup, env init, signal forwarding — while Node's own CreateProcess
+  argv encoding carries every argument verbatim. Unrecognized layouts
+  (yarn-classic `.bin` trees, pnpm store shims without the local link, …) keep
+  the legacy cmd path under the contract below.
+- **Pass-through contract:** the remaining cmd-wrapped launches — any client's
+  `.cmd`/`.bat`/extensionless binary, plus dsh-channel spawns — accept only
+  argv the line parser can carry verbatim. Anything else (embedded quotes,
+  `%VAR%`, metacharacters, empty args, line breaks, odd trailing-backslash
+  runs) fails loudly with an actionable error *before* any process starts,
+  instead of arriving corrupted or executing unintended commands. Direct-spawn
+  `.exe` launches are unaffected: Node encodes their argv losslessly itself.
+- **Workaround / power-user knob:** `BILI_CLIENT_BIN=<path>` still outranks
+  everything — point it at the real `codex.exe` (or at a script entry run
+  under node) to bypass the shim entirely.
+
+Verified on windows-latest CI against the real global `@openai/codex` install
+(`tests/win-cmd-argv.test.ts`, hard gate in `ci-windows-codex.yml`): the full
+corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
+Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
+child process item-by-item identical to the caller array.
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
 Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of
