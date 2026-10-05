@@ -385,6 +385,50 @@ test("search returns active blocks matching the query, ranked", () => {
   assert.equal(hits[0]!.blockId, "b1");
 });
 
+test("search finds keywords occurring fewer than three times in a summary (#2158)", () => {
+  const core = createCore();
+  const state = createInitialState();
+  state.blocks.push(
+    {
+      blockId: "b1",
+      runId: "r1",
+      tier: 1,
+      topic: "preflight overflow compress",
+      summary: "handled the preflight overflow path and its retry budget",
+      directMessageIds: [],
+      effectiveMessageIds: [],
+      directBlockIds: [],
+      createdAt: 0,
+      survivedCount: 0,
+      generation: "young",
+      active: true,
+    },
+    {
+      blockId: "b2",
+      runId: "r1",
+      tier: 1,
+      summary: "recorded probe alphaone and unique-marker-2026 独特中文短语甲乙丙 once each",
+      directMessageIds: [],
+      effectiveMessageIds: [],
+      directBlockIds: [],
+      createdAt: 1,
+      survivedCount: 0,
+      generation: "young",
+      active: true,
+    },
+  );
+
+  // Single occurrence in the summary, no topic: the minimum positive signal
+  // (0.04) was silently dropped by the old 0.1 relevance floor.
+  assert.deepEqual(core.search("unique-marker-2026", state).map((b) => b.blockId), ["b2"]);
+  assert.deepEqual(core.search("alphaone", state).map((b) => b.blockId), ["b2"]);
+  assert.deepEqual(core.search("独特中文短语甲乙丙", state).map((b) => b.blockId), ["b2"]);
+  // Topic matches still outrank summary-only matches.
+  assert.deepEqual(core.search("preflight", state).map((b) => b.blockId), ["b1"]);
+  // Zero lexical overlap still returns nothing.
+  assert.deepEqual(core.search("nonexistenttermxyz", state), []);
+});
+
 test("GC is fully removed: createCore() exposes no gc method", () => {
   const core = createCore() as unknown as Record<string, unknown>;
   assert.equal(core["gc"], undefined, "gc() must not exist — GC was removed");
