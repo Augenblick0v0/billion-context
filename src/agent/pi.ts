@@ -7,8 +7,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
+import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
@@ -413,6 +415,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #2185 方案 A: this bundle's own file path, registered per session so
+        // pi-subagents children load it deterministically (see module header).
+        const subagentReg: SubagentSelfRegState = {};
+        const entryFile = fileURLToPath(import.meta.url);
         // #1217: -p single-shot fires round 1 before session_start's manifest
         // fetch can resolve, leaving the request unmarked → anonymous
         // proxy-mode session. Prime the fetch at load time: the launcher
@@ -857,6 +863,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
+            if (agent === "pi") {
+                const regReason = selfRegisterForSession(subagentReg, {
+                    env: process.env,
+                    agent,
+                    sessionId: sessionIdOf(ctx),
+                    filePath: entryFile,
+                    log: (m) => console.warn(`bili-plugin(pi): ${m}`),
+                });
+                if (regReason !== "registered" && regReason !== "registered-already") {
+                    console.warn(`bili-plugin(pi): subagent self-registration skipped (${regReason})`);
+                }
+            }
             state.sid = undefined;
             // #1586 review: session_start captures its ctx for the whole
             // session — never suspend across it here. One-shot flows replace
@@ -867,6 +885,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
             void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+        });
+        // #2185: drop our required-child-extension entry when this session's
+        // extension runtime tears down (quit/reload/new/resume/fork).
+        pi.on("session_shutdown", () => {
+            disposeSubagentSelfReg(subagentReg);
         });
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
