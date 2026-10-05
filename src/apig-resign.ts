@@ -1,7 +1,9 @@
 import { createHash, createHmac } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 import { RESIGN_BUILTIN_SCHEME, resolveResignSettings, type ProviderRoute } from "./config.js";
-import { configFile } from "./paths.js";
+import { configFile, stateDir } from "./paths.js";
 
 /**
  * #1884 (CodeArts APIG): requests signed with SDK-HMAC-SHA256 carry a
@@ -26,19 +28,20 @@ import { configFile } from "./paths.js";
  * arming signed requests (they fall through to the normal takeover path —
  * pre-#1884 behavior) and the server-side guard stays silent.
  *
- * A BUILT-IN-scheme request that cannot be re-signed (no credential
- * resolvable) is REFUSED by default — 403 with an actionable message,
- * because its fix (provide the signing credential) is actionable. Every
- * OTHER detected signature can never be re-signed here — there is no
- * credential source outside the built-in scheme — so refusing it would only
- * convert a working link into a hard failure: those go DIRECT by default
- * (#2090), uncompressed, signature intact, loudly logged once per URL. The
- * false-positive cost of over-detection is one uncompressed link; the miss
- * cost is a hard 401 surfacing in someone else's plugin UI — the asymmetry
- * decides. Escape hatches keep their meaning: resign["<scheme>"].passthrough
- * / BILI_RESIGN_PASSTHROUGH=1 (now the effective default for non-built-in
- * schemes), and resign["<scheme>"].enabled=false / BILI_RESIGN=0 un-deploy
- * the branch entirely (pre-#1884 rewrite behavior).
+ * A signed request that cannot be re-signed (no credential resolvable for
+ * its scheme) is REFUSED by default — 403 with an actionable message — for
+ * EVERY scheme, built-in or not (#2090 plan A, owner ruling): bili's
+ * contract is "installed = compressed, or the user explicitly knows a link
+ * runs uncompressed" — a silent direct-forward violates it because the
+ * bypass is invisible in every channel the end user actually watches. The
+ * explicit opt-in IS the acknowledgment: resign["<scheme>"].passthrough /
+ * BILI_RESIGN_PASSTHROUGH=1 forwards byte-untouched WITHOUT compression and
+ * says so in the message, log, and web UI. Refusals are remembered
+ * (recordSignedRefusal → stateDir()/resign-pending.json) so every bili
+ * startup lists still-unresolved schemes next to the listen banner until
+ * they are configured away. resign["<scheme>"].enabled=false / BILI_RESIGN=0
+ * un-deploy the branch entirely (pre-#1884 rewrite behavior — upstream may
+ * reject the rewritten bodies; that choice also clears the reminder).
  *
  * Credential refresh is intentionally NOT ported: the plugin refreshes its
  * own credentials; when they expire, the upstream 401 is visible and the
@@ -51,6 +54,27 @@ export const APIG_RESIGN_CREDENTIAL_HEADER = "x-bili-resign-credential";
 /** Marker value for the scheme this module can re-sign (the config-level
  *  identity of the built-in resign key — see RESIGN_BUILTIN_SCHEME). */
 export const APIG_RESIGN_SCHEME = RESIGN_BUILTIN_SCHEME;
+
+/** #2090 plan A: the known body-covering signature schemes. Shape detection
+ *  (inboundSignedScheme) is the backstop that guarantees an UNregistered
+ *  scheme still fails loudly (actionable 403) instead of silently rewriting
+ *  a signed body; this registry adds friendly labels + provenance so refusal
+ *  messages, startup reminders, and the web UI can say WHAT the scheme is
+ *  instead of just its token. The list converges: every newly discovered
+ *  gateway scheme gets one entry (with the issue it came from). */
+export interface KnownSignatureScheme {
+    label: string;
+    source: string;
+    builtIn?: boolean;
+}
+
+export const KNOWN_SIGNATURE_SCHEMES: Record<string, KnownSignatureScheme> = {
+    "sdk-hmac-sha256": { label: "CodeArts APIG SDK-HMAC-SHA256", source: "#1884", builtIn: true },
+    "aws4-hmac-sha256": { label: "AWS SigV4 (AWS4-HMAC-SHA256)", source: "AWS SigV4" },
+    "hmac-sha256": { label: "generic HMAC-SHA256 authorization", source: "#1884" },
+    // dsh-our-free-model EAC channel: HMAC over `${timestamp}\n${METHOD}\n${path}\nsha256(body)`
+    "x-ofm-signature": { label: "dsh-our-free-model EAC gateway signature", source: "#2090" },
+};
 
 /** The minimal signing credential (subset of the plugin's CodeArtsCredential). */
 export interface ApigCredential {
@@ -102,7 +126,9 @@ export interface SignedRefusal {
  *  Protocol-native shapes (anthropic/openai wire) so real clients surface the
  *  message instead of choking on it. */
 export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"): SignedRefusal {
-    const message = `bili refused to forward this ${scheme}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available. Fix one of: provide a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service), set "resign": {"${scheme}": {"passthrough": true}} in the config file (${configFile()}; or env BILI_RESIGN_PASSTHROUGH=1) to forward THIS scheme byte-untouched without compression, or set "resign": {"${scheme}": {"enabled": false}} / BILI_RESIGN=0 to restore pre-resign handling.`;
+    const known = KNOWN_SIGNATURE_SCHEMES[scheme];
+    const schemeName = known ? `${scheme} (${known.label}, ${known.source})` : scheme;
+    const message = `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available for this scheme. The link WORKS WITHOUT COMPRESSION if you opt in explicitly — that opt-in is the acknowledgment that this link runs uncompressed: add {"resign":{"${scheme}":{"passthrough":true}}} to the config file (${configFile()}) or set env BILI_RESIGN_PASSTHROUGH=1, then restart bili; the bili web UI (/__bili/, Configuration → Signed upstreams) lists this scheme too. Alternatively restore pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 — the body is then rewritten and the upstream may reject it. Built-in scheme only: providing a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service) makes bili re-sign instead of refusing.`;
     if (protocol === "anthropic") {
         return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
     }
@@ -284,4 +310,112 @@ export function resignApig(
         extraSignedHeaders: benefit ? { maas_type: "benefit" } : undefined,
         now,
     });
+}
+
+// #2090 plan A — refusal memory. A refusal is only visible for the lifetime
+// of the request that got it; the user who will fix the config sees nothing
+// until the next failure. Persisting (scheme → where/when/how often) lets
+// EVERY bili startup re-surface still-unresolved schemes next to the listen
+// banner and in the web UI, until the user configures them away. The file is
+// a reminder aid, never a correctness path: read/write failures degrade to
+// "no reminder", never to a broken request.
+
+export interface ResignPendingEntry {
+    origin: string;
+    firstSeen: string;
+    lastSeen: string;
+    count: number;
+}
+
+const RESIGN_PENDING_MAX_ENTRIES = 32;
+
+function resignPendingFile(): string {
+    return path.join(stateDir(), "resign-pending.json");
+}
+
+function readPendingRefusalsRaw(): Record<string, ResignPendingEntry> {
+    try {
+        const parsed: unknown = JSON.parse(readFileSync(resignPendingFile(), "utf8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+        const out: Record<string, ResignPendingEntry> = {};
+        for (const [scheme, raw] of Object.entries(parsed as Record<string, unknown>)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+            const e = raw as Record<string, unknown>;
+            out[scheme] = {
+                origin: typeof e["origin"] === "string" ? e["origin"] : "",
+                firstSeen: typeof e["firstSeen"] === "string" ? e["firstSeen"] : new Date(0).toISOString(),
+                lastSeen: typeof e["lastSeen"] === "string" ? e["lastSeen"] : new Date(0).toISOString(),
+                count: typeof e["count"] === "number" && Number.isFinite(e["count"]) && e["count"] > 0 ? Math.floor(e["count"]) : 1,
+            };
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+function writePendingRefusals(map: Record<string, ResignPendingEntry>): void {
+    try {
+        mkdirSync(stateDir(), { recursive: true });
+        const tmp = `${resignPendingFile()}.tmp`;
+        writeFileSync(tmp, JSON.stringify(map, null, 2));
+        renameSync(tmp, resignPendingFile());
+    } catch (err) {
+        console.warn(`bili: cannot persist resign-pending.json (${err instanceof Error ? err.message : String(err)})`);
+    }
+}
+
+/** Remember that a signed request was refused (both lanes call this on the
+ *  refusal path). Bounded: newest 32 schemes survive a restart. */
+export function recordSignedRefusal(scheme: string, url: string): void {
+    const key = scheme.trim().toLowerCase();
+    if (key.length === 0) return;
+    const map = readPendingRefusalsRaw();
+    let origin = "";
+    try { origin = new URL(url).origin; } catch { origin = url.slice(0, 120); }
+    const now = new Date().toISOString();
+    const prev = map[key];
+    map[key] = prev
+        ? { origin: prev.origin || origin, firstSeen: prev.firstSeen, lastSeen: now, count: prev.count + 1 }
+        : { origin, firstSeen: now, lastSeen: now, count: 1 };
+    const keys = Object.keys(map);
+    if (keys.length > RESIGN_PENDING_MAX_ENTRIES) {
+        // Drop the oldest-seen overflow entries; keep the most recently active.
+        keys.sort((a, b) => map[a].firstSeen.localeCompare(map[b].firstSeen));
+        for (const drop of keys.slice(0, keys.length - RESIGN_PENDING_MAX_ENTRIES)) delete map[drop];
+    }
+    writePendingRefusals(map);
+}
+
+/** Forget a scheme's refusal memory — called when the scheme is configured
+ *  away (passthrough opted in, or the branch un-deployed via enabled=false /
+ *  BILI_RESIGN=0), so startup reminders stop nagging about it. */
+export function clearSignedRefusal(scheme: string): void {
+    const key = scheme.trim().toLowerCase();
+    const map = readPendingRefusalsRaw();
+    if (!(key in map)) return;
+    delete map[key];
+    writePendingRefusals(map);
+}
+
+export function readPendingRefusals(): Record<string, ResignPendingEntry> {
+    return readPendingRefusalsRaw();
+}
+
+/** Schemes whose refusal is still UNRESOLVED under the current settings —
+ *  drives the startup banner and the web UI card. An entry resolves when the
+ *  user made an explicit decision for its scheme: passthrough opted in (the
+ *  link runs uncompressed BY CHOICE) or the branch un-deployed
+ *  (enabled=false / BILI_RESIGN=0 — they accept upstream rejecting rewritten
+ *  bodies). Global env decisions resolve everything up front. */
+export function unresolvedRefusals(env: NodeJS.ProcessEnv = process.env): Record<string, ResignPendingEntry> {
+    if (env.BILI_RESIGN === "0") return {};
+    if (env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true") return {};
+    const out: Record<string, ResignPendingEntry> = {};
+    for (const [scheme, entry] of Object.entries(readPendingRefusalsRaw())) {
+        const settings = resolveResignSettings(env, {}, scheme);
+        if (settings.passthrough || !settings.enabled) continue;
+        out[scheme] = entry;
+    }
+    return out;
 }

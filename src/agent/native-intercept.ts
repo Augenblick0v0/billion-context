@@ -10,7 +10,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { envMillis } from "./native-bootstrap.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, encodeApigCredential, inboundSignedScheme, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
@@ -716,52 +716,61 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
-        // #1884/#2090: a body-covering signature cannot survive a rewrite —
-        // routing these through the proxy un-armed makes the upstream reject
-        // every request with 401 (APIG.0301 body hash mismatch / SigV4
-        // SignatureDoesNotMatch). When the host can supply the signing
-        // credential (dsh credential service, built-in scheme only), the
-        // request tunnels WITH a re-sign arm: bili re-signs every egress
-        // body it produces. Without a credential the request goes DIRECT
-        // (uncompressed, signature intact, logged once per URL): for
-        // non-built-in schemes there is NO credential source anywhere, so
-        // the pre-#2090 local refusal only converted a working link into a
-        // hard failure (#2090); the built-in scheme still refuses by default
-        // because its fix (provide the credential) is actionable.
+        // #1884/#2090 plan A: a body-covering signature cannot survive a
+        // rewrite — routing these through the proxy un-armed makes the
+        // upstream reject every request with 401 (APIG.0301 body hash
+        // mismatch / SigV4 SignatureDoesNotMatch). When the host can supply
+        // the signing credential (dsh credential service, built-in scheme
+        // only), the request tunnels WITH a re-sign arm: bili re-signs every
+        // egress body it produces. Without a credential the request is
+        // REFUSED locally by default for EVERY scheme — 403 with an
+        // actionable message naming the exact config opt-in (#2090 owner
+        // ruling: bili's contract is "installed = compressed, or the user
+        // explicitly knows a link runs uncompressed"; a silent direct-forward
+        // hides the bypass from every channel the end user watches). The
+        // explicit passthrough opt-in IS the acknowledgment: byte-untouched,
+        // no compression, loudly logged. Refusals are remembered
+        // (recordSignedRefusal) so bili startups keep listing unresolved
+        // schemes until they are configured away.
         // Passthrough/refusal are decided PER SCHEME — the lookup key is the
         // request's own signature scheme, so opting one signature into
         // verbatim forwarding never opens another (config
         // `resign["<scheme>"].passthrough`, env BILI_RESIGN_PASSTHROUGH wins;
         // BILI_RESIGN=0 or `resign["<scheme>"].enabled=false` un-deploy the
         // branch — signed bodies fall through to the normal takeover path,
-        // pre-#1884 behavior).
+        // pre-#1884 behavior — and clear the scheme's refusal memory).
         let resignExtra: Record<string, string> | undefined;
         const signedScheme = bodySignedSchemeOf(input, init);
-        if (signedScheme !== undefined && resignEnabled(undefined, signedScheme)) {
-            state.onSignedModelUrl?.(url, signedScheme);
-            let cred: { ak: string; sk: string; token?: string } | undefined;
-            if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
-                try {
-                    cred = await state.resignCredentialFor(url, signedScheme);
-                } catch {
-                    cred = undefined;
+        if (signedScheme !== undefined) {
+            if (!resignEnabled(undefined, signedScheme)) {
+                clearSignedRefusal(signedScheme);
+            } else {
+                state.onSignedModelUrl?.(url, signedScheme);
+                let cred: { ak: string; sk: string; token?: string } | undefined;
+                if (signedScheme === APIG_RESIGN_SCHEME && state.resignCredentialFor !== undefined) {
+                    try {
+                        cred = await state.resignCredentialFor(url, signedScheme);
+                    } catch {
+                        cred = undefined;
+                    }
                 }
-            }
-            if (cred === undefined) {
-                const failOpen = signedScheme !== APIG_RESIGN_SCHEME;
-                if (!failOpen && !resignPassthroughEnabled(undefined, signedScheme)) {
-                    state.onDispatch?.(url, "refused");
-                    const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
-                    return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
+                if (cred === undefined) {
+                    if (!resignPassthroughEnabled(undefined, signedScheme)) {
+                        state.onDispatch?.(url, "refused");
+                        recordSignedRefusal(signedScheme, url);
+                        const refusal = signedRefusal(signedScheme, url.endsWith("/messages") ? "anthropic" : "openai");
+                        return new Response(refusal.body, { status: refusal.status, headers: { "content-type": refusal.contentType, "x-bili-resign": "unavailable" } });
+                    }
+                    clearSignedRefusal(signedScheme);
+                    noteSignedDirect(url, signedScheme, "passthrough opt-in — byte-untouched, no compression");
+                    state.onDispatch?.(url, "direct");
+                    return send(input, init);
                 }
-                noteSignedDirect(url, signedScheme, failOpen ? "no re-sign credential exists for this scheme — byte-untouched, no compression" : "passthrough opt-in — byte-untouched, no compression");
-                state.onDispatch?.(url, "direct");
-                return send(input, init);
+                resignExtra = {
+                    [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
+                    [APIG_RESIGN_CREDENTIAL_HEADER]: encodeApigCredential(cred),
+                };
             }
-            resignExtra = {
-                [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
-                [APIG_RESIGN_CREDENTIAL_HEADER]: encodeApigCredential(cred),
-            };
         }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an

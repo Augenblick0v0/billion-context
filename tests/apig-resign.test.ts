@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createHash, createHmac } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,15 +20,18 @@ import {
     APIG_RESIGN_HEADER,
     APIG_RESIGN_SCHEME,
     apigBenefitFor,
+    clearSignedRefusal,
     decodeApigCredential,
     encodeApigCredential,
     inboundSignedScheme,
     modelOfJsonBody,
+    recordSignedRefusal,
     resignApig,
     resignEnabled,
     resignPassthroughEnabled,
     signApigHeaders,
     type ApigCredential,
+    unresolvedRefusals,
 } from "../src/apig-resign.ts";
 import { resolveResignSettings, type ProxyOptions } from "../src/config.ts";
 import { bodySignedSchemeOf, installNativeFetchIntercept, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
@@ -50,6 +53,16 @@ import { ACP_TEXT_CLOSE, ACP_TEXT_OPEN, createCore, defaultConfig, type Config, 
 const CRED: ApigCredential = { ak: "AKTEST123", sk: "SKTEST456", token: "tok-789" };
 const NOW = new Date("2026-10-02T10:30:00.000Z");
 const DATE_STAMP = "20261002T103000Z";
+
+// #2090 plan A: refusal memory (resign-pending.json) lives under stateDir() —
+// isolate this file's whole process so refusal-path tests never touch a real
+// user's ~/.local/state/billion-context and can assert on the file directly.
+const STATE_TMP = mkdtempSync(path.join(tmpdir(), "apig-resign-state-"));
+process.env.XDG_STATE_HOME = STATE_TMP;
+const PENDING_FILE = path.join(STATE_TMP, "billion-context", "resign-pending.json");
+function pendingMap(): Record<string, { origin: string; firstSeen: string; lastSeen: string; count: number }> {
+    try { return JSON.parse(readFileSync(PENDING_FILE, "utf8")) as Record<string, { origin: string; firstSeen: string; lastSeen: string; count: number }>; } catch { return {}; }
+}
 
 function sha256Hex(data: Uint8Array | string): string {
     return createHash("sha256").update(data).digest("hex");
@@ -395,7 +408,7 @@ test("#1884 intercept: BILI_RESIGN=0 → signed branch un-deployed, normal takeo
     });
 });
 
-test("#2090 intercept: non-built-in scheme (AWS4) → DIRECT by default (fail-open — no credential source can ever re-sign it)", async () => {
+test("#2090 intercept: non-built-in scheme (AWS4) → REFUSED by default with an actionable message (plan A)", async () => {
     const dispatches: string[] = [];
     const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
     const { sink, result } = await withIntercept(state, async (fetch) =>
@@ -404,28 +417,57 @@ test("#2090 intercept: non-built-in scheme (AWS4) → DIRECT by default (fail-op
             headers: { authorization: "AWS4-HMAC-SHA256 Credential=AK/20260101/cn-north-4/sms/sdk_request", "x-amz-content-sha256": "aa" },
             body: "{}",
         }));
-    assert.equal(sink.length, 1, "default is fail-open direct, not local refusal (#2090)");
-    assert.equal(result.status, 200, "recordingFetch answered — the request went out untouched");
-    assert.equal(sink[0].url, "http://127.0.0.1:9199/v1/chat/completions", "original URL, never rewritten through the proxy");
-    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined, "no arm marker on a direct send");
-    assert.deepEqual(dispatches, ["direct"]);
+    assert.equal(sink.length, 0, "plan A: un-re-signable signatures are refused locally, never rewritten into an upstream 401");
+    assert.equal(result.status, 403);
+    assert.equal(result.headers.get("x-bili-resign"), "unavailable");
+    const payload = JSON.parse(await result.text()) as { error: { code: string; message: string } };
+    assert.equal(payload.error.code, "bili_resign_unavailable");
+    assert.match(payload.error.message, /aws4-hmac-sha256/, "names the offending scheme");
+    assert.match(payload.error.message, /"passthrough":\s*true/, "carries the exact opt-in snippet");
+    assert.match(payload.error.message, /BILI_RESIGN_PASSTHROUGH=1/, "offers the env alternative");
+    assert.deepEqual(dispatches, ["refused"]);
 });
 
-test("#2090 intercept: x-ofm-signature (the reported bug) → DIRECT by default, signature intact", async () => {
-    const dispatches: string[] = [];
-    const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
-    const { sink, result } = await withIntercept(state, async (fetch) =>
-        fetch("http://127.0.0.1:9199/eac/v1/chat/completions", {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
-            body: JSON.stringify({ model: "eac-1", messages: [{ role: "user", content: "hi" }] }),
-        }));
-    assert.equal(sink.length, 1, "forwarded, not refused or rewritten");
-    assert.equal(result.status, 200);
-    assert.equal(sink[0].url, "http://127.0.0.1:9199/eac/v1/chat/completions", "original URL — the pre-#2090 code let this ride the rewrite path into an upstream 401");
-    assert.equal(sink[0].headers["x-ofm-signature"], "deadbeef", "signature header untouched");
-    assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined);
-    assert.deepEqual(dispatches, ["direct"]);
+test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED by default; explicit passthrough opt-in → byte-untouched direct", async () => {
+    // i) default: local 403 naming the scheme, and the refusal is remembered
+    {
+        const dispatches: string[] = [];
+        const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+        const { sink, result } = await withIntercept(state, async (fetch) =>
+            fetch("http://127.0.0.1:9199/eac/v1/chat/completions", {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
+                body: JSON.stringify({ model: "eac-1", messages: [{ role: "user", content: "hi" }] }),
+            }));
+        assert.equal(sink.length, 0, "plan A: refused locally — the pre-#2090 code let this ride the rewrite path into an upstream 401");
+        assert.equal(result.status, 403);
+        const payload = JSON.parse(await result.text()) as { error: { code: string; message: string } };
+        assert.equal(payload.error.code, "bili_resign_unavailable");
+        assert.match(payload.error.message, /x-ofm-signature/, "names the offending scheme");
+        assert.deepEqual(dispatches, ["refused"]);
+        assert.equal(pendingMap()["x-ofm-signature"]?.count, 1, "refusal remembered for the startup reminder");
+        assert.equal(pendingMap()["x-ofm-signature"]?.origin, "http://127.0.0.1:9199");
+    }
+    // ii) explicit opt-in (the acknowledgment that this link runs uncompressed) → direct, bytes intact
+    {
+        const dispatches: string[] = [];
+        const state = armedState({ onDispatch: (_u, action) => dispatches.push(action) });
+        const { sink, result } = await withConfigFile({ resign: { "x-ofm-signature": { passthrough: true } } }, async () =>
+            withIntercept(state, async (fetch) =>
+                fetch("http://127.0.0.1:9199/eac/v1/chat/completions", {
+                    method: "POST",
+                    headers: { "content-type": "application/json", "x-ofm-signature": "deadbeef" },
+                    body: JSON.stringify({ model: "eac-1", messages: [{ role: "user", content: "hi" }] }),
+                })));
+        assert.equal(sink.length, 1, "opt-in forwards, not refuses or rewrites");
+        assert.equal(result.status, 200);
+        assert.equal(sink[0].url, "http://127.0.0.1:9199/eac/v1/chat/completions", "original URL, never rewritten through the proxy");
+        assert.equal(sink[0].headers["x-ofm-signature"], "deadbeef", "signature header untouched");
+        assert.equal(sink[0].headers[APIG_RESIGN_HEADER], undefined, "no arm marker on a direct send");
+        assert.deepEqual(dispatches, ["direct"]);
+    }
+    // iii) the opt-in resolves the reminder — the pending record is cleared
+    assert.equal(pendingMap()["x-ofm-signature"], undefined, "passthrough branch clears the pending record");
 });
 
 test("#2090 intercept: resign.<scheme>.enabled=false un-deploys the branch (pre-resign rewrite path restored)", async () => {
@@ -440,6 +482,31 @@ test("#2090 intercept: resign.<scheme>.enabled=false un-deploys the branch (pre-
             }));
         assert.equal(sink[0].url, "http://127.0.0.1:40001/bili/http://127.0.0.1:9199/v1/chat/completions", "escape hatch: falls through to the rewrite path exactly like unsigned traffic");
         assert.deepEqual(dispatches, ["rewrite"]);
+    });
+});
+
+test("#2090 refusal memory: record / clear / unresolved filter", async () => {
+    clearSignedRefusal("x-ofm-signature");
+    recordSignedRefusal("x-ofm-signature", "http://127.0.0.1:9199/eac/v1/chat/completions");
+    const first = pendingMap()["x-ofm-signature"];
+    assert.ok(first);
+    recordSignedRefusal("x-ofm-signature", "http://127.0.0.1:9199/eac/v1/chat/completions");
+    const again = pendingMap()["x-ofm-signature"];
+    assert.equal(again.count, 2, "repeated refusals accumulate");
+    assert.equal(again.firstSeen, first.firstSeen, "firstSeen is stable across records");
+    assert.equal(again.origin, "http://127.0.0.1:9199", "origin parsed from the URL");
+    assert.ok(Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "recorded + unconfigured → unresolved");
+    await withConfigFile({ resign: { "x-ofm-signature": { passthrough: true } } }, async () => {
+        assert.ok(!Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "explicit opt-in resolves the reminder");
+    });
+    await withConfigFile({ resign: { "x-ofm-signature": { enabled: false } } }, async () => {
+        assert.ok(!Object.keys(unresolvedRefusals()).includes("x-ofm-signature"), "un-deployed branch resolves the reminder");
+    });
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        assert.deepEqual(unresolvedRefusals(), {}, "global env passthrough resolves everything");
+    });
+    await withEnv({ BILI_RESIGN: "0" }, async () => {
+        assert.deepEqual(unresolvedRefusals(), {}, "BILI_RESIGN=0 un-deploys everything");
     });
 });
 
@@ -638,11 +705,13 @@ test("e2e #1884: signed without the arm + BILI_RESIGN_PASSTHROUGH=1 → byte-unt
     });
 });
 
-// #2090: custom-scheme signatures have no credential source anywhere, so the
-// /bili/-lane guard fails open to byte-untouched forwarding BY DEFAULT. The
-// verifying upstream above would 401 any non-SDK signature, so this lane uses
-// a plain recording upstream that accepts everything and lets the assertions
-// check byte fidelity directly.
+// #2090 plan A: custom-scheme signatures have no credential source anywhere,
+// so the /bili/-lane guard REFUSES them locally by default (the refusal is
+// remembered in resign-pending.json → startup banner + web UI reminders) and
+// forwards byte-untouched ONLY when the user explicitly opts in (passthrough).
+// The verifying upstream above would 401 any non-SDK signature, so this lane
+// uses a plain recording upstream that accepts everything and lets the
+// assertions check byte fidelity directly.
 function startRecordingUpstream(): Promise<{ server: http.Server; port: number; calls: UpstreamRecord[] }> {
     const calls: UpstreamRecord[] = [];
     const server = http.createServer((req, res) => {
@@ -661,22 +730,80 @@ function startRecordingUpstream(): Promise<{ server: http.Server; port: number; 
     });
 }
 
-test("e2e #2090: x-ofm-signature through /bili/ → byte-untouched passthrough BY DEFAULT (no config, no env)", async () => {
-    const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
+test("e2e #2090: x-ofm-signature through /bili/ → REFUSED by default; explicit opt-in → byte-untouched", async () => {
+    // i) no config, no env → local 403 with the actionable message; upstream never sees the request
+    {
+        const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/eac/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "ofm-refused-1");
+            const r = await fetch(url, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-ofm-signature": sha256Hex(bodyStr) },
+                body: bodyStr,
+            });
+            const payload = JSON.parse(await r.text()) as { error: { code: string; message: string } };
+            assert.equal(r.status, 403, "plan A default: refuse locally instead of rewriting into an upstream 401");
+            assert.equal(payload.error.code, "bili_resign_unavailable");
+            assert.match(payload.error.message, /x-ofm-signature/, "names the offending scheme");
+            assert.match(payload.error.message, /"passthrough":\s*true/, "carries the exact opt-in snippet");
+            assert.equal(calls.length, 0, "nothing hit the wire");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    }
+    // ii) level-2 provider opt-in → the same request goes out byte-for-byte
+    {
+        const { server: upstream, port: upstreamPort, calls } = await startRecordingUpstream();
+        const { proxy, port: proxyPort } = await startResignProxy(upstreamPort, { resign: { "x-ofm-signature": { passthrough: true } } });
+        try {
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/eac/v1/chat/completions`;
+            const bodyStr = chatBody("deepseek-v4.1-flash", "ofm-optin-1");
+            const r = await fetch(url, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-ofm-signature": sha256Hex(bodyStr) },
+                body: bodyStr,
+            });
+            assert.equal(r.status, 200, `opt-in forwards byte-untouched so the upstream signature stays valid: ${await r.text()}`);
+            assert.equal(calls.length, 1);
+            assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
+            assert.equal(String(calls[0].headers["x-ofm-signature"]), sha256Hex(bodyStr), "signature header preserved");
+        } finally {
+            proxy.close();
+            (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    }
+});
+
+test("e2e #2090: GET /__bili/resign reports schemes, pending refusals, and the unresolved set", async () => {
+    const { server: upstream, port: upstreamPort } = await startRecordingUpstream();
     const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
     try {
-        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/eac/v1/chat/completions`;
-        const bodyStr = chatBody("deepseek-v4.1-flash", "ofm-failopen-1");
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-ofm-signature": sha256Hex(bodyStr) },
-            body: bodyStr,
-        });
-        const rBody = await r.text();
-        assert.equal(r.status, 200, `fail-open forwards byte-untouched so the upstream signature stays valid: ${rBody}`);
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0].body.toString("utf8"), bodyStr, "body forwarded byte-for-byte (no injection, no rewrite)");
-        assert.equal(String(calls[0].headers["x-ofm-signature"]), sha256Hex(bodyStr), "signature header preserved");
+        recordSignedRefusal("x-ofm-signature", "http://127.0.0.1:9199/eac/v1/chat/completions");
+        recordSignedRefusal("aws4-hmac-sha256", "http://127.0.0.1:9199/v1/chat/completions");
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/__bili/resign`);
+        assert.equal(r.status, 200, "loopback admin endpoint answers");
+        assert.match(String(r.headers.get("content-type")), /application\/json/);
+        const data = (await r.json()) as {
+            builtinScheme: string;
+            schemes: Record<string, { known?: { label: string }; builtIn: boolean; enabled: boolean; passthrough: boolean }>;
+            pending: Record<string, { count: number }>;
+            unresolved: string[];
+        };
+        assert.equal(data.builtinScheme, APIG_RESIGN_SCHEME);
+        assert.equal(data.schemes["sdk-hmac-sha256"].builtIn, true);
+        assert.ok(data.schemes["sdk-hmac-sha256"].known?.label, "registry label present for the built-in");
+        assert.equal(data.schemes["x-ofm-signature"].builtIn, false);
+        assert.ok(data.pending["x-ofm-signature"] && data.pending["x-ofm-signature"].count >= 1);
+        assert.ok(data.pending["aws4-hmac-sha256"] && data.pending["aws4-hmac-sha256"].count >= 1);
+        assert.ok(data.unresolved.includes("x-ofm-signature"), "recorded + unconfigured → unresolved");
+        assert.ok(data.unresolved.includes("aws4-hmac-sha256"));
     } finally {
         proxy.close();
         (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();

@@ -38,7 +38,7 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { APIG_RESIGN_SCHEME } from "../apig-resign.js";
+import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -989,11 +989,25 @@ export function apply(ctx: PluginContext): void {
         if (signedUrlSeen.size >= 64) return;
         signedUrlSeen.add(key);
         const line = scheme === APIG_RESIGN_SCHEME
-            ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or direct with passthrough configured)`
-            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: forwarding DIRECT by default (uncompressed, signature intact) so the upstream signature stays valid (#2090)`;
+            ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or byte-untouched direct with passthrough configured)`
+            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing locally by default with an actionable message (set resign["${scheme}"].passthrough to forward byte-untouched WITHOUT compression, #2090)`;
         console.error(line);
         persistClientEvent(line);
     };
+
+    // #2090 plan A: say at BOOT, not after the first failure — unresolved
+    // signed schemes remembered from earlier runs keep failing until the user
+    // configures them away.
+    {
+        const unresolved = unresolvedRefusals();
+        const entries = Object.entries(unresolved);
+        if (entries.length > 0) {
+            const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
+            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. They will keep failing until configured — add {"resign":{"<scheme>":{"passthrough":true}}} to the bili config file (or BILI_RESIGN_PASSTHROUGH=1) to forward them byte-untouched WITHOUT COMPRESSION; see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.`;
+            console.warn(line);
+            persistClientEvent(line);
+        }
+    }
 
     state.headersFor = (_url) => {
         maybeRetry(ctx);

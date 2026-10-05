@@ -92,6 +92,7 @@ export function renderPage(origin: string, version: string): string {
 </div>
 <div class="grid cols-2" style="margin-top:16px">
 <div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.passthrough_desc">${zh("cfg.passthrough_desc")}</p><div class="pt-row"><span id="pt-state" class="badge disk">—</span><span id="pt-source" class="dim small"></span></div><div style="margin-top:10px"><button id="clear-passthrough" class="btn sm" hidden><span data-i18n="cfg.pt_clear">${zh("cfg.pt_clear")}</span></button></div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.resign">${zh("cfg.resign")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.resign_desc">${zh("cfg.resign_desc")}</p><div id="resign-body" style="display:flex;flex-direction:column;gap:10px"><span class="dim small" data-i18n="cfg.resign_loading">${zh("cfg.resign_loading")}</span></div></div></div>
 </div>
 </section>
 <section id="page-logs" class="page" hidden>
