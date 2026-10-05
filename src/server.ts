@@ -153,7 +153,7 @@ import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
-import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
@@ -2834,19 +2834,24 @@ async function handle(
         // reservation measure against the SAME capped window.
         const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
-        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
-        // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
-        // state untouched. Active by default, explicitly opt-out-able (#2028) —
-        // auto pressure, overflow recovery, and manual /compact share one
-        // envelope, and a landed checkpoint durably shadows the raw history
-        // (irreversible), while every cost of refusing is dsh-side, caught, and
-        // recoverable; allowDshCompaction lifts the refusal for users who accept
-        // that trade. Runs before the #388 side-request lane: the compaction
-        // call is a full-budget request, so only this guard can catch it.
-        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
+        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
+        // is refused BEFORE any pipeline work: not forwarded, kernel state
+        // untouched. MARKER-DECISIVE since #2193: message count no longer gates
+        // — rc.2 replays the full shadowed region (~1100+ msgs) and the old ≤4
+        // bar made the guard silently pass through, letting a checkpoint land
+        // and destroy the compression substrate. Active by default, explicitly
+        // opt-out-able (#2028) — auto pressure, overflow recovery, and manual
+        // /compact share one envelope, and a landed checkpoint durably shadows
+        // the raw history (irreversible), while every cost of refusing is
+        // dsh-side, caught, and recoverable; allowDshCompaction lifts the
+        // refusal for users who accept that trade. Runs before the #388
+        // side-request lane: the compaction call is a full-budget request, so
+        // only this guard can catch it.
+        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed)) {
             if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
-                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
+                const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
+                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
