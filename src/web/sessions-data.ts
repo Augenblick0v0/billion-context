@@ -183,6 +183,9 @@ function getDiskStore(): SessionStore {
 
 let byFile: Map<string, DiskEntry> | null = null;
 let byId: Map<string, string> | null = null;
+// #2180 review: latches the first pristine resolution — once sessions existed, a vanished
+// root is breakage (#1937 stale snapshot), not "fresh install". Cleared on any successful walk.
+let resolvedPristine = false;
 let scanInFlight: Promise<void> | null = null;
 let decodeCount = 0;
 let detailDecodes = 0;
@@ -273,8 +276,8 @@ function isPristineSessionsRoot(error: unknown): boolean {
  *  GC checkpoint between files, and the parsed record is dropped immediately
  *  after summary extraction. Top-level walk failure: serve the previous
  *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI) —
- *  except a pristine default layout (#2180), which resolves to an EMPTY index
- *  instead of failing. */
+ *  except a pristine default layout BEFORE any successful walk (#2180), which
+ *  resolves to an EMPTY index instead of failing. */
 async function refreshIndex(): Promise<void> {
     if (scanInFlight) return scanInFlight;
     const run = (async () => {
@@ -284,10 +287,13 @@ async function refreshIndex(): Promise<void> {
         try {
             files = await walkSessionFiles(dir);
         } catch (error) {
-            if (!isPristineSessionsRoot(error)) throw error;
+            if (!(byFile === null || resolvedPristine) || !isPristineSessionsRoot(error)) throw error;
             byFile = new Map<string, DiskEntry>();
             byId = new Map<string, string>();
-            log("info", `[acp-web] sessions dir ${dir} not created yet (fresh install) — serving empty index (#2180)`);
+            if (!resolvedPristine) {
+                resolvedPristine = true;
+                log("info", `[acp-web] sessions dir ${dir} not created yet (fresh install) — serving empty index (#2180)`);
+            }
             return;
         }
         const prev = byFile ?? new Map<string, DiskEntry>();
@@ -341,6 +347,7 @@ async function refreshIndex(): Promise<void> {
         }
         byFile = next;
         byId = nextById;
+        resolvedPristine = false;
     })();
     scanInFlight = run.finally(() => { scanInFlight = null; });
     try {
@@ -363,6 +370,7 @@ function ensureIndex(): Promise<Map<string, DiskEntry>> {
 export function _resetDiskCacheForTest(): void {
     byFile = null;
     byId = null;
+    resolvedPristine = false;
     scanInFlight = null;
     diskStore = null;
     decodeCount = 0;

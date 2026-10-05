@@ -712,6 +712,21 @@ withPristineEnv("#2180: existing data root without sessions dir stays loud (#193
     await assert.rejects(buildSessionList(), "data root present but sessions dir missing must reject loudly");
 });
 
+withPristineEnv("#2180/#1937: data root deleted AFTER sessions existed serves stale snapshot, not empty", async (xdg) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const sessDir = path.join(xdg, "billion-context", "sessions");
+    const store = new SessionStore({ dir: sessDir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    _resetDiskCacheForTest();
+    assert.deepEqual((await buildSessionList()).map((s) => s.id), ["seed-1"], "session indexed while the data root exists");
+    rmrf(path.join(xdg, "billion-context"));
+    assert.deepEqual(
+        (await buildSessionList()).map((s) => s.id),
+        ["seed-1"],
+        "#1937: a vanished data root that once held sessions serves the stale index, never an empty one");
+});
+
 withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     for (let i = 0; i < 120; i++) {
