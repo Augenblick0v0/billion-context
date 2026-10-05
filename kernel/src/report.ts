@@ -1,6 +1,6 @@
 import { clampPrefix } from "./truncate.js";
 import { isToolMessage } from "./message-kind.js";
-import { BLOCKED_REF, refForRaw } from "./refs.js";
+import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
 import type {
@@ -389,7 +389,12 @@ function renderUncompressedRanges(
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
   for (const r of merged.slice(0, limit)) {
-    const range = r.count === 1 ? r.startRef : `${r.startRef}–${r.endRef}`;
+    // Ascending endpoint labels: non-monotonic refs (#1001) can make a
+    // positional span's labels numerically descending (#2168).
+    const range =
+      r.count === 1
+        ? r.startRef
+        : orderedRefPair(r.startRef, r.endRef).join("–");
     lines.push(
       `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}`,
     );
