@@ -105,6 +105,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | How upstream stream failures are presented after the 200 is committed: protocol-native error frames (default) or the legacy synthesized-completion shape. |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Stop stamping Anthropic-lane cache_control breakpoints entirely (escape hatch for upstreams/relays with their own breakpoint policy). |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued). |
+| `dsh.allowDshCompaction` | boolean | false | BILI_ALLOW_DSH_COMPACTION | Lift bili's local 403 refusal of dsh native compaction calls (#1729/#2028): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
@@ -1411,6 +1412,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
 | `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
 | `BILI_CHAIN_STAMP` | `chainEgressStamp` | false |
