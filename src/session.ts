@@ -644,6 +644,36 @@ export function listSessions(): Session[] {
     return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
+// #2170 measure 4 (runtime canary): the #2165 failure shape — one dsh
+// conversation's traffic split across BOTH the raw id and a `|sub:` fork,
+// both live at once (the raw session steals the compressions / anchor while
+// the fork carries the real turns). Surface any such split on /__bili/status
+// so an operator sees it without digging through logs. A base only warns when
+// it has ≥2 sessions that each carried traffic (requests>0) AND were seen
+// within the freshness window — idle leftovers from forks/adoption don't fire.
+export interface SplitSessionWarning {
+    base: string;
+    sessions: { id: string; requests: number; lastSeen: number }[];
+}
+export const SPLIT_CANARY_FRESH_MS = 10 * 60 * 1000;
+export function splitSessionWarnings(sessions: Session[], now: number = Date.now()): SplitSessionWarning[] {
+    const byBase = new Map<string, Session[]>();
+    for (const s of sessions) {
+        const base = s.id.split("|sub:")[0];
+        const arr = byBase.get(base);
+        if (arr) arr.push(s); else byBase.set(base, [s]);
+    }
+    const out: SplitSessionWarning[] = [];
+    for (const [base, group] of byBase) {
+        if (group.length < 2) continue;
+        const live = group.filter((s) => (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) < SPLIT_CANARY_FRESH_MS);
+        if (live.length >= 2) {
+            out.push({ base, sessions: live.map((s) => ({ id: s.id, requests: s.stats?.requests ?? 0, lastSeen: s.lastSeen ?? 0 })) });
+        }
+    }
+    return out;
+}
+
 /** Read-only in-memory lookup. Unlike getSession, never creates or reloads a
  *  session — used by the plugin tool API, which must not conjure state for a
  *  conversation it has never seen. */
