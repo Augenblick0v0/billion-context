@@ -129,7 +129,18 @@ function runCheck(kind: "cli" | "py", check: Check): { verdict: string; models: 
   const tmp = mkdtempSync(path.join(os.tmpdir(), "bili-theorem-"));
   const file = path.join(tmp, check.name + ".smt2");
   const wantModel = check.expect === "sat";
-  writeFileSync(file, src + (wantModel ? "\n(set-option :model true)\n(get-model)\n" : ""));
+  // The spec files carry assertions only. As a z3 CLI script they execute no
+  // check command and print no verdict unless (check-sat) is appended; the
+  // python-API path checks programmatically and needs nothing extra.
+  const trailer =
+    kind === "cli"
+      ? wantModel
+        ? "\n(set-option :model true)\n(check-sat)\n(get-model)\n"
+        : "\n(check-sat)\n"
+      : wantModel
+        ? "\n(set-option :model true)\n(get-model)\n"
+        : "";
+  writeFileSync(file, src + trailer);
   const args =
     kind === "cli"
       ? ["z3", "-smt2", file]
@@ -146,7 +157,13 @@ function runCheck(kind: "cli" | "py", check: Check): { verdict: string; models: 
     verdict = lines.find((l) => l === "sat" || l === "unsat" || l === "unknown") ?? "error";
     if (res.error) verdict = `error:${String(res.error)}`;
   }
-  const models = [...out.matchAll(/MODEL:(\w+)=([^\s)]+)/g)].map((m) => `${m[1]}=${m[2]}`);
+  // py path: MODEL:name=value lines from the shim. cli path: z3 prints the
+  // model as (define-fun name () Int <value>) pairs, value possibly on a
+  // following line.
+  const models = [
+    ...out.matchAll(/MODEL:(\w+)=([^\s)]+)/g),
+    ...(kind === "cli" ? [...out.matchAll(/\(define-fun (\w+) \(\) Int\r?\n?\s*(-?\d+)/g)] : []),
+  ].map((m) => `${m[1]}=${m[2]}`);
   return { verdict, models, ms };
 }
 
@@ -164,7 +181,7 @@ test("cache-theorem: solver obligations", async (t) => {
       const { verdict, models, ms } = runCheck(kind, check);
       timings.push([check.name, verdict, models, ms]);
       assert.equal(verdict, check.expect, `expected ${check.expect}, got ${verdict}`);
-      if (check.expect === "sat" && kind === "py" && check.modelVars?.length) {
+      if (check.expect === "sat" && check.modelVars?.length) {
         assert.ok(models.length > 0, "SAT check should expose a model witness");
       }
     });
