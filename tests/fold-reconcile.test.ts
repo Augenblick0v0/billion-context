@@ -305,4 +305,41 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.equal(errorLines(logs).length, 0, "5 permanently-missing ids never reach the error floor");
         assert.ok(logs.some((l) => l.level === "warn"));
     });
+
+    test("early exits (no folds / reconcile off) reset the streak instead of inflating a later episode", () => {
+        // #2193 follow-up: without the reset on those exits, a stale
+        // foldDriftStreak survives an episode boundary and the next episode
+        // escalates with an inflated consecutive-pass count.
+        const n = 12;
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        reconcileFoldCoverage(session, [msg("p1", "assistant", "drift pass one")], opts);
+        reconcileFoldCoverage(session, [msg("p2", "assistant", "drift pass two")], opts);
+        assert.equal(session.metadata.foldDriftStreak, 2, "two total-loss passes build a streak");
+
+        // Boundary A: every fold block disappears (e.g. native-compaction
+        // archive prune) — the covered set is empty.
+        const state = session.state as unknown as { blocks: unknown[] };
+        const origBlocks = state.blocks;
+        state.blocks = [];
+        reconcileFoldCoverage(session, [msg("p3", "assistant", "pass with no folds")], opts);
+        assert.equal(session.metadata.foldDriftStreak, undefined, "empty-covered pass clears the streak");
+
+        // Boundary B: reconcile toggled off mid-episode also resets.
+        state.blocks = origBlocks;
+        reconcileFoldCoverage(session, [msg("q0", "assistant", "episode two pre-pass")], opts);
+        assert.equal(session.metadata.foldDriftStreak, 1);
+        reconcileFoldCoverage(session, [msg("q1", "assistant", "x")], { ...opts, mode: "off" });
+        assert.equal(session.metadata.foldDriftStreak, undefined, "mode=off pass clears the streak");
+
+        // The fresh episode escalates on its OWN third total-loss pass.
+        reconcileFoldCoverage(session, [msg("q2", "assistant", "episode two pass one")], opts);
+        reconcileFoldCoverage(session, [msg("q3", "assistant", "episode two pass two")], opts);
+        assert.equal(errorLines(logs).length, 0, "stale streak must not pull escalation forward");
+        reconcileFoldCoverage(session, [msg("q4", "assistant", "episode two pass three")], opts);
+        assert.equal(errorLines(logs).length, 1, "fresh episode escalates on its own third pass");
+    });
 });

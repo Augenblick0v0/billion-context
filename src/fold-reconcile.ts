@@ -58,6 +58,20 @@ const FOLD_DRIFT_ESCALATE_PASSES = 3;
  *  edited/deleted messages) to stay at warn level. */
 const FOLD_DRIFT_ESCALATE_MIN_UNMATCHED = 10;
 
+/** #2193 follow-up: clear the drift-episode state. The main path resets it on
+ *  every non-total-loss pass; the early exits of reconcileFoldCoverage must do
+ *  the same, or a stale foldDriftStreak survives an episode boundary (all fold
+ *  blocks archived away, reconcile toggled off) and inflates the next episode's
+ *  consecutive-pass count — the error line would claim more passes than the
+ *  episode actually had. */
+function resetFoldDriftState(session: Session): void {
+    const md = session.metadata;
+    if (!md) return;
+    delete md[METADATA_DRIFT_STREAK];
+    delete md[METADATA_DRIFT_SINCE];
+    delete md[METADATA_DRIFT_ESCALATED];
+}
+
 /** Per-covered-id anchor recorded from the last pass in which the id was seen.
  *  Stored in session.metadata.foldAnchors (persisted, free-form field). */
 export interface FoldAnchor {
@@ -297,10 +311,16 @@ export interface ReconcileOptions {
  *  drift WARN only reports the honest residual). */
 export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opts: ReconcileOptions = {}): FoldReconcileResult {
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
-    if (mode === "off") return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (mode === "off") {
+        resetFoldDriftState(session);
+        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
-    if (covered.size === 0) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (covered.size === 0) {
+        resetFoldDriftState(session);
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
@@ -372,11 +392,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0;
     const prevStreak = (session.metadata[METADATA_DRIFT_STREAK] as number | undefined) ?? 0;
     if (!totalDrift) {
-        if (prevStreak !== 0) {
-            delete session.metadata[METADATA_DRIFT_STREAK];
-            delete session.metadata[METADATA_DRIFT_SINCE];
-            delete session.metadata[METADATA_DRIFT_ESCALATED];
-        }
+        if (prevStreak !== 0) resetFoldDriftState(session);
     } else {
         const streak = prevStreak + 1;
         session.metadata[METADATA_DRIFT_STREAK] = streak;
