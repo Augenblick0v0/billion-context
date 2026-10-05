@@ -90,9 +90,10 @@ export function mergeCompress(
         imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
-stripImages: pick("stripImages"),
+        stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
         visibilityMarkers: pick("visibilityMarkers"),
+        streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.
