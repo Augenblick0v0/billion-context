@@ -4279,7 +4279,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
         : [];
     const extNonHttpProviders = base === "pi" || base === "omp" ? resolveNonHttpProviders(process.env) : [];
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -4849,7 +4849,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: "pi", mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: "pi", strictPort: port > 0, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
