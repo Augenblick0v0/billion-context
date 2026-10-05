@@ -205,3 +205,67 @@ test("external summary HTTP: pre-aborted signal dispatches nothing and invalid e
     });
     assert.equal(calls, 0);
 });
+
+test("external summary HTTP batch: concurrent callers share a cross-protocol chain without mixing content or credentials", async () => {
+    const paths: string[] = [];
+    await upstream((req, res, body) => {
+        paths.push(req.url ?? "");
+        assert.equal(req.headers["x-session-id"], undefined);
+        assert.equal(req.headers["x-bili-access-token"], undefined);
+        if (req.url === "/primary") {
+            assert.equal(body.model, "primary-model");
+            assert.equal(req.headers.authorization, "Bearer primary-test-key");
+            res.writeHead(401);
+            res.end("private primary error");
+            return;
+        }
+        assert.equal(req.url, "/backup");
+        assert.equal(body.model, "backup-model");
+        assert.equal(req.headers.authorization, "Bearer backup-test-key");
+        assert.ok(Array.isArray(body.messages));
+        const user = body.messages.find((message: Record<string, unknown>) => message.role === "user") as Record<string, unknown>;
+        assert.equal(typeof user.content, "string");
+        const source = JSON.parse(user.content as string) as Record<string, unknown>;
+        res.end(JSON.stringify(completion("openai", JSON.stringify(source))));
+    }, async (url) => {
+        const executor = new ExternalSummaryExecutor(2);
+        const candidates = [
+            createSummaryHttpCandidate({ ...target(`${url}/primary`), model: "primary-model", headers: { authorization: "Bearer primary-test-key" } }, 4096),
+            createSummaryHttpCandidate({ ...target(`${url}/backup`, "openai"), model: "backup-model", headers: { authorization: "Bearer backup-test-key" } }, 4096),
+            createSummaryHttpCandidate(target(`${url}/unused`), 4096),
+        ];
+        const callers = ["client-A", "client-B"];
+        const results = await Promise.all(callers.map((caller) => executor.executeBatch([0, 1].map((range) => ({
+            ...work, content: `${caller} range ${range}`, reference: `${caller} current task`,
+        })), candidates, budget)));
+        for (const [callerIndex, result] of results.entries()) {
+            assert.equal(result.status, "finished");
+            for (const [rangeIndex, range] of result.results.entries()) {
+                assert.equal(range.status, "success");
+                if (range.status !== "success") assert.fail("backup must generate each range");
+                assert.equal(range.targetIndex, 1);
+                assert.deepEqual(JSON.parse(range.summary), {
+                    content: `${callers[callerIndex]} range ${rangeIndex}`, reference: `${callers[callerIndex]} current task`,
+                });
+            }
+        }
+    });
+    assert.equal(paths.filter((path) => path === "/primary").length, 4);
+    assert.equal(paths.filter((path) => path === "/backup").length, 4);
+    assert.equal(paths.length, 8);
+});
+
+test("external summary HTTP batch: a shared deadline aborts a real stalled response and skips later ranges", async () => {
+    let calls = 0;
+    await upstream((_req, res) => {
+        calls++;
+        if (calls === 1) res.end(JSON.stringify(completion("responses")));
+        else { res.writeHead(200, { "content-type": "text/event-stream" }); res.write(": still working\n\n"); }
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate(target(url), 4096);
+        const result = await new ExternalSummaryExecutor(1).executeBatch([work, work, work], [candidate], { ...budget, totalTimeoutMs: 300 });
+        assert.equal(result.status, "deadline");
+        assert.deepEqual(result.results.map((range) => range.status), ["success", "deadline"]);
+    });
+    assert.equal(calls, 2);
+});
