@@ -1372,7 +1372,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     log: (msg) => deps.log("info", msg),
                 };
                 const creditBefore = deps.session.stats.compressCreditTokens;
-                const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
+                // #2146: internal lane — must not arm the model-facing loop breaker.
+                const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx, { loopTracking: false });
                 if (applied.outcome === "refused") {
                     deps.log("warn", `[preflight] ${applied.text}`);
                     noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);

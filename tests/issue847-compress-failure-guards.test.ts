@@ -113,7 +113,10 @@ test("#847: repeated identical failing spec escalates; success clears the streak
     assert.match(second, /acp_status/, "escalation points at acp_status");
 
     const third = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
-    assert.match(third, /3 time\(s\)/, "alternating direction still counts as the same spec");
+    // #2146: at 3 consecutive failures (same or distinct specs) the cross-spec
+    // circuit breaker supersedes the exact-spec repeat text — alternating
+    // direction still counts as the same spec.
+    assert.match(third, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "third consecutive failure upgrades to the loop breaker");
 
     const success = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx).text;
     assert.ok(success.startsWith("[Compressed "), `large range compresses (got: ${success.slice(0, 100)})`);
