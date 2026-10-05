@@ -1837,9 +1837,11 @@ export async function pipePluginChatWithStrip(
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
      *  took over, in which case the caller drops the terminal event of the
-     *  attempt it came from. */
+     *  attempt it came from. Consults truncationRetried: a request whose stream
+     *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
+     *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined) return false;
+        if (refetch === undefined || truncationRetried) return false;
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
         if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
@@ -2844,7 +2846,8 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
-        if (degenerateRetried || refetch === undefined) return false;
+        // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
+        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
         if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
