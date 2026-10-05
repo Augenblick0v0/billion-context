@@ -13,17 +13,18 @@
 // post-array tail, and a judge asserts longest-prefix stability per pair
 // class (all four wires, one session each, proxy mode, streaming):
 //
-//   GROWTH   append-only turns: head and every element outside the <=3
-//            trailing volatile slots (chain checkpoint / nudge / imgNote —
-//            cf-suite convention TAIL_VOLATILE_SLOTS) byte-identical; the
-//            post-array suffix (tools / stream_options) byte-identical;
+//   GROWTH   append-only turns: head byte-identical; every core element
+//            byte-identical modulo the DECLARED volatile carriers (carrier
+//            contract below); only TAIL appends (the client's own additions)
+//            may grow the array; the post-array suffix (tools / stream_options)
+//            byte-identical;
 //   RETRY    transport-failure resend (socket death pre-response on the main
 //            model path, fetchWithTransportRetry #1688): the replay must be
 //            BYTE-EQUAL to the failed attempt — failure handling may not
 //            change a single request byte;
 //   SWITCH   client-driven model change proven as a double-probe A/B: the
 //            SAME history is sent twice, once per model. Every byte outside
-//            the model value (and the <=3 trailing volatile slots) must stay
+//            the model value (and the declared volatile carriers) must stay
 //            identical — the owner's "bytes unchanged but request params
 //            changed -> miss" concern (#2138): parameter drift must be
 //            attributable to the host's own switch, never to bili;
@@ -43,6 +44,22 @@
 //            MERGED into the last user turn (appendTrailingUserText contract:
 //            back-to-back user turns break provider replay grouping) — zero
 //            byte churn anywhere else, even when the proxy re-requests itself.
+//
+// Carrier contract (increment A): volatility is DECLARED per carrier and
+// located structurally instead of positionally (no "last N elements may
+// drift"). The only bytes allowed to differ between two calls with identical
+// history are: (1) the chain checkpoint tag <bili-chain .../>
+// (src/chain-checkpoint.ts) — stamped on every outbound with a volatile
+// digest+timestamp; rides as a dedicated trailing user element
+// (openai/responses) or merged as a trailing text part of the last user
+// element (anthropic/google); when merged, only bytes from the part's
+// opening brace are volatile and the tag may MIGRATE between turns as a new
+// last-user message appears (cmpEl handles both); (2) trailing NOTE messages
+// whose entire payload is a declared note (retrieval correction, image-full
+// guidance, kernel nudge — NOTE_MARKERS). Everything else — mid-history
+// elements AND the non-carrier parts of carrier-bearing elements — must be
+// byte-stable; any other difference fails CI. Marker containment cannot mask
+// real drift because the client corpus is asserted carrier/brace-free below.
 //
 // The mock upstream doubles as an IDEAL PREFIX-CACHE BILLING JUDGE: it bills
 // cached_tokens = floor(byteLCP/4) against the previous body of the stream
@@ -70,6 +87,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { DEGENERATE_RETRY_NUDGE } from "../src/degenerate-retry.ts";
+import { TAG_OPEN } from "../src/chain-checkpoint.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
@@ -77,7 +95,15 @@ type Wire = "responses" | "chat" | "anthropic" | "google";
 
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const REWRITE_MARKER = "HOST-REWRITTEN";
-const TAIL_VOLATILE_SLOTS = 3;
+// Declared trailing-note carriers (carrier contract): a dedicated trailing
+// user element is volatile iff its ENTIRE payload carries one of these.
+const NOTE_MARKERS: string[] = [
+    "[billion-context] Earlier acp_retrieve result(s)",
+    "[Downscaled screenshots:",
+    "If you compress, fold the ranges you keep in ONE call",
+    "Only use IDs from visible messages above",
+    "[TIER ",
+];
 const THRESHOLD = 64 * 1024; // high enough that no fold can fire before MIN_FOLD_T
 const MODEL_A = "gpt-proof-a";
 const MODEL_B = "gpt-proof-b";
@@ -100,6 +126,14 @@ const FILLER = (seed: number, kb: number): string => {
     const unit = Math.ceil((kb * 1024) / para.length);
     return Array.from({ length: unit }, (_, i) => para.replace(String(seed), `${seed}-${i}`)).join("");
 };
+
+// Masking guard: client-generated content must never resemble a declared
+// carrier or carry braces (the firstBraceBefore heuristic assumes the tag is
+// the only brace-bearing construct it can meet inside an element).
+for (const s of [INSTRUCTIONS, TOOL_RESULT_OK(0), TOOL_RESULT_FAIL(0), FILLER(0, 1)]) {
+    assert.ok(!s.includes("{") && !s.includes("<") && !s.includes(TAG_OPEN) && !NOTE_MARKERS.some((m) => s.includes(m)),
+        `corpus template must stay carrier/brace-free: ${JSON.stringify(s.slice(0, 24))}`);
+}
 
 const asArr = (x: unknown): Item[] => (Array.isArray(x) ? (x as Item[]) : []);
 
@@ -199,6 +233,100 @@ function leadingEqual(prev: Buffer, cur: Buffer, P: Layout, C: Layout): number {
 const headEq = (prev: Buffer, cur: Buffer, P: Layout, C: Layout): boolean => prev.subarray(0, P.arrStart).equals(cur.subarray(0, C.arrStart));
 const tailEq = (prev: Buffer, cur: Buffer, P: Layout, C: Layout): boolean => prev.subarray(P.arrEnd).equals(cur.subarray(C.arrEnd));
 
+function payloadTexts(el: Item): string[] {
+    const out: string[] = [];
+    if (typeof el.content === "string") out.push(el.content);
+    else if (Array.isArray(el.content)) for (const b of el.content) if (typeof b?.text === "string") out.push(b.text);
+    if (Array.isArray(el.parts)) for (const p of el.parts) if (typeof p?.text === "string") out.push(p.text);
+    return out;
+}
+
+function isDedicatedCarrier(t: string): boolean {
+    let el: Item;
+    try { el = JSON.parse(t) as Item; } catch { return false; }
+    const texts = payloadTexts(el);
+    if (texts.length === 0) return false;
+    return texts.every((tx) => tx.trim().startsWith(TAG_OPEN) || NOTE_MARKERS.some((mk) => tx.includes(mk)));
+}
+
+function firstBraceBefore(raw: string, idx: number): number {
+    const i = raw.lastIndexOf("{", idx);
+    assert.ok(i >= 0, `no object start before carrier at offset ${idx}`);
+    return i;
+}
+
+function balancedObjectEnd(raw: string, start: number): number {
+    let depth = 0;
+    for (let p = start; p < raw.length; p++) {
+        const c = raw[p]!;
+        if (c === "{") depth++;
+        else if (c === "}") { depth--; if (depth === 0) return p + 1; }
+    }
+    throw new Error("unbalanced carrier part");
+}
+
+// Byte-compares two encodings of the same logical element in which the chain
+// checkpoint may ride: strips each side's carrier part (from its opening
+// brace through its closing brace, plus the separating comma) and requires
+// the REMAINDER byte-equal. One side may carry no tag at all — the tag
+// migrates between turns as the last-user message changes. Each stripped
+// part must be a well-formed chain checkpoint followed only by closers.
+function cmpEl(pe: string, ce: string, label: string): void {
+    if (pe === ce) return;
+    const mp = pe.indexOf(TAG_OPEN);
+    const mc = ce.indexOf(TAG_OPEN);
+    assert.ok(mp >= 0 || mc >= 0, `${label}: stable bytes rewritten and no declared carrier is involved`);
+    const cut = (raw: string, m: number): string => {
+        if (m < 0) return raw;
+        const ps = firstBraceBefore(raw, m);
+        const pend = balancedObjectEnd(raw, ps);
+        const part = JSON.parse(raw.slice(ps, pend)) as Item;
+        const txt = typeof part.text === "string" ? part.text : typeof part.content === "string" ? part.content : undefined;
+        assert.ok(txt !== undefined && txt.startsWith(TAG_OPEN), `${label}: carrier part is not a chain-checkpoint tag`);
+        const post = raw.slice(pend);
+        assert.ok(/^[\]}]*$/.test(post), `${label}: unexpected content after the carrier part: ${JSON.stringify(post.slice(0, 48))}`);
+        return (ps > 0 ? raw.slice(0, ps - 1) : "") + post;
+    };
+    assert.equal(cut(pe, mp), cut(ce, mc), `${label}: pre-carrier bytes drifted (only the chain checkpoint itself may be volatile)`);
+}
+
+const coreLen = (buf: Buffer, L: Layout): number => {
+    let n = L.elems.length;
+    while (n > 0 && isDedicatedCarrier(elText(buf, L, n - 1))) n--;
+    return n;
+};
+
+interface CoreCmp { pCore: number; cCore: number; edits: number; }
+
+// Strict core comparison under the carrier contract: dedicated carrier
+// elements are peeled from the END of each side (arbitrary count —
+// existentially quantified), then every remaining shared index must be
+// byte-equal except (a) chain-tag volatility (cmpEl) and (b) when
+// hostEditAllowed, elements carrying REWRITE_MARKER (the host's own edit —
+// attributed to the host, never to bili). allowAppend expects ONE OR MORE
+// new core elements — the client's own additions (new user message plus the
+// prior turn's reply / tool pair; host-side, trusted, cache-safe by
+// construction because the shared prefix is checked positionally);
+// shrinkage belongs to fold transitions only and fails here.
+function coreCompare(wire: Wire, prev: Buffer, cur: Buffer, P: Layout, C: Layout, label: string, opts: { allowAppend: boolean; hostEditAllowed?: boolean }): CoreCmp {
+    const pc = coreLen(prev, P);
+    const cc = coreLen(cur, C);
+    assert.ok(cc >= pc, `${wire} ${label}: core element count shrank (${pc} -> ${cc}) outside a fold transition`);
+    const shared = Math.min(pc, cc);
+    let edits = 0;
+    for (let j = 0; j < shared; j++) {
+        const pe = elText(prev, P, j);
+        const ce = elText(cur, C, j);
+        if (pe === ce) continue;
+        if (!(opts.hostEditAllowed && ce.includes(REWRITE_MARKER))) cmpEl(pe, ce, `${wire} ${label} elem[${j}]`);
+        else edits++;
+    }
+    const appends = cc - shared;
+    if (opts.allowAppend) assert.ok(appends >= 1, `${wire} ${label}: no core elements appended — pair is not a growth`);
+    else assert.equal(appends, 0, `${wire} ${label}: core element count changed without a scripted append`);
+    return { pCore: pc, cCore: cc, edits };
+}
+
 function countSummaryEls(buf: Buffer, L: Layout): number {
     let n = 0;
     for (let i = 0; i < L.elems.length; i++) n += elText(buf, L, i).split(SUMMARY_MARKER).length - 1;
@@ -243,11 +371,9 @@ function checkGrowth(wire: Wire, bodies: string[], field: string, i: number, lin
     const P = layoutOf(PB, field);
     const C = layoutOf(CB, field);
     assert.ok(headEq(PB, CB, P, C), `${wire} pair#${i}->#${i + 1}: HEAD bytes mutated during growth — cache miss at byte 0`);
-    const k = leadingEqual(PB, CB, P, C);
-    const solid = Math.max(0, P.elems.length - TAIL_VOLATILE_SLOTS);
-    assert.ok(k >= solid, `${wire} pair#${i}->#${i + 1}: stable-byte leak at element[${k}] (need >= ${solid} of ${P.elems.length}) — during plain growth only the trailing volatile slots (chain/nudge/imgNote, <=${TAIL_VOLATILE_SLOTS}) may differ`);
+    const r = coreCompare(wire, PB, CB, P, C, `pair#${i}->#${i + 1}`, { allowAppend: true });
     assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${i}->#${i + 1}: post-array suffix (tools/stream_options) mutated during growth`);
-    lines.push(`proof[${wire}] pair#${i}->#${i + 1} GROWTH ok lcp=${lcpBytes(PB, CB)}/${CB.length} stablePrefix=elem[${k}]/${P.elems.length} sha=${sha16(cur)}`);
+    lines.push(`proof[${wire}] pair#${i}->#${i + 1} GROWTH ok lcp=${lcpBytes(PB, CB)}/${CB.length} core=${r.pCore}->${r.cCore}(+${r.cCore - r.pCore}) carriers=declared sha=${sha16(cur)}`);
 }
 
 function checkRetry(wire: Wire, bodies: string[], i: number, lines: string[]): void {
@@ -262,9 +388,9 @@ const maskModelValue = (b: string): string => b.replace(/"model":"[^"]*"/g, '"mo
 /** Double-probe A/B: the SAME client history was sent twice, once per model
  *  (the driver's switch scenario). Everything the proxy emits MUST be a pure
  *  function of (history, model): after masking the model value, head and
- *  post-array suffix are byte-identical, the element count is unchanged, and
- *  every element outside the <=3 trailing volatile slots is byte-identical.
- *  Any further drift means bili re-derived request parameters from the model —
+ *  post-array suffix are byte-identical, the core element count is unchanged,
+ *  and every core element is byte-identical modulo declared carriers. Any
+ *  further drift means bili re-derived request parameters from the model —
  *  the "bytes unchanged but params changed -> miss" leak class (#2138). */
 function checkSwitch(wire: Wire, bodies: string[], field: string, i: number, lines: string[]): void {
     const prev = bodies[i - 1]!;
@@ -279,12 +405,9 @@ function checkSwitch(wire: Wire, bodies: string[], field: string, i: number, lin
         assert.notEqual(String(c.model), String(p.model), `${wire} pair#${i}->#${i + 1}: probe did not actually change the model`);
         assert.equal(maskModelValue(CB.subarray(0, C.arrStart).toString("utf8")), maskModelValue(PB.subarray(0, P.arrStart).toString("utf8")), `${wire} pair#${i}->#${i + 1}: head bytes drifted beyond the model value on switch — bili re-derived ${field}-head params from the model`);
     }
-    assert.equal(C.elems.length, P.elems.length, `${wire} pair#${i}->#${i + 1}: element count changed on model switch`);
-    const k = leadingEqual(PB, CB, P, C);
-    const solid = Math.max(0, P.elems.length - TAIL_VOLATILE_SLOTS);
-    assert.ok(k >= solid, `${wire} pair#${i}->#${i + 1}: stable element[${k}] rewritten on model switch — bili re-derived history from the model`);
+    const r = coreCompare(wire, PB, CB, P, C, `pair#${i}->#${i + 1}`, { allowAppend: false });
     assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${i}->#${i + 1}: post-array suffix (tools/stream_options/generationConfig) drifted on model switch`);
-    lines.push(`proof[${wire}] pair#${i}->#${i + 1} SWITCH ok same-history-A/B drift=${wire === "google" ? "url-model-only" : "model-value-only"} volatile-tail<=${TAIL_VOLATILE_SLOTS} sha=${sha16(cur)}`);
+    lines.push(`proof[${wire}] pair#${i}->#${i + 1} SWITCH ok same-history-A/B drift=${wire === "google" ? "url-model-only" : "model-value-only"} carriers=declared core=${r.pCore}->${r.cCore} sha=${sha16(cur)}`);
 }
 
 /** Host-side mid-history rewrite (control group): the client edits an old
@@ -307,13 +430,13 @@ function checkHostRewrite(wire: Wire, bodies: string[], field: string, i: number
     assert.ok(!prev.includes(REWRITE_MARKER), `${wire} pair#${i}->#${i + 1}: control invalid — marker predates the rewrite`);
     assert.ok(headEq(PB, CB, P, C), `${wire} pair#${i}->#${i + 1}: head bytes mutated across a host-side rewrite`);
     assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${i}->#${i + 1}: post-array suffix mutated across a host-side rewrite`);
-    const k = leadingEqual(PB, CB, P, C);
+    const r = coreCompare(wire, PB, CB, P, C, `pair#${i}->#${i + 1}`, { allowAppend: true, hostEditAllowed: true });
     if (cur.includes(REWRITE_MARKER)) {
-        assert.ok(k < C.elems.length && elText(CB, C, k).includes(REWRITE_MARKER), `${wire} pair#${i}->#${i + 1}: divergence at element[${k}] is NOT the host-edited message — bili moved something mid-history`);
-        lines.push(`proof[${wire}] pair#${i}->#${i + 1} HOSTRW ok edit-adopted@elem[${k}] stablePrefix=${k}/${C.elems.length} sha=${sha16(cur)}`);
+        assert.equal(r.edits, 1, `${wire} pair#${i}->#${i + 1}: expected exactly one host-edited core element, got ${r.edits} — bili moved something mid-history`);
+        lines.push(`proof[${wire}] pair#${i}->#${i + 1} HOSTRW ok edit-adopted core=${r.pCore}->${r.cCore}(+${r.cCore - r.pCore}) sha=${sha16(cur)}`);
     } else {
-        assert.ok(k === Math.min(P.elems.length, C.elems.length), `${wire} pair#${i}->#${i + 1}: host edit absent from wire BUT stable prefix ends at element[${k}] of ${P.elems.length} — unexplained mid-history churn`);
-        lines.push(`proof[${wire}] pair#${i}->#${i + 1} HOSTRW ok edit-dropped-by-canonical-rebuild stablePrefix=${k}/${P.elems.length} tailDelta=${C.elems.length - P.elems.length} sha=${sha16(cur)}`);
+        assert.equal(r.edits, 0, `${wire} pair#${i}->#${i + 1}: host edit absent from wire BUT core churn detected — unexplained mid-history movement`);
+        lines.push(`proof[${wire}] pair#${i}->#${i + 1} HOSTRW ok edit-dropped-by-canonical-rebuild core=${r.pCore}->${r.cCore}(+${r.cCore - r.pCore}) sha=${sha16(cur)}`);
     }
 }
 
@@ -801,6 +924,35 @@ function runProof(wire: Wire, bodies: string[], urls: string[], ev: ProofEvents)
     for (const [a, b] of [...ev.retry, ...ev.switch, ...ev.rewrite]) {
         assert.ok(a >= 0 && b < bodies.length, `${wire}: scripted pair [${a},${b}] out of range (${bodies.length} bodies)`);
         handled.add(b);
+    }
+    // Consecutive scripted events can leave their boundary pair unclassified
+    // (two probe events share one unchanged history). Classify it explicitly
+    // instead of letting it fall through as growth: equal core length + same
+    // model ⇒ pure resend (must stay carrier-stable); different model ⇒ a
+    // switch; unequal core length ⇒ the client advanced the history and the
+    // pair remains a normal growth step.
+    const evSorted = [...ev.retry, ...ev.switch, ...ev.rewrite].sort((x, y) => x[0] - y[0]);
+    for (let k = 0; k + 1 < evSorted.length; k++) {
+        const [, b1] = evSorted[k]!;
+        const [a2] = evSorted[k + 1]!;
+        if (a2 !== b1 + 1) continue;
+        const PB = Buffer.from(bodies[b1]!, "utf8");
+        const CB = Buffer.from(bodies[a2]!, "utf8");
+        const P = layoutOf(PB, field);
+        const C = layoutOf(CB, field);
+        if (coreLen(PB, P) !== coreLen(CB, C)) continue;
+        const sameModel = wire === "google"
+            ? urls[b1] === urls[a2]
+            : String((JSON.parse(bodies[a2]!) as Item).model) === String((JSON.parse(bodies[b1]!) as Item).model);
+        handled.add(a2);
+        if (sameModel) {
+            assert.ok(headEq(PB, CB, P, C), `${wire} pair#${a2}->#${a2 + 1}: HEAD bytes mutated on a pure resend`);
+            const r = coreCompare(wire, PB, CB, P, C, `pair#${a2}->#${a2 + 1}`, { allowAppend: false });
+            assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${a2}->#${a2 + 1}: post-array suffix mutated on a pure resend`);
+            lines.push(`proof[${wire}] pair#${a2}->#${a2 + 1} RESEND ok same-hist-same-model core=${r.pCore}->${r.cCore} carriers=declared sha=${sha16(bodies[a2]!)}`);
+        } else {
+            checkSwitch(wire, bodies, field, a2, lines);
+        }
     }
     let growth = 0;
     for (let i = 1; i < bodies.length; i++) {
