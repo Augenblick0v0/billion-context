@@ -662,7 +662,7 @@ withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir rejects 
 
     process.env.BILI_SESSIONS_DIR = path.join(dir, "gone-subdir");
     _resetDiskCacheForTest();
-    await assert.rejects(buildSessionList(), undefined, "no prior snapshot → reject (→ HTTP 500), never silent empty");
+    await assert.rejects(buildSessionList(), "no prior snapshot → reject (→ HTTP 500), never silent empty");
 });
 
 withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", async (dir) => {
