@@ -7373,13 +7373,50 @@ async function resolveFakeCompletion(
     return buffer;
 }
 
-/** Derive a short human-readable title from the first user text message.
- *  Used so the web UI can show "Fix auth bug" instead of an opaque hash. */
-function deriveTitle(messages: CoreMessage[]): string | undefined {
+// Host-injected contextual user fragments: machine-generated context sent as
+// USER-role messages ahead of the first real question (codex: AGENTS.md
+// instructions, environment context). Using one as the session title locks the
+// title to launch boilerplate forever (#2118). Evidence-permitlist mirroring
+// codex's own type_markers (openai/codex codex-rs/context-fragments/src/fragment.rs
+// matches_marked_text: trimmed text starts with open AND ends with close, ASCII
+// case-insensitive) — extend only with source evidence, never keyword filters.
+const CONTEXTUAL_USER_FRAGMENT_MARKERS: ReadonlyArray<readonly [string, string]> = [
+    ["# AGENTS.md instructions", "</INSTRUCTIONS>"],
+    ["<environment_context>", "</environment_context>"],
+];
+
+function asciiCI(hay: string, needle: string): boolean {
+    if (hay.length !== needle.length) return false;
+    for (let i = 0; i < hay.length; i++) {
+        const h = hay.charCodeAt(i);
+        const n = needle.charCodeAt(i);
+        if (h === n) continue;
+        const hl = h >= 65 && h <= 90 ? h + 32 : h;
+        const nl = n >= 65 && n <= 90 ? n + 32 : n;
+        if (hl !== nl) return false;
+    }
+    return true;
+}
+
+export function isContextualUserFragment(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    return CONTEXTUAL_USER_FRAGMENT_MARKERS.some(([open, close]) =>
+        asciiCI(t.slice(0, open.length), open) && asciiCI(t.slice(t.length - close.length), close));
+}
+
+/** Derive a short human-readable title from the first real user text message.
+ *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
+ *  Contextual fragments (#2118) are skipped — if no real question has arrived
+ *  yet, no title is set and derivation retries on later requests. */
+export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
-        const clean = (m.text ?? "").replace(/\s+/g, " ").trim();
-        if (clean) return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
+        const raw = m.text ?? "";
+        if (!raw.trim()) continue;
+        if (isContextualUserFragment(raw)) continue;
+        const clean = raw.replace(/\s+/g, " ").trim();
+        return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
     return undefined;
 }
