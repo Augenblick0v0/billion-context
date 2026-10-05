@@ -238,8 +238,9 @@ test("#2072 e2e: flagged host-native caller routes home past a stale sibling wit
         // identical (acp_cache, {}) call left a fresher unique witness. The
         // host-stamped id must win — A sees A's panel, never B's blocks.
         const outA = await forwardTool(h.baseUrl, "hs-a", "acp_cache", {}, undefined, true);
-        assert.ok(outA.includes(urlA), "the caller's own session must be served");
-        assert.ok(!outA.includes(urlB), "the witnessing sibling's state must NOT leak into the reply");
+        assert.equal(outA.failed, false, "a served cache report is not a business failure");
+        assert.ok(outA.text.includes(urlA), "the caller's own session must be served");
+        assert.ok(!outA.text.includes(urlB), "the witnessing sibling's state must NOT leak into the reply");
 
         // Control leg: the SAME call on the legacy (unflagged) wire shape
         // fails closed on current master instead of misrouting (#2016) — the
@@ -255,7 +256,7 @@ test("#2072 e2e: flagged host-native caller routes home past a stale sibling wit
         resetToolRingForTest();
         await modelTurn(h, "hs-a", "WITNESS:acp_cache alpha's own witness turn");
         const outOwn = await forwardTool(h.baseUrl, "hs-a", "acp_cache", {}, undefined, true);
-        assert.ok(outOwn.includes(urlA), "agreeing witness + stamped id must still serve the caller's session");
+        assert.ok(outOwn.text.includes(urlA), "agreeing witness + stamped id must still serve the caller's session");
     } finally {
         await h.stop();
     }

@@ -182,7 +182,7 @@ describe("createV1ServerHooks", () => {
             forward: async (o: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => {
                 forwarded.push({ conversationId, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
                 assert.equal(o, origin);
-                return `panel:${tool}`;
+                return { text: `panel:${tool}`, failed: false };
             },
             forwarded,
         };
@@ -262,7 +262,7 @@ describe("createV1ServerHooks", () => {
         const deps = makeDeps();
         deps.forward = async (o: string) => {
             forwarded.push(o);
-            return "ok";
+            return { text: "ok", failed: false };
         };
         const hooks = createV1ServerHooks(() => live, {}, deps);
         await hooks.tool?.compress?.execute({}, { sessionID: "s" });
@@ -354,7 +354,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
             isLegacy: (sid) => sid === "ses_legacy",
             forward: async (_o, sid, tool, args, nativeCaller?: boolean) => {
                 forwarded.push({ sid, tool, args, ...(nativeCaller === true ? { nativeCaller: true } : {}) });
-                return "proxied";
+                return { text: "proxied", failed: false };
             },
             log: () => {},
         });
@@ -418,7 +418,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
             z: fakeZ,
             legacy: fakeLegacyModule(events),
             isLegacy: (sid) => sid === "ses_legacy",
-            forward: async () => "proxied",
+            forward: async () => ({ text: "proxied", failed: false }),
             log: () => {},
         });
         await assert.rejects(
@@ -440,7 +440,7 @@ describe("createV1ServerHooks legacy routing (#920)", () => {
             z: fakeZ,
             legacy,
             isLegacy: () => false,
-            forward: async () => "proxied",
+            forward: async () => ({ text: "proxied", failed: false }),
             log: () => {},
         }).config?.(cfg);
         // legacy saw no provider key (shadow had provider: undefined)
@@ -526,7 +526,7 @@ describe("derived-session inheritance report (#1362)", () => {
     }
 
     function v1Deps(extra: Record<string, unknown> = {}) {
-        return { z: fakeZ, forward: async () => "", ...extra };
+        return { z: fakeZ, forward: async () => ({ text: "", failed: false } as const), ...extra };
     }
 
     it("reports a child's parentID once through the identity register channel", async () => {
