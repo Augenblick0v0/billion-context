@@ -152,7 +152,7 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
+import { hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -2172,6 +2172,33 @@ async function handle(
                   clientProvided: !!convHeader,
               }
             : undefined;
+        // #2156: a request that will ride the #388 side passthrough further
+        // down must NEVER participate in persona namespace resolution.
+        // subagentNamespace's first-seen-system anchor is mutable process
+        // state: whichever request arrives first under an identity claims the
+        // raw key. A side request carries kernel-no-touch status, yet anchoring
+        // it lets its utility system claim the raw key and fork every real
+        // main turn onto `|sub:<fp>` — the host-stamped bare id then finds
+        // zero refs and compress fails permanently (this issue). Side requests
+        // therefore resolve VERBATIM: they neither read nor write the anchor
+        // and share the main session key per the #388 contract (before the
+        // fix, once any main turn had anchored, they instead rode junk
+        // `|sub:<fp(side)>` sessions). Mirrors the #388 lane condition below
+        // minus publicForkPrefix, which needs the session resolved AFTER this
+        // point: a public-fork child arrives under a FRESH childConversationId
+        // where first-seen anchoring returns the raw key anyway, so omitting
+        // the veto cannot move any key. detectAcpArtifacts stays last — it
+        // re-encodes the whole history and must only run for the all-bili
+        // subset (same short-circuit discipline as the demotedSide gate below;
+        // proxy-mode traffic never reaches it because the plugin header gate
+        // fails first).
+        const sideAgent = pluginRequestAgentHeader(req.headers);
+        const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
+            && (isSideRequest(parsed, sideAgent)
+                || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
+                    && req.headers["x-bili-ws-lane"] === undefined
+                    && hasLeakedBiliToolsOnly(parsed)
+                    && detectAcpArtifacts(bodyBuffer, parsed) === null));
         // #1916/#1307/#1314: the dsh persona fingerprint — dsh stamps ONE
         // conversation id on every model request of a session, INCLUDING the
         // auto-review classifyRisk() calls (fixed REVIEW_POLICY system + a
@@ -2206,11 +2233,11 @@ async function handle(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : dshPersona
+                  : dshPersona && !sideRequestLike
                     ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
-              ? (dshPersona
+              ? (dshPersona && !sideRequestLike
                     ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -2241,11 +2268,13 @@ async function handle(
                      // conversation evolved (upgrade / plugin / AGENTS.md),
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
-                     ? subagentNamespace(
-                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                           (parsed as ResponsesRequestBody).instructions,
-                       )
-                     : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
+                      ? (!sideRequestLike
+                          ? subagentNamespace(
+                                responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                                (parsed as ResponsesRequestBody).instructions,
+                            )
+                          : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
+                      : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
         // this request onto a suffixed session key (kernel anchor mismatch).
         // Used by the recordPluginSession branch below so the fork records
