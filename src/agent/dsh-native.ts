@@ -838,6 +838,16 @@ export function apply(ctx: PluginContext): void {
         state.ready = trackChain(start());
     }
 
+    // #2187: arm the recovery loop at PLAN time, not on first traffic. After
+    // a boot-time spawn failure NO caller can reach maybeRetry — headersFor
+    // is only consulted once an origin has resolved, /acp early-returns while
+    // base-less, and the recovery timer below arms itself only from inside
+    // maybeRetry — so the lane stayed degraded for the whole session. Happy
+    // path: single-flight joins the bootstrap started above (no second
+    // spawn); failure path: the timer re-fires state.respawn() every
+    // RETRY_INTERVAL_MS until a proxy lands.
+    maybeRetry(ctx);
+
     // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
     // endpoint logs once; same-state refusals accumulate silently and re-print
     // only on an attribution STATE change (none↔threw), always carrying the
@@ -1096,6 +1106,11 @@ export function _resetRegisterForTest(base: string | undefined): void {
         recoveryTimer = undefined;
     }
     activeCtx = undefined;
+    // #2187: apply() now reaches the respawn arming on every plan, so a stale
+    // single-flight wrapper (capturing a previous test's spawn stub) must not
+    // survive a reset.
+    state.respawn = undefined;
+    state.onGiveUp = undefined;
     register.base = base;
     register.toolsReady = false;
     register.dead = false;
