@@ -451,7 +451,9 @@ test("#2196 real win32: the official wrapper answers --help through plain node (
     if (!entry) return;
     // The production launch shape for this path is exactly `node <entry> <args>`
     // — prove the official wrapper boots its vendor binary through it, offline.
-    const res = spawnSync(process.execPath, [entry, "--help"], { timeout: 15000, stdio: ["ignore", "pipe", "ignore"] });
-    assert.equal(res.status, 0, `wrapper --help must exit 0 (stderr: ${res.stderr.toString("utf8").slice(0, 200)})`);
+    const res = spawnSync(process.execPath, [entry, "--help"], { timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+    if (res.status !== 0 || res.error) {
+        assert.fail(`wrapper --help exited ${res.status} (${res.error ?? ""}): ${res.stderr?.toString("utf8").slice(0, 300) ?? ""}`);
+    }
     assert.ok(res.stdout.toString("utf8").length > 0);
 });
