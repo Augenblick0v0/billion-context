@@ -7,7 +7,7 @@ import {
 import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
-import { handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -23,6 +23,7 @@ import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName }
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
+import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { classifyUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
@@ -273,7 +274,7 @@ export function executeProxyTool(
     ctx: LoopCtx,
     callId?: string,
     rawArguments?: string,
-): string {
+): ProxyToolResult {
     if (toolName === "compress") {
         // #1502: on strict-JSON.parse failure the caller passes the raw argument
         // string here — the kernel's lenient parser salvages fence/trailing-
@@ -306,7 +307,7 @@ export function executeProxyTool(
     if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
         return executeImageFull(args, ctx.session, ctx.config, callId);
     }
-    return `[Unknown proxy tool: ${toolName}]`;
+    return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
 
 function recordUsage(
@@ -367,9 +368,15 @@ export async function* runCompressLoop(
     const fetchUpstream = (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
-        const wireBodyStr = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body);
+        // #2131: also hand over the exact message count — bodies above the
+        // forensics cap are stored clipped and parse to zero messages.
+        const wireObj = requestOptions.wireTransform ? requestOptions.wireTransform(body) : body;
+        const wireBodyStr = JSON.stringify(wireObj);
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
-        noteForwardedBody(ctx.session, wireBodyStr);
+        // #2131 follow-up: the message array lives under `messages` (chat),
+        // `input` (Responses) or `contents` (Google) depending on wire shape.
+        const wireArr = [wireObj.messages, wireObj.input, wireObj.contents].find((v): v is unknown[] => Array.isArray(v));
+        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers));
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.
@@ -820,14 +827,14 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId, rawArgs));
-                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature });
                     if (ctx.visibilityMarkers !== false) {
-                        const markerKey = `${call.name}\u0000${result}`;
+                        const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result);
+                            yield adapter.emitMarker(call.name, result.text);
                         }
                     }
                 } else {
@@ -1131,13 +1138,15 @@ export async function* runCompressLoop(
                 // a thinking session is the split-turn signature — remember it
                 // on the session so #651's reasoning-drop never fires here
                 // again (kernel gate prevents the split; this closes the loop).
+                // #2169: match BOTH field spellings — the chat wire says
+                // reasoning_content, DeepSeek's Responses wire says reasoning_text.
                 if (
                     e.status === 400 &&
-                    /reasoning_content/i.test(e.body) &&
+                    /reasoning_(?:content|text)/i.test(e.body) &&
                     ctx.session.metadata.strictReasoningEcho !== true
                 ) {
                     ctx.session.metadata.strictReasoningEcho = true;
-                    ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
+                    ctx.log(`[acp-loop] 400 mentions a reasoning echo field — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684/#2169)`);
                     loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
                 }
                 // #762: persist the exact re-requested body on 4xx (env-gated: BILI_DUMP_4XX=1).

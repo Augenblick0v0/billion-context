@@ -181,6 +181,13 @@ export interface IflowConfig {
     baseUrl?: string;
 }
 
+export interface AntigravityConfig {
+    /** The user's pre-existing `CLOUD_CODE_URL` env (undocumented override
+     *  verified against the v2.19.1 language_server binary, #2115) — relay-wrap
+     *  semantics, same as GeminiConfig.baseUrl. */
+    baseUrl?: string;
+}
+
 export interface McodeProvider {
     baseUrl?: string;
 }
@@ -234,6 +241,7 @@ export interface ClientConfig {
     kimi?: KimiConfig;
     gemini?: GeminiConfig;
     iflow?: IflowConfig;
+    antigravity?: AntigravityConfig;
     mcode?: McodeConfig;
     aider?: AiderConfig;
     goose?: GooseConfig;
@@ -567,6 +575,10 @@ export function readIflowEnvConfig(env: NodeJS.ProcessEnv): IflowConfig {
     // is the documented primary, the camel form is accepted too.
     const raw = nonEmpty(env.IFLOW_BASE_URL) ? env.IFLOW_BASE_URL : nonEmpty(env.IFLOW_baseUrl) ? env.IFLOW_baseUrl : undefined;
     return { baseUrl: raw };
+}
+
+export function readAntigravityEnvConfig(env: NodeJS.ProcessEnv): AntigravityConfig {
+    return { baseUrl: nonEmpty(env.CLOUD_CODE_URL) ? env.CLOUD_CODE_URL : undefined };
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
@@ -1530,6 +1542,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.kimi = readKimiConfig(resolveKimiHome(env), env);
     config.gemini = readGeminiEnvConfig(env);
     config.iflow = readIflowEnvConfig(env);
+    config.antigravity = readAntigravityEnvConfig(env);
     config.mcode = readMcodeConfig(env);
     config.aider = readAiderConfig(env, cwd);
     config.goose = readGooseConfig(resolveGooseDirs(env), env);
@@ -1657,7 +1670,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

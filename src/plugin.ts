@@ -14,6 +14,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
+import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
@@ -1469,7 +1470,7 @@ export async function handlePluginTool(
     delete args.conversation_id;
     const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
-    let result: string | undefined;
+    let result: ProxyToolResult | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -1505,10 +1506,10 @@ export async function handlePluginTool(
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
-            const restored = tool === "decompress" && (/^\[Block [^\n]+ content /.test(toolResult) || /^\[decompress [^\n]+: restored \d+ item\(s\)/.test(toolResult));
+            const restored = tool === "decompress" && (/^\[Block [^\n]+ content /.test(toolResult.text) || /^\[decompress [^\n]+: restored \d+ item\(s\)/.test(toolResult.text));
             if (before && (creditDelta !== 0 || session.lastCompress !== compressBefore || restored)) {
                 // Credit was already applied to lastInputTokens by the tool; do not net it twice.
-                const restoredTokens = restored ? countMessageTokens({ text: toolResult }) + restoredInjections.reduce((sum, p) => sum + countMessageTokens(p.injection), 0) : 0;
+                const restoredTokens = restored ? countMessageTokens({ text: toolResult.text }) + restoredInjections.reduce((sum, p) => sum + countMessageTokens(p.injection), 0) : 0;
                 recordContextObservation(session, Math.max(0, before.tokens - creditDelta) + restoredTokens, "estimate");
             }
             return toolResult;
@@ -1531,18 +1532,25 @@ export async function handlePluginTool(
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
-    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.length} chars)`);
+    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"})`);
     // Same deep link on the /acp-cache display surfaces: clients wrap this text in
     // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
     // (src/acp-panel.ts). The MCP acp_cache path shares this endpoint — one extra line
     // is harmless context and lets the model tell the user the link, too.
-    let sentResult = result;
+    let sentResult = result.text;
     if (tool === "acp_cache") {
         const wu = webSessionUrl(deps.webOrigin, session.id);
-        if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result}`;
+        if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result.text}`;
     }
+    // #1875: ok stays the transport/execution signal (200 = the tool ran); the
+    // business effect rides additive fields so clients can distinguish an
+    // accepted fold from a kernel refusal without parsing the receipt text.
+    const body: Record<string, unknown> = { ok: true, tool, conversationId };
+    if (result.outcome !== undefined) body.outcome = result.outcome;
+    if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
+    body.result = sentResult;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, tool, conversationId, result: sentResult }));
+    res.end(JSON.stringify(body));
 }
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
@@ -1820,6 +1828,8 @@ export async function pipePluginChatWithStrip(
     // one turn: its framing stays open, and the retry's content blocks are
     // shifted past the ones already streamed.
     let degenerateRetried = false;
+    let truncationRetried = false;
+    let forwardedAny = false;
     let inRetry = false;
     let retryIndexOffset = 0;
     let blocksForwarded = 0;
@@ -1827,9 +1837,11 @@ export async function pipePluginChatWithStrip(
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
      *  took over, in which case the caller drops the terminal event of the
-     *  attempt it came from. */
+     *  attempt it came from. Consults truncationRetried: a request whose stream
+     *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
+     *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined) return false;
+        if (refetch === undefined || truncationRetried) return false;
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
         if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
@@ -1871,6 +1883,50 @@ export async function pipePluginChatWithStrip(
         streams.clear();
         // The first attempt is terminal and its body is drained; close the
         // reader we are abandoning rather than leaving the socket held.
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
+    };
+    /** #2171: one-shot re-issue when the upstream stream dies having delivered
+     *  NOTHING client-visible (only SSE keep-alive comments, which are
+     *  protocol-invisible). The observed relay failure accepts the request,
+     *  returns 200 + event-stream headers, never emits a single data frame,
+     *  and is cut ~180s later by its no-first-byte timeout; a manual re-send
+     *  of the identical request always heals with a warm prefix cache, and the
+     *  hung attempt never produced a usage frame, so the retry is
+     *  unambiguously safe: no duplication risk (nothing was delivered), no
+     *  side effects (stateless completion), zero billing for the dead attempt.
+     *  Shares the single stream-level re-issue budget with retryEmptyTurn so a
+     *  request re-sends at most once; anything parsed, held, or written keeps
+     *  the #721 in-band error (partial content must not be regenerated). */
+    const retryZeroByteCut = async (): Promise<boolean> => {
+        if (refetch === undefined) return false;
+        if (degenerateRetried || truncationRetried) return false;
+        // Zero-visible predicate: no framing opened, no content block started,
+        // no prose accumulated or held by the tag filter, no unparseable frame
+        // forwarded verbatim, no partial SSE event left in the buffer.
+        if (sawThinking || sawToolUse || blocksForwarded > 0 || visibleTextChars > 0 ||
+            proseAcc.length > 0 || streams.size > 0 || forwardedAny || buf.length > 0) return false;
+        if (res.destroyed || res.writableEnded) return false;
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] zero-byte cut retry failed (${e instanceof Error ? e.message : String(e)}); falling through to the truncation signal (#2171)`);
+            return false;
+        }
+        if (!next) return false;
+        truncationRetried = true;
+        log?.("[plugin] upstream stream cut after headers with zero visible output; re-issuing the request once (#2171)");
+        sawTerminal = false;
+        finalFinishReason = undefined;
+        streams.clear();
         try {
             await reader.cancel();
         } catch {
@@ -1941,6 +1997,7 @@ export async function pipePluginChatWithStrip(
     };
     const write = (s: string) => {
         if (res.destroyed || res.writableEnded) return;
+        forwardedAny = true;
         if (!res.write(Buffer.from(s, "utf8"))) {
             return awaitDrain(res);
         }
@@ -2347,7 +2404,12 @@ export async function pipePluginChatWithStrip(
     try {
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                // #2171: an EOF with nothing client-visible yet is safely
+                // re-issuable — try the one-shot retry before giving up.
+                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                break;
+            }
             if (value && value.length > 0) {
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
@@ -2588,6 +2650,8 @@ export async function pipePluginResponsesWithStrip(
     // done(itemN) before added(itemN+1) (#1061) — so by the terminal only the
     // last item's family can still be held.
     let degenerateRetried = false;
+    let truncationRetried = false;
+    let forwardedAny = false;
     let inRetry = false;
     /** Text the client actually assembled from this attempt's deltas. */
     let visibleTextChars = 0;
@@ -2610,8 +2674,55 @@ export async function pipePluginResponsesWithStrip(
     let heldItemId: unknown;
     let heldOutputIndex: unknown;
     let heldResponseId: unknown;
+    /** #2171 (responses twin of the chat pipe's helper): one-shot re-issue
+     *  when the upstream stream dies having delivered NOTHING client-visible
+     *  (only SSE keep-alive comments, which are protocol-invisible). The
+     *  observed relay failure returns 200 + event-stream headers, never emits
+     *  a single data frame, and is cut ~180s later; a manual re-send always
+     *  heals with a warm prefix cache and the dead attempt bills nothing, so
+     *  the retry is unambiguously safe. Shares the single stream-level
+     *  re-issue budget with retryEmptyTurn; anything parsed, held, or written
+     *  keeps the #721 in-band error. */
+    const retryZeroByteCut = async (): Promise<boolean> => {
+        if (refetch === undefined) return false;
+        if (degenerateRetried || truncationRetried) return false;
+        // Zero-visible predicate: no item framing held, no status observed, no
+        // prose accumulated or held by the filters, no verbatim frame
+        // forwarded, no partial SSE event left in the buffer.
+        if (sawFunctionCall || sawReasoning || visibleTextChars > 0 || fastPathChars > 0 ||
+            proseAcc.length > 0 || heldEvents.length > 0 || heldVisibleChars > 0 ||
+            argStreams.size > 0 || responseStatus !== undefined || forwardedAny || buf.length > 0) return false;
+        if (res.destroyed || res.writableEnded) return false;
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] zero-byte cut retry failed (${e instanceof Error ? e.message : String(e)}); falling through to the truncation signal (#2171)`);
+            return false;
+        }
+        if (!next) return false;
+        truncationRetried = true;
+        log?.("[plugin] upstream stream cut after headers with zero visible output; re-issuing the request once (#2171)");
+        sawTerminal = false;
+        heldEvents = [];
+        heldVisibleChars = 0;
+        heldItemId = undefined;
+        heldOutputIndex = undefined;
+        heldResponseId = undefined;
+        tagFilter.flush();
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
+    };
     const write = (s: string): Promise<void> => {
         if (res.destroyed || res.writableEnded) return Promise.resolve();
+        forwardedAny = true;
         if (!res.write(Buffer.from(s, "utf8"))) {
             return awaitDrain(res);
         }
@@ -2735,7 +2846,8 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
-        if (degenerateRetried || refetch === undefined) return false;
+        // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
+        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
         if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
@@ -2813,7 +2925,12 @@ export async function pipePluginResponsesWithStrip(
     try {
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                // #2171: an EOF with nothing client-visible yet is safely
+                // re-issuable — try the one-shot retry before giving up.
+                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                break;
+            }
             if (value && value.length > 0) {
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;

@@ -17,6 +17,7 @@ import { IMAGE_FULL_TOOL_NAME, imageCompressionEnabled } from "./image-compress.
 import { ccrEnabled, retrieveToolName } from "./store.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 const EFFECTIVE_ABSORB_KEY = "effectiveAbsorb";
 
@@ -79,11 +80,11 @@ export type AbsorbExecCtx = {
 // and the plugin tool API share this). Returns model-facing result text;
 // failures carry FAILED so visibility markers render ❌ and the loop's
 // repeat-failure guard reasons about them uniformly with compress failures.
-export function executeAbsorb(args: unknown, callId: string | undefined, absorb: AbsorbConfig, ctx: AbsorbExecCtx): string {
+export function executeAbsorb(args: unknown, callId: string | undefined, absorb: AbsorbConfig, ctx: AbsorbExecCtx): ProxyToolResult {
     const log = ctx.log ?? ((msg: string) => loggerLog("info", msg));
     const parsed = parseAbsorbInput(args, callId, (w) => log(`[acp-absorb] ${w}`));
     if (!parsed) {
-        return '[absorb FAILED: invalid input — expected { ref: "mNNNNN", summary: "..." }]';
+        return toolFail('[absorb FAILED: invalid input — expected { ref: "mNNNNN", summary: "..." }]');
     }
     const before = ctx.session.state.absorbed?.length ?? 0;
     let outcome: AbsorbOutcome;
@@ -98,12 +99,12 @@ export function executeAbsorb(args: unknown, callId: string | undefined, absorb:
         });
     } catch (err) {
         log(`[acp-absorb] error: ${String(err)}`);
-        return `[absorb FAILED: ${String(err)}]`;
+        return toolFail(`[absorb FAILED: ${String(err)}]`);
     }
     ctx.session.state = outcome.state;
     if (!outcome.ok) {
         log(`[acp-absorb] ${outcome.resultText}`);
-        return `[absorb FAILED: ${outcome.resultText}]`;
+        return toolFail(`[absorb FAILED: ${outcome.resultText}]`);
     }
     // ok=true also covers the no-op re-absorb ("already absorbed"); detect a
     // real absorption by the appended record so credits net exactly once.
@@ -119,5 +120,5 @@ export function executeAbsorb(args: unknown, callId: string | undefined, absorb:
     } else {
         log(`[acp-absorb] ${outcome.resultText}`);
     }
-    return outcome.resultText;
+    return toolOk(outcome.resultText);
 }

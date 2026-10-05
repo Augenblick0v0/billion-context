@@ -37,6 +37,24 @@ export function refForRaw(map: MessageRefMap, rawId: string): string | null {
   return map.byRaw[rawId] ?? null;
 }
 
+/** Canonical DISPLAY order for a positional ref pair. Direction is
+ *  notational — resolveBoundaries swaps reversed pairs, so both orders select
+ *  the same region and rendering may canonicalize to ascending numeric order.
+ *  Under non-monotonic refs (client history rewrite #1001, subagent
+ *  interleaving) a positional span's endpoint labels can be numerically
+ *  descending; printing them as-is reads as a malformed range, and copy-
+ *  pasted reversed pairs trip validators that reject startId > endId (#2168).
+ *  Pairs with an unparseable side ("BLOCKED", bN specs) pass through. */
+export function orderedRefPair(
+  startRef: string,
+  endRef: string,
+): [string, string] {
+  const a = refToIndex(startRef);
+  const b = refToIndex(endRef);
+  if (a !== null && b !== null && b < a) return [endRef, startRef];
+  return [startRef, endRef];
+}
+
 export function rawForRef(map: MessageRefMap, ref: string): string | null {
   return map.byRef[ref] ?? null;
 }

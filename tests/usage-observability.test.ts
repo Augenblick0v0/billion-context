@@ -70,7 +70,7 @@ test("#695: applyRanges marks the next request as fold-materializing and logs th
         textMsg("raw_7", "user", "x".repeat(5000)),
     ]);
     ctx.session.stats.lastInputTokens = 100000;
-    const out = applyRanges(parseCompressInput(COMPRESS_ARGS), ctx);
+    const out = applyRanges(parseCompressInput(COMPRESS_ARGS), ctx).text;
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
     assert.equal(ctx.session.stats.pendingFoldUsage, true, "flag set for the fold-materializing request");
     const obs = ctx.logs.find((l) => l.includes("[acp-compress-obs]"));

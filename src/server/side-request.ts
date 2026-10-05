@@ -33,6 +33,59 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
 }
 
+// #2170 measure 1: the two lane gates extracted from src/server.ts so they have
+// ONE home and an exhaustive truth-table test. They are PURE — the two effects
+// that guard demotion (detectAcpArtifacts' full-history re-encode and the
+// stripLeakedBiliTools mutation) stay in the caller and MUST stay lazily
+// evaluated after demoteGate (never hoisted — see the sideRequestLike note in
+// src/server.ts: the artifact scan may only run for the all-bili subset).
+export interface DemoteGateSignals {
+    countTokens: boolean;
+    responsesCompact: boolean;
+    protocol: WireProtocol | null;
+    pluginMode: boolean;
+    requestAgent: string | undefined;
+    wsLaneEnvelope: boolean;
+    publicForkPrefix: boolean;
+}
+// Heuristic demotion eligibility — every conjunct is cheap (no request-body
+// scan). `publicForkPrefix` deliberately vetoes: a public-fork child's EARLY
+// mainline turns (raw inherited prefix, no artifacts yet, no agent header)
+// false-positive the leak-shape heuristic; once anchored, the fork's side
+// requests enter the lane via `sideIntent` instead (which resolves without
+// any fork input — the #2164 fix).
+export function demoteGate(s: DemoteGateSignals): boolean {
+    return !s.countTokens && !s.responsesCompact && s.protocol !== null && s.pluginMode
+        && s.requestAgent !== "main" && !s.wsLaneEnvelope && !s.publicForkPrefix;
+}
+
+export interface SideLaneSignals {
+    countTokens: boolean;
+    responsesCompact: boolean;
+    protocol: WireProtocol | null;
+    // stripLeakedBiliTools() ran and stripped (only ever true when demoteGate
+    // held and detectAcpArtifacts returned null — the caller's short-circuit).
+    stripApplied: boolean;
+    sideIntent: boolean;
+    requestAgent: string | undefined;
+}
+export type SideLaneDecision = { lane: "side" | "main"; demoted: boolean; reason: string };
+// The #388 lane decision. `demoted` ⊆ `lane === "side"`. No fork input can
+// reach here: intent-certain side requests ride the lane under a fork receipt
+// (#2164) — that property is structural (there is no fork field to consult).
+export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
+    if (s.countTokens || s.responsesCompact || s.protocol === null) {
+        return { lane: "main", demoted: false, reason: "not a model turn" };
+    }
+    if (s.stripApplied) {
+        return { lane: "side", demoted: true, reason: "leaked bili tools stripped (#1897)" };
+    }
+    if (s.sideIntent) {
+        return { lane: "side", demoted: false, reason: s.requestAgent !== undefined ? `agent=${s.requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}` };
+    }
+    return { lane: "main", demoted: false, reason: "main turn" };
+}
+
 // #1897: hosts like omp register bili's ACP tools as first-class extension tools
 // and include them in EVERY model request — including side requests (title-gen),
 // which carry no host action tools of their own. The title request defeats both
@@ -92,7 +145,11 @@ function biliToolNamesIn(parsed: Record<string, unknown>): string[] | null {
  *  starved tool-carrying request is the death-spiral rescue path —
  *  restoreOutputBudget must run so the model regains the output room to emit
  *  compress — so such requests stay main turns even when every tool is bili's. */
-export function stripLeakedBiliTools(parsed: unknown): boolean {
+/** #2156: READ-ONLY structural twin of stripLeakedBiliTools — same verdict,
+ *  no mutation. Lets callers (the persona-anchor bypass in server.ts) ask
+ *  "would this request be demoted via #1897?" before any decision point that
+ *  must not pay the mutation or re-run the check. */
+export function hasLeakedBiliToolsOnly(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const p = parsed as Record<string, unknown>;
     const names = biliToolNamesIn(p);
@@ -102,7 +159,12 @@ export function stripLeakedBiliTools(parsed: unknown): boolean {
         const raw = readOutputBudget(p, field);
         if (typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS) return false;
     }
-    delete p.tools;
+    return true;
+}
+
+export function stripLeakedBiliTools(parsed: unknown): boolean {
+    if (!hasLeakedBiliToolsOnly(parsed)) return false;
+    delete (parsed as Record<string, unknown>).tools;
     return true;
 }
 

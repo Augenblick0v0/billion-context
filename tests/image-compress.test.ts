@@ -310,13 +310,13 @@ test("image_full restores original resolution for the rest of the session", asyn
     assert.ok(note.includes("Downscaled screenshots"));
     assert.ok(note.includes("image_full"));
 
-    const bad = executeImageFull({}, s, cfg);
+    const bad = executeImageFull({}, s, cfg).text;
     assert.ok(bad.startsWith(IMAGE_FULL_FAILURE_MARKER));
 
-    const ghost = executeImageFull({ ref: "m99999" }, s, cfg);
+    const ghost = executeImageFull({ ref: "m99999" }, s, cfg).text;
     assert.ok(ghost.startsWith(IMAGE_FULL_FAILURE_MARKER));
 
-    const ok = executeImageFull({ ref: "m00001" }, s, cfg);
+    const ok = executeImageFull({ ref: "m00001" }, s, cfg).text;
     assert.ok(!ok.startsWith(IMAGE_FULL_FAILURE_MARKER));
     assert.equal(isImageFullRestored(s.state, "m00001"), true);
     assert.equal(imageFullTrailingNote(s), undefined);
@@ -330,7 +330,7 @@ test("image_full restores original resolution for the rest of the session", asyn
     assert.equal(antSrc(fresh).media_type, "image/png");
 
     // Idempotent: a second restore of the same ref is a no-op success.
-    const again = executeImageFull({ ref: "m00001" }, s, cfg);
+    const again = executeImageFull({ ref: "m00001" }, s, cfg).text;
     assert.ok(!again.startsWith(IMAGE_FULL_FAILURE_MARKER));
     assert.equal(s.stats.imageFullRestores, 1);
 });

@@ -139,7 +139,7 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     for (let i = 0; i < inc.folds.length; i++) {
         const a = inc.folds[i]!;
         const b = batch.folds[i]!;
-        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack"] as const) {
+        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack", "cadenceOk"] as const) {
             assert.deepEqual(a[key], b[key], `fold ${i} ${key}: incremental ${String(a[key])} !== batch ${String(b[key])}`);
         }
     }
@@ -157,10 +157,15 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     assert.equal(f1.T, 0);
     assert.ok(Math.abs(f1.breakevenTurns! - 2.5008976660682225) < 1e-9);
     assert.equal(f1.paidBack, true);
+    assert.equal(f1.cadenceOk, true);
     assert.equal(f1.savedSoFar, (12140 - 1000) * 3);
     const f2 = inc.folds.find((f) => f.seq === 2)!;
     assert.equal(f2.turnsToNextFold, null);
-    assert.equal(f2.paidBack, null);
+    // #2044: the last fold is now evaluable on the full post-fold window —
+    // zero post-fold requests against a positive n* is NOT PAID BACK (yet),
+    // no longer unobserved; cadenceOk stays null with no next fold.
+    assert.equal(f2.paidBack, false);
+    assert.equal(f2.cadenceOk, null);
     assert.equal(f2.requestsAfter, 0);
     assert.equal(inc.totals.balanced, true);
 });
@@ -279,7 +284,7 @@ test("handleAcpCache full detail windows the text view past 512 lines (#1489)", 
     for (let i = 0; i < 600; i++) {
         recordCacheSample(session, { at: T0 + 1000 * i, input: 100000, cached: 99000 });
     }
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /LINE ITEMS \(last 512 of 600\):/);
     const rows = full.split("\n").filter((l) => /\s+99\.0%\s/.test(l));
     assert.equal(rows.length, 512);
@@ -303,7 +308,7 @@ test("legacy-trimmed sessions keep their historical deficit honest through the w
     const r = buildSessionCacheReport(session);
     assert.equal(r.lines.length, 612);
     assert.equal(r.linesOmitted, 88);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /LINE ITEMS \(last 512 of 700\):/);
 });
 
@@ -313,7 +318,7 @@ test("handleAcpCache renders the grand ledger with a closing identity", () => {
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 5000, 8192, "m00010")], { V: 10000, Vp: 5000 });
     recordCacheSample(session, { at: T0 + 2000, input: 6000, cached: 1000 });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /ACP CACHE REPORT \(cl-\d+\)/);
     assert.match(text, /GRAND LEDGER/);
     assert.match(text, /identity check\s+OK/);
@@ -326,7 +331,7 @@ test("empty session reports zero balanced totals", () => {
     const r = buildSessionCacheReport(session);
     assert.equal(r.totals.requests, 0);
     assert.equal(r.totals.balanced, true);
-    assert.match(handleAcpCache(session), /identity check\s+OK/);
+    assert.match(handleAcpCache(session).text, /identity check\s+OK/);
 });
 
 test("handleAcpCache defaults to summary; detail full restores the per-line listing", () => {
@@ -339,10 +344,10 @@ test("handleAcpCache defaults to summary; detail full restores the per-line list
     for (let i = 0; i < 12; i++) {
         recordCacheSample(session, { at: T0 + 13000 + 1000 * i, input: 100000, cached: 99000 });
     }
-    const summary = handleAcpCache(session);
+    const summary = handleAcpCache(session).text;
     assert.match(summary, /\[summary — detail:"full" for every fold & line\]/);
     assert.match(summary, /no anomalies \(24 requests, median hit 99\.0%\)/);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.ok(!full.includes("[summary"));
     const rows = full.split("\n").filter((l) => /\s+99\.0%\s/.test(l));
     assert.equal(rows.length, 24);
@@ -352,7 +357,7 @@ test("handleAcpCache rejects non-full detail values back to summary", () => {
     const session = makeSession();
     withView20(session);
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
-    assert.match(handleAcpCache(session, { detail: "everything" }), /\[summary/);
+    assert.match(handleAcpCache(session, { detail: "everything" }).text, /\[summary/);
 });
 
 /** Two-fold session with ONE fully-cached sample between the folds (T stays 0,
@@ -399,7 +404,7 @@ test("stamped priceProfile re-prices fold economics end to end (#1279)", () => {
     assert.equal(fd.breakevenTurns, 2.5);
     assert.equal(fb.paidBack, false);
     assert.equal(fd.paidBack, false);
-    assert.match(handleAcpCache(ds), /FOLD ECONOMICS \(2 folds @ w=1 r=0\.1 q=1\.5\)/);
+    assert.match(handleAcpCache(ds).text, /FOLD ECONOMICS \(2 folds @ w=1 r=0\.1 q=1\.5\)/);
 
     const batch = buildCacheReport(
         [
@@ -554,15 +559,15 @@ test("handleAcpCache renders the model-switch section in both modes (#1535)", ()
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     session.metadata.lastModel = "claude-opus-4-6";
     recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /MODEL SWITCHES/);
     assert.match(text, /1 switch\(es\)/);
     assert.match(text, /gpt-5 → claude-opus-4-6/);
     assert.match(text, /attributed 10\.0K/);
-    const full = handleAcpCache(session, { detail: "full" });
+    const full = handleAcpCache(session, { detail: "full" }).text;
     assert.match(full, /MODEL SWITCHES/);
     const none = makeSession();
-    assert.match(handleAcpCache(none), /MODEL SWITCHES\n  none observed/);
+    assert.match(handleAcpCache(none).text, /MODEL SWITCHES\n  none observed/);
 });
 
 test("unknown-cache sample is quarantined out of the closure, not booked as a miss (#1536)", () => {
@@ -658,7 +663,7 @@ test("handleAcpCache renders the CACHE INVALIDATION breakdown incl. unmeasured (
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic", upstream: "https://api.openai.com" });
     recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
     recordCacheSample(session, { at: T0 + 3000, input: 11500, cached: null });
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /CACHE INVALIDATION/);
     assert.match(text, /wire switch:/);
     assert.match(text, /upstream switch:/);
@@ -737,7 +742,7 @@ test("a large never-caused unattributed residual gets an explicit provider-side 
     for (let i = 0; i < 5; i++) {
         recordCacheSample(session, { at: T0 + 1000 * (i + 1), input: 100000, cached: 90000 });
     }
-    const text = handleAcpCache(session);
+    const text = handleAcpCache(session).text;
     assert.match(text, /CACHE INVALIDATION/);
     assert.match(text, /no observable cause|no cause observed/i);
     assert.match(text, /NOT a bili bug|not a bili bug/i);
@@ -767,5 +772,5 @@ test("pre-#1847 ledger lines keep their historical per-event attribution (#1847)
     const r = buildSessionCacheReport(session);
     assert.equal(r.modelSwitches.events.length, 1);
     assert.equal(r.modelSwitches.events[0].attributed, 40000, "legacy sw line keeps its historical charge display");
-    assert.doesNotMatch(handleAcpCache(session), /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
+    assert.doesNotMatch(handleAcpCache(session).text, /cold rounds/, "legacy charge is not mislabeled as post-switch cold tail");
 });

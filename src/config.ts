@@ -259,6 +259,20 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** Force preflight summarization calls to use streaming (SSE) instead of
+     *  the default non-stream call (#2133). The error-driven self-learn flag
+     *  (`session.metadata.preflightStreamSummary`) only fires on a 400 whose
+     *  body says "stream … true" — a gateway that cuts long non-streaming
+     *  completions with a timeout status (Cloudflare's HTTP 524 is the
+     *  canonical case) never triggers it, so every summary round-trip fails
+     *  and preflight spins without folding until an operator hand-edits the
+     *  session file. Set this where such a gateway sits between bili and the
+     *  origin: every preflight summary call then streams from the first
+     *  attempt. Deepest level wins (global → provider → model), so it can be
+     *  scoped to just the affected route; unset = legacy behavior (non-stream
+     *  first, learn on 400). No-op on the Google wire (its summary calls are
+     *  always streamed via :streamGenerateContent). */
+    streamSummary?: boolean;
     /** Override the kernel's compression prompt text (compressPhilosophy /
      *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
@@ -781,7 +795,34 @@ export type ProxyOptions = {
      *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
      *  `stableSystemAnchor: true` in the config file (env wins). */
     stableSystemAnchor?: boolean;
+    /** #2028: opt-in to letting dsh's built-in auto-compaction (compaction-basic)
+     *  run through bili instead of being refused by the #1729 wire guard.
+     *  Default OFF (= guard active): dsh compaction envelopes (final user
+     *  message = COMPACTION_INSTRUCTION template, ≤4 messages) are refused
+     *  locally with 403 — bili owns compression on that lane. When ON the
+     *  call is forwarded and may LAND: a landed checkpoint durably shadows
+     *  the raw history (irreversible) and destroys bili's compression
+     *  substrate, which is why this stays off by default. On non-web
+     *  profiles the shipped bundle patch (`auto: false`) still suppresses
+     *  AUTO-triggering — only manual /compact benefits there; on web
+     *  profiles (where no patch layer reaches the preset-nested instance,
+     *  #1772) auto-triggering works as-is. Enable with
+     *  `{ "dsh": { "allowDshCompaction": true } }` in the config file, or env
+     *  BILI_ALLOW_DSH_COMPACTION=1. */
+    allowDshCompaction?: boolean;
 };
+
+/** #2028: dsh client-lane settings namespace — home for dsh-specific file
+ *  config so future dsh keys have a section instead of cluttering the root.
+
+ *  The field below USED to sit at the top level (`"allowDshCompaction": true`) in pre-review drafts;
+ *  a top-level value in an existing file is auto-relocated here on load
+ *  (normalizeLegacyAllowDshCompaction) rather than dropped (§7.3).
+ */
+export interface DshFileSettings {
+    /** Enable with `{ "dsh": { "allowDshCompaction": true } }`; full behavior contract on the FileConfig side. */
+    allowDshCompaction?: boolean;
+}
 
 /** The routing fields a provider entry can carry — exactly what
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
@@ -932,6 +973,15 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     const filePassthrough = loadConfigFile().passthrough === true;
     if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
+}
+
+// #2028: resolved dsh-native-compaction opt-in state shared by loadOptions and
+// the web config API (single source of truth — the GET handler must not
+// re-derive it). Same "0-off" env semantics as the loadOptions line.
+export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
+    const fileAllow = loadConfigFile().dsh?.allowDshCompaction === true;
+    if (env.BILI_ALLOW_DSH_COMPACTION !== undefined) return { enabled: env.BILI_ALLOW_DSH_COMPACTION !== "0", source: "env" };
+    return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
@@ -1176,6 +1226,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #2028: default OFF keeps the #1729 wire refusal unconditional unless
+        // explicitly opted out — see the Options.allowDshCompaction docstring.
+        allowDshCompaction: (env.BILI_ALLOW_DSH_COMPACTION ?? (fileConfig.dsh?.allowDshCompaction === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -1306,6 +1359,12 @@ type FileConfig = {
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
+    /** dsh client-lane settings (#2028) — nested under `dsh.*` so future dsh keys
+     *  get a home instead of cluttering the root; see {@link DshFileSettings}. A
+     *  legacy bare top-level `"allowDshCompaction"` value is auto-relocated onto
+     *  `dsh.allowDshCompaction` on load/save (normalizeLegacyAllowDshCompaction).
+     *  Env BILI_ALLOW_DSH_COMPACTION still wins over the file. */
+    dsh?: DshFileSettings;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).
@@ -1457,6 +1516,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
@@ -1475,7 +1535,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile",
+    "reconcile", "streamSummary",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -1521,8 +1581,10 @@ export function loadConfigFile(): FileConfig {
         if (cached && cached.raw === raw) return cached.value;
         const parsed: unknown = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            warnUnknownTopLevelKeys(parsed as Record<string, unknown>);
-            value = parsed as FileConfig;
+            const obj = parsed as Record<string, unknown>;
+            normalizeLegacyAllowDshCompaction(obj);
+            warnUnknownTopLevelKeys(obj);
+            value = obj as FileConfig;
         } else {
             value = {};
         }
@@ -1540,6 +1602,29 @@ export function loadConfigFile(): FileConfig {
     return value;
 }
 
+
+// #2028 relocation: a bare top-level allowDshCompaction predates the dsh.*
+// section (it never shipped beyond preview builds, but hand-saved files may
+// carry it) — carry the value into dsh.allowDshCompaction instead of letting
+// the loader drop it silently (§7.3 never-silently-clobber). A null/missing
+// value is a clear intent (dropped quietly); anything non-boolean is left in
+// place so the unknown-top-level-key warning still names it.
+let warnedLegacyDshConflict = false;
+export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>): void {
+    if (!Object.prototype.hasOwnProperty.call(obj, "allowDshCompaction")) return;
+    const legacy = obj.allowDshCompaction;
+    if (legacy === null || legacy === undefined) { delete obj.allowDshCompaction; return; }
+    if (typeof legacy !== "boolean") return;
+    delete obj.allowDshCompaction;
+    const d = obj.dsh;
+    const dObj = d !== null && typeof d === "object" && !Array.isArray(d) ? (d as Record<string, unknown>) : undefined;
+    if (dObj === undefined) { obj.dsh = { allowDshCompaction: legacy }; return; }
+    if (dObj.allowDshCompaction === undefined) { dObj.allowDshCompaction = legacy; return; }
+    if (!warnedLegacyDshConflict) {
+        warnedLegacyDshConflict = true;
+        loggerLog("warn", "[acp-config] both top-level \"allowDshCompaction\" and \"dsh.allowDshCompaction\" present — the dsh.* value wins, the top-level one is dropped");
+    }
+}
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
 export interface ResignFileSettings {
     enabled?: boolean;
@@ -1821,6 +1906,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("streamSummary" in obj) {
+        if (typeof obj.streamSummary !== "boolean") ok = false;
+        else out.streamSummary = obj.streamSummary;
     }
     if ("rules" in obj) {
         if (typeof obj.rules !== "boolean") ok = false;

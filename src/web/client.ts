@@ -83,12 +83,20 @@ export const WEB_CLIENT = `(function () {
         if (on) { btn.dataset.label = btn.innerHTML; btn.classList.add("busy"); btn.disabled = true; }
         else { btn.classList.remove("busy"); btn.disabled = false; if (btn.dataset.label !== undefined) btn.innerHTML = btn.dataset.label; }
     }
+    // #1937: hard 20s cap — a wedged admin endpoint must fail visibly instead of
+    // stacking unbounded in-flight requests while the UI keeps polling.
     async function json(url, opts) {
-        const res = await fetch(url, opts);
-        let body = null;
-        try { body = await res.json(); } catch (e) {}
-        if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
-        return body;
+        const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timer = ac ? setTimeout(() => ac.abort(), 20000) : null;
+        try {
+            const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
+            let body = null;
+            try { body = await res.json(); } catch (e) {}
+            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            return body;
+        } finally {
+            if (timer !== null) clearTimeout(timer);
+        }
     }
     async function putCfg(btn, payload) {
         busy(btn, true);
@@ -160,6 +168,55 @@ export const WEB_CLIENT = `(function () {
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
     let latestAlerts = [];
+    // #1937: server-side paging state for the session list (50 rows per page).
+    const SES_PAGE_SIZE = 50;
+    let sesPage = 1;
+    let sesTotal = 0;
+    // #1937: poll failure accounting — exponential backoff (5s → 10s → … cap 60s),
+    // one persistent error strip instead of toast spam, and an in-flight guard so
+    // slow responses never stack concurrent admin requests.
+    let pollFailures = 0;
+    let nextPollAt = 0;
+    let pollBusy = false;
+    let lastErrMsg = "";
+    function friendlyMsg(e) {
+        const m = String((e && e.message) || "");
+        if (/abort/i.test(m)) return t("data.timeout");
+        return m || t("data.generic");
+    }
+    function showDataError(msg) {
+        lastErrMsg = msg;
+        let el = $("bili-data-error");
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "bili-data-error";
+            el.className = "banner err";
+            const host = document.querySelector ? (document.querySelector("main") || document.body) : document.body;
+            if (host && host.appendChild) host.prepend ? host.prepend(el) : host.appendChild(el);
+        }
+        el.textContent = t("data.error", { msg });
+        el.hidden = false;
+    }
+    function hideDataError() {
+        const el = $("bili-data-error");
+        if (el) { el.hidden = true; el.textContent = ""; }
+    }
+
+    function sortKeysDeep(x) {
+        if (Array.isArray(x)) return x.map(sortKeysDeep);
+        if (x !== null && typeof x === "object") { const o = {}; Object.keys(x).sort().forEach((k) => { o[k] = sortKeysDeep(x[k]); }); return o; }
+        return x;
+    }
+    function canonCfgText(s) {
+        try { return JSON.stringify(sortKeysDeep(JSON.parse(s))); } catch (e) { return "\u0000" + s; }
+    }
+    let cfgSavedSnap = null;
+    function refreshDirtyFlag() {
+        const el = $("cfg-file-edit");
+        const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
+        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+    }
 
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
@@ -198,12 +255,18 @@ export const WEB_CLIENT = `(function () {
         return '<td class="num"><span class="hitc" title="' + escapeHtml(t("ses.drop_ph")) + '">(' + parts.join("/") + ")</span></td>";
     }
     // MODEL SWITCHES column (#1535): mid-session model changes re-bill the stable prefix;
-    // shows count · dropped tokens, honest dash when none.
+    // shows count · dropped tokens, honest dash when none. #2131: appends 🔑 key
+    // switches (relay account rotation) when observed — rare but cache-fatal.
     function switchTd(s) {
-        if (!s.modelSwitches) return '<td class="num dim">' + t("common.none") + "</td>";
-        const tip = escapeHtml(t("ses.th_switches_tip"));
-        if (!s.switchMissedTokens) return '<td class="num" title="' + tip + '">' + s.modelSwitches + "</td>";
-        return '<td class="num" title="' + tip + '">' + s.modelSwitches + " · " + fmtW(s.switchMissedTokens) + "</td>";
+        const modelPart = s.modelSwitches
+            ? s.modelSwitches + (!s.switchMissedTokens ? "" : " · " + fmtW(s.switchMissedTokens))
+            : "";
+        const keyPart = s.keySwitches
+            ? '<span title="' + escapeHtml(t("ses.th_keyswitches_tip")) + '">🔑' + s.keySwitches + (!s.keySwitchMissedTokens ? "" : " · " + fmtW(s.keySwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart].filter(Boolean);
+        return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
     function sessionRow(s, compact) {
@@ -274,8 +337,11 @@ export const WEB_CLIENT = `(function () {
             if (!recent.length) rb.innerHTML = '<tr><td colspan="13" class="dim">' + t("common.empty") + "</td></tr>";
             recent.forEach((s) => rb.appendChild(sessionRow(s, false)));
             renderBanners(d);
+            return true;
         } catch (e) {
-            if (!silent) toast(t("toast.failed", { msg: e.message }), "err");
+            lastErrMsg = friendlyMsg(e);
+            if (!silent) toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
         }
     }
     function renderBanners(d) {
@@ -435,24 +501,57 @@ export const WEB_CLIENT = `(function () {
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
+    // #1937: the list is server-side paged & filtered — page 1 replaces the
+    // cache, load-more appends the next page, search re-queries with ?q=.
     async function refreshSessions(showToast) {
         try {
-            const d = await json("/__bili/sessions");
+            const d = await json(sessionListUrl(1));
             sessionsCache = d.sessions || [];
+            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
+            sesPage = 1;
             hiddenEmptyN = d.hiddenEmpty || 0;
             renderSessionTable();
+            updateLoadMoreBtn();
+            return true;
         } catch (e) {
-            if (showToast) toast(t("toast.failed", { msg: e.message }), "err");
+            lastErrMsg = friendlyMsg(e);
+            if (showToast) toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
         }
     }
-    function renderSessionTable() {
+    function sessionListUrl(page) {
         const input = $("ses-search");
-        const q = ((input && input.value) || "").toLowerCase();
-        const rows = sessionsCache.filter((s) => !q
-            || (s.title || "").toLowerCase().indexOf(q) >= 0
-            || (s.label || "").toLowerCase().indexOf(q) >= 0
-            || s.id.toLowerCase().indexOf(q) >= 0);
-        $("ses-count").textContent = t("ses.count", { count: rows.length });
+        const q = ((input && input.value) || "").trim();
+        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+    }
+    async function loadMoreSessions() {
+        const btn = $("ses-loadmore");
+        if (btn) busy(btn, true);
+        try {
+            const next = sesPage + 1;
+            const d = await json(sessionListUrl(next));
+            sessionsCache = sessionsCache.concat(d.sessions || []);
+            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
+            sesPage = next;
+            renderSessionTable();
+            updateLoadMoreBtn();
+            return true;
+        } catch (e) {
+            lastErrMsg = friendlyMsg(e);
+            toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
+        } finally {
+            if (btn) busy(btn, false);
+        }
+    }
+    function updateLoadMoreBtn() {
+        const btn = $("ses-loadmore");
+        if (!btn) return;
+        btn.hidden = !(sessionsCache.length < sesTotal);
+    }
+    function renderSessionTable() {
+        const rows = sessionsCache;
+        $("ses-count").textContent = t("ses.count", { count: sesTotal });
         const heEl = $("ses-empty-hint");
         if (heEl) {
             if (hiddenEmptyN > 0) { heEl.hidden = false; heEl.textContent = t("ses.empty_hidden", { n: hiddenEmptyN }); }
@@ -859,6 +958,51 @@ export const WEB_CLIENT = `(function () {
             });
             parts.push("</tbody></table></div></details>");
         }
+        // #2131: key switch events (relay account rotation) — fingerprints only,
+        // raw credentials never leave the ledger.
+        const keySw = ledger.keySwitches;
+        if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
+            const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.key_fp") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+            keySw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2131: per-call body-stability proof (digest vs previous settled request).
+        // Defensive reads — servers predating #2131 carry no ledger.stability, and an
+        // unpaired shape (paired=0) must render nothing.
+        const stRaw = ledger.stability && typeof ledger.stability === "object" ? ledger.stability : null;
+        if (stRaw && (Number(stRaw.paired) || 0) > 0) {
+            const st = {
+                paired: Number(stRaw.paired) || 0,
+                equal: Number(stRaw.equal) || 0,
+                diverged: Number(stRaw.diverged) || 0,
+                head: Number(stRaw.head) || 0,
+                append: Number(stRaw.append) || 0,
+                mid: Number(stRaw.mid) || 0,
+                unknownOffset: Number(stRaw.unknownOffset) || 0,
+                sizeBuckets: Array.isArray(stRaw.sizeBuckets) ? stRaw.sizeBuckets : [],
+                gapSplit: stRaw.gapSplit && typeof stRaw.gapSplit === "object" ? stRaw.gapSplit : null,
+            };
+            const divParts = [];
+            if (st.equal > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_identical")) + " <b>" + st.equal + "</b></span>");
+            if (st.head > 0) divParts.push('<span style="color:#bf8700">' + escapeHtml(t("det.stab_head")) + " <b>" + st.head + "</b></span>");
+            if (st.append > 0) divParts.push('<span style="color:#57606a">' + escapeHtml(t("det.stab_append")) + " <b>" + st.append + "</b></span>");
+            if (st.mid > 0) divParts.push('<span style="color:#cf222e">' + escapeHtml(t("det.stab_mid")) + " <b>" + st.mid + "</b></span>");
+            if (st.unknownOffset > 0) divParts.push('<span class="dim">' + escapeHtml(t("det.stab_unknown")) + " <b>" + st.unknownOffset + "</b></span>");
+            let stabBody = '<div class="mono small" style="line-height:1.8">' + escapeHtml(t("det.stab_pairs", { n: st.paired })) + ": " + (st.diverged > 0 ? '<span style="color:' + (st.mid > 0 ? "#cf222e" : "inherit") + '">' + st.diverged + " ↓</span>" : "0") + (divParts.length ? " — " + divParts.join(" · ") : "") + "</div>";
+            const sb = st.sizeBuckets.filter((b) => b && (Number(b.n) || 0) >= 3);
+            if (sb.length >= 2) {
+                stabBody += '<div class="dim small mono" style="margin-top:4px">' + escapeHtml(t("det.stab_size")) + ": " + sb.map((b) => Math.round(((Number(b.lo) || 0) / 1000)) + "K=" + (Number(b.hitMedian) || 0).toFixed(0) + "%").join("  ") + "</div>";
+            }
+            if (st.gapSplit && st.gapSplit.lowHitMedGapMs != null && st.gapSplit.highHitMedGapMs != null) {
+                stabBody += '<div class="dim small mono" style="margin-top:4px">' + escapeHtml(t("det.stab_gap", { a: ((Number(st.gapSplit.lowHitMedGapMs) || 0) / 1000).toFixed(1), b: ((Number(st.gapSplit.highHitMedGapMs) || 0) / 1000).toFixed(1) })) + "</div>";
+            }
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.stab_tip")) + '"><b>' + escapeHtml(t("det.stab_title")) + "</b></summary>"
+                + '<div style="padding:4px 8px 10px">' + stabBody + "</div></details>");
+        }
         const tot = ledger.totals;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.cache_econ") + "</span>" + (tot ? (tot.balanced ? ' <span class="badge ok">' + t("det.ce_balanced") + "</span>" : ' <span class="badge warn">' + t("det.ce_unbalanced") + "</span>") : "") + '</div><div class="card-b">' + (d.ledger ? '<div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px"><button id="cacherpt-copy" class="btn sm">' + t("common.copy") + '</button><button id="cacherpt-dl" class="btn sm">' + t("det.report_dl") + "</button></div>" : ""));
         if (tot) {
@@ -1188,7 +1332,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
-            hydrateQuickConfig();
+            if (fe) cfgSavedSnap = fe.value;
+            hydrateQuickConfig(cfg);
+            refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
             ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
@@ -1212,7 +1358,7 @@ export const WEB_CLIENT = `(function () {
             toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
-    function hydrateQuickConfig() {
+    function hydrateQuickConfig(cfg) {
         const box = $("quick-fields");
         if (!box) return;
         box.innerHTML = "";
@@ -1241,6 +1387,8 @@ export const WEB_CLIENT = `(function () {
             const cp = compressOf(draft);
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
+            dsgRow.inp.checked = Boolean(draft.dsh && draft.dsh.allowDshCompaction === true);
+            dsgWarnNote.hidden = !(draft.dsh && draft.dsh.allowDshCompaction === true);
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             ["default", "lean"].forEach((name) => {
@@ -1274,6 +1422,7 @@ export const WEB_CLIENT = `(function () {
             if (fe) fe.value = JSON.stringify(draft, null, 2);
             quickBroken(false);
             syncAll();
+            refreshDirtyFlag();
         }
         function row(id, label) {
             const w = document.createElement("div");
@@ -1318,6 +1467,26 @@ export const WEB_CLIENT = `(function () {
         qCtrls.push(ptRow.inp);
         ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
         void ptRow.ctl;
+        // #2028: env BILI_ALLOW_DSH_COMPACTION outranks the file — keep the control out
+        // of qCtrls in that case so quickBroken's blanket enable/disable never re-enables it.
+        const dsgEnvForced = Boolean(cfg.allowDshCompaction && cfg.allowDshCompaction.source === "env");
+        const dsgRow = row("quick-dsg", t("cfg.q_dsh_compact"));
+        if (!dsgEnvForced) qCtrls.push(dsgRow.inp);
+        const dsgWarnNote = document.createElement("div");
+        dsgWarnNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#9a6700";
+        dsgWarnNote.textContent = t("cfg.q_dsh_compact_warn");
+        dsgWarnNote.hidden = true;
+        box.appendChild(dsgWarnNote);
+        const dsgEnvNote = document.createElement("div");
+        dsgEnvNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        dsgEnvNote.textContent = t("cfg.q_dsh_compact_env");
+        dsgEnvNote.hidden = true;
+        box.appendChild(dsgEnvNote);
+        dsgRow.inp.addEventListener("change", () => commit((d) => {
+            if (dsgRow.inp.checked) { if (!d.dsh || typeof d.dsh !== "object") d.dsh = {}; d.dsh.allowDshCompaction = true; }
+            else { if (d.dsh) { delete d.dsh.allowDshCompaction; if (Object.keys(d.dsh).length === 0) delete d.dsh; } }
+        }));
+        if (dsgEnvForced) { dsgRow.inp.disabled = true; dsgEnvNote.hidden = false; }
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -1448,7 +1617,7 @@ export const WEB_CLIENT = `(function () {
         moreA.style.cssText = "font-size:12px;color:#0969da";
         moreA.textContent = t("cfg.q_more");
         box.appendChild(moreA);
-        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); refreshDirtyFlag(); });
         syncAll();
     }
     async function loadUpstream(cfg) {
@@ -1481,7 +1650,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadLogs() {
         const qEl = $("log-search");
-        if (!qEl || !$("log-body")) return;
+        if (!qEl || !$("log-body")) return true;
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
@@ -1501,12 +1670,13 @@ export const WEB_CLIENT = `(function () {
             } else {
                 bodyEl.textContent = rows.join("\\n");
             }
-        } catch (e) { /* the log endpoint is best-effort; stay quiet */ }
+            return true;
+        } catch (e) { /* the log endpoint is best-effort; stay quiet */ lastErrMsg = friendlyMsg(e); return false; }
     }
 
     function bindLauncherNotes() {
         // Per-client launch notes (from the README launcher table) as hover tooltips.
-        const N = { pi: t("con.note_pi"), codex: t("con.note_codex"), claude: t("con.note_claude"), omp: t("con.note_omp"), opencode: t("con.note_opencode"), hermes: t("con.note_hermes"), dsh: t("con.note_dsh"), codebuddy: t("con.note_codebuddy"), qoder: t("con.note_qoder"), trae: t("con.note_trae"), jcode: t("con.note_jcode"), kimi: t("con.note_kimi"), gemini: t("con.note_gemini"), iflow: t("con.note_iflow"), qwen: t("con.note_qwen"), mcode: t("con.note_mcode"), aider: t("con.note_aider"), copilot: t("con.note_copilot"), amp: t("con.note_amp"), goose: t("con.note_goose") };
+        const N = { pi: t("con.note_pi"), codex: t("con.note_codex"), claude: t("con.note_claude"), omp: t("con.note_omp"), opencode: t("con.note_opencode"), hermes: t("con.note_hermes"), dsh: t("con.note_dsh"), codebuddy: t("con.note_codebuddy"), qoder: t("con.note_qoder"), trae: t("con.note_trae"), jcode: t("con.note_jcode"), kimi: t("con.note_kimi"), gemini: t("con.note_gemini"), iflow: t("con.note_iflow"), qwen: t("con.note_qwen"), antigravity: t("con.note_antigravity"), mcode: t("con.note_mcode"), aider: t("con.note_aider"), copilot: t("con.note_copilot"), amp: t("con.note_amp"), goose: t("con.note_goose") };
         document.querySelectorAll(".chip[data-launcher]").forEach((el) => { const n = N[el.getAttribute("data-launcher")]; if (n) el.title = n; });
     }
 
@@ -1549,8 +1719,16 @@ export const WEB_CLIENT = `(function () {
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
             location.reload();
         });
+        // #1937: search is server-side (?q=) — debounced re-query, not a local filter.
         const search = $("ses-search");
-        if (search) search.addEventListener("input", renderSessionTable);
+        if (search) {
+            let sesTimer = null;
+            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false), 300); });
+        }
+        const sref = $("ses-refresh");
+        if (sref) sref.addEventListener("click", () => refreshSessions(true));
+        const lm = $("ses-loadmore");
+        if (lm) lm.addEventListener("click", loadMoreSessions);
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -1691,13 +1869,29 @@ export const WEB_CLIENT = `(function () {
     hydrate();
     initStaticHandlers();
     route();
-    setInterval(() => {
+    // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
+    // persistent error strip instead of silent toast-spam retries, and a slow
+    // wedged response can never stack onto an in-flight poll.
+    setInterval(async () => {
         if (document.hidden) return;
-        // #1682: keep the global alert banner fresh on every view — silent, so a
-        // restarting server cannot spam toasts from background views.
-        if (current === "overview") loadOverview();
-        else loadOverview(true);
-        if (current === "sessions" && $("session-detail-view").hidden) refreshSessions(false);
-        else if (current === "logs") loadLogs();
+        if (pollBusy) return;
+        if (pollFailures > 0 && Date.now() < nextPollAt) return;
+        pollBusy = true;
+        try {
+            // #1682: keep the global alert banner fresh on every view — silent, so a
+            // restarting server cannot spam toasts from background views.
+            let ok = current === "overview" ? await loadOverview() : await loadOverview(true);
+            // A paged-down or searched list must not be clobbered by the background refresh.
+            if (current === "sessions" && $("session-detail-view").hidden && sessionsCache.length <= SES_PAGE_SIZE) ok = (await refreshSessions(false)) && ok;
+            else if (current === "logs") ok = (await loadLogs()) && ok;
+            if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
+            else {
+                pollFailures += 1;
+                nextPollAt = Date.now() + Math.min(5000 * Math.pow(2, pollFailures), 60000);
+                showDataError(lastErrMsg || t("data.generic"));
+            }
+        } finally {
+            pollBusy = false;
+        }
     }, 5000);
 })();`;

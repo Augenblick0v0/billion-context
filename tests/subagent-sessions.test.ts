@@ -60,7 +60,7 @@ function seedDispatch(idCall: string, idResult: string, sessionId: string): Core
 }
 
 function runApply(ctx: Ctx, args: unknown): string {
-    return applyRanges(parseCompressInput(args), ctx);
+    return applyRanges(parseCompressInput(args), ctx).text;
 }
 
 function opencode(ctx: Ctx): Ctx {

@@ -27,6 +27,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
@@ -248,6 +249,10 @@ if (plan.mode !== "off") armNativePi(plan);
 // never patch globalThis.fetch or bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     installNativeFetchIntercept(state);
+    // #2111: the Codex Responses WS leg shares the fetch intercept's enable
+    // conditions and lifecycle — off mode patches nothing, repeated loads are
+    // no-ops, and the wrapper installs before any model connection exists.
+    installNativeWebSocketIntercept(state);
 }
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */

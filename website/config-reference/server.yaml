@@ -299,6 +299,13 @@ entries:
     group: behavior
     desc_en: "Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued)."
     desc_zh: "在内核重建的 Responses 请求上保留 previous_response_id（默认剔除，使重建请求体永不引用上游从未签发过的响应 id）。"
+  - key: dsh.allowDshCompaction
+    type: boolean
+    default: "false"
+    env: BILI_ALLOW_DSH_COMPACTION
+    group: behavior
+    desc_en: "Lift bili's local 403 refusal of dsh native compaction calls (#1729/#2028): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in."
+    desc_zh: "解除 bili 对 dsh 原生压缩调用的本地 403 拒绝（#1729/#2028）：为 true 时 dsh 的 compaction-basic 可经 bili 执行；其 checkpoint 会永久覆盖原始历史，属显式的不可逆 opt-in。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"

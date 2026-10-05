@@ -297,6 +297,40 @@ on `workflow_dispatch` with `@opencode/cli@2.0.3` pinned (V2 lane), same
 discipline as the pi/codex pins (#815). The V1 lane (1.x) is exercised by the
 same suite via `E2E_OC_BIN`.
 
+## Native-lane suite (`e2e-pi-codex-ws.test.ts`) — real `pi` Codex Responses WebSocket lane vs deterministic mock
+
+Real `pi` (pinned `pi-stable`, see CI) with a custom `openai-codex-responses`
+provider pointed at a local mock that speaks BOTH legs — POST/SSE and a
+WebSocket upgrade on one port — through the real built proxy. Zero tokens.
+
+Gated: `ACP_TEST_E2E_PI_WS=1` (skip-by-default like the other real-client
+lanes); needs the built `dist/agent/pi-native.js`. Override the binary with
+`E2E_PI_BIN`.
+
+```bash
+ACP_TEST_E2E_PI_WS=1 E2E_PI_BIN=pi node --import tsx --test tests/e2e/e2e-pi-codex-ws.test.ts
+```
+
+### Mechanics
+
+Scenarios: **A** explicit `websocket` — intercept, `/bili/` rewrite,
+upgrade-header stamps (`x-bili-plugin*`, `session-id` == conversation id),
+compress/decompress round trip reflected in subsequent requests; **B**
+`auto` — WS used when the handshake succeeds, `previous_response_id`
+incremental continuation frames observed and expanded by the proxy; **C**
+`auto` against a WS-refusing upstream — clean mid-stream failure (the
+client-side handshake now targets the local proxy, which always succeeds),
+then an explicit-`sse` ctx proves that lane is unaffected; **D** explicit
+`sse` regression guard — full fold cycle over plain HTTP, zero WS
+connections; **E** two subagent-style sessions sharing one proxy (attach
+mode) interleave with identical tool args and never cross state.
+
+### CI
+
+`.github/workflows/ci-e2e-pi-ws.yml` (pull_request + workflow_dispatch),
+mirrors `ci-e2e-native.yml`: pins `pi-stable@0.83.6`, symlinks the canonical
+`pi` bin, collects `tmp/e2e-pi-codex-ws-*` artifacts on failure.
+
 ## Release canary (`e2e-release-canary.test.ts`) — automated no-op self-update drill
 
 `ACP_TEST_CANARY=1` runs the #1811 release-receive drill: the BUILT tree is

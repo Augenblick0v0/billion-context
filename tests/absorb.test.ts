@@ -109,7 +109,7 @@ test("executeAbsorb: success records absorption, credits net exactly once", () =
         config,
         messages: turn.messages,
         session,
-    });
+    }).text;
     assert.ok(!result.includes("FAILED"), result);
     assert.match(result, /^absorbed m\d+/);
     assert.equal(session.state.absorbed?.length, 1);
@@ -120,7 +120,7 @@ test("executeAbsorb: success records absorption, credits net exactly once", () =
     assert.equal(session.stats.lastInputTokens, 100_000 - record.tokensReclaimed);
 
     // Re-absorbing the same ref is an ok=true no-op and must NOT credit again.
-    const again = executeAbsorb({ ref, summary: "retry" }, "call_y", config.absorb!, { config, messages: turn.messages, session });
+    const again = executeAbsorb({ ref, summary: "retry" }, "call_y", config.absorb!, { config, messages: turn.messages, session }).text;
     assert.ok(!again.includes("FAILED"), again);
     assert.match(again, /already absorbed/);
     assert.equal(session.state.absorbed?.length, 1);
@@ -131,9 +131,9 @@ test("executeAbsorb: bad ref and invalid input fail with FAILED marker", () => {
     const { turn, config } = makeTurn();
     const session = makeSession();
     session.state = turn.state;
-    const badRef = executeAbsorb({ ref: "m99999", summary: "x" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const badRef = executeAbsorb({ ref: "m99999", summary: "x" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badRef, /\[absorb FAILED: absorb failed: ref m99999/);
-    const badInput = executeAbsorb({ summary: "no ref" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const badInput = executeAbsorb({ summary: "no ref" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.match(badInput, /\[absorb FAILED: invalid input/);
     assert.equal((session.state.absorbed ?? []).length, 0);
 });
@@ -165,7 +165,7 @@ test("applyAbsorbView: hides recorded pairs even after the feature is disabled",
     const session = makeSession();
     session.state = turn.state;
     const ref = refFor("t-res");
-    const result = executeAbsorb({ ref, summary: "short" }, undefined, config.absorb!, { config, messages: turn.messages, session });
+    const result = executeAbsorb({ ref, summary: "short" }, undefined, config.absorb!, { config, messages: turn.messages, session }).text;
     assert.ok(!result.includes("FAILED"), result);
     const hidden = applyAbsorbView(turn.messages, session.state, defaultConfig(200000), 100_000);
     assert.deepEqual(hidden.map((m) => m.id), ["u1"], "both halves of the absorbed pair are hidden");
