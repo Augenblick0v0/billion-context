@@ -603,7 +603,9 @@ test(`Responses WS faults: repeated ${code} stops after one transport recovery`,
         assert.equal(f.rows.length, 4);
         assert.equal(f.rows[3].request.previous_response_id, undefined);
         assert.ok(!JSON.stringify(f.rows[3].full).includes("bounded retry"));
-        const log = (await readLogUntil(f.logPath, [/upstream rejected phase=await-first-event status=400/]))
+        // The retry-count assert below reads `upstream retry reason=` lines that are not in the wait list —
+        // settle them first (same buffered-log race class as #2212).
+        const log = (await readLogUntil(f.logPath, [/upstream rejected phase=await-first-event status=400/, /upstream retry reason=/]))
             .split("\n").filter(line => line.includes("[responses-ws]")).join("\n");
         assert.equal((log.match(/upstream retry reason=/g) ?? []).length, 1);
         assert.doesNotMatch(log, /private-error-message|fake-credential/);
