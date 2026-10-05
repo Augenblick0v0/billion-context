@@ -81,29 +81,33 @@ test("external summary batch: pre-aborted requests do not dispatch any range", a
     assert.deepEqual(result, { status: "cancelled", results: [] });
 });
 
-test("external summary batch: queue time consumes the shared deadline", async () => {
+test("external summary batch: queue time consumes the shared deadline", async (t) => {
+    let elapsed = 0;
+    t.mock.method(performance, "now", () => elapsed);
     const executor = new ExternalSummaryExecutor(1);
     let entered!: () => void;
     const dispatched = new Promise<void>((resolve) => { entered = resolve; });
     let release!: (value: string) => void;
     const occupied = executor.execute(work[0], [{ summarize: () => { entered(); return new Promise((resolve) => { release = resolve; }); } }], budget);
     await dispatched;
-    const timer = setTimeout(() => release("occupying summary"), 40);
     let calls = 0;
     try {
-        const result = await executor.executeBatch(work, [{ summarize: async (request, signal) => {
+        const pending = executor.executeBatch(work, [{ summarize: async () => {
             calls++;
             if (calls === 1) {
-                await new Promise((resolve) => setTimeout(resolve, 20));
+                elapsed = 60;
                 return "first summary";
             }
-            return stalled.summarize(request, signal);
+            elapsed = 121;
+            return "late summary";
         } }], { ...budget, totalTimeoutMs: 120 });
+        elapsed = 40;
+        release("occupying summary");
+        const result = await pending;
         assert.equal(result.status, "deadline");
         assert.deepEqual(result.results.map((range) => range.status), ["success", "deadline"]);
         assert.equal(calls, 2);
     } finally {
-        clearTimeout(timer);
         release("cleanup summary");
         assert.equal((await occupied).status, "success");
     }
