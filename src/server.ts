@@ -6785,11 +6785,13 @@ async function forward(
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
             // first post-fold rejection left strictReasoningEcho unset — #651 kept
             // dropping reasoning and every following turn split again.
-            if (upstream.status === 400 && /reasoning_content/i.test(errBody.toString("utf8"))) {
+            // #2169: match BOTH field spellings — the chat wire says
+            // reasoning_content, DeepSeek's Responses wire says reasoning_text.
+            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errBody.toString("utf8"))) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
-                    log("warn", `[${s.id}] upstream 400 mentions reasoning_content — learned strictReasoningEcho for this session (#684/#762); reasoning-drop disabled`);
+                    log("warn", `[${s.id}] upstream 400 mentions a reasoning echo field — learned strictReasoningEcho for this session (#684/#762/#2169); reasoning-drop disabled`);
                 }
             }
         }
