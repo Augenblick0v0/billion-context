@@ -9,8 +9,14 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-04",
+    "updated": "2026-10-05",
     "releases": [
+      {
+        "version": "0.1.185",
+        "date": "2026-10-05",
+        "tier": "critical",
+        "summary": "Severe dsh fix: background side requests (title generation etc.) could steal the main session's anchor and permanently break compression (#2156, #2160) — side traffic now rides a dedicated lane (#2157). Windows: bili no longer exits after a self-update (#2095). Restart dsh once. 丨 严重修复:dsh 后台侧请求(标题生成等)会抢占主会话锚点、永久破坏压缩(#2156、#2160),现已走独立通道(#2157);Windows 自更新后不再退出(#2095)。重启一次 dsh。"
+      },
       {
         "version": "0.1.184",
         "date": "2026-10-04",
