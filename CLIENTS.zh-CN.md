@@ -28,9 +28,9 @@
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
 
-## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code)
+## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
-面向 gemini-cli 架构家族的三个启动器(#1043 第一梯队)。三者中两个有 base-URL 环境变量钩子,一个没有:
+面向 gemini-cli 架构家族的四个启动器(#1043 第一梯队)。四者中三个有 base-URL 环境变量钩子,一个没有:
 
 - **`bili gemini`** —— Gemini CLI(`@google/gemini-cli`)。设置
   `GOOGLE_GEMINI_BASE_URL=<proxy>/bili/<upstream>`(默认上游
@@ -50,10 +50,33 @@
   但它遵循标准代理环境变量,所以启动器走证书 MITM:`HTTPS_PROXY=<proxy>` +
   `NODE_EXTRA_CA_CERTS=<bili CA>`,并把默认模型主机(DashScope / Qwen 网关 /
   常见第三方端点)静态加白。自建中转主机用 `--mitm-domain <host>` 追加。
-  尽力而为的路由 —— 日志里出现 `BLIND TUNNEL WARNING` 说明有主机没进白名单。
+   尽力而为的路由 —— 日志里出现 `BLIND TUNNEL WARNING` 说明有主机没进白名单。
+- **`bili antigravity`** —— Google Antigravity(#2115)。启动器驱动官方 CLI
+  二进制 **`agy`**(Gemini CLI 的继任者,Gemini CLI 已于 2026-06 退役;在
+  `PATH` 或 `~/.local/bin/agy`,Windows 为 `%LOCALAPPDATA%\agy\bin`)。其模型
+  通道在闭源 Go `language_server` 内部,该进程遵循一个**未公开的**
+  `CLOUD_CODE_URL` 环境变量覆盖(已在 v2.19.1 二进制中验证:*"Overriding
+  CloudCodeServerURL via CLOUD_CODE_URL environment variable"*),形态与
+  gemini-cli 的 base-URL 钩子相同。启动器设置
+  `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
+  `https://cloudcode-pa.googleapis.com`;如果你自己导出了 `CLOUD_CODE_URL`,
+  该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
+  `:streamGenerateContent` / `:generateContent` / `:countTokens` 请求走
+  Google 原生适配器,与 `bili gemini` 一样被压缩。若服务端改用 gRPC 方法
+  path(`/google.internal.cloud.code.v1internal.CloudCode/*`),这些请求不被
+  识别、原样透传不压缩 —— 属优雅降级,确认后可用按 lane 的 `protocol`
+  声明(#1909)修复。若 Google 将来移除该环境钩子,退路是证书 MITM:
+  language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
+  `cloudcode-pa.googleapis.com` 加进 `"mitm".domains` 并信任 bili 根 CA
+  即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
+  CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
 
-三者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
-fork 继承同一面)。按设计保持 launcher-only。
+四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
+fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>/` 下的
+`plugin.json`、`hooks.json`、`mcp_config.json`、`skills/`、JS sidecar ——
+但每个面都只能追加:工具、提示词、UI、事件回调,没有任何一个能拦截或改写
+模型请求/响应流,那条流完全留在闭源 language_server 内部,所以 wire-only
+是 v1 的上限)。按设计保持 launcher-only。
 
 ## Hermes（Nous Research）
 

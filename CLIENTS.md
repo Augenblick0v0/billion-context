@@ -365,10 +365,10 @@ The #321 budget `-c` args are kept verbatim (embedded mode honors them
 identically). If you want the shared background server, run native `codex`
 directly — no compression, but tools still work via `bili plugin install codex`.
 
-## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
+## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
-Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of
-the three have a base-URL env hook; one doesn't:
+Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of
+the four have a base-URL env hook; one doesn't:
 
 - **`bili gemini`** — Gemini CLI (`@google/gemini-cli`). Sets
   `GOOGLE_GEMINI_BASE_URL=<proxy>/bili/<upstream>` (default upstream
@@ -392,12 +392,41 @@ the three have a base-URL env hook; one doesn't:
   `HTTPS_PROXY=<proxy>` + `NODE_EXTRA_CA_CERTS=<bili CA>` with a static
   whitelist of the default model hosts (DashScope / Qwen gateway / common
   third-party endpoints). Custom relay hosts: add them with
-  `--mitm-domain <host>`. Best-effort route — a `BLIND TUNNEL WARNING` in the
-  log means a host is missing from the whitelist.
+   `--mitm-domain <host>`. Best-effort route — a `BLIND TUNNEL WARNING` in the
+   log means a host is missing from the whitelist.
+- **`bili antigravity`** — Google Antigravity (#2115). The launcher drives the
+  official CLI binary **`agy`** (the successor of Gemini CLI, which was
+  discontinued in 2026-06; found on `PATH` or at `~/.local/bin/agy`, Windows
+  `%LOCALAPPDATA%\agy\bin`). Its model channel lives inside the closed-source
+  Go `language_server`, which honors an **undocumented** `CLOUD_CODE_URL` env
+  override (verified in the v2.19.1 binary: *"Overriding CloudCodeServerURL
+  via CLOUD_CODE_URL environment variable"*) — same shape as the gemini-cli
+  base-URL hook. The launcher sets
+  `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
+  `https://cloudcode-pa.googleapis.com`; if you export your own
+  `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
+  no CA install. The proxy recognizes the wire **by path**:
+  `:streamGenerateContent` / `:generateContent` / `:countTokens` requests are
+  routed to the Google-native adapter and compressed like `bili gemini`. If
+  the server instead uses gRPC method paths
+  (`/google.internal.cloud.code.v1internal.CloudCode/*`), those requests are
+  not recognized and relay verbatim without compression — a graceful degrade,
+  fixable with a per-lane `protocol` declaration (#1909) once confirmed.
+  Fallback if Google ever removes the env hook: cert-MITM — the
+  language_server honors `HTTPS_PROXY` and does not pin certificates, so add
+  `cloudcode-pa.googleapis.com` to `"mitm".domains` and trust bili's root CA.
+  The desktop app and the IDE extension share this same language_server
+  channel; the launcher drives the CLI specifically — desktop users can export
+  `CLOUD_CODE_URL` manually or use the MITM recipe.
 
-None of the three has a native mode: none exposes an in-loop tool injection
+None of the four has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit
-that surface). Launcher-only by design.
+that surface; Antigravity ships a user-plugin system — `plugins/<name>/`
+with `plugin.json`, `hooks.json`, `mcp_config.json`, `skills/`, JS sidecars —
+but every surface is additive only: tools, prompts, UI, event callbacks.
+Nothing in it can intercept or rewrite the model request/response stream,
+which stays entirely inside the closed language_server, so wire-only
+integration is the ceiling for v1). Launcher-only by design.
 
 ## Pi (pi.dev coding agent)
 
