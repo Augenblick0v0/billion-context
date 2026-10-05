@@ -414,16 +414,16 @@ HTTP-based provider (Anthropic, OpenAI chat/completions/responses, Gemini,
 Mistral, OpenRouter, Azure, custom relays…) rides this path as a named
 plugin-mode session.
 
-**The WebSocket gap (#2073).** A WebSocket connection never goes through
-`globalThis.fetch`, so pi's WebSocket model transports bypass the native
-intercept entirely whenever the handshake succeeds:
+**WebSocket coverage (#2073, implemented in #2111).** A WebSocket connection never goes through `globalThis.fetch`, so the native extension also wraps `globalThis.WebSocket` at load time — before pi's first model connection (pi's Node branch reads the global per call; its Bun branch caches a subclass on first call, which is why install-time ordering is safe on both runtimes). Only supported Codex Responses model connections are rewritten — every other WebSocket (devtools, third-party libraries, already-routed URLs) passes through untouched:
 
 | Provider / transport | Status |
 |---|---|
 | All HTTP providers | ✅ covered — named plugin-mode session |
 | `openai-codex-responses` (ChatGPT backend-api), `transport: "sse"` | ✅ covered — identical to any HTTP provider |
-| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ❌ bypasses the proxy while the WebSocket succeeds — the ACP tools are still registered and their calls still reach the proxy, but no model request from that session ever arrives, so no conversation state exists. Tool calls fail at the routing stage (`unknown plugin conversation` + `NO MODEL REQUESTS`, #1158 diagnostic). Until #2072 ships the failure is worse than loud: a stale outbound witness from a *sibling* subagent session can silently answer with that other session's state (#2063) — treat status panels from such sessions as untrustworthy until you check bili.log |
-| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (tracked under #2073) |
+| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ✅ covered (#2111) — the constructor URL is rewritten to `<proxy-ws>/bili/<https-upstream>` (e.g. `wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`). Constructor args, subprotocols and request headers are preserved, so the same `session-id` pi sends on SSE rides the upgrade and the session identity is byte-identical across transports; subagents keep their own ids. `previous_response_id` incremental continuation works over the lane (the proxy expands deltas before the pipeline and re-optimizes them back upstream) |
+| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (out of #2111's scope, tracked separately under #2073) |
+
+One topology consequence of the intercept: pi's client-side handshake now targets the local proxy (which always succeeds), so an *upstream* WS refusal surfaces as a mid-stream transport failure instead of triggering pi's same-turn SSE fallback — that fallback only fires on a client-side handshake failure. The explicit `sse` lane below remains the deterministic escape hatch.
 
 **Workaround for the codex provider.** Force the SSE lane in pi's settings
 (`~/.pi/agent/settings.json`; project `.pi/settings.json` overrides):
@@ -439,13 +439,7 @@ the codex provider) consume it — HTTP-only providers ignore it. Verified on
 Windows + Pi 1.0.2 (#2063 owner repro): explicit `sse` enters bili with the
 correct session id.
 
-The tracked fix (client-side `globalThis.WebSocket` interception, owner-gated
-per #2073) is viable rather than speculative: pi sends the same `session-id`
-header on its WebSocket upgrades as on SSE (value = the pi session id),
-Node's built-in WebSocket forwards constructor `headers` (verified on Node
-22), and the proxy side already speaks the wire — the WS bridge admits the
-prefix shape `/bili/<upstream>/responses` keyed on exactly that header
-(`src/ws-bridge.ts`, `src/responses-ws.ts` `codexResponsesCodec`).
+The lane is verified end-to-end (`tests/e2e/e2e-pi-codex-ws.test.ts`, real pi against a deterministic mock upstream through the real proxy): explicit-websocket and auto routing, upgrade-header stamps with `session-id` == conversation id, compress/decompress round trips reflected in subsequent requests, `previous_response_id` expansion, upstream-refusal behavior, the explicit-sse regression guard, and two concurrent subagent-style sessions sharing one proxy without cross-talk.
 
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 
