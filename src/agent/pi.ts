@@ -285,7 +285,11 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal, conversationId !== "unknown");
-                return { content: [{ type: "text", text: output }] };
+                // #2204: a business failure (e.g. a refused export) must reach
+                // the host as isError — rendering it as plain success text is
+                // what hid the #2204 write failures from OMP.
+                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true };
+                return { content: [{ type: "text", text: output.text }] };
             } catch (err) {
                 return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
             }
@@ -652,7 +656,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const toolArgs = /(^|\s)(--)?full(\s|$)/.test(args ?? "") ? { detail: "full" as const } : {};
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown");
+                        const out = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown");
+                        if (out.failed) {
+                            notify(`bili: cache report failed: ${out.text}`, "error");
+                            return;
+                        }
+                        text = out.text;
                     } catch (err) {
                         notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
@@ -713,7 +722,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     }
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs, undefined, conversationId !== "unknown");
+                        const out = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs, undefined, conversationId !== "unknown");
+                        if (out.failed) {
+                            notify(`bili: acp_rule failed: ${out.text}`, "error");
+                            return;
+                        }
+                        text = out.text;
                     } catch (err) {
                         notify(`bili: acp_rule failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;

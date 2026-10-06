@@ -434,7 +434,11 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            return forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            // #2204: dsh tool results are plain strings — a business failure
+            // throws so the host renders an error, not success text.
+            if (out.failed) throw new Error(out.text);
+            return out.text;
         },
     };
 }
@@ -706,7 +710,8 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     }
     try {
         const report = await forwardTool(base, target, "acp_cache", {}, undefined, true);
-        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
+        if (report.failed) return { kind: "error", text: report.text };
+        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report.text}` : report.text };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {
