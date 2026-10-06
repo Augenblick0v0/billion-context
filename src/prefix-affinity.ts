@@ -407,6 +407,25 @@ export class PrefixAffinityResolver {
         return best ? { sessionId: best.sessionId, sharedDepth: best.sharedDepth } : null;
     }
 
+    /** #2241: does `messages` continue the tracked chain of `sessionId`?
+     * True when the session's stored chain is a byte-exact head-anchored
+     * prefix of the incoming list — the progressive hash at the stored
+     * depth equals the stored tail hash (equal depth = byte-exact replay,
+     * which also counts). The building block for the dsh persona anchor
+     * migration: a system-text change whose history continues the raw
+     * key's chain is the SAME conversation (model switch), not a new
+     * persona. Cryptographic equality of the whole prefix is the
+     * discriminator — no depth floor beyond chainHashes' MIN_CANONICAL_BYTES. */
+    chainContinues(messages: unknown[], sessionId: string): boolean {
+        const entry = this.trackedChains.get(sessionId);
+        if (!entry) return false;
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return false;
+        const hashes = chainHashes(msgs);
+        if (hashes.length === 0 || msgs.length < entry.depth) return false;
+        return hashes[entry.depth - 1] === entry.tailHash;
+    }
+
     /** Drop tracking for a removed session. */
     forget(sessionId: string): void {
         this.trackedChains.delete(sessionId);

@@ -110,6 +110,7 @@ import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
+import { dshPersonaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
@@ -2269,11 +2270,26 @@ async function handle(
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
                   : dshPersona && !sideRequestLike
-                    ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
+                    // #2241: continuity-aware anchor — a system change whose
+                    // history continues the raw key's prefix-affinity chain
+                    // (model switch) MIGRATES the anchor instead of forking
+                    // the main lane off the raw key; only history-discontinuous
+                    // requests (review blobs) still fork onto `|sub:<fp>`.
+                    ? dshPersonaNamespace(
+                          anthropicIdentity?.value ?? anthropicSignal,
+                          personaSystemText,
+                          (parsed as AnthropicRequestBody).messages,
+                          log,
+                      )
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike
-                    ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
+                    ? dshPersonaNamespace(
+                          openaiIdentity?.value ?? openaiSignal,
+                          personaSystemText,
+                          (parsed as OpenAIRequestBody).messages,
+                          log,
+                      )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain

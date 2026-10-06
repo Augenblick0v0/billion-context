@@ -197,7 +197,11 @@ test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary
         // REVIEW_POLICY system, full-budget model turn (NOT a side request —
         // budget 300, no tools, no side agent) → keyed by design onto
         // `|sub:<fp>` (#1916/#1307/#1314) and rides the main pipeline there.
-        await h.dshSend(conv, [mainMsg(0), { role: "user", content: "REVIEW: tool call risk assessment" }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        // #2241: the blob is the FLATTENED transcript as a single fresh user
+        // message — it does NOT byte-exactly continue the raw key's chain, so
+        // the continuity-aware anchor still forks it (a replay that DID
+        // continue the chain is the same conversation evolving, not a persona).
+        await h.dshSend(conv, [{ role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nassistant: ok\nProposed tool call: bash rm -rf /tmp/x. Decide SAFE or UNSAFE." }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
         const all = listSessions();
         const kids = all.filter((s) => s.id.startsWith(conv + "|") || s.id.includes(conv + "|sub:"));
         assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
