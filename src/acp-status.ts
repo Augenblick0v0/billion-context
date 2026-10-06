@@ -16,6 +16,7 @@ import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./ses
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION } from "./version.js";
+import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export interface AcpStatusCtx {
     core: CompressionCore;
@@ -36,7 +37,7 @@ function fmtBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
 }
 
-export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): string {
+export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
     const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
     const tool = typeof args.tool === "string" ? args.tool : undefined;
@@ -53,7 +54,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             host: `billion-context ${VERSION}`,
         },
     });
-    if (scope) return base;
+    if (scope) return toolOk(base);
     const extra: string[] = [];
     try {
         const turn = ctx.core.processTurn({
@@ -200,5 +201,5 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact counts: GET /__bili/stats → unrecognizedPaths.`);
     }
-    return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
+    return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

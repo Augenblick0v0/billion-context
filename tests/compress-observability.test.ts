@@ -62,7 +62,7 @@ const COMPRESS_ARGS = { content: [{ startId: "m00001", endId: "m00002", summary:
 
 function runApply(ctx: Ctx, args: unknown): string {
     const ranges = parseCompressInput(args);
-    return applyRanges(ranges, ctx);
+    return applyRanges(ranges, ctx).text;
 }
 
 test("#189: applyRanges records lastCompress (shrink ratio + fold point) and logs observability", () => {

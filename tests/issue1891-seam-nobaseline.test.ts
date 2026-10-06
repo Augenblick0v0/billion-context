@@ -60,7 +60,7 @@ test("#1891: first measurable sample books its uncached bill as new content, nev
     assert.equal(report.invalidation.remaining, 0, "initial bill must not pollute the unattributed TTL bucket");
     assert.equal(report.initialBills.samples, 1);
     assert.equal(report.initialBills.inputTokens, 100_000);
-    const text = handleAcpCache(s);
+    const text = handleAcpCache(s).text;
     assert.ok(!text.includes("CACHE SEAM"), "no seam section for an opener");
     assert.match(text, /initial bills \(no prior baseline\)/);
 });
@@ -75,7 +75,7 @@ test("#1891 field signature: input=25074 cached=1024 (hit 4%) is an initial bill
     assert.equal(line.nc, 24_050, "unexplained==input−cached from the field log becomes newContent");
     assert.equal(line.tr, 0);
     assert.equal(led.agg.seamSuspects, 0);
-    assert.ok(!handleAcpCache(s).includes("CACHE SEAM"));
+    assert.ok(!handleAcpCache(s).text.includes("CACHE SEAM"));
 });
 
 test("#1891 guard against over-suppression: a REAL mid-history break after a baseline still flags", () => {

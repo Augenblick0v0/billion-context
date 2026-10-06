@@ -54,6 +54,7 @@ import {
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
+import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -146,18 +147,27 @@ export {
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
 const SPAWN_WAIT_MS = 20000;
+// #2187: grace beyond the initial wait for a LIVE child still starting.
+// Spawn-window startups have been observed taking 26-45s on slow Windows
+// machines (AV / first-run disk activity); the one-shot 20s budget misread
+// that as failure and left the lane degraded for the whole session.
+const SLOW_START_GRACE_MS = 40_000;
+// Total wait for a live child: initial window + grace. A child that EXITS or
+// fails to spawn still fails fast (the poll loop breaks on exit/error).
+export const SPAWN_BUDGET_MS = SPAWN_WAIT_MS + SLOW_START_GRACE_MS;
 const PROBE_TIMEOUT_MS = 1500;
-// #707: max age of a starting marker still treated as an in-progress bring-up.
-// A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
-// disks and client teardown before it clears the marker.
-const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
+// #707/#2187: max age of a starting marker still treated as an in-progress
+// bring-up. A well-behaved starter resolves within SPAWN_BUDGET_MS (a live
+// child may take the whole budget); the slack covers slow disks and client
+// teardown before it clears the marker.
+const STARTING_MARKER_TTL_MS = SPAWN_BUDGET_MS + 30_000;
 // #1903: budget for the post-exit re-discovery below. A spawned child dying
 // before becoming healthy is evidence the port it wanted is HELD — but our
 // one-shot discovery snapshot may predate the holder publishing its identity
@@ -721,6 +731,29 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "antigravity") {
+        // #2115: Antigravity's model channel runs inside the closed Go
+        // language_server, which honors the undocumented CLOUD_CODE_URL env
+        // override (verified in the v2.19.1 binary: "Overriding
+        // CloudCodeServerURL via CLOUD_CODE_URL environment variable"). The
+        // stock endpoint is cloudcode-pa.googleapis.com; bili recognizes the
+        // wire by path (:streamGenerateContent et al. → google adapter). A
+        // user-exported CLOUD_CODE_URL is a relay: wrap IT instead of the
+        // stock endpoint (claude semantics). Fallback if Google removes the
+        // knob: cert-MITM (the server honors HTTPS_PROXY, no pinning) — see
+        // CLIENTS.md (Gemini family section).
+        const raw = nonEmpty(config.antigravity?.baseUrl) ? config.antigravity!.baseUrl! : "https://cloudcode-pa.googleapis.com";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("CLOUD_CODE_URL")) {
+                rewriteKeys.add("CLOUD_CODE_URL");
+                httpRewrites.push({ key: "CLOUD_CODE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs;
+            // Antigravity falls back to its own default endpoint).
+        }
     } else if (client === "aider") {
         // #1048: aider's Python stack (litellm → httpx, plus requests) honors
         // standard proxy envs for all outbound traffic, so no URL rewriting
@@ -1149,6 +1182,23 @@ export function buildQwenEnv(origin: string, caPath: string, baseEnv: NodeJS.Pro
     };
 }
 
+/** #2115: CLOUD_CODE_URL points language_server straight at the loopback
+ *  proxy; no proxy/CA env needed (the override IS the route). */
+export function buildAntigravityEnv(
+    origin: string,
+    caPath: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
+    const r = httpRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
+    if (r) env.CLOUD_CODE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
+    if (hr) env.CLOUD_CODE_URL = hr.realUpstream;
+    return env;
+}
+
 /**
  * #653: qoder's auto-compact window is a single env knob —
  * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
@@ -1253,12 +1303,14 @@ function isPrivateIPv4(host: string): boolean {
  *  yet verified against a real build, so v1 runs pure wire mode (the proxy
  *  injects the context tools on the wire). kimi is excluded as well: its
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
-  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
-  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
-  *  copilot/amp/goose are excluded likewise: closed or unverified MCP
-  *  surfaces, v1 runs pure wire mode (#1049). */
+ *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
+ *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
+ *  copilot/amp/goose are excluded likewise: closed or unverified MCP
+ *  surfaces, v1 runs pure wire mode (#1049). antigravity is excluded too
+ *  (#2115): its model channel is a closed Go binary with no MCP-injection
+ *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1626,7 +1678,10 @@ export function isSqliteMain(name: string, siblings: ReadonlySet<string>): boole
  *  copySqliteSet copied it into the overlay, so mergeSqliteSet can tell "this
  *  side is bili's own unmodified generation from the previous launch" — the
  *  NORMAL steady state under copy-on-launch — from "this side advanced on its
- *  own" (a concurrent plain run), which is the only true divergence. */
+ *  own" (a concurrent plain run), which is the only true divergence. Since
+ *  #2195 this snapshot also decides the MERGE WINNER (not just whether the
+ *  loser may be dropped silently): a WAL-only commit leaves the main db's
+ *  bytes AND mtime untouched, so only provenance can tell the generations apart. */
 export const SQLITE_ORIGIN_FILE = ".bili-sqlite-origin.json";
 type SqliteOriginMap = Record<string, Record<string, { h: string; s: number }>>;
 
@@ -1693,44 +1748,55 @@ function recordSqliteOrigin(overlay: string, base: string): void {
     writeSqliteOrigin(overlay, map);
 }
 
-/** True when every currently-present member of `loserDir`'s SQLite set still
- *  matches the origin snapshot bili recorded when it copied the set into the
- *  overlay (#1919): the loser is then bili's own unmodified generation,
- *  redundant with the winner's, safe to drop without a conflict file or a
- *  warning. A recorded sidecar may be ABSENT now — an external plain run that
- *  checkpointed an empty WAL deletes it without touching the main — but a
- *  present member that was never recorded, or whose size/hash changed since
- *  the copy, means the side advanced independently: not stale. The same
- *  snapshot serves both sides because the copy is byte-exact. Missing or
- *  corrupt record (e.g. upgrade mid-cycle) → false → conservative fallback. */
-function sqliteLoserIsStaleCopy(overlay: string, loserDir: string, base: string): boolean {
+/** How one side's SQLite set compares to the origin snapshot bili recorded
+ *  when it copied the set into the overlay (#1919/#2195):
+ *   "unchanged" — every currently-present member still matches its recorded
+ *     size+hash. A recorded sidecar may be ABSENT now: a checkpoint deletes an
+ *     empty WAL without touching the main.
+ *   "changed"   — a commit (or other advance) landed here: the main or a
+ *     commit-bearing member differs from the record, or a commit-bearing
+ *     member appeared that the copy never held. A zero-byte -wal is NOT one:
+ *     merely OPENING a WAL-mode db creates an empty -wal plus a -shm (and
+ *     reading rewrites the -shm), so neither alone proves a business commit.
+ *   "unknown"   — no usable snapshot (first launch, upgrade mid-cycle, manual
+ *     deletion): NOTHING can be claimed about this side's age; callers must
+ *     fall back conservatively instead of assuming a winner.
+ *  The same snapshot serves both sides because the copy is byte-exact. */
+export type SqliteSideState = "unchanged" | "changed" | "unknown";
+
+function sqliteSideVsOrigin(overlay: string, dir: string, base: string): SqliteSideState {
     const rec = readSqliteOrigin(overlay)[base];
-    if (rec === undefined || rec[base] === undefined) return false;
+    if (rec === undefined || rec[base] === undefined) return "unknown";
     const matches = (m: string, st: fs.Stats): boolean => {
         const info = rec[m];
         if (info === undefined) return false;
         if (st.size !== info.s) return false;
-        const h = sha256File(path.join(loserDir, m));
+        const h = sha256File(path.join(dir, m));
         return h !== undefined && h === info.h;
     };
     let mainSt: fs.Stats;
     try {
-        mainSt = fs.lstatSync(path.join(loserDir, base));
+        mainSt = fs.lstatSync(path.join(dir, base));
     } catch {
-        return false;
+        return "changed"; // the recorded main vanished: not the copied generation
     }
-    if (!mainSt.isFile() || !matches(base, mainSt)) return false;
+    if (!mainSt.isFile() || !matches(base, mainSt)) return "changed";
     for (const m of sqliteSetMembers(base)) {
-        if (m === base) continue;
+        if (m === base || m === `${base}-shm`) continue;
         let st: fs.Stats;
         try {
-            st = fs.lstatSync(path.join(loserDir, m));
+            st = fs.lstatSync(path.join(dir, m));
         } catch {
             continue;
         }
-        if (!st.isFile() || !matches(m, st)) return false;
+        if (!st.isFile()) return "changed";
+        if (rec[m] !== undefined) {
+            if (!matches(m, st)) return "changed";
+        } else if (!(m.endsWith("-wal") && st.size === 0)) {
+            return "changed"; // commit-bearing member the copy never held
+        }
     }
-    return true;
+    return "unchanged";
 }
 
 /** Copy a real-home SQLite set into the overlay as PRIVATE regular files
@@ -1788,15 +1854,20 @@ function freeConflictName(dst: string): string {
 }
 
 /** Move a SQLite set (see sqliteSetMembers) from overlay to real home as one
- *  unit (#381). The authoritative generation is decided ONCE by the main db's
- *  mtime — a WAL/journal is only valid against its exact main db, so the whole
- *  set must come from a single side: per-member mtime adjudication could splice
- *  a newer main db with a newer WAL from the other side and corrupt the
- *  database. The winner's members become the real home's active set. When BOTH
- *  sides hold a main, the loser is checked against the origin snapshot recorded
- *  at copy time (#1919): still byte-identical → bili's own unmodified generation,
- *  dropped silently; different (or no snapshot) → true divergence, preserved as
- *  `<name>.bili-conflict` (never overwritten). A
+ *  unit (#381). The authoritative generation is decided ONCE per set — never
+ *  per member, because a WAL/journal is only valid against its exact main db:
+ *  per-member adjudication could splice a newer main db with a newer WAL from
+ *  the other side and corrupt the database. Winner selection (#2195): provenance
+ *  against the copy-time origin snapshot first — a side still byte-identical to
+ *  what bili copied cannot outrank a side that committed, because a commit may
+ *  touch ONLY the WAL (the main keeps its old bytes AND old mtime) and a file
+ *  copy can carry the source mtime forward; then the main db's mtime when both
+ *  sides advanced independently or no usable snapshot exists. The winner's
+ *  members become the real home's active set. When BOTH sides hold a main, the
+ *  loser still byte-identical to the origin snapshot is bili's own unmodified
+ *  generation, dropped silently; a loser that differs from it (or whose
+ *  provenance is unknown) is a true divergence, preserved as
+ *  `<name>.bili-conflict` with a loud warning (never overwritten). A
  *  set with no main db on either side (orphan sidecars) is stale residue and is
  *  preserved wholesale as conflicts, never moved in as an active db. If any
  *  rename fails (real db open/locked on Windows) the moved ones roll back and
@@ -1848,23 +1919,39 @@ export function mergeSqliteSet(overlay: string, realHome: string, base: string):
         );
     }
     let winner: "overlay" | "real" | "orphan";
-    if (oMain && rMain) winner = rMain.mtimeMs >= oMain.mtimeMs ? "real" : "overlay";
-    else if (oMain) winner = "overlay";
+    if (oMain && rMain) {
+        // #2195: provenance first, mtime second. A SQLite commit may touch ONLY
+        // the WAL — the main db keeps its old bytes AND its old mtime — and a
+        // file copy can carry the source mtime forward (measured on Windows),
+        // so a main-mtime comparison alone selects the STALE generation exactly
+        // when the copy preserved timestamps and the newer commit is WAL-only.
+        // Against the copy-time origin snapshot the unmodified side is provably
+        // the redundant one, whichever way the mtimes fall. Mtime stays in play
+        // only when BOTH sides advanced independently (true #1917 divergence)
+        // or no usable snapshot exists to prove anything (unknown → conservative).
+        const oSide = sqliteSideVsOrigin(overlay, overlay, base);
+        const rSide = sqliteSideVsOrigin(overlay, realHome, base);
+        if (oSide === "changed" && rSide === "unchanged") winner = "overlay";
+        else if (rSide === "changed" && oSide === "unchanged") winner = "real";
+        else if (oSide === "unchanged" && rSide === "unchanged") winner = "real"; // byte-equivalent generations; fixed pick
+        else winner = rMain.mtimeMs >= oMain.mtimeMs ? "real" : "overlay";
+    } else if (oMain) winner = "overlay";
     else if (rMain) winner = "real";
     else winner = "orphan";
     // Both sides hold a main. Under copy-on-launch that is the NORMAL steady
     // state (#1919), not a divergence signal: every launch's copy phase leaves
     // a fresh overlay copy next to the previous launch's merged-back db, so
     // after the first launch both sides ALWAYS hold a main — even when nothing
-    // ran concurrently. Provenance decides: the loser still byte-identical to
-    // the origin snapshot (sqliteLoserIsStaleCopy) is bili's own unmodified
-    // generation, redundant with the winner's — drop it silently. Only a loser
-    // that differs from what bili copied is a true divergence (concurrent plain
-    // run) and keeps the loud warning + conflict preservation. Any failure of
-    // the stale check or of the silent drop falls through to that conservative
-    // path: no data loss, at worst one extra warning/conflict file.
+    // ran concurrently. The loser still byte-identical to the origin snapshot
+    // (sqliteSideVsOrigin === "unchanged") is bili's own unmodified generation,
+    // redundant with the winner's — drop it silently. Only a loser that differs
+    // from what bili copied (or whose provenance is unknown) is a true
+    // divergence (concurrent plain run) and keeps the loud warning + conflict
+    // preservation. Any failure of the stale check or of the silent drop falls
+    // through to that conservative path: no data loss, at worst one extra
+    // warning/conflict file.
     if (oMain !== undefined && rMain !== undefined) {
-        const stale = sqliteLoserIsStaleCopy(overlay, winner === "real" ? overlay : realHome, base);
+        const stale = sqliteSideVsOrigin(overlay, winner === "real" ? overlay : realHome, base) === "unchanged";
         let dropped = true;
         if (stale) {
             const loserDir = winner === "real" ? overlay : realHome;
@@ -1883,7 +1970,7 @@ export function mergeSqliteSet(overlay: string, realHome: string, base: string):
         }
         if (!stale || !dropped) {
             console.error(
-                `bili: both ${overlay} and ${realHome} held a distinct ${base} — kept the newer generation (${winner}), ` +
+                `bili: both ${overlay} and ${realHome} held a distinct ${base} — kept the winning generation (${winner}), ` +
                     `the other side is preserved as .bili-conflict. Concurrent plain/bili runs diverge by design (#1917); ` +
                     `check the conflict file if you expect rows from both.` +
                     (stale && !dropped
@@ -2607,9 +2694,11 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *
  *  What moves back into the real home:
  *   - SQLite sets (main + WAL/SHM/journal) merge as ONE generation via
- *     mergeSqliteSet: winner by main-db mtime only, the loser stale-checked
- *     against the copy-time origin snapshot (#1919) and either dropped
- *     silently or preserved as .bili-conflict (#1917). Any rename failure
+ *     mergeSqliteSet: winner by provenance against the copy-time origin
+ *     snapshot (#2195; #1919), main-db mtime only when both sides advanced
+ *     or no snapshot exists; the loser is dropped silently when still
+ *     byte-identical to the snapshot, otherwise preserved as .bili-conflict
+ *     (#1917). Any rename failure
  *     (real db open/locked — e.g. a concurrent native codex on Windows) rolls
  *     the set back and it stays in the overlay for the next launch's startup
  *     merge;
@@ -3397,8 +3486,10 @@ function pickAttachable(
 }
 
 /** #707: wait for another launcher's in-flight bring-up to produce a live
- *  instance. Bounded by SPAWN_WAIT_MS; breaks early when the starting marker
- *  disappears (starter gave up / crashed). The final probe closes the
+ *  instance. Bounded by SPAWN_BUDGET_MS — the starter's own live-child wait
+ *  has the same envelope (#2187); bailing earlier would double-spawn against
+ *  a still-starting child; breaks early when the starting marker disappears
+ *  (starter gave up / crashed). The final probe closes the
  *  deadline-boundary sliver: the starter's own poll window ends ~now, and its
  *  success path clears the marker — indistinguishable from a failure bail
  *  without one last look. */
@@ -3413,7 +3504,7 @@ async function waitForStarterInstance(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
 ): Promise<ProxyInstanceFile | undefined> {
-    const deadline = now() + SPAWN_WAIT_MS;
+    const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
         pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, refusedLog, diag);
     let inst: ProxyInstanceFile | undefined;
@@ -3722,7 +3813,7 @@ export async function ensureProxyRunning(
     };
     // #1225: an in-flight starter of a DIFFERENT declared lane can never
     // produce an instance we may attach to — waiting would only stall this
-    // launch behind its SPAWN_WAIT_MS window. Undeclared lanes wildcard.
+    // launch behind its SPAWN_BUDGET_MS window. Undeclared lanes wildcard.
     const starterLaneMatches = (m: ProxyStartingMarker): boolean =>
         opts.lane === undefined || m.lane === undefined || m.lane === opts.lane;
     const marker = readStartingMarker();
@@ -3834,7 +3925,7 @@ export async function ensureProxyRunning(
 
         // #401/#480: fail fast when OUR spawned child dies before becoming
         // healthy — otherwise a startup crash (bad config, missing upstream, …)
-        // burns the whole SPAWN_WAIT_MS poll window before erroring.
+        // burns the whole spawn wait budget before erroring.
         let childExit: { code: number | null; signal: string | null } | undefined;
         // #809/D: an async spawn failure (EACCES/ENOENT on the resolved runtime)
         // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
@@ -3853,9 +3944,19 @@ export async function ensureProxyRunning(
             childError = rest[0];
         });
 
-        const deadline = now() + SPAWN_WAIT_MS;
+        const deadline = now() + SPAWN_BUDGET_MS;
+        // #2187: announce the phase boundary once — a live child past the
+        // initial window is still being waited for, and the log is the only
+        // place to see that the budget was extended instead of failing.
+        let slowStartNoticed = false;
         while (now() < deadline) {
             if (childExit || childError !== undefined) break;
+            if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
+                slowStartNoticed = true;
+                console.error(
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (log: ${logPath})`,
+                );
+            }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -3937,7 +4038,7 @@ export async function ensureProxyRunning(
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
@@ -4017,10 +4118,10 @@ async function abortLaunchOnBusyOverlay(handle: ProxyHandle, err: OverlayBusyErr
 
 /** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
  *  tokens get wrapped in double quotes, so a space-free launch produces a
- *  byte-identical line to the old shell:true form. A token containing an
- *  embedded double quote stays bare: cmd.exe has no escape mechanism for
- *  quotes, so wrapping would only change how it is mangled (today's behavior
- *  preserved). */
+ *  byte-identical line to the old shell:true form. Pure formatter: callers
+ *  must pre-validate their tokens through the #2196 safe-set guard
+ *  (winCmdUnsafeToken) — an embedded double quote stays bare here only
+ *  because such tokens never reach this path anymore. */
 export function quoteWinToken(token: string): string {
     if (!/\s/.test(token) || token.includes('"')) return token;
     return `"${token}"`;
@@ -4041,7 +4142,11 @@ export function buildWindowsCommandLine(cmd: string, args: readonly string[]): s
  *  extension) spawns directly and the OS quotes the executable and argv
  *  itself, spaces included. shell:true is never used anymore: no DEP0190, no
  *  cmd.exe re-splitting of spaced paths at their first space (which truncated
- *  both the command and its args). */
+ *  both the command and its args).
+ *  #2196: the comspec form re-feeds user argv into cmd.exe's LINE parser,
+ *  which has no escape mechanism — so before building the line, every token
+ *  (command included) must pass the safe-set guard; unsafe tokens throw with
+ *  an actionable error instead of being mangled or interpreted silently. */
 export function planClientSpawn(
     cmd: string,
     args: readonly string[],
@@ -4053,6 +4158,15 @@ export function planClientSpawn(
     const base = cmd.slice(Math.max(cmd.lastIndexOf("/"), cmd.lastIndexOf("\\")) + 1);
     const needsCmd = lower.endsWith(".cmd") || lower.endsWith(".bat") || !path.extname(base);
     if (!needsCmd) return { command: cmd, args: [...args] };
+    const tokens = [cmd, ...args];
+    tokens.forEach((token, i) => {
+        const reason = winCmdUnsafeToken(token);
+        if (reason) throw winCmdRefusalError(
+            i === 0 ? "resolved command" : `argument #${i - 1}`,
+            reason,
+            "Set BILI_CLIENT_BIN to the native executable (e.g. the real codex.exe) or to a script entry run under node, or reword the argument.",
+        );
+    });
     const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
     return {
         command: comspec,
@@ -4104,9 +4218,82 @@ export function isOnPath(name: string, env: NodeJS.ProcessEnv): boolean {
     return resolveOnPath(name, env) !== undefined;
 }
 
+/** #2196: given a resolved codex .cmd/.bat shim, locate the official npm
+ *  package's JS entry when this is a trusted npm install layout: the shim sits
+ *  beside <dir>/node_modules/@openai/codex whose package.json is named
+ *  "@openai/codex" and declares a resolvable "codex" bin entry, AND the shim
+ *  text references that package (npm-generated shims always do; a hand-written
+ *  codex.cmd placed beside an unrelated tree must not hijack the launch).
+ *  Running that entry under Node reproduces exactly what the shim does — its
+ *  vendor-binary lookup, env init, signal forwarding — while Node's own
+ *  CreateProcess argv encoding carries user arguments verbatim instead of
+ *  cmd.exe mangling them (#2196). Returns undefined for any other layout
+ *  (yarn-classic .bin trees, pnpm store shims without the local node_modules
+ *  link, ...): those keep the legacy cmd path under the safe-set guard. */
+export function resolveCodexOfficialJsEntry(shimPath: string): string | undefined {
+    const pkgDir = path.join(path.dirname(shimPath), "node_modules", "@openai", "codex");
+    let pkgJson: unknown;
+    try {
+        pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+    } catch {
+        return undefined;
+    }
+    if (!pkgJson || typeof pkgJson !== "object") return undefined;
+    const meta = pkgJson as { name?: unknown; bin?: unknown };
+    if (meta.name !== "@openai/codex") return undefined;
+    let rel: string | undefined;
+    if (typeof meta.bin === "string") rel = meta.bin;
+    else if (meta.bin && typeof meta.bin === "object" && !Array.isArray(meta.bin)) {
+        const v = (meta.bin as Record<string, unknown>)["codex"];
+        if (typeof v === "string") rel = v;
+    }
+    if (!rel) return undefined;
+    const entry = path.resolve(pkgDir, rel);
+    try {
+        if (!fs.statSync(entry).isFile()) return undefined;
+    } catch {
+        return undefined;
+    }
+    try {
+        const shimText = fs.readFileSync(shimPath, "utf8").slice(0, 65536);
+        if (!shimText.includes("@openai\\codex") && !shimText.includes("@openai/codex")) return undefined;
+    } catch {
+        return undefined;
+    }
+    return entry;
+}
+
+/** #2196: Windows-only codex resolution that never routes through cmd.exe's
+ *  line parser when it can be avoided: per PATH directory the native
+ *  codex.exe wins over codex.cmd/codex.bat (earliest directory still wins
+ *  overall), and a .cmd/.bat hit is upgraded to `node <official bin/codex.js>`
+ *  whenever the trusted npm layout is present. Returns undefined when no
+ *  codex.{exe,cmd,bat} exists anywhere — the caller falls through to the
+ *  generic resolution (which also covers the extensionless case). */
+function resolveCodexWin32(env: NodeJS.ProcessEnv): { command: string; prefixArgs: string[] } | undefined {
+    const p = env.PATH;
+    if (!p) return undefined;
+    for (const dir of p.split(path.delimiter)) {
+        if (!dir) continue;
+        for (const ext of [".exe", ".cmd", ".bat"]) {
+            const f = path.join(dir, "codex" + ext);
+            try {
+                if (fs.existsSync(f) && fs.statSync(f).isFile()) {
+                    if (ext === ".exe") return { command: f, prefixArgs: [] };
+                    const entry = resolveCodexOfficialJsEntry(f);
+                    if (entry) return { command: process.execPath, prefixArgs: [entry] };
+                    return { command: f, prefixArgs: [] };
+                }
+            } catch {}
+        }
+    }
+    return undefined;
+}
+
 export function resolveClientCommand(
     client: ClientName,
     env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform = process.platform,
 ): { command: string; prefixArgs: string[] } {
     const binOverride = env.BILI_CLIENT_BIN?.trim();
     if (binOverride) {
@@ -4161,6 +4348,36 @@ export function resolveClientCommand(
             }
         }
         return { command: binBase, prefixArgs: [] };
+    }
+    if (client === "antigravity") {
+        // #2115: the CLI binary is named `agy` (Gemini CLI successor), not
+        // `antigravity`; install.sh places it at ~/.local/bin/agy (Windows:
+        // %LOCALAPPDATA%\agy\bin\agy.exe).
+        const resolved = resolveOnPath("agy", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        const base = process.platform === "win32"
+            ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "agy", "bin", "agy")
+            : path.join(os.homedir(), ".local", "bin", "agy");
+        for (const ext of process.platform === "win32" ? [".exe", ""] : [""]) {
+            const candidate = base + ext;
+            try {
+                if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
+            } catch {
+                // Unreadable candidate: fall through to the next extension.
+            }
+        }
+        return { command: base, prefixArgs: [] };
+    }
+    if (client === "codex" && platform === "win32") {
+        // #2196: the default npm install is a codex.cmd shim whose %*
+        // forwarding re-parses every user argument through cmd.exe (embedded
+        // quotes split tokens, %VAR% expands, &|<>^() execute). Prefer forms
+        // that never enter that parser; a leftover .cmd/.bat only reaches
+        // cmd.exe when neither exists — where the safe-set guard in
+        // planClientSpawn then refuses argv it cannot carry verbatim instead
+        // of corrupting it silently.
+        const win32Hit = resolveCodexWin32(env);
+        if (win32Hit) return win32Hit;
     }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
@@ -4612,6 +4829,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // whitelisted for the proxy's CA. NODE_EXTRA_CA_CERTS is additive, so
         // the plain root CA suffices.
         env = buildQwenEnv(origin, resolveCaCertPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "antigravity") {
+        // #2115: CLOUD_CODE_URL points language_server straight at the loopback
+        // proxy (undocumented override verified in the v2.19.1 binary); no
+        // proxy/CA env needed. Fallback if Google removes the knob: cert-MITM
+        // (the server honors HTTPS_PROXY, no pinning) — CLIENTS.md.
+        env = buildAntigravityEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
+        if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
+            console.error(
+                "bili: no routable antigravity upstream found (unparseable CLOUD_CODE_URL?) — traffic will NOT go through the proxy.",
+            );
+        }
     } else if (base === "aider") {
         // #1048: cert-MITM like jcode/kimi — aider's Python stack (litellm →
         // httpx, plus requests) honors standard proxy envs for all outbound
@@ -4684,7 +4912,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             if (!codexRunModePinned(params.clientArgs)) {
-                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env);
+                const { command: codexBin, prefixArgs: codexPrefix } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
                 if (codexSupportsNoDaemon(codexBin, codexPrefix, deps.platform ?? process.platform)) {
                     clientArgs = ["--no-daemon", ...clientArgs];
                     console.error("bili: codex pinned to embedded mode (--no-daemon) — the launcher proxy is session-scoped; a shared background server would outlive it and bypass compression.");
@@ -4795,7 +5023,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     }
 
-    const { command, prefixArgs } = resolveClientCommand(base, process.env);
+    const { command, prefixArgs } = resolveClientCommand(base, process.env, deps.platform ?? process.platform);
     const effectiveClientArgs = piTestArgs(params.client, clientArgs);
     let code = 0;
     try {
@@ -4808,7 +5036,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         code = 1;
     } finally {
         await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
-        releaseOverlayLease();
+        // #2195: the exit merge-back must run while this launch STILL holds the
+        // exclusive overlay lease — releasing first lets a concurrent launch
+        // acquire the overlay and start its own copy/write cycle mid-merge.
         if (gooseOverlay) {
             try {
                 finalizeGooseHome(gooseOverlay);
@@ -4819,6 +5049,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated);
             } catch {}
         }
+        releaseOverlayLease();
         if (opencodeTmpFile) {
             try {
                 fs.rmSync(path.dirname(opencodeTmpFile), { recursive: true, force: true });

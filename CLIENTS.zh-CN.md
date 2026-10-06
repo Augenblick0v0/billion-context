@@ -28,9 +28,9 @@
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
 
-## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code)
+## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
-面向 gemini-cli 架构家族的三个启动器(#1043 第一梯队)。三者中两个有 base-URL 环境变量钩子,一个没有:
+面向 gemini-cli 架构家族的四个启动器(#1043 第一梯队)。四者中三个有 base-URL 环境变量钩子,一个没有:
 
 - **`bili gemini`** —— Gemini CLI(`@google/gemini-cli`)。设置
   `GOOGLE_GEMINI_BASE_URL=<proxy>/bili/<upstream>`(默认上游
@@ -50,10 +50,33 @@
   但它遵循标准代理环境变量,所以启动器走证书 MITM:`HTTPS_PROXY=<proxy>` +
   `NODE_EXTRA_CA_CERTS=<bili CA>`,并把默认模型主机(DashScope / Qwen 网关 /
   常见第三方端点)静态加白。自建中转主机用 `--mitm-domain <host>` 追加。
-  尽力而为的路由 —— 日志里出现 `BLIND TUNNEL WARNING` 说明有主机没进白名单。
+   尽力而为的路由 —— 日志里出现 `BLIND TUNNEL WARNING` 说明有主机没进白名单。
+- **`bili antigravity`** —— Google Antigravity(#2115)。启动器驱动官方 CLI
+  二进制 **`agy`**(Gemini CLI 的继任者,Gemini CLI 已于 2026-06 退役;在
+  `PATH` 或 `~/.local/bin/agy`,Windows 为 `%LOCALAPPDATA%\agy\bin`)。其模型
+  通道在闭源 Go `language_server` 内部,该进程遵循一个**未公开的**
+  `CLOUD_CODE_URL` 环境变量覆盖(已在 v2.19.1 二进制中验证:*"Overriding
+  CloudCodeServerURL via CLOUD_CODE_URL environment variable"*),形态与
+  gemini-cli 的 base-URL 钩子相同。启动器设置
+  `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
+  `https://cloudcode-pa.googleapis.com`;如果你自己导出了 `CLOUD_CODE_URL`,
+  该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
+  `:streamGenerateContent` / `:generateContent` / `:countTokens` 请求走
+  Google 原生适配器,与 `bili gemini` 一样被压缩。若服务端改用 gRPC 方法
+  path(`/google.internal.cloud.code.v1internal.CloudCode/*`),这些请求不被
+  识别、原样透传不压缩 —— 属优雅降级,确认后可用按 lane 的 `protocol`
+  声明(#1909)修复。若 Google 将来移除该环境钩子,退路是证书 MITM:
+  language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
+  `cloudcode-pa.googleapis.com` 加进 `"mitm".domains` 并信任 bili 根 CA
+  即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
+  CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
 
-三者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
-fork 继承同一面)。按设计保持 launcher-only。
+四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
+fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>/` 下的
+`plugin.json`、`hooks.json`、`mcp_config.json`、`skills/`、JS sidecar ——
+但每个面都只能追加:工具、提示词、UI、事件回调,没有任何一个能拦截或改写
+模型请求/响应流,那条流完全留在闭源 language_server 内部,所以 wire-only
+是 v1 的上限)。按设计保持 launcher-only。
 
 ## Hermes（Nous Research）
 
@@ -91,20 +114,38 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
+**Responses 原生链式(一个坑)。** bili 靠重放完整 `input` 来压缩,因此无法跟随 OpenAI 原生的 `previous_response_id` 链式续传:只带增量的续传请求会在上游丢失之前的轮次,却仍返回 200。对 codex 而言今天这不是问题 —— 观察到的构建都发 `store:false` 且从不设置 `previous_response_id`(是观察不是证明;E2E 未覆盖该形态)。若你把走原生链式的 Responses 客户端指向 bili,要么重发完整 input/output 历史,要么设 `ACP_KEEP_RESPONSE_ID=1`;bili 剥掉非空 `previous_response_id` 时现在会记一条 `warn`(#1954)。完整链式支持跟踪在 #1973。见[官方迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)。
+
+### 运行模式:`bili codex` 钉死 embedded(#1867)
+
+自 ~0.156 起,Codex 可以附着到(或自动拉起)一台机器全局共享的后台 server,其模型流量用的是 **daemon 启动时**存在的环境变量,而不是会话启动时的。启动器的代理是会话级的(端口随进程消亡),所以长寿 daemon 没法安全地经它路由:若 codex 先于 bili env 启动,之后的 `bili codex` 会话会静默附着上去、**完全绕过压缩**;若 bili 先启动,幸存的 daemon 则一直指向死端口。因此启动器显式传 `--no-daemon` —— 先探测 `codex --help` 是否有该 flag(旧版本二进制原样启动),且仅当用户未自行钉死模式(`--no-daemon` 或 `--remote`)时。结果:确定性的 embedded 运行,无逐次启动的回退警告,无静默绕过。#321 的预算 `-c` 参数原样保留(embedded 模式同等生效)。想要共享后台 server 的话,直接跑原生 `codex` —— 没有压缩,但工具仍可通过 `bili plugin install codex` 使用。
+
+### Windows 启动路径:用户 argv 不再重新进入 cmd.exe(#2196)
+
+Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发会让每个用户参数再经 **cmd.exe 行解析器**解析一遍——该解析器没有任何转义机制:嵌入双引号拆词(`Please say "hello world" exactly` 到达时变成四个参数)、`%VAR%` 被展开、`&|<>^()` 成为命令操作符、空参数消失。普通带空格提示词恰好能幸存,所以 #679 的空格截断修复没有暴露它。#2196 让启动器拒绝把用户 argv 喂进这个解析器:
+
+- **解析顺序(win32 专属):** 每个 PATH 目录内原生 `codex.exe` 优先于 `codex.cmd`/`codex.bat`(最早目录仍整体优先);`.cmd`/`.bat` 命中若位于可信 npm 布局旁——`<dir>/node_modules/@openai/codex`,package.json name 为 `@openai/codex`、有可解析的 `"codex"` bin 条目、且 shim 文本引用该包(放在无关树旁的手写 `codex.cmd` 不得劫持启动)——则升级为 `node <官方 bin/codex.js>`。Node 下运行官方 wrapper 与 shim 行为完全一致——vendor 二进制查找、env 初始化、信号转发——而 Node 自己的 CreateProcess argv 编码逐字无损携带每个参数。未识别布局(yarn-classic `.bin` 树、无本地链接的 pnpm store shim……)保留旧 cmd 路径并遵循下述契约。
+- **透传契约:** 其余 cmd 包装启动——任何客户端的 `.cmd`/`.bat`/无扩展名二进制,加上 dsh-channel spawn——只接受行解析器能逐字携带的 argv;其余(嵌入引号、`%VAR%`、元字符、空参数、换行、奇数尾反斜杠)在**任何进程启动之前**以可操作的错误明确失败,而不是损坏到达或执行非预期命令。直接 spawn 的 `.exe` 不受影响:Node 自身无损编码其 argv。
+- **绕行 / power-user 旋钮:** `BILI_CLIENT_BIN=<path>` 仍最高优先——指向真实 `codex.exe`(或经 node 运行的脚本入口)即可完全绕开 shim。
+
+已在 windows-latest CI 上对真实全局 `@openai/codex` 安装验证(`tests/win-cmd-argv.test.ts`,`ci-windows-codex.yml` 硬门禁):完整语料——空参数、普通空格、嵌入引号、TOML `-c` 值、JSON、Unicode、尾反斜杠、`%COMSPEC%`、`!VAR!`、`&|<>^()`——逐项与调用方数组相等地到达子进程。
+
 ## Pi(pi.dev coding agent)
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
 
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
-**WebSocket 缺口(#2073)。** WebSocket 连接从不经过 `globalThis.fetch`,所以 pi 的 WS 模型传输在握手成功时整体绕过原生拦截:
+**WebSocket 覆盖(#2073,#2111 实现)。** WebSocket 连接从不经过 `globalThis.fetch`,所以原生扩展在加载时(首个模型连接之前)同时包装 `globalThis.WebSocket`(pi 的 Node 分支每次调用都读全局,Bun 分支首次调用时缓存子类——两个运行时的安装时序都因此安全)。只重写受支持的 Codex Responses 模型连接——其余 WebSocket(devtools、第三方库、已路由 URL)原样通过:
 
 | Provider / 传输 | 状态 |
 |---|---|
 | 全部 HTTP provider | ✅ 覆盖 —— 具名 plugin-mode 会话 |
 | `openai-codex-responses`(ChatGPT backend-api),`transport: "sse"` | ✅ 覆盖 —— 与任何 HTTP provider 无异 |
-| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ❌ WS 成功期间绕过代理 —— ACP 工具照常注册、调用照常到达代理,但该会话没有任何模型请求到过代理,会话状态不存在。工具调用在路由阶段失败(`unknown plugin conversation` + `NO MODEL REQUESTS`,#1158 诊断)。#2072 落地前失败形态比「大声」更糟:*兄弟*子代理会话的过期 outbound witness 可能静默用别人的会话状态应答(#2063)—— 此类会话的状态面板在核对 bili.log 之前不可信 |
-| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(归入 #2073 跟踪) |
+| `openai-codex-responses`,`transport: "auto"`(默认)/ `"websocket"` / `"websocket-cached"` | ✅ 覆盖(#2111)—— 构造器 URL 被重写为 `<proxy-ws>/bili/<https-upstream>`(例:`wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`)。构造器参数、子协议、请求头全部保留,pi 在 SSE 上发的同一个 `session-id` 随升级握手到达,会话标识跨传输字节一致;子代理各用自己的会话 ID。`previous_response_id` 增量续传在该车道可用(代理先展开 delta 再进管线,回上游前再优化回 delta) |
+| AWS Bedrock(`bedrock-converse-stream`) | ❌ Bedrock 流量全部走 WS、无 transport 选项、升级握手不带自定义头 —— 仅靠 URL 拦截无法覆盖,需要代理侧专门的 WS codec(不在 #2111 范围,归入 #2073 另行跟踪) |
+
+拦截带来一个拓扑后果:pi 的客户端握手现在指向本地代理(总是成功),因此*上游*拒绝 WS 握手会以流中传输失败的形式暴露,而不再触发 pi 的同轮 SSE 回退——该回退只在客户端握手失败时触发。下面的显式 `sse` 车道仍是确定性绕行手段。
 
 **Codex provider 的绕行办法。** 在 pi 配置里强制 SSE 车道(`~/.pi/agent/settings.json`;项目 `.pi/settings.json` 可覆盖):
 
@@ -114,7 +155,7 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 默认值 `"auto"` 先试 WS、握手失败才回退 SSE;旧布尔键 `"websockets": false` 会自动迁移。该键全局生效,但只有支持多传输的 provider(目前是 codex provider)消费它,纯 HTTP provider 不受影响。Windows + Pi 1.0.2 实机验证(#2063 owner 复现):显式 `sse` 携带正确会话 ID 进入 bili。
 
-已立项的修法(客户端侧 `globalThis.WebSocket` 拦截,#2073 中 owner-gated)是可行而非推测:pi 在 WS 升级握手上发送与 SSE 相同的 `session-id` 头(值 = pi 会话 ID),Node 内置 WebSocket 会转发构造器 `headers`(Node 22 实测),且代理侧已经会讲这条线 —— WS 桥按 `/bili/<upstream>/responses` 前缀形状准入、恰好以该 header 键控(`src/ws-bridge.ts`、`src/responses-ws.ts` `codexResponsesCodec`)。
+该车道已经过端到端实证(`tests/e2e/e2e-pi-codex-ws.test.ts`,真实 pi 对确定性 mock 上游经真实代理):显式 websocket 与 auto 路由、升级握手上 stamp 与 `session-id` == 会话 ID 一致、compress/decompress 往返并反映到后续请求、`previous_response_id` 展开、上游拒绝行为、显式 sse 回归守卫,以及两个并发子代理式会话共享一个代理互不串扰。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 

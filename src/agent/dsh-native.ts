@@ -38,6 +38,7 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -433,7 +434,11 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            return forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            // #2204: dsh tool results are plain strings — a business failure
+            // throws so the host renders an error, not success text.
+            if (out.failed) throw new Error(out.text);
+            return out.text;
         },
     };
 }
@@ -705,7 +710,8 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     }
     try {
         const report = await forwardTool(base, target, "acp_cache", {}, undefined, true);
-        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
+        if (report.failed) return { kind: "error", text: report.text };
+        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report.text}` : report.text };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {
@@ -837,6 +843,16 @@ export function apply(ctx: PluginContext): void {
         };
         state.ready = trackChain(start());
     }
+
+    // #2187: arm the recovery loop at PLAN time, not on first traffic. After
+    // a boot-time spawn failure NO caller can reach maybeRetry — headersFor
+    // is only consulted once an origin has resolved, /acp early-returns while
+    // base-less, and the recovery timer below arms itself only from inside
+    // maybeRetry — so the lane stayed degraded for the whole session. Happy
+    // path: single-flight joins the bootstrap started above (no second
+    // spawn); failure path: the timer re-fires state.respawn() every
+    // RETRY_INTERVAL_MS until a proxy lands.
+    maybeRetry(ctx);
 
     // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
     // endpoint logs once; same-state refusals accumulate silently and re-print
@@ -975,7 +991,7 @@ export function apply(ctx: PluginContext): void {
         return undefined;
     };
     const signedUrlSeen = new Set<string>();
-    state.onSignedModelUrl = (rawUrl) => {
+    state.onSignedModelUrl = (rawUrl, scheme) => {
         const key = (() => {
             try {
                 const u = new URL(rawUrl);
@@ -987,10 +1003,26 @@ export function apply(ctx: PluginContext): void {
         if (signedUrlSeen.has(key)) return;
         if (signedUrlSeen.size >= 64) return;
         signedUrlSeen.add(key);
-        const line = `bili-native-dsh: signed model request observed (${key}) — #1884 re-sign arm engaged when a credential resolves; otherwise it goes direct (uncompressed, signature intact)`;
+        const line = scheme === APIG_RESIGN_SCHEME
+            ? `bili-native-dsh: signed model request observed (${key}, ${scheme}) — #1884 re-sign arm engaged when a credential resolves; otherwise local refusal (or byte-untouched direct with passthrough configured)`
+            : `bili-native-dsh: signed model request observed (${key}, ${scheme}) — bili cannot re-sign this scheme: refusing per the compress-or-refuse contract (no unsigned pass-through — the link stays unavailable until bili ships a re-signer for it, #2090)`;
         console.error(line);
         persistClientEvent(line);
     };
+
+    // #2090 plan A: say at BOOT, not after the first failure — unresolved
+    // signed schemes remembered from earlier runs keep failing until the user
+    // configures them away.
+    {
+        const unresolved = unresolvedRefusals();
+        const entries = Object.entries(unresolved);
+        if (entries.length > 0) {
+            const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
+            const line = `bili-native-dsh: ${entries.length} signed scheme(s) were refused earlier and remain UNRESOLVED: ${list}. Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them (no configuration passes a signed body through unsigned); see the bili web UI (/__bili/, Configuration → Signed upstreams) for details.`;
+            console.warn(line);
+            persistClientEvent(line);
+        }
+    }
 
     state.headersFor = (_url) => {
         maybeRetry(ctx);
@@ -1096,6 +1128,11 @@ export function _resetRegisterForTest(base: string | undefined): void {
         recoveryTimer = undefined;
     }
     activeCtx = undefined;
+    // #2187: apply() now reaches the respawn arming on every plan, so a stale
+    // single-flight wrapper (capturing a previous test's spawn stub) must not
+    // survive a reset.
+    state.respawn = undefined;
+    state.onGiveUp = undefined;
     register.base = base;
     register.toolsReady = false;
     register.dead = false;

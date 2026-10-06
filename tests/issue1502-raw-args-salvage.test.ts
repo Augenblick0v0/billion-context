@@ -87,7 +87,7 @@ test("#1502: salvageable args that strict JSON.parse rejects compress via rawArg
     const raw = `{"content": [{"startId": "m00001", "endId": "m00002", "summary": "${LONG_SUMMARY}"}],}`;
     assert.throws(() => JSON.parse(raw), "premise: strict JSON.parse really fails");
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c1", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c1", raw).text;
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out}`);
     assert.equal(ctx.session.state.blocks.length, 1, "block created");
 });
@@ -100,7 +100,7 @@ test("#1502: lenient ladder variants all salvage via rawArguments (fenced / sing
     ];
     for (const [label, raw] of variants) {
         const ctx = makeCtx();
-        const out = executeProxyTool("compress", {}, ctx, `c_${label}`, raw);
+        const out = executeProxyTool("compress", {}, ctx, `c_${label}`, raw).text;
         assert.ok(out.startsWith("[Compressed"), `${label}: expected success, got: ${out}`);
         assert.equal(ctx.session.state.blocks.length, 1, `${label}: block created`);
     }
@@ -108,7 +108,7 @@ test("#1502: lenient ladder variants all salvage via rawArguments (fenced / sing
 
 test("#1502: without rawArguments the degraded {} still gets the #1384 empty-call receipt (unchanged)", () => {
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_empty");
+    const out = executeProxyTool("compress", {}, ctx, "c_empty").text;
     assert.ok(out.includes("carried no content at all"), out);
     assert.ok(out.includes("Do NOT re-issue an empty call"), out);
 });
@@ -116,7 +116,7 @@ test("#1502: without rawArguments the degraded {} still gets the #1384 empty-cal
 test("#1502: unparseable garbage gets the corruption receipt, not the empty-call verdict (unbalanced → truncated)", () => {
     const raw = '{"content": [{"startId": "m00001"';
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_garbage", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c_garbage", raw).text;
     assert.ok(out.startsWith("[Compression FAILED"), out);
     assert.ok(out.includes(`(${raw.length} chars)`), "safe len label present: " + out);
     assert.ok(out.includes("were not parseable JSON"), out);
@@ -130,7 +130,7 @@ test("#1502: unparseable garbage gets the corruption receipt, not the empty-call
 test("#1502: balanced garbage → malformed-json label without the truncation note", () => {
     const raw = "{this is not json at all}";
     const ctx = makeCtx();
-    const out = executeProxyTool("compress", {}, ctx, "c_garbage2", raw);
+    const out = executeProxyTool("compress", {}, ctx, "c_garbage2", raw).text;
     assert.ok(out.includes("were not parseable JSON"), out);
     assert.ok(!out.includes("(looks truncated)"), out);
     const keys = ctx.session.metadata["compressFailKeys"] as unknown[];

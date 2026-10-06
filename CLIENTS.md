@@ -365,10 +365,50 @@ The #321 budget `-c` args are kept verbatim (embedded mode honors them
 identically). If you want the shared background server, run native `codex`
 directly — no compression, but tools still work via `bili plugin install codex`.
 
-## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
+### Windows launch path: user argv never re-enters cmd.exe (#2196)
 
-Three launchers for the gemini-cli architecture family (#1043 tier 1). Two of
-the three have a base-URL env hook; one doesn't:
+On Windows the default npm install puts a `codex.cmd` shim on PATH, and its
+`%*` forwarding re-parses every user argument through cmd.exe's LINE parser —
+which has no escape mechanism: embedded double quotes split tokens
+(`Please say "hello world" exactly` arrived as four arguments), `%VAR%`
+expands, `&|<>^()` act as command operators, and empty arguments vanish.
+Plain spaced prompts survived, which is why the #679 space-truncation fix did
+not expose it. #2196 makes the launcher refuse to feed user argv into that
+parser:
+
+- **Resolution order (win32 only):** within each PATH directory the native
+  `codex.exe` wins over `codex.cmd`/`codex.bat` (earliest directory still wins
+  overall); a `.cmd`/`.bat` hit is upgraded to `node <official bin/codex.js>`
+  when it sits beside a trusted npm layout — `<dir>/node_modules/@openai/codex`
+  whose package.json is named `@openai/codex` with a resolvable `"codex"` bin
+  entry, AND shim text referencing that package (a hand-written `codex.cmd`
+  placed beside an unrelated tree must not hijack the launch). Running the
+  official wrapper under Node reproduces exactly what the shim does — vendor
+  binary lookup, env init, signal forwarding — while Node's own CreateProcess
+  argv encoding carries every argument verbatim. Unrecognized layouts
+  (yarn-classic `.bin` trees, pnpm store shims without the local link, …) keep
+  the legacy cmd path under the contract below.
+- **Pass-through contract:** the remaining cmd-wrapped launches — any client's
+  `.cmd`/`.bat`/extensionless binary, plus dsh-channel spawns — accept only
+  argv the line parser can carry verbatim. Anything else (embedded quotes,
+  `%VAR%`, metacharacters, empty args, line breaks, odd trailing-backslash
+  runs) fails loudly with an actionable error *before* any process starts,
+  instead of arriving corrupted or executing unintended commands. Direct-spawn
+  `.exe` launches are unaffected: Node encodes their argv losslessly itself.
+- **Workaround / power-user knob:** `BILI_CLIENT_BIN=<path>` still outranks
+  everything — point it at the real `codex.exe` (or at a script entry run
+  under node) to bypass the shim entirely.
+
+Verified on windows-latest CI against the real global `@openai/codex` install
+(`tests/win-cmd-argv.test.ts`, hard gate in `ci-windows-codex.yml`): the full
+corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
+Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
+child process item-by-item identical to the caller array.
+
+## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
+
+Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of
+the four have a base-URL env hook; one doesn't:
 
 - **`bili gemini`** — Gemini CLI (`@google/gemini-cli`). Sets
   `GOOGLE_GEMINI_BASE_URL=<proxy>/bili/<upstream>` (default upstream
@@ -392,12 +432,41 @@ the three have a base-URL env hook; one doesn't:
   `HTTPS_PROXY=<proxy>` + `NODE_EXTRA_CA_CERTS=<bili CA>` with a static
   whitelist of the default model hosts (DashScope / Qwen gateway / common
   third-party endpoints). Custom relay hosts: add them with
-  `--mitm-domain <host>`. Best-effort route — a `BLIND TUNNEL WARNING` in the
-  log means a host is missing from the whitelist.
+   `--mitm-domain <host>`. Best-effort route — a `BLIND TUNNEL WARNING` in the
+   log means a host is missing from the whitelist.
+- **`bili antigravity`** — Google Antigravity (#2115). The launcher drives the
+  official CLI binary **`agy`** (the successor of Gemini CLI, which was
+  discontinued in 2026-06; found on `PATH` or at `~/.local/bin/agy`, Windows
+  `%LOCALAPPDATA%\agy\bin`). Its model channel lives inside the closed-source
+  Go `language_server`, which honors an **undocumented** `CLOUD_CODE_URL` env
+  override (verified in the v2.19.1 binary: *"Overriding CloudCodeServerURL
+  via CLOUD_CODE_URL environment variable"*) — same shape as the gemini-cli
+  base-URL hook. The launcher sets
+  `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
+  `https://cloudcode-pa.googleapis.com`; if you export your own
+  `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
+  no CA install. The proxy recognizes the wire **by path**:
+  `:streamGenerateContent` / `:generateContent` / `:countTokens` requests are
+  routed to the Google-native adapter and compressed like `bili gemini`. If
+  the server instead uses gRPC method paths
+  (`/google.internal.cloud.code.v1internal.CloudCode/*`), those requests are
+  not recognized and relay verbatim without compression — a graceful degrade,
+  fixable with a per-lane `protocol` declaration (#1909) once confirmed.
+  Fallback if Google ever removes the env hook: cert-MITM — the
+  language_server honors `HTTPS_PROXY` and does not pin certificates, so add
+  `cloudcode-pa.googleapis.com` to `"mitm".domains` and trust bili's root CA.
+  The desktop app and the IDE extension share this same language_server
+  channel; the launcher drives the CLI specifically — desktop users can export
+  `CLOUD_CODE_URL` manually or use the MITM recipe.
 
-None of the three has a native mode: none exposes an in-loop tool injection
+None of the four has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit
-that surface). Launcher-only by design.
+that surface; Antigravity ships a user-plugin system — `plugins/<name>/`
+with `plugin.json`, `hooks.json`, `mcp_config.json`, `skills/`, JS sidecars —
+but every surface is additive only: tools, prompts, UI, event callbacks.
+Nothing in it can intercept or rewrite the model request/response stream,
+which stays entirely inside the closed language_server, so wire-only
+integration is the ceiling for v1). Launcher-only by design.
 
 ## Pi (pi.dev coding agent)
 
@@ -414,16 +483,16 @@ HTTP-based provider (Anthropic, OpenAI chat/completions/responses, Gemini,
 Mistral, OpenRouter, Azure, custom relays…) rides this path as a named
 plugin-mode session.
 
-**The WebSocket gap (#2073).** A WebSocket connection never goes through
-`globalThis.fetch`, so pi's WebSocket model transports bypass the native
-intercept entirely whenever the handshake succeeds:
+**WebSocket coverage (#2073, implemented in #2111).** A WebSocket connection never goes through `globalThis.fetch`, so the native extension also wraps `globalThis.WebSocket` at load time — before pi's first model connection (pi's Node branch reads the global per call; its Bun branch caches a subclass on first call, which is why install-time ordering is safe on both runtimes). Only supported Codex Responses model connections are rewritten — every other WebSocket (devtools, third-party libraries, already-routed URLs) passes through untouched:
 
 | Provider / transport | Status |
 |---|---|
 | All HTTP providers | ✅ covered — named plugin-mode session |
 | `openai-codex-responses` (ChatGPT backend-api), `transport: "sse"` | ✅ covered — identical to any HTTP provider |
-| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ❌ bypasses the proxy while the WebSocket succeeds — the ACP tools are still registered and their calls still reach the proxy, but no model request from that session ever arrives, so no conversation state exists. Tool calls fail at the routing stage (`unknown plugin conversation` + `NO MODEL REQUESTS`, #1158 diagnostic). Until #2072 ships the failure is worse than loud: a stale outbound witness from a *sibling* subagent session can silently answer with that other session's state (#2063) — treat status panels from such sessions as untrustworthy until you check bili.log |
-| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (tracked under #2073) |
+| `openai-codex-responses`, `transport: "auto"` (default) or `"websocket"` / `"websocket-cached"` | ✅ covered (#2111) — the constructor URL is rewritten to `<proxy-ws>/bili/<https-upstream>` (e.g. `wss://chatgpt.com/backend-api/codex/responses` → `ws://127.0.0.1:<port>/bili/https://chatgpt.com/backend-api/codex/responses`). Constructor args, subprotocols and request headers are preserved, so the same `session-id` pi sends on SSE rides the upgrade and the session identity is byte-identical across transports; subagents keep their own ids. `previous_response_id` incremental continuation works over the lane (the proxy expands deltas before the pipeline and re-optimizes them back upstream) |
+| AWS Bedrock (`bedrock-converse-stream`) | ❌ all Bedrock traffic is WebSocket, with no transport option and no custom headers on the upgrade — not coverable by URL interception alone; it needs a dedicated proxy-side WS codec (out of #2111's scope, tracked separately under #2073) |
+
+One topology consequence of the intercept: pi's client-side handshake now targets the local proxy (which always succeeds), so an *upstream* WS refusal surfaces as a mid-stream transport failure instead of triggering pi's same-turn SSE fallback — that fallback only fires on a client-side handshake failure. The explicit `sse` lane below remains the deterministic escape hatch.
 
 **Workaround for the codex provider.** Force the SSE lane in pi's settings
 (`~/.pi/agent/settings.json`; project `.pi/settings.json` overrides):
@@ -439,13 +508,7 @@ the codex provider) consume it — HTTP-only providers ignore it. Verified on
 Windows + Pi 1.0.2 (#2063 owner repro): explicit `sse` enters bili with the
 correct session id.
 
-The tracked fix (client-side `globalThis.WebSocket` interception, owner-gated
-per #2073) is viable rather than speculative: pi sends the same `session-id`
-header on its WebSocket upgrades as on SSE (value = the pi session id),
-Node's built-in WebSocket forwards constructor `headers` (verified on Node
-22), and the proxy side already speaks the wire — the WS bridge admits the
-prefix shape `/bili/<upstream>/responses` keyed on exactly that header
-(`src/ws-bridge.ts`, `src/responses-ws.ts` `codexResponsesCodec`).
+The lane is verified end-to-end (`tests/e2e/e2e-pi-codex-ws.test.ts`, real pi against a deterministic mock upstream through the real proxy): explicit-websocket and auto routing, upgrade-header stamps with `session-id` == conversation id, compress/decompress round trips reflected in subsequent requests, `previous_response_id` expansion, upstream-refusal behavior, the explicit-sse regression guard, and two concurrent subagent-style sessions sharing one proxy without cross-talk.
 
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 

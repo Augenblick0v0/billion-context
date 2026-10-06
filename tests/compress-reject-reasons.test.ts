@@ -37,7 +37,7 @@ test("#362: parse-level rejections surface per-entry reasons in the model-facing
     const out = applyRanges(
         parseCompressInput({ content: [{ summary: "no bounds" }, { startId: "m00001", endId: "m00002" }] }),
         makeCtx(),
-    );
+    ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.ok(out.includes("kind=no-valid-ranges"), `kind reported, got: ${out}`);
     assert.ok(out.includes("dropped=2"), `dropped count reported, got: ${out}`);
@@ -51,7 +51,7 @@ test("#362: shape drift (content vs ranges key) reports kind=missing-content", (
     const out = applyRanges(
         parseCompressInput({ ranges: [{ startId: "m00001", endId: "m00002", summary: "s" }] }),
         makeCtx(),
-    );
+    ).text;
     assert.ok(out.includes("kind=missing-content"), `kind reported, got: ${out}`);
     assert.ok(!out.includes("Rejected entries"), "no per-entry reasons for shape-level failure");
 });

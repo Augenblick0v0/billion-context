@@ -185,20 +185,20 @@ test("decompress and search_context fall back to the parent chain read-only (#13
     const ctx: ProxyToolCtx = { core, config, messages: [], session: child, log: () => undefined };
 
     // Child-local decompress of the PARENT's block id: read-only fallback.
-    const out = resolveDecompress({ blockId }, ctx);
+    const out = resolveDecompress({ blockId }, ctx).text;
     assert.match(out, new RegExp(`read-only from derived session ${parent.id.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")} \\(#1333\\)`), "decompress must name the derived source");
     assert.match(out, new RegExp(`one-level fixture content of ${blockId}`), "cached one-level view is served");
 
     // full flag serves the cached full view.
-    const full = resolveDecompress({ blockId, full: true }, ctx);
+    const full = resolveDecompress({ blockId, full: true }, ctx).text;
     assert.match(full, new RegExp(`full fixture content of ${blockId}`));
 
     // Range restore against a parent block is refused with guidance.
-    assert.match(resolveDecompress({ blockId, startId: "m00001" }, ctx), /range restore .*derived-parent blocks is not supported/);
+    assert.match(resolveDecompress({ blockId, startId: "m00001" }, ctx).text, /range restore .*derived-parent blocks is not supported/);
 
     // search_context with no conversation_id falls back to the parent's blocks
     // (query needs >= 3 summary terms to clear the kernel's 0.1 relevance floor).
-    const search = executeSearchContextTarget({ query: "user turn exchanges" }, core, child.id, child.state);
+    const search = executeSearchContextTarget({ query: "user turn exchanges" }, core, child.id, child.state).text;
     assert.match(search, /Found \d+ block\(s\)/, "search must surface parent blocks");
     assert.match(search, new RegExp(blockId));
 
@@ -207,8 +207,8 @@ test("decompress and search_context fall back to the parent chain read-only (#13
     const loneChild = getSession(`pfa-lone-child-${run}`, { protocol: "openai", upstreamOrigin: "http://upstream" });
     const loneBlock = lone.state.blocks.filter((b) => b.active)[0]!.blockId;
     const loneCtx: ProxyToolCtx = { core, config, messages: [], session: loneChild, log: () => undefined };
-    assert.equal(resolveDecompress({ blockId: loneBlock }, loneCtx), `[Block ${loneBlock} not found]`);
-    assert.match(executeSearchContextTarget({ query: "user turn" }, core, loneChild.id, loneChild.state), /^\[No compressed blocks exist yet/);
+    assert.equal(resolveDecompress({ blockId: loneBlock }, loneCtx).text, `[Block ${loneBlock} not found]`);
+    assert.match(executeSearchContextTarget({ query: "user turn" }, core, loneChild.id, loneChild.state).text, /^\[No compressed blocks exist yet/);
 
     // Read-only: the parent state and cache are untouched by the fallback.
     assert.equal(parent.state.blocks.filter((b) => b.active).length, parentId.length);

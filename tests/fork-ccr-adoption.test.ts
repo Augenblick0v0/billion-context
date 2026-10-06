@@ -171,7 +171,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     assert.ok(cstore.byRef["m00003"], "covered ref adopted into child store");
     // AC1: hit with the true original text (GHSA jc6g v2: the tool result
     // itself carries the framed original — nothing queues).
-    const ack = executeRetrieve({ ref: "m00003" }, child);
+    const ack = executeRetrieve({ ref: "m00003" }, child).text;
     assert.match(ack, /acp-retrieved #m00003/);
     assert.ok(ack.includes(BIG_A.slice(0, 200)), "the tool result carries the true original");
     assert.ok(!ack.includes(STORED_PLACEHOLDER_MARKER));
@@ -179,7 +179,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     // Ref-filtered: the edited message's ref (m00008) is NOT carried — the
     // child will self-heal its own m00008 on its next turn.
     assert.equal(cstore.byRef["m00008"], undefined);
-    assert.match(executeRetrieve({ ref: "m00008" }, child), /not found/);
+    assert.match(executeRetrieve({ ref: "m00008" }, child).text, /not found/);
     // AC2: no placeholder-shaped payloads.
     for (const payload of Object.values(cstore.byHash)) {
         assert.ok(!payload.includes(STORED_PLACEHOLDER_MARKER));
@@ -249,7 +249,7 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     // Pre-turn: only the covered refs m00001..m00004 are seeded into
     // messageRefs; the store index is deliberately independent of it.
     assert.equal(child.state.messageRefs.byRef["m00007"], undefined);
-    const ack = executeRetrieve({ ref: "m00007" }, child);
+    const ack = executeRetrieve({ ref: "m00007" }, child).text;
     assert.match(ack, /acp-retrieved #m00007/);
     assert.ok(ack.includes(BIG_B.slice(0, 200)), "adopted original rides in the tool result (v2)");
 
@@ -275,7 +275,7 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     );
     assert.ok([...child.state.blocks].some((b) => b.active && b.blockId !== armed.blockId), "child's own fold created a second block");
     assert.equal(contentStoreOf(child).byRef["m00007"].hash, cstore.byRef["m00007"].hash, "adopted entry survives the child's own fold");
-    const reAck = executeRetrieve({ ref: "m00007" }, child);
+    const reAck = executeRetrieve({ ref: "m00007" }, child).text;
     assert.match(reAck, /acp-retrieved #m00007/);
     assert.ok(reAck.includes(BIG_B.slice(0, 200)), "still retrievable in the tool result after the fold");
 });
@@ -310,7 +310,7 @@ test("child persists its own companion and survives a proxy restart (#1341)", ()
         assert.equal(dropSessionForGc(child.id), true, "evict from memory (restart)");
         const reloaded = getSession(child.id, META);
         assert.equal(reloaded.state.blocks.length, 1);
-        const ack = executeRetrieve({ ref: "m00003" }, reloaded);
+        const ack = executeRetrieve({ ref: "m00003" }, reloaded).text;
         assert.match(ack, /acp-retrieved #m00003/);
         assert.ok(ack.includes(BIG_A.slice(0, 200)), "true original after reload (v2 tool result)");
     } finally {

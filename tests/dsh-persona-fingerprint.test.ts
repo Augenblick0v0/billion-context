@@ -31,6 +31,7 @@ process.env.BILI_PERSIST = "0";
 const MODEL = "claude-sonnet-4-5";
 const MAIN_SYSTEM = "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp.";
 const REVIEW_SYSTEM = "You are the final authorization reviewer for exactly one pending tool call.\nAnswer with one word.";
+const SIDE_SYSTEM = "You are a title generator. Write one short title for the conversation.";
 
 const forkKey = (conv: string, system: string): string =>
     `${conv}|sub:${createHash("sha256").update(system, "utf8").digest("hex").slice(0, 16)}`;
@@ -243,6 +244,125 @@ test("e2e anthropic lane: the same persona fork applies to dsh-over-anthropic", 
         const fork = forkKey(CONV, REVIEW_SYSTEM);
         assert.ok(peekSession(fork), "review request forked onto its own session on the anthropic lane too");
         assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// #2156: a side request (title-gen shape: tiny budget, no tools, its own
+// utility system) arriving FIRST under the conversation id used to claim the
+// persona anchor — the kernel's first-seen-system rule anchored its system on
+// the raw key, so every real main turn forked onto `|sub:<fp(main)>` and the
+// host-stamped bare id found zero refs: compress failed permanently. Side
+// requests must resolve verbatim: they never touch kernel state (#388), so
+// they must neither read nor write the anchor. A later facet of the same
+// mechanism: once any main turn had anchored, side requests rode junk
+// `|sub:<fp(side)>` sessions instead of sharing the main key.
+test("e2e openai lane #2156: side request FIRST must not steal the persona anchor", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-sidefirst";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const tools = [{ type: "function", function: { name: "bash", description: "run", parameters: { type: "object", properties: {} } } }];
+        const side = () => ({ model: MODEL, max_tokens: 100, messages: [{ role: "system", content: SIDE_SYSTEM }, { role: "user", content: "Summarize this conversation in one short title." }] });
+
+        // Phase 1 — the side request arrives BEFORE any main turn (the race).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify(side()) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s1 = peekSession(CONV);
+        assert.ok(s1, "side request resolved onto the raw conversation key (#388: side requests share the main key)");
+        assert.equal(Object.keys(s1.state.messageRefs.byRaw).length, 0, "side passthrough touches no kernel state");
+        assert.equal(s1.stats.requests, 0, "side passthrough counts no requests");
+        assert.ok(!peekSession(forkKey(CONV, SIDE_SYSTEM)), "no junk |sub:<fp(side)> session");
+
+        // Phase 2 — the FIRST main turn keeps the raw key even though a side
+        // request arrived before it (the anchor-steal repro).
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, tools, messages: [{ role: "system", content: MAIN_SYSTEM }, ...mainMsgs(12)] }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const main = peekSession(CONV);
+        assert.ok(main, "main session exists under the RAW key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 12, "refs assigned under the bare id — compress with the host-stamped id works");
+        assert.ok(!peekSession(forkKey(CONV, MAIN_SYSTEM)), "main turn did NOT fork onto |sub:<fp(main)>");
+        assert.equal(main.stats.requests, 1, "exactly the main turn counted under the raw key");
+
+        // Phase 3 — a LATER side request still rides the raw key (second facet:
+        // pre-fix it minted a junk |sub:<fp(side)> session once anchored).
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(side()) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.ok(!peekSession(forkKey(CONV, SIDE_SYSTEM)), "post-anchor side request did not mint a junk forked session");
+        assert.equal(peekSession(CONV)?.stats.requests, 1, "side request counted nowhere");
+
+        // Phase 4 — review persona still forks (the #1916 mechanism this fix
+        // must not disturb): full-pipeline request, own system, own fork.
+        const r4 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: MODEL,
+                max_tokens: 384_000,
+                messages: [
+                    { role: "system", content: REVIEW_SYSTEM },
+                    { role: "user", content: "Conversation transcript (flattened):\nuser: build it\nassistant: ok\nDecide: risky?" },
+                ],
+            }),
+        });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        const fork = peekSession(forkKey(CONV, REVIEW_SYSTEM));
+        assert.ok(fork, "review persona still forks onto |sub:<fp> after the fix");
+        assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e anthropic lane #2156: the same anchor-steal race on dsh-over-anthropic", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-sidefirst-anthropic";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const side = () => ({
+            model: MODEL,
+            max_tokens: 100,
+            system: [{ type: "text", text: SIDE_SYSTEM }],
+            messages: [{ role: "user", content: [{ type: "text", text: "Summarize this conversation in one short title." }] }],
+        });
+
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify(side()) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s1 = peekSession(CONV);
+        assert.ok(s1, "side request resolved onto the raw conversation key");
+        assert.equal(Object.keys(s1.state.messageRefs.byRaw).length, 0, "side passthrough touches no kernel state");
+
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                model: MODEL,
+                max_tokens: 64_000,
+                system: [{ type: "text", text: MAIN_SYSTEM }],
+                messages: Array.from({ length: 12 }, (_, i): { role: string; content: { type: string; text: string }[] } => ({
+                    role: i % 2 === 0 ? "user" : "assistant",
+                    content: [{ type: "text", text: `main-${i + 1}-` + "z".repeat(6000) }],
+                })),
+            }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const main = peekSession(CONV);
+        assert.ok(main, "main session exists under the RAW key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 12, "refs assigned under the bare id");
+        assert.ok(!peekSession(forkKey(CONV, MAIN_SYSTEM)), "main turn did NOT fork onto |sub:<fp(main)>");
     } finally {
         await closeRig(rig);
     }

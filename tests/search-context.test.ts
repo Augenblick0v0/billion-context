@@ -85,24 +85,24 @@ test("buildVisibilityMarker: real failures still ❌", () => {
 test("executeSearchContext: missing query → FAILED string", () => {
     const core = createCore();
     const state = createInitialState();
-    assert.equal(executeSearchContext({}, core, state), "[search_context FAILED: query is required]");
-    assert.equal(executeSearchContext({ query: "" }, core, state), "[search_context FAILED: query is required]");
+    assert.equal(executeSearchContext({}, core, state).text, "[search_context FAILED: query is required]");
+    assert.equal(executeSearchContext({ query: "" }, core, state).text, "[search_context FAILED: query is required]");
 });
 
 test("executeSearchContext: zero active blocks → explicit empty-state message (#714)", () => {
     const core = createCore();
     const state = createInitialState();
-    assert.equal(executeSearchContext({ query: "anything" }, core, state), "[No compressed blocks exist yet — nothing to search.]");
+    assert.equal(executeSearchContext({ query: "anything" }, core, state).text, "[No compressed blocks exist yet — nothing to search.]");
 });
 
 test("executeSearchContext: active block exists but none match → no-match string", () => {
     const { core, state } = makeSessionWithBlock();
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state), /^\[No blocks matched "zzz-no-such-topic"\]$/);
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state).text, /^\[No blocks matched "zzz-no-such-topic"\]$/);
 });
 
 test("executeSearchContext: matching block → Found listing with id/topic/preview", () => {
     const { core, state } = makeSessionWithBlock();
-    const out = executeSearchContext({ query: "auth token" }, core, state);
+    const out = executeSearchContext({ query: "auth token" }, core, state).text;
     assert.match(out, /^Found \d+ block\(s\) for "auth token":/);
     assert.ok(out.includes("(T"), "tier present");
     assert.ok(out.includes("auth token exchange"), "summary preview present");
@@ -113,7 +113,7 @@ test("executeSearchContext: clamp cut straddling an astral char leaves no lone s
     assert.equal(straddle.length, 205);
     assert.equal(straddle.charCodeAt(199), 0xd83e, "high half sits exactly on the 200-unit cut");
     const { core, state } = makeSessionWithBlock(straddle);
-    const out = executeSearchContext({ query: "aaaa" }, core, state);
+    const out = executeSearchContext({ query: "aaaa" }, core, state).text;
     assert.match(out, /^Found 1 block\(s\)/);
     assert.ok(!hasUnpairedSurrogate(out), "no unpaired surrogate anywhere in the result");
     const previewLine = out.split("\n").find((l) => l.startsWith("  ")) ?? "";
@@ -126,7 +126,7 @@ test("executeSearchContext: astral char fully inside the prefix is kept (#816 co
     const inside = "a".repeat(197) + "\u{1F980}" + "b".repeat(20);
     assert.equal(inside.length, 219);
     const { core, state } = makeSessionWithBlock(inside);
-    const out = executeSearchContext({ query: "aaaa" }, core, state);
+    const out = executeSearchContext({ query: "aaaa" }, core, state).text;
     const previewLine = out.split("\n").find((l) => l.startsWith("  ")) ?? "";
     assert.ok(previewLine.includes("\u{1F980}"), "intact pair survives the clamp");
     assert.ok(!hasUnpairedSurrogate(out));

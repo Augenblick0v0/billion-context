@@ -50,7 +50,6 @@ import { createHash } from "node:crypto";
 const MIN_CANONICAL_BYTES = 24;
 
 /** Upper bound on tracked chains (LRU-evicted, global — content is the
-/** Upper bound on tracked chains (LRU-evicted, global — content is the
  *  only key, so there are no per-credential buckets). Chains are PERMANENT
  *  (#1724): the product promise is month- to year-level single sessions, so
  *  validity never expires with time — a chain leaves the table only under
@@ -149,6 +148,34 @@ function sortKeys(value: unknown): unknown {
     return value;
 }
 
+/** Canonical form for IDENTITY hashing (#2188): sorted-key JSON with every
+ *  `cache_control` field dropped. Claude Code stamps a `cache_control`
+ *  breakpoint on its last message + last assistant message and MOVES them as
+ *  the conversation grows, so a --resume/--fork replay of an earlier history
+ *  differs from the parent's final live request ONLY by where those hints sit.
+ *  They are transport-layer cache hints, not conversation content — hashing
+ *  them made EVERY resume/fork miss findResumeParent (the shared prefix was no
+ *  longer byte-stable across a breakpoint shift). Stripping them makes the
+ *  identity chain invariant to breakpoint placement while still requiring the
+ *  actual content to match byte-for-byte. */
+function canonicalForHash(value: unknown): string {
+    return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        const out: Record<string, unknown> = {};
+        for (const key of Object.keys(record).sort()) {
+            if (key === "cache_control") continue; // #2188: transport-layer hint, not content
+            out[key] = canonicalize(record[key]);
+        }
+        return out;
+    }
+    return value;
+}
+
 function sha256(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex");
 }
@@ -163,7 +190,7 @@ function chainHashes(messages: unknown[]): string[] {
     let prev = "";
     let bytes = 0;
     for (const message of messages) {
-        const canonical = stableStringify(message);
+        const canonical = canonicalForHash(message);
         bytes += canonical.length;
         prev = sha256(`${prev}\u0000${canonical}`);
         hashes.push(prev);
@@ -176,7 +203,7 @@ function chainHashes(messages: unknown[]): string[] {
  *  cannot match across a truncation), these support lineage lookups: fork-LCP
  *  from index 0, and truncated-run detection strictly inside a stored chain. */
 function perItemHashes(messages: unknown[]): string[] {
-    return messages.map((m) => sha256(stableStringify(m)));
+    return messages.map((m) => sha256(canonicalForHash(m)));
 }
 
 /** Length of the longest common prefix of two per-item hash arrays. */

@@ -123,7 +123,7 @@ test("compaction archive: decompress on an archived block gives an explicit reas
     const { session, blockId, tail } = sessionWithActiveBlock();
     runShortenedTurn(session, tail, true);
     const ctx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
-    const out = resolveDecompress({ blockId }, ctx);
+    const out = resolveDecompress({ blockId }, ctx).text;
     assert.match(out, /decompress FAILED/);
     assert.match(out, /pre-compaction archive/);
     assert.match(out, /no longer reachable/);
@@ -133,7 +133,7 @@ test("compaction archive: acp_status surfaces the archive instead of listing it 
     const { session, blockId, tail } = sessionWithActiveBlock();
     runShortenedTurn(session, tail, true);
     const ctx: LoopCtx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
-    const out = executeProxyTool("acp_status", {}, ctx);
+    const out = executeProxyTool("acp_status", {}, ctx).text;
     assert.match(out, /PRE-COMPACTION ARCHIVE/);
     assert.match(out, /decompress is unavailable/);
     assert.ok(out.includes(blockId), "acp_status names the archived block");

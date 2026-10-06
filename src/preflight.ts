@@ -106,6 +106,8 @@ export interface PreflightDeps {
     unknownBaseline?: boolean;
     /** #1933 F1: origin of the upstream this request routes to. When it matches the route that learned the session's estimate-calibration factor k̂, every per-round text estimate is scaled by k̂ so gate, per-round exit and final fit judge one payload on the same scale as the trigger that started this invocation; absent or mismatched → raw estimates (legacy behavior). */
     upstreamOrigin?: string;
+    /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
+    forceStreamSummary?: boolean;
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -684,7 +686,10 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // reject the max_output_tokens parameter. Each capability is learned at
     // most once (guarded below), so the compatibility retries are bounded:
     // at most one extra attempt per capability, in either rejection order.
-    let stream = deps.session.metadata.preflightStreamSummary === true;
+    // #2133: compress.streamSummary forces SSE from the first attempt — the
+    // learn path above only sees 400 "stream required" rejections, which a
+    // gateway timeout (524) never produces.
+    let stream = deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true;
     let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
     for (;;) {
         try {
@@ -1282,9 +1287,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 };
                 const creditBefore = deps.session.stats.compressCreditTokens;
                 const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
-                if (applied.startsWith("[Compression FAILED")) {
-                    deps.log("warn", `[preflight] ${applied}`);
-                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
+                if (applied.outcome === "refused") {
+                    deps.log("warn", `[preflight] ${applied.text}`);
+                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
                     skipSet.add(skipKey);
                     break;
                 }

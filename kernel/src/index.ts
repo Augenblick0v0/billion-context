@@ -24,6 +24,7 @@ export {
   emptyRefMap,
   indexToRef,
   refToIndex,
+  orderedRefPair,
   refForRaw,
   rawForRef,
   BLOCKED_REF,

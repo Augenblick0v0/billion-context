@@ -123,7 +123,7 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<string> {
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<{ text: string; failed: boolean }> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
@@ -144,8 +144,11 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
-        if (res.ok && data.ok) return data.result ?? "";
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: string };
+        // #1875: ok:true means the tool RAN; the business effect rides outcome.
+        // failure/refusal receipts become MCP isError so hosts surface them to
+        // the model — partial still counts as success.
+        if (res.ok && data.ok) return { text: data.result ?? "", failed: data.outcome === "failure" || data.outcome === "refused" };
         // #656: the shim's captured id was never registered — the host likely
         // resumed its session and forked a new id after this shim spawned.
         // Adopt the proxy's latest active conversation and retry once. Armed
@@ -304,8 +307,8 @@ async function handleMessage(msg: {
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeThreadId !== undefined);
-                sendResult(id, { content: [{ type: "text", text }], isError: false });
+                const out = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeThreadId !== undefined);
+                sendResult(id, { content: [{ type: "text", text: out.text }], isError: out.failed });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC
                 // errors, so the host surfaces them to the model.

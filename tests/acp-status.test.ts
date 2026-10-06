@@ -65,16 +65,16 @@ function rangesSection(report: string): string {
 
 test("#389: acp_status after compress lists no already-compressed refs, without a new prepare", () => {
     const ctx = makeCtx12();
-    const before = handleAcpStatus({}, ctx);
+    const before = handleAcpStatus({}, ctx).text;
     assert.ok(rangesSection(before).includes("m00001"), "pre-compress report lists m00001 as compressible (fixture sanity)");
 
-    const result = applyRanges(parseCompressInput(JSON.parse(COMPRESS_ARGS)), ctx);
+    const result = applyRanges(parseCompressInput(JSON.parse(COMPRESS_ARGS)), ctx).text;
     assert.ok(!result.startsWith("[Compression FAILED"), `compress succeeded (got: ${result.slice(0, 80)})`);
     assert.ok(ctx.session.state.blocks.some((b) => b.blockId === "b1" && b.active), "block b1 active after compress");
 
     // No new prepare between the compress and this status call — the exact
     // #389 scenario. The report must derive ranges/nudge from live state.
-    const after = handleAcpStatus({}, ctx);
+    const after = handleAcpStatus({}, ctx).text;
     assert.ok(after.includes("b1"), "base report shows the new active block");
     // #1179: BLOCK SPANS (and other sections) legitimately name covered refs —
     // scope the check to actual range-entry lines ("  mNNNNN–mNNNNN …").
@@ -87,7 +87,7 @@ test("#389: acp_status after compress lists no already-compressed refs, without 
 
 test("#389: scope= short-circuit returns the live base report only", () => {
     const ctx = makeCtx12();
-    const out = handleAcpStatus({ scope: "uncompressed" }, ctx);
+    const out = handleAcpStatus({ scope: "uncompressed" }, ctx).text;
     assert.ok(out.includes("UNCOMPRESSED"), "scope= base report present");
     assert.ok(!out.includes("Compressible ranges"), "scope= output carries no ranges section");
     assert.ok(!out.includes("Nudge:"), "scope= output carries no nudge line");
@@ -139,13 +139,13 @@ test("#897: acp_status surfaces blind-tunneled CONNECT traffic as UNDECRYPTED TR
     _resetBlindTunnelStatsForTest();
     try {
         const ctx = makeCtx12();
-        const clean = handleAcpStatus({}, ctx);
+        const clean = handleAcpStatus({}, ctx).text;
         assert.ok(!clean.includes("UNDECRYPTED TRAFFIC"), "no section when no blind tunnels recorded");
 
         recordBlindTunnel("copilot.tencent.com");
         recordBlindTunnel("copilot.tencent.com");
         recordBlindTunnel("api.deepseek.com");
-        const out = handleAcpStatus({}, ctx);
+        const out = handleAcpStatus({}, ctx).text;
         assert.ok(out.includes("UNDECRYPTED TRAFFIC (instance-level)"), "section present when blind tunnels exist");
         assert.ok(out.includes("3 CONNECT tunnel(s)"), `total count rendered (got: ${out.slice(-400)})`);
         assert.ok(out.includes("copilot.tencent.com×2"), "per-host counts with real hosts, most tunnels first");
@@ -162,16 +162,16 @@ test("#1577: acp_status surfaces an active instance-level advisory", () => {
     try {
         const ctx = makeCtx12();
         const clean = handleAcpStatus({}, ctx);
-        assert.ok(!clean.includes("CRITICAL ADVISORY"), "no section when no advisory is active");
+        assert.ok(!clean.text.includes("CRITICAL ADVISORY"), "no section when no advisory is active");
 
         _setAdvisoryStateForTest({
             active: { id: "bc-2026-001", affected: ">=0.1.155 <0.1.158", target: "0.1.157", reason: "corrupts tool-call arguments", currentVersion: "0.1.156" },
         });
         const out = handleAcpStatus({}, ctx);
-        assert.ok(out.includes("CRITICAL ADVISORY (instance-level):"), "section present while an advisory is active");
-        assert.ok(out.includes("[bc-2026-001] version 0.1.156 is affected (corrupts tool-call arguments)"), "id + affected version + reason rendered");
-        assert.ok(out.includes("npm install -g billion-context@0.1.157"), "manual fallback command present");
-        assert.ok(out.includes("GET /__bili/status → advisory"), "points at the live-state field");
+        assert.ok(out.text.includes("CRITICAL ADVISORY (instance-level):"), "section present while an advisory is active");
+        assert.ok(out.text.includes("[bc-2026-001] version 0.1.156 is affected (corrupts tool-call arguments)"), "id + affected version + reason rendered");
+        assert.ok(out.text.includes("npm install -g billion-context@0.1.157"), "manual fallback command present");
+        assert.ok(out.text.includes("GET /__bili/status → advisory"), "points at the live-state field");
     } finally {
         _resetAdvisoryWatcherForTest();
     }
@@ -179,11 +179,11 @@ test("#1577: acp_status surfaces an active instance-level advisory", () => {
 
 test("acp_status renders the ACTIVE SURFACE line from the session's pack stamp", () => {
     const ctx = makeCtx12();
-    const unstamped = handleAcpStatus({}, ctx).split("\n").find((l) => l.startsWith("ACTIVE SURFACE:"));
+    const unstamped = handleAcpStatus({}, ctx).text.split("\n").find((l) => l.startsWith("ACTIVE SURFACE:"));
     assert.ok(unstamped?.includes("pack=default"), `unstamped session reports pack=default (got: ${unstamped})`);
     const stamped = makeCtx12();
     (stamped.session as { meta: { activePack?: string } }).meta.activePack = "lean";
-    const report = handleAcpStatus({}, stamped);
+    const report = handleAcpStatus({}, stamped).text;
     const line = report.split("\n").find((l) => l.startsWith("ACTIVE SURFACE:"));
     assert.ok(line, "ACTIVE SURFACE line present once stamped");
     assert.ok(line!.startsWith("ACTIVE SURFACE: pack=lean | host=billion-context "), `host identity rendered (got: ${line})`);

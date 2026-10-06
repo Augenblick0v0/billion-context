@@ -16,7 +16,7 @@ process.env.XDG_DATA_HOME = path.join(root, "data");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 
 // Imported AFTER the XDG env above: MARKER_FILE is frozen at module load.
-const { decideAutoRestart, probeHostFor, performSelfRestart, readLastRestart, RESTART_COOLDOWN_MS } = await import("../src/restart.ts");
+const { decideAutoRestart, probeHostFor, performSelfRestart, readLastRestart, selfRestartSpawnOptions, RESTART_COOLDOWN_MS } = await import("../src/restart.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
@@ -86,11 +86,12 @@ function makeCrashStub(name: string): string {
     return p;
 }
 
-type SpawnRecord = { child?: ChildProcess; args?: string[] };
+type SpawnRecord = { child?: ChildProcess; args?: string[]; options?: SpawnOptions };
 
 function makeSpawn(stubPath: string, port: number, record: SpawnRecord): (execPath: string, args: string[], options: SpawnOptions) => ChildProcess {
-    return (_execPath, args, _options) => {
+    return (_execPath, args, options) => {
         record.args = args;
+        record.options = options;
         const child = spawn(process.execPath, [stubPath, String(port)], { stdio: "ignore" });
         record.child = child;
         return child;
@@ -135,6 +136,26 @@ test("probeHostFor: wildcards map to their loopback counterpart", () => {
     assert.equal(probeHostFor("::"), "::1");
     assert.equal(probeHostFor("127.0.0.1"), "127.0.0.1");
     assert.equal(probeHostFor("192.168.1.5"), "192.168.1.5");
+});
+
+// #2095: the replacement died on Windows because it was spawned non-detached —
+// a console-attached parent's exit tears down libuv's kill-on-job-close job
+// object and takes the child with it mid-boot. Pin the platform split so a
+// future "simplification" back to a single non-detached spawn is caught.
+test("selfRestartSpawnOptions: win32 detaches+hide+ignore-stdio; posix inherits (#2095)", () => {
+    const win = selfRestartSpawnOptions("win32");
+    assert.equal(win.detached, true, "win32 must detach so the replacement outlives the parent's exit");
+    assert.equal(win.windowsHide, true, "win32 must hide the console (#1887 pattern)");
+    assert.equal(win.stdio, "ignore", "win32 stdio ignored — the durable log file is independent of stderr");
+    assert.ok(win.env, "env must be inherited on win32 (BILI_PARENT_PID / BILI_LAUNCH_TOKEN)");
+
+    for (const p of ["linux", "darwin"] as NodeJS.Platform[]) {
+        const posix = selfRestartSpawnOptions(p);
+        assert.equal(posix.detached, undefined, `${p} must stay NON-detached so stopProxy() group kill reaches it (#414)`);
+        assert.equal(posix.windowsHide, undefined, `${p} keeps no console-hide flag in this path`);
+        assert.equal(posix.stdio, "inherit", `${p} keeps inherited stdio so it logs wherever the parent does`);
+        assert.ok(posix.env, `${p} env must be inherited`);
+    }
 });
 
 test("performSelfRestart: broken install fails sanity check, service untouched", { timeout: 30_000 }, async () => {
@@ -245,6 +266,40 @@ test("performSelfRestart: handover succeeds at zero in-flight", { timeout: 30_00
         record.child?.kill();
         server.closeAllConnections?.();
         await new Promise<void>((r) => server.close(() => r()));
+    }
+});
+
+// #2095 wiring guard: the options-matrix test above pins selfRestartSpawnOptions
+// in isolation; this proves performSelfRestart actually hands THAT output (for
+// the requested platform) to spawn — so a regression that hardcodes one set of
+// options or ignores deps.platform is caught, not just a broken helper.
+test("performSelfRestart: hands the platform-specific spawn options through to spawn (#2095)", { timeout: 30_000 }, async () => {
+    for (const platform of ["win32", "linux"] as NodeJS.Platform[]) {
+        const { server, port } = await startServer();
+        const { log } = makeLog();
+        const record: SpawnRecord = {};
+        try {
+            const result = await performSelfRestart({
+                server, host: "127.0.0.1", port,
+                installDir: makeInstall("1.0.1"),
+                runningVersion: "1.0.0", diskVersion: "1.0.1",
+                log, inFlightProvider: () => 0,
+                platform,
+                spawnImpl: makeSpawn(makeReadyStub(`stub-opts-${platform}.mjs`), port, record),
+                settleMs: 500, readyTimeoutMs: 5000,
+                finish: () => {},
+            });
+            assert.equal(result.ok, true, JSON.stringify(result));
+            assert.deepEqual(
+                record.options,
+                selfRestartSpawnOptions(platform),
+                `${platform}: spawn must be called with the platform-specific options`,
+            );
+        } finally {
+            record.child?.kill();
+            server.closeAllConnections?.();
+            await new Promise<void>((r) => server.close(() => r()));
+        }
     }
 });
 

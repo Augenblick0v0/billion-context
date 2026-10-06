@@ -20,6 +20,7 @@ import type { CompressSettings } from "./config.js";
 import type { ResolvedImageBilling } from "./image-tokens.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
+import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Image pre-compression host side (#1095 / acp-kernel#353). The kernel owns
 // the pure decisions (routing, recipe, token estimation, image_full state
@@ -383,11 +384,11 @@ function cachedFormat(mediaType: string): ImageFormat {
 /** Execute one image_full call (sticky restore for the rest of the session).
  *  Mirrors executeRetrieve's shape; the restore itself is passive — the next
  *  forward pass emits the cached/original bytes for the ref. */
-export function executeImageFull(args: Record<string, unknown>, session: Session, config: Config, callId?: string): string {
+export function executeImageFull(args: Record<string, unknown>, session: Session, config: Config, callId?: string): ProxyToolResult {
     session.stats.imageFullCalls = (session.stats.imageFullCalls ?? 0) + 1;
     const parsed = parseImageFullInput(args, callId, (w) => loggerLog("info", `[acp-image] ${w}`));
     if (!parsed) {
-        return `${IMAGE_FULL_FAILURE_MARKER} invalid input — expected { ref: "mNNNNN" }`;
+        return toolFail(`${IMAGE_FULL_FAILURE_MARKER} invalid input — expected { ref: "mNNNNN" }`);
     }
     const wasRestored = isImageFullRestored(session.state, parsed.ref);
     const outcome = applyImageFull({ ref: parsed.ref, state: session.state, config });
@@ -403,7 +404,7 @@ export function executeImageFull(args: Record<string, unknown>, session: Session
     } else {
         loggerLog("info", `[acp-image] image_full ${parsed.ref}: rejected (${outcome.resultText})`);
     }
-    return outcome.resultText;
+    return outcome.ok ? toolOk(outcome.resultText) : toolFail(outcome.resultText);
 }
 
 /** Trailing-message guidance for the model: how many images are currently
