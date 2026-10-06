@@ -249,6 +249,12 @@ two small node scripts that do the work around the client:
   against the live proxy manifest, the routed entries gain
   `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
   Tool calls bind via the per-call `conversation_id` argument (#760).
+- **What gets cleaned vs. never touched (unified ACP invariants):** model
+  prose may have bili render-tag echoes / marker lines / degenerate residue
+  stripped in transit; the **thinking channel** (anthropic `thinking`, google
+  `thought`, openai `reasoning_content`/`reasoning`, responses reasoning
+  summaries), **tool-call arguments** (model-written file content) and
+  **user messages** are byte-for-byte untouched.
 - **Routing scope (#1622):** native mode wraps **every** provider entry with
   a usable http(s) `baseURL` — the same "all providers ride compression"
   semantics as the in-process natives (pi/dsh) — not just the bigmodel

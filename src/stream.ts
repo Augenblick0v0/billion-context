@@ -8,7 +8,7 @@ import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.j
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
@@ -601,11 +601,16 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     }
     b.content = newContent;
     if (converted && !sawRealToolUse) b.stop_reason = "end_turn";
+    // Absorb signature in whole text (m00885): drop only when the request
+    // actually instructed the model about absorb — the shape check alone
+    // cannot tell an emission from a user-quoted fragment.
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
+    const requestText = JSON.stringify(ctx.messages);
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;
-        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t))) {
+        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t) || (absorbArmed && containsToolCallEmissionText(t)))) {
             ctx.log(`[warn: tag echo] non-stream model output contains ACP echo (render tags/markers/internal artifacts), stripped: ${t.slice(0, 120).replace(/\n/g, " ")}`);
-            (blk as { text?: string }).text = stripAcpTags(t);
+            (blk as { text?: string }).text = stripAcpTags(t, absorbArmed, requestText);
         }
     }
     return body;
