@@ -75,8 +75,19 @@ function mockCtx() {
     };
 }
 
+// #2260(F): ambient proxy env must never leak into this suite — a BILI_PROVIDER_REWRITES
+// inherited from the runner's shell flips planNativeDsh to "off" (src/agent/dsh-native.ts),
+// so the spawn would be skipped and the timeouts below would test nothing.
+const SEALED_PROXY_ENV = ["BILI_PROVIDER_REWRITES", "BILI_MITM_HOSTS", "NODE_EXTRA_CA_CERTS"];
+
 async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
     const saved: Record<string, string | undefined> = {};
+    for (const k of SEALED_PROXY_ENV) {
+        if (!(k in env)) {
+            saved[k] = process.env[k];
+            delete process.env[k];
+        }
+    }
     for (const k of Object.keys(env)) {
         saved[k] = process.env[k];
         const v = env[k];
