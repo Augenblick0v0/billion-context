@@ -9,6 +9,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { conversationHeaderSource, instructionsFingerprintApplies } from "../src/session-id.ts";
+import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
 
 // #1102: opencode's system-context reconcile rewrites `instructions` whenever
 // AGENTS.md is edited mid-session. Its conversation ids are persona-scoped
@@ -297,11 +298,16 @@ test("e2e #150: codex root thread reusing a task id across personas still splits
         res.write(completed(700));
         res.end();
     }, async (url, statsUrl, _bodies) => {
-        const input = [{ type: "message", role: "user", content: "task turn" }];
+        // #2250: the two tasks must differ in CONTENT, not just instructions —
+        // continuity now keys on the message chain; a byte-identical payload
+        // under new instructions is the SAME conversation evolving (migrate),
+        // while #150's scenario is a genuinely fresh task reusing the id.
+        const input = [{ type: "message", role: "user", content: "task A first turn" }];
         const req1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "task A persona instructions", input }) });
         assert.equal(req1.status, 200);
         await req1.text();
-        const req2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "task B persona instructions (different task reusing the id)", input }) });
+        const inputB = [{ type: "message", role: "user", content: "task B first turn (unrelated task reusing the id)" }];
+        const req2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions: "task B persona instructions (different task reusing the id)", input: inputB }) });
         assert.equal(req2.status, 200);
         await req2.text();
 
@@ -310,5 +316,54 @@ test("e2e #150: codex root thread reusing a task id across personas still splits
         const ids = stats.sessions.map((s: { id: string }) => s.id).sort();
         assert.equal(ids[0], TASK_ID);
         assert.ok(ids[1].startsWith(`${TASK_ID}|sub:`), `forked namespace, got ${ids[1]}`);
+    });
+});
+
+test("e2e #2250: codex instructions drift with CONTINUING history keeps ONE session (model switch / AGENTS.md edit)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetSessionsForTest();
+    setRegistryForTest({});
+    resetPersonaAnchorsForTest();
+
+    const TASK_ID = "codex-task-id-2250";
+    const headers = {
+        "content-type": "application/json",
+        "user-agent": "codex_cli_rs/0.147.0",
+        "session-id": TASK_ID,
+        "x-codex-turn-metadata": JSON.stringify({ thread_source: "user", thread_id: "t-root-2250" }),
+        "thread-id": "t-root-2250",
+    };
+    const INSTRUCTIONS_A = "You are Codex, the main agent (model: gpt-5.3).";
+    const INSTRUCTIONS_B = "You are Codex, the main agent (model: glm-5.3). \nWorkspace guidance updated.";
+
+    const user = (n: number) => ({ type: "message", role: "user", content: [`turn ${n}: please continue the task`] });
+    const assistant = (n: number) => ({ type: "message", role: "assistant", content: [{ type: "output_text", text: `assistant answer ${n}` }] });
+    const post = async (url: string, instructions: string, input: unknown[]) => {
+        const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-drift-e2e", stream: true, instructions, input }) });
+        assert.equal(res.status, 200);
+        await res.text();
+    };
+
+    await withProxy((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write(textEvents("codex answer"));
+        res.write(completed(700));
+        res.end();
+    }, async (url, statsUrl) => {
+        // Turn 1-2 on instructions A: grow the conversation (full replay each
+        // turn — the codex shape).
+        await post(url, INSTRUCTIONS_A, [user(1)]);
+        await post(url, INSTRUCTIONS_A, [user(1), assistant(1), user(2)]);
+
+        // Turn 3: instructions drift (model switch / AGENTS.md edit), history
+        // fully replayed and continued. Must NOT fork — the anchor migrates.
+        await post(url, INSTRUCTIONS_B, [user(1), assistant(1), user(2), assistant(2), user(3)]);
+
+        // Turn 4: still instructions B — plain match on the migrated anchor.
+        await post(url, INSTRUCTIONS_B, [user(1), assistant(1), user(2), assistant(2), user(3), assistant(3), user(4)]);
+
+        const stats = (await (await fetch(statsUrl)).json()) as { sessions: Array<{ id: string }> };
+        assert.equal(stats.sessions.length, 1, `instructions drift with continuing history must keep ONE session (got ${JSON.stringify(stats.sessions.map((x) => x.id))})`);
+        assert.equal(stats.sessions[0]!.id, TASK_ID, "the session stays on the raw key — no |sub: fork");
     });
 });
