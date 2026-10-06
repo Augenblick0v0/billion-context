@@ -4,12 +4,13 @@
 // (opencode `skill({name})`, Claude Code/ZCode `Skill({skill})`, any tool
 // reading `<dir>/<name>/SKILL.md`), so one knob addresses an individual skill
 // without new config fields. These host-side tests cover the config plumbing
-// plus end-to-end anthropic-wire compression runs; unit-level coverage of the
-// projection and matcher lives in kernel/tests/protected-paths.test.ts.
+// plus end-to-end compression runs over the anthropic, openai-chat and
+// responses wires; unit-level coverage of the projection and matcher lives in
+// kernel/tests/protected-paths.test.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, refForRaw, coveredMessageIds } from "acp-kernel";
-import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
+import { anthropicToCore, openaiToCore, responsesToCore, type AnthropicRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CoreMessage } from "acp-kernel";
 import { parseCompressSettings } from "../src/config.ts";
 import { extractPlanState } from "../src/decompress-shared.ts";
@@ -159,4 +160,48 @@ test("extractPlanState honors skill path patterns (extraPatterns [\"skill/*\"])"
     const st = extractPlanState(msgs, ["skill/*"]);
     assert.ok(st, "plan state extracted via skill path pattern");
     assert.ok(st!.terms.has("orchestrator"), "skill load terms present");
+});
+
+// --- Non-anthropic wires: projection feeds the same path matcher -------------
+
+test("openai-chat wire: Skill({skill}) loads project to skill/<name> under path patterns", () => {
+    const body: OpenAIRequestBody = { model: "gpt-test", messages: [
+        { role: "user", content: "start of a long working session" },
+        { role: "assistant", content: null, tool_calls: [
+            { id: "sk-orc", type: "function", function: { name: "Skill", arguments: JSON.stringify({ skill: "release-orchestrator" }) } },
+            { id: "sk-light", type: "function", function: { name: "Skill", arguments: JSON.stringify({ skill: "review-loop" }) } },
+        ] },
+        { role: "tool", tool_call_id: "sk-orc", content: `skill release-orchestrator payload ${"y".repeat(400)}` },
+        { role: "tool", tool_call_id: "sk-light", content: `skill review-loop payload ${"y".repeat(400)}` },
+    ] };
+    const core = createCore();
+    const config = { ...defaultConfig(200000), protectedTools: ["skill/release-orchestrator"], preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const { msgs } = openaiToCore(body);
+    const turn = core.processTurn({ messages: msgs, state: createInitialState(), config, tokenCount: 9999, renderTags: "text-only" });
+    const refOf = (m: CoreMessage): string | null => refForRaw(turn.state.messageRefs, m.id);
+    const kept = pairOf(msgs, "sk-orc");
+    assert.equal(refOf(kept.call), "BLOCKED", "named skill call BLOCKED on openai wire");
+    assert.equal(refOf(kept.result), "BLOCKED", "named skill result BLOCKED on openai wire");
+    const light = pairOf(msgs, "sk-light");
+    assert.ok(/^m\d+$/.test(refOf(light.call) ?? ""), "non-matching skill stays foldable");
+});
+
+test("responses wire: skill({name}) loads project to skill/<name> under path patterns", () => {
+    const body: ResponsesRequestBody = { model: "gpt-test", input: [
+        { type: "message", role: "user", content: "start of a long working session" },
+        { type: "function_call", call_id: "call-orc", name: "skill", arguments: JSON.stringify({ name: "release-orchestrator" }) },
+        { type: "function_call_output", call_id: "call-orc", output: `skill release-orchestrator payload ${"y".repeat(400)}` },
+        { type: "function_call", call_id: "call-light", name: "skill", arguments: JSON.stringify({ name: "review-loop" }) },
+        { type: "function_call_output", call_id: "call-light", output: `skill review-loop payload ${"y".repeat(400)}` },
+    ] };
+    const core = createCore();
+    const config = { ...defaultConfig(200000), protectedLatestTools: ["skill/*"], preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const { msgs } = responsesToCore(body);
+    const turn = core.processTurn({ messages: msgs, state: createInitialState(), config, tokenCount: 9999, renderTags: "text-only" });
+    const refOf = (m: CoreMessage): string | null => refForRaw(turn.state.messageRefs, m.id);
+    for (const id of ["call-orc", "call-light"]) {
+        const { call, result } = pairOf(msgs, id);
+        assert.equal(refOf(call), "BLOCKED", `${id} latest-per-name call BLOCKED on responses wire`);
+        assert.equal(refOf(result), "BLOCKED", `${id} latest-per-name result BLOCKED on responses wire`);
+    }
 });
