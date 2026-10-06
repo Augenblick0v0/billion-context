@@ -253,6 +253,52 @@ test("#2190 round 2 stripAcpTags: drift forms die whole-text, genuine words surv
     }
 });
 
+// #2190 round 4: H2-exclusion invariant (#2248 debate). Every state-machine
+// path that TOUCHES a well-formed acplike pair must fire at least one onDrop
+// (i.e. leave a [tag-echo] log line): swallow-mode entry always follows a
+// logged drop (match path / BROKEN_ATTRS), the definite-tail hold budget is
+// TAG_OPEN_CAP with DROP-not-release over-cap, and the 80-char release budget
+// only exists inside swallow mode. A zero-log stream therefore cannot have
+// leaked a complete pair through the filter — the residual question (why the
+// bytes never entered) is answered by the exit audits, not by a silent
+// internal path. Probed empirically on the v0.1.185-identical filter.
+test("#2190 round 4 invariant: touching a well-formed pair always fires >=1 drop callback", () => {
+    const LT = String.fromCharCode(0x3c), GT = String.fromCharCode(0x3e);
+    const runScenario = (chunks: string[]): { drops: number; out: string } => {
+        let drops = 0;
+        const f = createTagEchoFilter(() => { drops++; });
+        let out = "";
+        for (const c of chunks) out += f.push(c);
+        out += f.flush();
+        return { drops, out };
+    };
+    const openTrunc = LT + "acp tokens=\"2\"";
+    const openFull = openTrunc + GT;
+    const close = LT + "/" + "acp" + GT;
+    // A: truncated open + short body, stream ends -> EOF rule drops, logged
+    let r = runScenario([openTrunc, "x".repeat(90)]);
+    assert.equal(r.drops, 1, "A: EOF drop must be logged");
+    assert.equal(r.out.includes("m"), false);
+    // B: truncated open + body past TAG_OPEN_CAP -> over-cap drop, logged
+    r = runScenario([openTrunc, "x".repeat(4200)]);
+    assert.equal(r.drops, 1, "B: over-cap definite-tail drop must be logged");
+    assert.equal(r.out.length, 0, "B: nothing released");
+    // C: complete pair char-by-char -> stripped, logged
+    r = runScenario([...(openFull + "m00001" + close)]);
+    assert.equal(r.drops, 1, "C: pair strip must be logged");
+    assert.equal(r.out, "", "C: pair dies");
+    // D: complete open + body past SWALLOW_CAP, no close -> budget RELEASES
+    // the prose body, but the open's drop already logged
+    r = runScenario([openFull, "y".repeat(90)]);
+    assert.ok(r.drops >= 1, "D: swallow entry drop must be logged");
+    assert.equal(r.out, "y".repeat(90), "D: body is prose, released verbatim");
+    // E: truncated open + long body, close arrives late -> ref leaks as BARE
+    // prose (no pair) but drops are logged
+    r = runScenario([openTrunc, "z".repeat(4200), GT + "m00001" + close]);
+    assert.ok(r.drops >= 1, "E: drops must be logged");
+    assert.ok(!r.out.includes(LT), "E: no tag markup survives");
+});
+
 test("#2190 round 2 gate: drift-name heads engage the render-tag predicates once spaced", () => {
     assert.equal(mayStartRenderTag("\x3cacacp "), true);
     assert.equal(mayStartRenderTag("\x3caccessp x"), true);
