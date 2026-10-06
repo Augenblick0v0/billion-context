@@ -212,6 +212,17 @@ entries:
     desc_zh: "匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。"
     site_en: "<code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default)."
     site_zh: "<code>forkAdoption</code> —— 匿名 fork 会话并入父会话（默认关）。"
+  - key: affinitySimhash
+    type: boolean
+    default: "true"
+    env: BILI_AFFINITY_SIMHASH
+    group: behavior
+    id: tt.simhash
+    site_group: beh
+    desc_en: "Simhash chain-alignment adoption for anonymous clients (#2265): a client-side pervasive decorative rewrite (e.g. Trae re-stamping model tags on every assistant message) re-attaches the existing session with its compression state instead of minting fresh and re-folding from zero."
+    desc_zh: "匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。"
+    site_en: "<code>affinitySimhash</code> — simhash chain-alignment re-attaches sessions after pervasive client rewrites (on by default)."
+    site_zh: "<code>affinitySimhash</code> —— 大面积客户端改写后按 simhash 链对齐重新挂回会话（默认开）。"
   - key: resumeInheritance
     type: boolean
     default: "true"

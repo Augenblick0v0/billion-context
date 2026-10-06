@@ -117,6 +117,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
+import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
@@ -859,6 +860,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         };
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
+            // #2265: simhash chain-alignment adoption (identity ladder rung 2)
+            //  — on by default; affinitySimhash: false / BILI_AFFINITY_SIMHASH=0
+            //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
+            setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
             atomicWriteInstanceFile(instanceRecord);
         } catch {
@@ -2409,7 +2414,13 @@ async function handle(
                     : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
                 return;
             }
-            if (anonAffinity.matchedDepth > 0) {
+            if (anonAffinity.via === "simhash" && anonAffinity.adoption) {
+                // #2265: the exact chain broke (client-side decorative rewrite,
+                //  e.g. Trae re-stamping model tags) but chain-level similarity
+                //  re-attached the EXISTING session — fold state survives.
+                log("info", `[prefix-affinity] simhash adoption: anonymous ${protocol} request → session ${anonAffinity.sessionId} (chain rewritten client-side; ${Math.round(anonAffinity.adoption.coverage * 100)}% of ${anonAffinity.matchedDepth} positions similar, mean Hamming ${anonAffinity.adoption.meanHamming.toFixed(1)} — re-attaching, compression state preserved #2265)`);
+                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} re-attached via simhash alignment (coverage ${Math.round(anonAffinity.adoption.coverage * 100)}%, depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth})`);
+            } else if (anonAffinity.matchedDepth > 0) {
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
@@ -2529,7 +2540,7 @@ async function handle(
             session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
         if (anonAffinity) {
-            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
+            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags);
             scheduleAffinityPersist();
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
