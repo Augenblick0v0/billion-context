@@ -1344,6 +1344,42 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
 
+### Why the first compaction waits until 200k
+
+Compaction does **not** trigger on absolute window position — it triggers on
+**growth intervals**: by default the first soft compaction fires after the
+session grows **50k tokens past its boot content**
+([`nudgeGrowthTokens`](#nudgegrowthtokens), a flat step independent of window
+size). The absolute position of the first compaction is therefore ≈ **boot +
+50k**:
+
+- boot 30k–50k (the dsh default) → first compaction at ~80k–100k;
+- a boot around 100k, or a growth step set to ~100k → the first compaction may
+  wait until **~200k**.
+
+The forced threshold ([`maxContextLimit`](#maxcontextlimit), default 75%) is
+only a backstop, and it applies to the *effective* window — the output reserve
+`min(max_tokens, outputHeadroomMaxPct × window)` (cap default `0.25`, see
+[`outputHeadroomMaxPct`](#outputheadroommaxpct)) is subtracted first. The
+reserve is usually small and only maxes out at the 25% cap when the request
+carries a very large `max_tokens`: a 262,144-token window with
+`max_tokens = 131072` → effective window 196,608 → forced line ≈147k; the same
+window with an 8k reserve → forced line ≈190k.
+
+After that the cadence stays growth-based: one incremental compaction per +50k
+of compressible growth. On local models each compaction is a full re-prefill —
+a heavy boot plus a large window puts several of them into one long task, which
+is how wall-clock ends up 2–3× longer.
+
+To make the first compaction fire earlier (and save tokens), in this order:
+
+1. **trim the system prompt, disable unneeded tools, prune skills** — boot
+   size directly determines the absolute position of the first compaction;
+2. **lower `nudgeGrowthTokens` to ~50k** (especially if it was raised to 100k);
+3. **enable lean mode** (`promptPack: "lean"`).
+
+Measure actual boot/context usage with `/acp` or the web UI before tuning.
+
 ### Soft target with elastic headroom (#1122)
 
 Autonomous agents often want two things at once: keep the *active* context small (cost/latency), while allowing a single task to burst well past that target when it genuinely needs to (e.g., reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — one field plays two roles at once (the usage-ratio denominator **and** the hard preflight wall), so any payload above it gets folded mid-task or fails fast (#1122).
@@ -1362,7 +1398,7 @@ Express it with the existing soft bands instead: keep the limit at the native wi
 
 How compression actually decides (acp-kernel, verified):
 
-1. **Growth layer (day-to-day driver, absolute tokens):** a proactive nudge fires once cumulative growth since the last anchor (session start / last nudge / post-compression reset) reaches the growth floor **and** enough compressible mass has accumulated. Both numbers are absolute and window-independent by design: adaptive step = `clamp(round(window × 5%), 20k, 50k)` → 20k on windows ≤ ~400k, capped at 50k on ≥1M windows; growth floor ≈ 20k (22.5k on ≥1M). This layer keeps compressing long sessions even far below any percentage band.
+1. **Growth layer (day-to-day driver, absolute tokens):** a proactive nudge fires once cumulative growth since the last anchor (session start / last nudge / post-compression reset) reaches the growth gate **and** enough compressible mass has accumulated. Both numbers are absolute and window-independent by design: the growth step is flat 50k at every window size (kernel `nudge.growthFloor == nudge.growthCap == 50000`, golden-pinned; window-percentage scaling was deliberately removed — #379/#380; override with `nudgeGrowthTokens`); the growth gate is `max(20k, 0.45 × step)` ≈ 22.5k, and the T1 path additionally needs ≥ one step (50k) of compressible mass. This layer keeps compressing long sessions even far below any percentage band.
 2. **Pressure layer (percent of the window):** `usage ≥ maxContextLimit` (default 75%) → a nudge is injected every turn until context drops back under; `usage ≥ emergencyThresholdPercent` (default 95%) → forced nudge + emergency truncation.
 3. **Qualification layer (kernel default 45%, not exposed):** gates only the turn-1 cold-start ticket and the block-count floor for T2/T3 tier escalation — not part of the day-to-day path.
 

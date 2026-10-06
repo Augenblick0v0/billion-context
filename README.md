@@ -338,6 +338,16 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Why does the first compaction wait until ~200k?** Compaction does not
+trigger on absolute window position but on growth intervals: by default the
+first soft compaction fires 50k tokens past the boot content
+(`compress.nudgeGrowthTokens`, flat and window-independent). With a boot around
+100k — or with the growth step set to ~100k — the first compaction may wait
+until ~200k. To make it fire earlier: 1) trim the system prompt, disable
+unneeded tools, prune skills; 2) lower `compress.nudgeGrowthTokens` to ~50k;
+3) enable lean mode. Worked example in
+[CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
+
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher
