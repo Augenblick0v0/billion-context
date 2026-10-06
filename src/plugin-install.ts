@@ -1860,6 +1860,38 @@ function rootFromDistFile(file: string): string {
     return path.dirname(path.dirname(path.dirname(file)));
 }
 
+// #2260(F): cache spec slots are `billion-context@<spec>`; for registry
+// installs <spec> is a dotted version, which lexicographic sort mis-orders
+// ("0.1.9" > "0.1.186" because '9' > '1'). Compare all-numeric specs per
+// segment; anything non-numeric ("latest", file: specs) falls back to plain
+// string order — same relative position as before.
+function compareSpecSlots(a: string, b: string): number {
+    const SPEC_PREFIX = "billion-context@";
+    const av = a.startsWith(SPEC_PREFIX) ? a.slice(SPEC_PREFIX.length) : a;
+    const bv = b.startsWith(SPEC_PREFIX) ? b.slice(SPEC_PREFIX.length) : b;
+    const segments = (s: string): number[] | null => {
+        const parts = s.split(".");
+        if (parts.length === 0) return null;
+        const out: number[] = [];
+        for (const p of parts) {
+            if (!/^\d+$/.test(p)) return null;
+            out.push(Number(p));
+        }
+        return out;
+    };
+    const an = segments(av);
+    const bn = segments(bv);
+    if (an !== null && bn !== null) {
+        const len = Math.max(an.length, bn.length);
+        for (let i = 0; i < len; i++) {
+            const d = (an[i] ?? 0) - (bn[i] ?? 0);
+            if (d !== 0) return d;
+        }
+        return 0;
+    }
+    return av.localeCompare(bv);
+}
+
 /** #1234/#2199: on-disk root of the OpenCode v2 cache copy of billion-context —
  *  $XDG_CACHE_HOME/opencode/npm/billion-context@<spec>/<ts>/node_modules/billion-
  *  context (newest spec slot, newest timestamp wins). Read-only; undefined when
@@ -1877,7 +1909,7 @@ export function opencodeCacheCopyRoot(env: NodeJS.ProcessEnv = process.env): str
     } catch {
         return undefined;
     }
-    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort().reverse()) {
+    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort(compareSpecSlots).reverse()) {
         let stamps: string[];
         try {
             stamps = fs.readdirSync(path.join(npm, slot));

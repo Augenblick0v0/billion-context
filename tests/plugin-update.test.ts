@@ -104,6 +104,30 @@ test("opencodeCacheCopyRoot: resolves newest spec slot / newest timestamp, undef
     }
 });
 
+// #2260(F): spec slots must order by VERSION, not by string — lexicographic
+// sort put @0.1.9 ahead of @0.1.186 ("9" > "1"), reporting the STALE copy.
+test("opencodeCacheCopyRoot: version-ordered spec slots (0.1.186 beats 0.1.9); non-numeric specs keep string order", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-oc-cache-ver-"));
+    try {
+        const cacheHome = path.join(base, "cache");
+        const npm = path.join(cacheHome, "opencode", "npm");
+        const make = (spec: string, version: string): string => {
+            const root = path.join(npm, `billion-context@${spec}`, "1700000000000", "node_modules", "billion-context");
+            mkdirSync(root, { recursive: true });
+            writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "billion-context", version }));
+            return root;
+        };
+        make("0.1.9", "0.1.9");
+        const v186 = make("0.1.186", "0.1.186");
+        assert.equal(opencodeCacheCopyRoot({ XDG_CACHE_HOME: cacheHome }), v186, "numeric version order, not lexicographic");
+        // non-numeric specs keep their pre-existing relative position (string compare)
+        const latest = make("latest", "9.9.9");
+        assert.equal(opencodeCacheCopyRoot({ XDG_CACHE_HOME: cacheHome }), latest, "'latest' still sorts after digit-led specs");
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("pluginUpdate: opencode lane reports self-update-in-place (#1234), surfaces disk version, never claims 'never overwrites'", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-plugin-update-"));
     try {
