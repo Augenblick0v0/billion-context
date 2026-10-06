@@ -109,7 +109,7 @@ import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
@@ -4414,6 +4414,15 @@ async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
+    // #2218: body-only relay affinity for plugin hosts. dsh desktop's only
+    // identity signal is the bili-internal x-bili-plugin-conversation header
+    // (already forwarded as x-session-id by buildForwardTarget); body-keyed
+    // relays (workbuddy panel) can't read headers, so stamp the conversation
+    // id into prompt_cache_key too. Gated to admin-rewritten or loopback
+    // destinations — strict direct APIs can 400 unknown body params (#1403).
+    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin)) {
+        rebuilt.prompt_cache_key = session.id;
+    }
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without
     // it, streaming sessions never learn their real input_tokens →
@@ -5518,7 +5527,14 @@ function buildForwardTarget(
     }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
-    if (affinity && !clientConversationHeader(req.headers)) {
+    // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is
+    // bili-internal — no third-party upstream can read it — so a plugin host
+    // (dsh desktop) whose ONLY identity signal it is would otherwise arrive
+    // at a relay with zero usable session signal and lose sticky routing /
+    // cache pools (workbuddy hub and sub2api both key off x-session-id).
+    // Treat it like "no header": forward the affinity as x-session-id.
+    const convSource = conversationHeaderSource(req.headers);
+    if (affinity && (!convSource || convSource.name === "x-bili-plugin-conversation")) {
         headers["x-session-id"] = affinity;
     }
     const decision = resolveProxyDecision(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
