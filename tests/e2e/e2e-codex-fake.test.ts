@@ -490,8 +490,167 @@ test("#1965: a clean bili exit writes the run's state back into the real home; n
 	// recovered thread (a fresh session could not contain it).
 	assert.match(fs.readFileSync(lastFile2, "utf8"), /收到#1/, "the resumed session must carry the original turn back into the model's view");
 	const oracle = readOracle(reqLog);
-	const flat = (c: unknown): string => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (p && typeof p === "object" && "text" in p ? String(p.text) : "")).join("") : String(c ?? ""));
+	const flat = (c: unknown): string => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (p && typeof p === "object" && "text" in p ? String((p as { text: unknown }).text) : "")).join("") : String(c ?? ""));
 	const inputText = (oracle[oracle.length - 1]?.input || []).map((it) => flat((it as { content?: unknown }).content)).join("\n");
 	assert.ok(inputText.includes("收到#1"), "the resume request must replay the original turn's prompt");
 	assert.ok(inputText.includes("收到#2"), "the resume request must append the new turn");
+});
+
+test("#2195: two sequential bili launches keep every thread in the real home", { skip: skipReason, timeout: 480_000 }, async (t) => {
+	// Issue #2195 repro shape: two SEQUENTIAL `bili codex exec` runs, no
+	// concurrent codex. Each run's thread must end up in the REAL home's ACTIVE
+	// state_5.sqlite after a clean exit — never quarantined into .bili-conflict.
+	// On Windows a file copy preserves the source mtime and a WAL-only commit
+	// leaves the main db's bytes AND mtime untouched, so this is the real-machine
+	// gate for the generation-winner selection (unit-covered deterministically
+	// in tests/launcher-sqlite-overlay.test.ts).
+	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-2195-"));
+	const codexCwd = fs.mkdtempSync(path.join(CWD_ROOT, "cwd-"));
+	const codexHome = path.join(work, "codex-home");
+	const xdg = {
+		config: path.join(work, "xdg-config"),
+		cache: path.join(work, "xdg-cache"),
+		state: path.join(work, "xdg-state"),
+	};
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	const fakePort = await freePort();
+	let fake: ReturnType<typeof spawn> | undefined;
+	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
+
+	await assertPortDead(fakePort);
+	fake = spawn(process.execPath, [FAKE_UPSTREAM], {
+		env: { ...process.env, FAKE_PORT: String(fakePort), FAKE_HOST: "127.0.0.1", FAKE_MODEL: MODEL },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	await waitFor(`http://127.0.0.1:${fakePort}/v1/models`, 15_000);
+
+	// PLAIN base_url (no /bili/ pre-bake): routing comes from the launcher's own
+	// injection, exactly like a user's real `bili codex` invocation.
+	fs.writeFileSync(path.join(codexHome, "config.toml"), [
+		`model = "${MODEL}"`,
+		'model_provider = "e2e"',
+		"",
+		"[model_providers.e2e]",
+		'name = "OpenAI"',
+		`base_url = "http://127.0.0.1:${fakePort}/v1"`,
+		'wire_api = "responses"',
+		'env_key = "E2E_UPSTREAM_KEY"',
+		"",
+	].join("\n"));
+
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	for (const k of [
+		"BILLION_CONTEXT_PROXY", "BILI_PROVIDER_REWRITES", "BILI_MITM_HOSTS", "BILI_MCP_PROXY",
+		"BILI_NATIVE_CLAUDE", "BILLION_CONTEXT_PLUGIN", "BILI_ZONE_PORT", "BILI_CLAUDE_NATIVE_PORT",
+		"BILI_UPSTREAM_PROXY", "ACP_PORT", "SSL_CERT_FILE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	]) delete childEnv[k];
+
+	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+		const lastFile = path.join(work, `${label}.last`);
+		const logFile = path.join(work, `${label}.log`);
+		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+			cwd: codexCwd,
+			env: {
+				...childEnv,
+				CODEX_HOME: codexHome,
+				XDG_CONFIG_HOME: xdg.config,
+				XDG_CACHE_HOME: xdg.cache,
+				XDG_STATE_HOME: xdg.state,
+				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+				BILI_CLIENT_BIN: CODEX_BIN,
+				E2E_UPSTREAM_KEY: "fake",
+				RUST_LOG: "error",
+				...windowEnv(60_000),
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		child.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logFile, c); } catch { /* noop */ } });
+		const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } reject(new Error(`${label} timed out after ${TMO * 2}ms`)); }, TMO * 2);
+		child.on("exit", (code) => {
+			clearTimeout(timer);
+			const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-4000) : "";
+			if ((code ?? -1) !== 0) reject(new Error(`${label} exited with code=${code}\nlauncher stderr:\n${tail}`));
+			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
+			else resolve();
+		});
+	});
+
+	const threadCountOf = (p: string): number => {
+		assert.ok(sqliteMod, "node:sqlite unavailable for db assertions");
+		const db = new sqliteMod.DatabaseSync(p, { readOnly: true });
+		try {
+			assert.equal(String(db.prepare("PRAGMA integrity_check").get()!.integrity_check), "ok", `${p} must pass integrity_check`);
+			const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((r) => String(r.name));
+			const threadTable = tables.find((x) => /thread/i.test(x));
+			assert.ok(threadTable, `state_5.sqlite must carry a thread table, got ${JSON.stringify(tables)}`);
+			return Number(db.prepare(`SELECT COUNT(*) AS c FROM ${threadTable}`).get()!.c);
+		} finally {
+			db.close();
+		}
+	};
+	const realThreads = (): number => {
+		const p = path.join(codexHome, "state_5.sqlite");
+		assert.ok(fs.existsSync(p), `state_5.sqlite must be back in the real home, got ${JSON.stringify(fs.readdirSync(codexHome))}`);
+		return threadCountOf(p);
+	};
+
+	// Launch 1: creates thread A.
+	await launcherRun("t1", "请只回复: 收到#1");
+	const c1 = realThreads();
+	assert.ok(c1 >= 1, "first launch's thread record must be readable in the real home");
+	for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation after launch 1: ${n}`);
+
+	// Launch 2: creates thread B — the step that lost B into .bili-conflict on Windows.
+	await launcherRun("t2", "请只回复: 收到#2");
+	const c2 = realThreads();
+	assert.equal(c2, c1 + 1, `the second launch's thread must ALSO be in the real home's active db (#2195): before=${c1} after=${c2}`);
+	for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation on sequential runs: ${n}`);
+
+	// Launch 3 in flight: the NEXT active overlay must already carry A+B
+	// (the acceptance criterion beyond the exit-time write-back). The overlay
+	// db exists from the copy phase until this launch's finalize, so poll it.
+	const run3 = launcherRun("t3", "请只回复: 收到#3");
+	const overlayDb = path.join(`${codexHome}-bili`, "state_5.sqlite");
+	let overlayCount = -1;
+	const pollStart = Date.now();
+	while (Date.now() - pollStart < 90_000) {
+		if (fs.existsSync(overlayDb)) {
+			try {
+				overlayCount = threadCountOf(overlayDb);
+				break;
+			} catch { /* transient lock mid-copy/mid-write: retry */ }
+		}
+		await new Promise((r) => setTimeout(r, 250));
+	}
+	assert.ok(overlayCount >= c2, `the next launch's active overlay must carry all previous threads (saw ${overlayCount}, need >= ${c2})`);
+	await run3;
+	assert.equal(realThreads(), c2 + 1, "launch 3's thread writes back on top of A+B");
+	for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation after launch 3: ${n}`);
+
+	// Native codex (NO bili) resumes the latest session straight off the real
+	// home — the issue left `codex resume` recovery unverified.
+	const lastFile4 = path.join(work, "t4.last");
+	const native = spawn(CODEX_BIN, ["exec", "--skip-git-repo-check", "--output-last-message", lastFile4, "resume", "--last", "请只回复: 收到#4"], {
+		cwd: codexCwd,
+		env: {
+			...childEnv,
+			CODEX_HOME: codexHome,
+			XDG_CONFIG_HOME: xdg.config,
+			XDG_CACHE_HOME: xdg.cache,
+			XDG_STATE_HOME: xdg.state,
+			E2E_UPSTREAM_KEY: "fake",
+			RUST_LOG: "error",
+		},
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	const code4 = await new Promise<number>((resolve, reject) => {
+		const timer = setTimeout(() => { try { native.kill("SIGKILL"); } catch { /* gone */ } reject(new Error("native codex resume timed out")); }, TMO * 2);
+		native.on("exit", (c) => { clearTimeout(timer); resolve(c ?? -1); });
+	});
+	assert.equal(code4, 0, "native codex resume must succeed off the real home");
+	// The fake answers from the FIRST 收到#N in the replayed text: "#3" coming
+	// back proves launch 3's turn was restored from the recovered thread.
+	assert.match(fs.readFileSync(lastFile4, "utf8"), /收到#3/, "the resumed session must carry launch 3's turn back into the model's view");
 });
