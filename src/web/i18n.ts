@@ -88,9 +88,12 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // client-native rewrites must not read as "third-party plugin" evidence.
         "conflict.found": "：发现",
         "conflict.what_plugin": "与 bili 并存的第三方压缩插件",
+        // #2261: bili's own siblings are first-party — never label them third-party.
+        "conflict.what_sibling": "与 bili 并存的 bili 自家兄弟扩展（billion-context-pi / opencode-acp）",
         "conflict.what_native": "客户端原生自动压缩改写会话历史",
         "conflict.what_join": "、",
         "conflict.risk_active": "的痕迹。两个压缩器作用于同一会话会双压缩、破坏消息引用，可能导致上下文错乱——请只保留一个压缩器。",
+        "conflict.risk_sibling": "的痕迹。它们是 bili 自家的兄弟扩展，不是第三方压缩插件：当 bili 主导会话时会自动让位（native 模式经 BILLION_CONTEXT_NATIVE 标记、launcher/手动接线经 /bili/ baseUrl 自检），没有第二个压缩器在活动——确认版本较新后清除本记录即可，无需移除任何插件。",
         "conflict.risk_historical": "的痕迹（最近 7 天无新事件，以下为存量记录）——确认另一个压缩器已移除或被 bili 拦截后，可点右侧按钮清除。",
         "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats → conflicts。",
         "conflict.clear_btn": "清除记录",
@@ -447,9 +450,12 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // #2102: composed per kind family present — see the zh entry above.
         "conflict.found": ": traces of ",
         "conflict.what_plugin": "a third-party compression plugin co-resident with bili",
+        // #2261: see the zh entry above — siblings are first-party.
+        "conflict.what_sibling": "a bili sibling extension (billion-context-pi / opencode-acp) co-resident with bili",
         "conflict.what_native": "client-native auto-compaction rewriting conversation history",
         "conflict.what_join": " and ",
         "conflict.risk_active": " were found. Two compressors on one conversation double-compress and corrupt message refs, which can scramble context — keep exactly one compressor.",
+        "conflict.risk_sibling": " were found. These are bili's OWN sibling extensions, not third-party compressors: while bili drives the session they stand down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise), so no second compressor is active — verify your versions are recent and clear this record; nothing needs removing.",
         "conflict.risk_historical": " were found (no events in the last 7 days — stock records only) — once you've confirmed the other compressor is removed or blocked by bili, clear them with the button.",
         "conflict.where": "Details: Sessions page below or GET /__bili/stats → conflicts.",
         "conflict.clear_btn": "Clear records",

@@ -61,6 +61,21 @@ export function isDesignBenign(finding: ThirdPartyFinding, pluginAgent: string |
     return false;
 }
 
+/** #2261: reverse-map a recorded conflict detail back to its plugin entry so
+ *  display surfaces can tell bili's OWN siblings apart from true third parties
+ *  — every other surface labels the whole "third-party-plugin" kind as a
+ *  foreign compressor, which mislabels first-party siblings and commands
+ *  removal of extensions that stand down by design (#820/#920). Detail shape
+ *  (single producer, server.ts scan site): "<client>: <entry> (<source>)[ [suspected]]".
+ *  Classifying at display time (not record time) also covers stock ledgers
+ *  written by older versions before any sibling tag existed. */
+export function isSiblingConflictDetail(detail: string): boolean {
+    const m = /^(\S+): (.+) \((.+)\)( \[suspected\])?$/.exec(detail.trim());
+    if (!m) return false;
+    const entry = m[2]!;
+    return isLegacyBcpEntry(entry) || isOpencodeAcpEntry(entry);
+}
+
 export const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Compression-ACTION tokens only. Bare "context" is deliberately EXCLUDED
@@ -139,10 +154,19 @@ function isBiliSelf(entry: string): boolean {
     return /[/\\]billion-context([/\\]|$)/.test(entry.trim());
 }
 
+/** #2261: opencode-acp entry identity — bare name, npm spec (with or without
+ *  version), or any path whose segments contain opencode-acp. Shared by the
+ *  scanner and the conflict-display sibling classifier so the two can never
+ *  drift apart. */
+export function isOpencodeAcpEntry(entry: string): boolean {
+    const trimmed = entry.trim();
+    const bare = trimmed.replace(/^npm:/, "");
+    return bare === "opencode-acp" || /^opencode-acp@/.test(bare) || /(^|[/\\])opencode-acp([/\\]|$)/.test(trimmed);
+}
+
 function classifyOpencodeEntry(c: Collector, entry: string, source: string): void {
     if (isBiliSelf(entry)) return;
-    const trimmed = entry.trim();
-    if (/^opencode-acp(@|$)/.test(trimmed) || /[/\\]opencode-acp([/\\]|$)/.test(trimmed)) {
+    if (isOpencodeAcpEntry(entry)) {
         add(c, { client: "opencode", entry, source, match: "known", knownId: "opencode-acp" });
         return;
     }

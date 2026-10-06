@@ -10,6 +10,7 @@
 // no conversation data — only the evidence notes.
 
 import { markDirty, type Session } from "./session.js";
+import { isSiblingConflictDetail } from "./thirdparty-scan.js";
 
 export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
 
@@ -68,7 +69,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // read as a live alarm (it previously said "two compressors ..." imperatively
     // even when every event was months old).
     const { active, historical } = splitConflictEvents(events, now);
-    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). Two compressors on one conversation (bili + a third-party compression plugin or client native compaction) double-compress and corrupt message refs:`);
+    lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:`);
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
@@ -80,11 +81,18 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
     }
     const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
-    lines.push(active.length === 0
-        ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compressor is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
-        : allSuspected
-            ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
-            : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+    // #2261: a ledger naming ONLY bili's own siblings (billion-context-pi /
+    // opencode-acp) is not a foreign-compressor alarm — they stand down while
+    // bili drives the session (#820/#920), so never command removal for them.
+    const siblingEvents = events.filter((e) => e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail));
+    const siblingsOnly = siblingEvents.length > 0 && siblingEvents.length === events.length;
+    lines.push(siblingsOnly
+        ? "Every event above names bili's OWN sibling extension (billion-context-pi / opencode-acp), not a third-party compressor: while bili drives the session it stands down automatically (BILLION_CONTEXT_NATIVE marker in native mode, /bili/ baseUrl self-check otherwise), so no second compressor is active. Verify your bili/sibling versions are recent, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear."
+        : active.length === 0
+            ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compression plugin is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
+            : allSuspected
+                ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
+                : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
     return lines;
 }
 
@@ -98,11 +106,15 @@ export interface ConflictSummary {
     /** #2102: timestamp of the newest event across all sessions, or null. */
     lastAt: number | null;
     kinds: Partial<Record<ConflictKind, number>>;
+    /** #2261: plugin-kind events naming bili's OWN siblings (billion-context-pi /
+     *  opencode-acp) — display-time classification of recorded details, additive
+     *  to `kinds`, so surfaces can stop calling first-party siblings "third-party". */
+    sibling: number;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
 }
 
 export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [] };
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0 };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
@@ -110,6 +122,7 @@ export function summarizeConflicts(sessions: Session[], now: number = Date.now()
         summary.events += events.length;
         for (const e of events) {
             summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
+            if (e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)) summary.sibling += 1;
             if (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS) summary.active += 1; else summary.historical += 1;
             if (summary.lastAt === null || e.at > summary.lastAt) summary.lastAt = e.at;
         }
