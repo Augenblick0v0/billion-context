@@ -123,6 +123,18 @@ test("codexTomlProblem: valid structures pass silently", () => {
         'instructions = """\nnot a key line at all\n"""\nmodel = "y"\n',
         "instructions = '''\nstill fine [unclosed\n'''\n",
         '"dotted.key" = 1\n[a.b]\nc = 2\n',
+        // #2260(E): quoted keys with spaces / non-ASCII are VALID TOML — the
+        // pre-fix regex false-fataled these and bili refused the launch.
+        '"my key" = 1\n',
+        '"ключ" = 2\n',
+        "'lit-eral' = 3\n",
+        'a."b c".d = 4\n',
+        '"esc\\"aped" = 5\n',
+        // bracket-opened values spanning lines are value context, not key lines
+        "arr = [\n  \"a\",\n  \"b\",\n]\nmodel = \"y\"\n",
+        "t = {\n  a = 1,\n}\nmodel = \"y\"\n",
+        // brackets inside values / strings / comments must not skew the depth
+        "s = \"a]b[c\" # note ]\nmodel = \"y\"\n",
     ];
     for (const t of ok) assert.equal(codexTomlProblem(t), null, JSON.stringify(t));
 });
@@ -133,6 +145,9 @@ test("codexTomlProblem: structural breakage is reported with its line", () => {
     assert.ok(typeof p === "string" && p.startsWith("line 2:"), String(p));
     const garbage = "model = \"x\"\nthis is not toml\n";
     assert.ok(codexTomlProblem(garbage)?.startsWith("line 2:"));
+    // #2260(E): unbalanced brackets are structurally broken (codex hard-fails)
+    assert.match(String(codexTomlProblem("arr = [\n  \"a\"\n")), /never closed/);
+    assert.ok(codexTomlProblem("model = \"x\"\n]\n")?.startsWith("line 2:"));
 });
 
 function writeHome(files: Record<string, string>): string {

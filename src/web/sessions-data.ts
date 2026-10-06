@@ -8,7 +8,7 @@ import { buildSessionCacheReport } from "../cache-ledger.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
-import { statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 
@@ -271,21 +271,30 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
-/** #2180: a top-level ENOENT means "pristine" — a fresh install where the data
- *  root was never created, so no session file can exist anywhere — only when
- *  the DEFAULT layout is in effect: BILI_SESSIONS_DIR unset AND the XDG data
- *  root itself absent. An explicit override pointing nowhere, or a data root
- *  that exists without its sessions subdir, stays loud (#1937): silence there
- *  would hide a moved/misconfigured path while real sessions sit elsewhere. */
+// #2260(F)/#2180 follow-up: bili's own infra dirs created under the data root
+// BEFORE any session exists (ensureRootCA() makes <data>/ca at proxy start) —
+// their presence alone must not read as "misconfigured". The set is closed by
+// construction: paths.ts writes only `sessions` and `ca` directly under it.
+const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
+
+/** #2180: a top-level ENOENT means "pristine" — no session file can exist
+ *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
+ *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  dirs (a fresh install where ensureRootCA() already ran). An explicit
+ *  override pointing nowhere, or a data root containing anything else, stays
+ *  loud (#1937): silence there would hide a moved/misconfigured path while
+ *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
     if (process.env.BILI_SESSIONS_DIR) return false;
+    let entries: string[];
     try {
         statSync(dataDir());
-        return false;
+        entries = readdirSync(dataDir());
     } catch (e) {
         return (e as NodeJS.ErrnoException).code === "ENOENT";
     }
+    return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
 /** Single-flight index refresh. Steady-state cost is one stat per file; only

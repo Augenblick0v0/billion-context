@@ -818,15 +818,66 @@ export function mergeCodexViews(base: CodexConfig, overlay: CodexConfig): CodexC
     return out;
 }
 
+// #2260(E): one TOML key part — bare ([A-Za-z0-9_-]+), basic string with
+// escapes ("my key", "ключ"), or literal string ('a-b'). The pre-fix regex
+// only accepted \w runs inside quotes, so VALID quoted keys with spaces or
+// non-ASCII false-positived as broken and bili refused the whole launch
+// (exit 2) where codex itself parses the profile fine.
+const TOML_KEY_PART_RE = new RegExp(String.raw`^(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'(?:[^'\n])*')(?:\.(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'(?:[^'\n])*'))*$`);
+
+/** One pass over a TOML line outside a multi-line string: net
+ *  array/inline-table bracket delta plus the key-side text (everything up to
+ *  the first `=` at depth 0, trimmed; the whole line when there is no `=`).
+ *  Quote-aware (basic-string escapes, literal strings) and comment-aware
+ *  (`#` outside strings ends the active line) so brackets in values, strings
+ *  or comments never skew the depth count. */
+function scanTomlLine(line: string): { delta: number; key: string } {
+    let delta = 0;
+    let dq = false;
+    let sq = false;
+    let escaped = false;
+    let pastEq = false;
+    let key = "";
+    for (const ch of line) {
+        if (escaped) {
+            escaped = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (dq) {
+            if (ch === "\\") escaped = true;
+            else if (ch === "\"") dq = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (sq) {
+            if (ch === "'") sq = false;
+            if (!pastEq) key += ch;
+            continue;
+        }
+        if (ch === "#") break;
+        if (ch === "\"") { dq = true; if (!pastEq) key += ch; continue; }
+        if (ch === "'") { sq = true; if (!pastEq) key += ch; continue; }
+        if (ch === "=" && !pastEq) { pastEq = true; continue; }
+        if (ch === "[" || ch === "{") delta += 1;
+        else if (ch === "]" || ch === "}") delta -= 1;
+        if (!pastEq) key += ch;
+    }
+    return { delta, key: key.trim() };
+}
+
 /** Structural sanity check for a codex TOML file (base or profile): every
  *  non-blank non-comment line must be a table header, an array-of-tables
- *  header, or `key = …`. Multi-line strings ("""…""" / '''…''') are tracked so
- *  their bodies do not false-positive. Returns a human-readable problem or
- *  null. Deliberately NOT a full TOML parser — it only distinguishes
- *  "structurally broken" (where codex itself hard-fails, verified 0.147) from
- *  "valid TOML without fields bili reads" (which must pass silently). */
+ *  header, or `key = …` with a TOML-legal key side. Multi-line strings
+ *  ("""…""" / '''…''') and bracket-opened values (arrays / inline tables
+ *  spanning lines) are tracked so their bodies do not false-positive. Returns
+ *  a human-readable problem or null. Deliberately NOT a full TOML parser — it
+ *  only distinguishes "structurally broken" (where codex itself hard-fails,
+ *  verified 0.147) from "valid TOML without fields bili reads" (which must
+ *  pass silently). */
 export function codexTomlProblem(text: string): string | null {
     let multiline: string | null = null;
+    let depth = 0;
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i]!.trim();
@@ -843,10 +894,21 @@ export function codexTomlProblem(text: string): string | null {
             if (count % 2 === 1) { opened = d; break; }
         }
         if (opened) { multiline = opened; continue; }
+        const scan = scanTomlLine(line);
+        if (depth > 0) {
+            // Inside an array/inline table opened on an earlier line: the body
+            // is value context, not key context.
+            depth += scan.delta;
+            continue;
+        }
         if (/^\[[^\[\]]+\]$/.test(line) || /^\[\[[^\[\]]+\]\]$/.test(line)) continue;
-        if (/^[\w"'][\w."'-]*(\.[\w"'][\w."'-]*)*\s*=/.test(line)) continue;
+        if (TOML_KEY_PART_RE.test(scan.key)) {
+            depth = Math.max(0, scan.delta);
+            continue;
+        }
         return `line ${i + 1}: unrecognized structure (${line.slice(0, 60)})`;
     }
+    if (depth > 0) return `line ${lines.length}: array/inline table opened above is never closed`;
     return null;
 }
 

@@ -665,10 +665,11 @@ withSessionsDir("#1937/#2180: vanished dir serves stale snapshot; explicit missi
     await assert.rejects(buildSessionList(), "no prior snapshot → reject (→ HTTP 500), never silent empty");
 });
 
-// #2180: pristine default layout (BILI_SESSIONS_DIR unset AND the XDG data root
-// itself never created) must resolve to an EMPTY index, not the loud rejection
-// above — withSessionsDir can't express that (it always sets the env var), so
-// these drive XDG_DATA_HOME directly.
+// #2180: pristine default layout (BILI_SESSIONS_DIR unset AND the XDG data
+// root absent or holding only bili's own infra dirs — #2260(F)) must resolve
+// to an EMPTY index, not the loud rejection above — withSessionsDir can't
+// express that (it always sets the env var), so these drive XDG_DATA_HOME
+// directly.
 
 function withPristineEnv<T>(name: string, fn: (xdg: string) => Promise<T>): void {
     test(name, async () => {
@@ -705,11 +706,23 @@ withPristineEnv("#2180: fresh install (data root never created) serves empty dat
     assert.deepEqual((await buildSessionList()).map((s) => s.id), ["first-1"], "first persisted session creates the dir and shows up");
 });
 
-withPristineEnv("#2180: existing data root without sessions dir stays loud (#1937)", async (xdg) => {
+withPristineEnv("#2180/#1937: data root holding FOREIGN content stays loud", async (xdg) => {
     mkdirSync(path.join(xdg, "billion-context"), { recursive: true });
+    writeFileSync(path.join(xdg, "billion-context", "stray-file.json"), "{}");
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
-    await assert.rejects(buildSessionList(), "data root present but sessions dir missing must reject loudly");
+    await assert.rejects(buildSessionList(), "non-infra content under the data root must reject loudly (#1937)");
+});
+
+// #2260(F): the reported repro — ensureRootCA() creates <data>/ca at proxy
+// start, so a fresh install's first web load found a data root WITHOUT its
+// sessions subdir and 500'd until the first session was persisted.
+withPristineEnv("#2260(F): fresh install after proxy start (data root holds only ca/) serves empty data, not 500", async (xdg) => {
+    mkdirSync(path.join(xdg, "billion-context", "ca"), { recursive: true });
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    assert.deepEqual(await buildSessionList(), [], "ca/ alone is bili infra — pristine, empty list");
+    assert.equal((await buildOverview()).sessions, 0, "overview aggregates zero sessions instead of 500ing");
 });
 
 withPristineEnv("#2180/#1937: data root deleted AFTER sessions existed serves stale snapshot, not empty", async (xdg) => {

@@ -2746,6 +2746,40 @@ test("buildCodexArgs: no rewrites → just extra args", () => {
     assert.deepEqual(buildCodexArgs("http://h:p", [], [], ["--foo"]), ["--foo"]);
 });
 
+// #2260(D): cli.ts only eats a LEADING `--` right after the client name, so a
+// non-leading one reaches buildCodexArgs inside extra — and everything past it
+// is positional to codex's parser. Appending there turned the rewrites into
+// prompt text and silently bypassed the proxy (`bili codex exec -- "-p"`).
+test("buildCodexArgs: #2260(D) rewrites land BEFORE a user `--` separator, not after its positionals", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, [], ["exec", "--", "-p"]), [
+        "exec",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
+test("buildCodexArgs: #2260(D) last-wins holds across `--` — a user -c before the separator still loses to bili's rewrite", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["-c", "model_providers.x.base_url=https://user-picked.local/v1", "--", "-p"],
+    );
+    assert.deepEqual(out, [
+        "-c", "model_providers.x.base_url=https://user-picked.local/v1",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
 test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
@@ -6325,6 +6359,53 @@ test("resolveClientCommand: mcode resolves `mcode` on PATH, falls back to <insta
         else process.env.USERPROFILE = prevUserProfile;
         rmrf(dir);
         rmrf(home);
+    }
+});
+
+test("resolveClientCommand: antigravity/mcode honor the injectable platform param (#2260)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-home-"));
+    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-lad-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    try {
+        process.env.HOME = home;
+        // os.homedir() reads USERPROFILE on win32, not HOME — seal it so the
+        // non-win32 expectations below hold on every host (CI runs on Windows).
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = home;
+        // Before #2260 these branches read process.platform directly, so the
+        // win32 layout was unreachable from tests (and wrong under any future
+        // platform-injection use). Pin both layouts via EXPLICIT platform args
+        // so the test stays host-independent (a bare default-platform call
+        // resolves through the real host's os.homedir() and cannot hold one
+        // literal on both Windows and POSIX runners).
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData }, "win32"),
+            { command: path.join(localAppData, "agy", "bin", "agy"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "linux"),
+            { command: path.join(home, ".local", "bin", "agy"), prefixArgs: [] },
+        );
+        const mdDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-plat-"));
+        fs.mkdirSync(path.join(mdDir, "bin"), { recursive: true });
+        fs.writeFileSync(path.join(mdDir, "bin", "mcode.cmd"), "");
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "win32"),
+            { command: path.join(mdDir, "bin", "mcode.cmd"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "linux"),
+            { command: path.join(mdDir, "bin", "mcode"), prefixArgs: [] },
+        );
+        rmrf(mdDir);
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        rmrf(home);
+        rmrf(localAppData);
     }
 });
 

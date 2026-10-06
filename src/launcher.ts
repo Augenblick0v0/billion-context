@@ -963,14 +963,23 @@ export function buildCodexArgs(
     // bypasses the proxy. The TARGET itself is already chosen from the merged
     // effective view (profile + CLI overrides), so appending never hides a
     // user-selected endpoint behind a stale one.
-    const args = [...extra];
+    // #2260(D): "after the user's argv" means after the user's FLAGS, not
+    // after their positionals — everything past a `--` is positional to
+    // codex's parser, so appending there turns the rewrites into prompt text
+    // and the traffic bypasses the proxy. Insert before the first `--` when
+    // one exists; all user flag tokens still precede the rewrites, keeping
+    // last-wins intact.
+    const rewrites: string[] = [];
     for (const r of httpRewrites) {
-        args.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
+        rewrites.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
     }
     for (const r of httpsRewrites) {
-        args.push("-c", `${r.key}=${r.realUpstream}`);
+        rewrites.push("-c", `${r.key}=${r.realUpstream}`);
     }
-    return args;
+    if (rewrites.length === 0) return [...extra];
+    const sep = extra.indexOf("--");
+    if (sep === -1) return [...extra, ...rewrites];
+    return [...extra.slice(0, sep), ...rewrites, ...extra.slice(sep)];
 }
 
 /**
@@ -4043,10 +4052,43 @@ export async function ensureProxyRunning(
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
+        // #2260(A)/#2187: the timeout is the ONE terminal path where the
+        // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
+        // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
+        // persistently slow host accumulated ~1 zombie per ~70s (each also
+        // stranding the lane sticky-port ladder). Hard-kill before failing.
+        killAbandonedChild(child);
+        console.error(
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — it never became ready and would otherwise outlive this failure (log: ${logPath})`,
+        );
         throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
+}
+
+/** #2260(A)/#2187: unconditional hard-kill of a spawned-but-abandoned proxy
+ *  child, all platforms. Deliberately NOT stopProxy(): its win32 path returns
+ *  without killing because the #414 design assumes THIS process exits ≤2s
+ *  later, letting the child's BILI_PARENT_PID watch run the graceful path —
+ *  an assumption that does not hold when the spawner keeps living (plugin
+ *  lane: long-lived desktop host), where the abandoned child would leak
+ *  forever. The victim never became healthy, so it served no traffic and
+ *  holds no sessions; SIGKILL loses nothing and reaches even a hung event
+ *  loop (SIGTERM would wait for a stuck loop to drain). Stale instance
+ *  records left behind are inert by the dead-pid checks in discovery. */
+function killAbandonedChild(child: SpawnChild | undefined): void {
+    if (!child || child.pid === undefined || child.pid <= 0) return;
+    if (process.platform !== "win32") {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+        } catch {
+            /* group already gone */
+        }
+    }
+    try {
+        child.kill?.("SIGKILL");
+    } catch {}
 }
 
 export function stopProxy(handle: ProxyHandle): void {
@@ -4344,7 +4386,7 @@ export function resolveClientCommand(
         const resolved = resolveOnPath("mcode", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
         const binBase = path.join(resolveMcodeInstallDir(env), "bin", "mcode");
-        for (const ext of process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
             const candidate = binBase + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
@@ -4360,10 +4402,10 @@ export function resolveClientCommand(
         // %LOCALAPPDATA%\agy\bin\agy.exe).
         const resolved = resolveOnPath("agy", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
-        const base = process.platform === "win32"
+        const base = platform === "win32"
             ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "agy", "bin", "agy")
             : path.join(os.homedir(), ".local", "bin", "agy");
-        for (const ext of process.platform === "win32" ? [".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".exe", ""] : [""]) {
             const candidate = base + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };

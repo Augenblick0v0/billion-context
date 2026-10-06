@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { piSubagentsAdapter, wirePiSubagents } from "../src/agent/pi-subagents.ts";
 import type { ExtensionAPI, CommandCtx } from "../src/agent/pi.ts";
+import { loadConfigFile } from "../src/config.ts";
+import { DEFAULT_DELEGATE_POLICY, resolveDelegate } from "billion-context-pi-subagents";
 
 // #2186: hermetic wiring tests for the inlined acp_delegate surface. The
 // delegate tools are never EXECUTED here (they spawn real pi children); only
@@ -271,4 +273,55 @@ test("piSubagentsAdapter maps the pi.subagents section onto the package adapter 
         piSubagentsAdapter({ debug: true, maxConcurrent: 2, displayUsage: "merged", prompt: "P", thinkingLevel: "low" }),
         { delegate: { maxConcurrent: 2, displayUsage: "merged", thinkingLevel: "low" }, delegatePrompt: "P", debug: true },
     );
+});
+
+// #2260(F): pins the documented precedence PI_ACP_DELEGATE_* > pi.subagents >
+// acp.json > default (CONFIGURATION.md). The env readers live INSIDE the
+// bundled package's resolveDelegate, so this drives that real function through
+// bili's loader chain — a future package or adapter change that silently drops
+// env must fail here.
+test("PI_ACP_DELEGATE_* env beats pi.subagents file values, which beat defaults (#2260)", () => {
+    const envKeys = [
+        "PI_ACP_DELEGATE_FORCE_ENABLE",
+        "PI_ACP_DELEGATE_MAX_DEPTH",
+        "PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES",
+        "PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES",
+        "PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES",
+        "PI_ACP_DELEGATE_MAX_CONCURRENT",
+    ];
+    const saved: Record<string, string | undefined> = {};
+    const setEnv = (vals: Record<string, string | undefined>) => {
+        for (const k of envKeys) {
+            saved[k] = process.env[k];
+            if (vals[k] === undefined) delete process.env[k];
+            else process.env[k] = vals[k];
+        }
+    };
+    try {
+        writeBiliConfig({ pi: { subagents: { maxDepth: 5, syncTimeoutMinutes: 7, forceEnable: false } } });
+        const adapter = piSubagentsAdapter(loadConfigFile().pi?.subagents ?? true);
+
+        setEnv({ PI_ACP_DELEGATE_MAX_DEPTH: "3", PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES: "2", PI_ACP_DELEGATE_FORCE_ENABLE: "true" });
+        const fromEnv = resolveDelegate(adapter);
+        assert.equal(fromEnv.maxDepth, 3, "env maxDepth beats file 5");
+        assert.equal(fromEnv.syncTimeoutMs, 2 * 60_000, "env sync timeout beats file 7");
+        assert.equal(fromEnv.forceEnable, true, "env forceEnable=true beats file false");
+
+        setEnv({});
+        const fromFile = resolveDelegate(adapter);
+        assert.equal(fromFile.maxDepth, 5, "file maxDepth wins without env");
+        assert.equal(fromFile.syncTimeoutMs, 7 * 60_000, "file sync timeout wins without env");
+        assert.equal(fromFile.forceEnable, false, "file forceEnable=false holds without env");
+
+        clearBiliConfig();
+        const fromDefaults = resolveDelegate(piSubagentsAdapter(true));
+        assert.equal(fromDefaults.maxDepth, DEFAULT_DELEGATE_POLICY.maxDepth, "package default when neither env nor file");
+        assert.equal(fromDefaults.forceEnable, false);
+    } finally {
+        for (const k of envKeys) {
+            if (saved[k] === undefined) delete process.env[k];
+            else process.env[k] = saved[k];
+        }
+        clearBiliConfig();
+    }
 });
