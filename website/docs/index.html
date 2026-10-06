@@ -36,11 +36,12 @@
     <div class="docs-wrap">
       <aside class="docs-toc" aria-label="On this page">
         <a href="#quickstart" data-i18n="d.toc_qs">Quickstart</a>
+        <a href="#webui" data-i18n="d.toc_webui">Web UI</a>
         <a href="#connect" data-i18n="d.toc_connect">Connect clients</a>
         <a href="#commands" data-i18n="d.toc_commands">Commands</a>
         <a href="#config" data-i18n="d.toc_config">Configuration</a>
+        <a href="#params" data-i18n="d.toc_params">Full parameter reference</a>
         <a href="#how" data-i18n="d.toc_how">How compression works</a>
-        <a href="#webui" data-i18n="d.toc_webui">Web UI</a>
         <a href="#privacy" data-i18n="d.toc_privacy">Privacy</a>
         <a href="#faq" data-i18n="d.toc_faq">FAQ</a>
         <a href="#resources" data-i18n="d.toc_links">Resources</a>
@@ -60,8 +61,20 @@ bili                               # standalone daemon @ http://127.0.0.1:8787</
         <p data-i18n="d.qs.p2">The daemon binds loopback only — nothing is exposed externally. Every instance serves a built-in dashboard:</p>
         <div class="codebox">
           <div class="codebox-head"><span class="mono">browser</span><button class="copy-btn" type="button" data-copy="http://127.0.0.1:8787/__bili/" data-i18n="common.copy">Copy</button></div>
-          <pre class="mono"><code>http://127.0.0.1:8787/__bili/</code></pre>
+          <pre class="mono"><code><a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a></code></pre>
         </div>
+        <p class="hint" data-i18n-html="d.qs.next">Open it — that's the web panel, toured in the very next section. When you're ready to wire up an agent, continue to <a href="#connect">Connect clients</a>.</p>
+
+        <h2 id="webui" data-i18n="d.toc_webui">Web UI</h2>
+        <p class="hint" data-i18n-html="d.wu.access">Access: once the daemon is up, open <code>http://127.0.0.1:8787/__bili/</code> in a browser (change the port if you set ACP_PORT; it binds loopback only). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.</p>
+        <p data-i18n-html="d.wu.p">Every running instance serves a built-in dashboard at <code>/__bili/</code>:</p>
+        <ul class="wu-list">
+          <li data-i18n="d.wu.ov">Overview — total sessions and requests, gross and net savings, global hit rate with miss breakdown, protocol distribution.</li>
+          <li data-i18n="d.wu.se">Sessions — usage cards, context trajectory chart, cache economics with fold detail, compression blocks, and the Markdown handoff document (copy or download).</li>
+          <li data-i18n="d.wu.cf">Configuration — view and edit the JSON config; changes apply immediately.</li>
+          <li data-i18n="d.wu.cn">Connect — per-instance wiring guide with copyable commands.</li>
+          <li data-i18n="d.wu.lo">Logs — live tail of the daemon log, filterable by session id or keyword, downloadable as plain text.</li>
+        </ul>
 
         <h2 id="connect" data-i18n="d.toc_connect">Connect clients</h2>
         <p data-i18n="d.cn.p">Three ways to put the proxy between your agent and the model. Pick whichever fits your client:</p>
@@ -153,20 +166,15 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
         <h2 id="config" data-i18n="d.toc_config">Configuration</h2>
         <p data-i18n="d.cf.p">Everything lives in one JSON file, created automatically on first run:</p>
         <div class="codebox">
-          <div class="codebox-head"><span class="mono">~/.config/billion-context/billion-context.json</span><button class="copy-btn" type="button" data-copy='{ "compress": { "maxContextLimit": "75%", "promptPack": "lean", "ccr": { "enabled": true } }, "providers": { "https://api.anthropic.com": { "models": { "claude-sonnet-4-6": { "context": 200000 } } } } }' data-i18n="common.copy">Copy</button></div>
-          <pre class="mono"><code>{
-  "compress": {
-    "maxContextLimit": "75%",
-    "promptPack": "lean",
-    "ccr": { "enabled": true }
-  },
-  "providers": {
-    "https://api.anthropic.com": {
-      "models": { "claude-sonnet-4-6": { "context": 200000 } }
-    }
-  }
-}</code></pre>
+          <div class="codebox-head"><span class="mono">~/.config/billion-context/billion-context.json</span><button class="copy-btn" type="button" data-copy='{}' data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>{}</code></pre>
         </div>
+        <p data-i18n="d.cf.min">An empty object is valid — every field is optional and falls back to its built-in default.</p>
+        <p data-i18n-html="d.cf.panel">Prefer not to edit JSON by hand? The web panel's <a href="http://127.0.0.1:8787/__bili/#/config">Configuration page</a> validates your edits and writes this same file — changes apply immediately.</p>
+        <p data-i18n-html="d.cf.env">Environment variables win over the config file — precedence: env &gt; file &gt; built-in default, and a set variable owns the knob even if its value looks invalid. The full variable list sits in the <a href="#params">parameter reference</a> below.</p>
+
+        <h2 id="params" data-i18n="d.toc_params">Full parameter reference</h2>
+        <p data-i18n-html="d.ref.intro">Every configurable field, exhaustively. This section is generated from the same YAML seeds as the repository's CONFIGURATION.md — one copy, so the site and the repo docs can't drift apart.</p>
         <h3 data-i18n="d.cf.t_compress">compress — every knob</h3>
         <table class="client-table param-table">
           <thead><tr><th data-i18n="d.cf.th_param">Parameter</th><th data-i18n="d.cf.th_type">Type</th><th data-i18n="d.cf.th_desc">What it does</th></tr></thead>
@@ -285,7 +293,8 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li data-i18n-html="tt.nat"><code>native.attachExternal</code> — let launcher-less native plugins attach to an external daemon (off by default).</li>
 <!-- /bili:gen -->
         </ul>
-        <p data-i18n="d.cf.env">Environment variables win over the config file — precedence: env &gt; file &gt; built-in default, and a set variable owns the knob even if its value looks invalid. Common ones:</p>
+        <h3 data-i18n="d.cf.t_env">Environment variables</h3>
+        <p class="hint" data-i18n="d.cf.env_note">A common subset, with what each knob owns. The complete, always-current environment-variable list lives in CONFIGURATION.md in the repository (same source).</p>
         <div class="codebox">
           <div class="codebox-head"><span class="mono">env</span><button class="copy-btn" type="button" data-copy="ACP_PORT=8787&#10;ACP_HOST=127.0.0.1&#10;ACP_UPSTREAM=https://api.anthropic.com&#10;ACP_PASSTHROUGH=1&#10;ACP_PROVIDERS=/path/to/routes.json&#10;BILI_CONFIG_FILE=~/.config/billion-context/billion-context.json&#10;BILI_SESSIONS_DIR=~/.local/share/billion-context/sessions&#10;BILI_UPSTREAM_PROXY=http://host:port&#10;ACP_MODEL_CONTEXT_LIMIT=200000&#10;BILI_MITM_DOMAINS=api.foo.com&#10;BILI_REPLAY_RETRY_MAX=3&#10;BILI_SESSION_GC=1&#10;BILI_IMAGE_TOKEN_CAP=8192&#10;BILI_SUBAGENT_SPLIT=0&#10;BILI_FORK_ADOPTION=1&#10;ACP_LOG_FILE=/path/to/bili.log&#10;ACP_COMPRESS_TOOL=0&#10;ACP_COMPRESS_NUDGE=0" data-i18n="common.copy">Copy</button></div>
           <pre class="mono env-pre"><code>ACP_PORT=8787                    # listen port
@@ -318,22 +327,18 @@ ACP_COMPRESS_NUDGE=0             # disable growth nudges</code></pre>
         </ul>
         <p class="how-paper" data-i18n-html="d.how.paper">The full treatment, with numbers: <a href="https://github.com/ranxianglei/billion-context/blob/master/paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md" target="_blank" rel="noopener">read the preprint</a>.</p>
 
-        <h2 id="webui" data-i18n="d.toc_webui">Web UI</h2>
-        <p class="hint" data-i18n-html="d.wu.access">Access: once the daemon is up, open <code>http://127.0.0.1:8787/__bili/</code> in a browser (change the port if you set ACP_PORT; it binds loopback only). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.</p>
-        <p data-i18n-html="d.wu.p">Every running instance serves a built-in dashboard at <code>/__bili/</code>:</p>
-        <ul class="wu-list">
-          <li data-i18n="d.wu.ov">Overview — total sessions and requests, gross and net savings, global hit rate with miss breakdown, protocol distribution.</li>
-          <li data-i18n="d.wu.se">Sessions — usage cards, context trajectory chart, cache economics with fold detail, compression blocks, and the Markdown handoff document (copy or download).</li>
-          <li data-i18n="d.wu.cf">Configuration — view and edit the JSON config; changes apply immediately.</li>
-          <li data-i18n="d.wu.cn">Connect — per-instance wiring guide with copyable commands.</li>
-          <li data-i18n="d.wu.lo">Logs — live tail of the daemon log, filterable by session id or keyword, downloadable as plain text.</li>
-        </ul>
-
         <h2 id="privacy" data-i18n="d.toc_privacy">Privacy</h2>
         <p data-i18n="d.pr.p1">billion-context runs only on your machine and binds loopback by default. It forwards model traffic — OAuth tokens pass through untouched, unauthenticated probes aside — and uploads nothing.</p>
         <p data-i18n-html="d.pr.p2">Session records stay local (<code>~/.local/share/billion-context/sessions</code>); the log sits beside the state dir. Export any session with <code>bili export</code>, delete files whenever you like.</p>
 
         <h2 id="faq" data-i18n="d.toc_faq">FAQ</h2>
+        <details class="faq-item"><summary data-i18n="fa.when.q">When does compression happen?</summary><p data-i18n-html="fa.when.a">It's model-driven: the injected context tools are called by the model as context grows; gentle growth nudges (~50K-token steps by design, adjustable via <code>compress.nudgeGrowthTokens</code>) prompt it along the way, and preflight fires as a hard backstop when the input alone exceeds the window (#470). Watch it live with <code>/acp</code> or the web UI.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.firstfold.q">Why does the first compaction wait until ~200k?</summary><p data-i18n-html="fa.firstfold.a">Compaction triggers on growth intervals, not absolute window position: by default the first soft compaction fires 50k tokens past boot content (<code>compress.nudgeGrowthTokens</code>, flat and window-independent). With boot around 100k — or the growth step set to ~100k — the first compaction may land at ~200k. To fold earlier: 1) trim the system prompt, disable unneeded tools, prune skills; 2) lower <code>compress.nudgeGrowthTokens</code> to ~50k; 3) enable lean mode. Worked example: <a href="https://github.com/ranxianglei/billion-context/blob/master/CONFIGURATION.md#why-the-first-compaction-waits-until-200k">CONFIGURATION.md</a>.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.cache.q">How do I check my cache hit rate?</summary><p data-i18n-html="fa.cache.a">Don't dig through logs — <code>/acp-cache</code> prints a text report straight in the client, headed by a clickable Web UI link to the session's chart and attribution. Rule of thumb: compression itself costs ≤2% of input, so a healthy session sits at 95–97% hit rate. Below that, attribution names the usual suspects in order: ① upstream cache TTL expiry, ② a model switch, ③ a bili bug (report it with the page attached), ④ other/unknown. <code>/acp-cache [full]</code> lists every fold and line item; plain HTTP: <code>GET /__bili/cache-report</code>; per-request <code>[acp-usage]</code> lines still land in the log for deep dives.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.acp.q">What does /acp show?</summary><p data-i18n-html="fa.acp.a">In clients with the native plugin (opencode, dsh), <code>/acp</code> renders the ACP status panel of the current conversation straight from the proxy — session, blocks, compressible ranges, usage; before the first model request it shows an idle notice instead. <code>/acp-cache [full]</code> prints the cache report above.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.webquery.q">Can I query sessions and config over the web?</summary><p data-i18n-html="fa.webquery.a">Yes — open <a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a>: overview dashboard, session list with per-session detail, live logs, config editor, upstream connectivity test. Everything is also available as plain JSON (<code>/__bili/stats</code>, <code>/__bili/sessions</code>, <code>/__bili/config</code>, …) for scripting.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.paths.q">Where are logs and session data stored?</summary><p data-i18n-html="fa.paths.a">Log: <code>~/.local/state/billion-context/bili.log</code> (also mirrored to stderr); session state: <code>~/.local/share/billion-context/</code> (XDG-overridable; Windows AV exclusion #362, opt-in cleanup #1082). Full paths: CONFIGURATION.md in the repository.</p></details>
+        <details class="faq-item"><summary data-i18n="fa.trans.q">Is bili transparent? How do I turn it off?</summary><p data-i18n-html="fa.trans.a">Unrecognized endpoints forward unchanged (CLIENTS.md), and every mode reverses cleanly: <code>bili plugin remove &lt;client&gt;</code> for native installs; stop the launcher command / env vars / <code>/bili/</code> prefix for the other two — traffic goes direct again immediately.</p></details>
         <details class="faq-item"><summary data-i18n="fa.node.q">Which Node version?</summary><p data-i18n="fa.node.a">Node 22 or newer — required by the npm package.</p></details>
         <details class="faq-item"><summary data-i18n="fa.win.q">Does it work on Windows?</summary><p data-i18n="fa.win.a">Recommended: WSL2. Inside WSL everything uses 127.0.0.1 as usual; a Windows-side client should reach the proxy via the WSL host IP, or simply run the client inside WSL too.</p></details>
         <details class="faq-item"><summary data-i18n="fa.cost.q">Do I pay for the proxy itself?</summary><p data-i18n="fa.cost.a">No — it's free and open source (MIT plus an attribution clause). Token savings come from smaller contexts and your provider's prompt caching; the economics panel shows the real per-session numbers.</p></details>
