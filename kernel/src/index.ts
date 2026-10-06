@@ -366,6 +366,8 @@ export {
   isMessageLatestProtected,
   isMessageProtected,
   matchToolPattern,
+  matchToolPath,
+  projectToolPath,
   type LatestProtected,
 } from "./protected.js";
 export {

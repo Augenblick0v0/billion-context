@@ -88,6 +88,99 @@ export function matchToolPattern(toolName: string, pattern: string): boolean {
   return name === pat;
 }
 
+/** Canonical protected-path space (#1947): skill loads normalize to
+ *  `skill/<name>` regardless of which client produced them —
+ *  opencode `skill({name})`, Claude Code/ZCode `Skill({skill})`, and pi's
+ *  agentskills-spec file reads (`<dir>/<name>/SKILL.md` through any read
+ *  tool) all land in the same space; every other tool projects to its own
+ *  name. Projection failure degrades to the tool name, so behavior for
+ *  non-skill traffic is byte-identical to name-only matching. */
+
+const SKILL_INPUT_FIELDS = ["skill", "name", "command"] as const;
+const SKILL_MD_PATH_RE = /[\/\\]([^\/\\]+)[/\\]SKILL\.md$/i;
+
+function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return typeof v === "object" && v !== null && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Project a tool message onto the canonical protected path. Tool RESULTS
+ *  carry no call input (their `.text` is output content, never to be parsed
+ *  as input), so they always degrade to the tool name — slash-pattern
+ *  protection of a result flows through call-id pairing, exactly like today. */
+export function projectToolPath(msg: CoreMessage): string {
+  const name = msg.toolName;
+  if (!name) return "";
+  if (msg.contentType === "tool-result") return name;
+  const text = msg.text;
+  if (typeof text !== "string" || text.length === 0) return name;
+  const isSkillTool = name.toLowerCase() === "skill";
+  // Cheap gate: only spend JSON work on inputs that can possibly project.
+  if (!isSkillTool && !text.includes("SKILL.md")) return name;
+  const obj = parseJsonObject(text);
+  if (!obj) return name;
+  if (isSkillTool) {
+    for (const field of SKILL_INPUT_FIELDS) {
+      const v = obj[field];
+      if (typeof v === "string" && v.length > 0) return `skill/${v}`;
+    }
+  }
+  for (const v of Object.values(obj)) {
+    if (typeof v !== "string") continue;
+    const m = SKILL_MD_PATH_RE.exec(v);
+    if (m) return `skill/${m[1]}`;
+  }
+  return name;
+}
+
+function matchSegment(value: string, pattern: string, ci: boolean): boolean {
+  if (pattern === "*") return true;
+  const v = ci ? value.toLowerCase() : value;
+  const p = ci ? pattern.toLowerCase() : pattern;
+  if (p.endsWith("*")) return v.startsWith(p.slice(0, -1));
+  return v === p;
+}
+
+/** Match a projected tool path against a protectedTools/protectedLatestTools
+ *  pattern. Syntax (three forms):
+ *  - `name` (no `/`) — the NODE AND ALL DESCENDANTS: leading segment matches
+ *    (case-INsensitive, #1725) and any depth below is covered. `skill` ≡
+ *    `skill/*`. For non-skill tools the path IS the name, so legacy entries
+ *    behave exactly as before.
+ *  - `a/b/…` — per-segment: segment 0 case-insensitive, deeper segments
+ *    case-SENSITIVE (skill names are identifiers, typed exactly); a plain
+ *    final segment matches that exact path only.
+ *  - trailing-`*` in the FINAL segment — intra-segment prefix glob that never
+ *    crosses `/` (`skill/review-*`); a bare final `*` is the subtree wildcard
+ *    (what makes `skill` ≡ `skill/*`). Intermediate `*` spans exactly one
+ *    segment. */
+export function matchToolPath(path: string, pattern: string): boolean {
+  const [pHead, ...pRest] = path.split("/");
+  const [qHead, ...qRest] = pattern.split("/");
+  if (!pHead || !qHead || !matchSegment(pHead, qHead, true)) return false;
+  if (qRest.length === 0) return true;
+  if (pRest.length < qRest.length) return false;
+  for (let i = 0; i < qRest.length - 1; i++) {
+    const pv = pRest[i];
+    const qv = qRest[i];
+    if (pv === undefined || qv === undefined || !matchSegment(pv, qv, false)) {
+      return false;
+    }
+  }
+  const last = qRest[qRest.length - 1];
+  if (last === undefined) return false;
+  if (last === "*") return true;
+  if (pRest.length !== qRest.length) return false;
+  const v = pRest[pRest.length - 1];
+  return v !== undefined && matchSegment(v, last, false);
+}
+
 export function isMessageProtected(
   msg: CoreMessage,
   config: Pick<Config, "protectedTools" | "isToolProtected">,
@@ -106,8 +199,9 @@ export function isMessageProtected(
     return true;
   }
 
+  const path = projectToolPath(msg);
   for (const pattern of config.protectedTools) {
-    if (matchToolPattern(msg.toolName, pattern)) return true;
+    if (matchToolPath(path, pattern)) return true;
   }
 
   if (config.isToolProtected?.(msg.toolName, msg.text)) return true;
@@ -160,6 +254,12 @@ export function isMessageProtectedWithPairing(
  *  tools (e.g. todo_list) where only the newest result is the source of truth
  *  and every older result is strictly redundant.
  *
+ *  Patterns containing `/` are PATH patterns (#1947): they group by projected
+ *  path and keep ONE latest instance per distinct path (latest-per-name —
+ *  `skill/*` keeps each skill's newest load). Slash-free patterns keep the
+ *  legacy semantics verbatim (one latest across everything the name pattern
+ *  matches).
+ *
  *  `callIds` holds the latest calls' toolCallIds (pairing covers the result
  *  half, including results projected without a toolName); `msgIds` holds
  *  latest calls that lack a toolCallId (pairing impossible — protect by id). */
@@ -177,19 +277,32 @@ export function collectLatestProtected(
   const patterns = config.protectedLatestTools ?? [];
   if (patterns.length === 0) return { callIds, msgIds };
   for (const pattern of patterns) {
-    let last: CoreMessage | undefined;
-    for (const m of messages) {
-      if (
-        m.contentType === "tool-call" &&
-        m.toolName &&
-        matchToolPattern(m.toolName, pattern)
-      ) {
-        last = m;
+    if (!pattern.includes("/")) {
+      let last: CoreMessage | undefined;
+      for (const m of messages) {
+        if (
+          m.contentType === "tool-call" &&
+          m.toolName &&
+          matchToolPattern(m.toolName, pattern)
+        ) {
+          last = m;
+        }
       }
+      if (!last) continue;
+      if (last.toolCallId) callIds.add(last.toolCallId);
+      else msgIds.add(last.id);
+      continue;
     }
-    if (!last) continue;
-    if (last.toolCallId) callIds.add(last.toolCallId);
-    else msgIds.add(last.id);
+    const lastByPath = new Map<string, CoreMessage>();
+    for (const m of messages) {
+      if (m.contentType !== "tool-call" || !m.toolName) continue;
+      const path = projectToolPath(m);
+      if (matchToolPath(path, pattern)) lastByPath.set(path, m);
+    }
+    for (const last of lastByPath.values()) {
+      if (last.toolCallId) callIds.add(last.toolCallId);
+      else msgIds.add(last.id);
+    }
   }
   return { callIds, msgIds };
 }
