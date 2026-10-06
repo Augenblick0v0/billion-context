@@ -44,14 +44,14 @@ entries:
     site_zh: "max_tokens 输出预留占窗口的最大比例（0–1，默认 0.25）。"
   - key: compress.nudgeGrowthTokens
     type: number
-    default: "50000 (kernel flat cadence)"
+    default: "unset — window-scaled: clamp(5% × window, 20k, 50k)"
     group: compress
     id: cw.ngt
     render: compress-row
-    desc_en: "Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size)."
-    desc_zh: "增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。"
-    site_en: "Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens."
-    site_zh: "增长门槛（默认 50000）：可折叠片段超出基线增长达到该 token 数才发提醒。"
+    desc_en: "Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens. Default scales with the window (50k at ≥1M, 20k below 400k — #2110); set a number to pin a flat window-independent step."
+    desc_zh: "增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒。默认随窗口缩放（≥1M 窗 50k，<400k 窗 20k，#2110）；设为具体数字可钉住固定步长（与窗口无关）。"
+    site_en: "Growth gate (default window-scaled: 20k–50k): nudges fire only when a foldable range exceeds baseline growth by this many tokens."
+    site_zh: "增长门槛（默认随窗口缩放：20k–50k）：可折叠片段超出基线增长达到该 token 数才发提醒。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
