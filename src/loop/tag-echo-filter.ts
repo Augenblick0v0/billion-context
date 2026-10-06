@@ -163,11 +163,14 @@ function looseCloseEnd(s: string): number {
 // termination, same discipline as looseCloseSpan (a partial close at the
 // buffer end is still undecidable and stays held).
 const DEGEN_CLOSE_NAME = /^[a-zA-Z][a-zA-Z0-9]{0,15}>/;
+// Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
+// this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
+const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
 function degenCloseAfterRef(s: string): { start: number; end: number } | null {
     let idx = s.indexOf(CLOSE_HEAD);
     while (idx >= 0) {
         const m = DEGEN_CLOSE_NAME.exec(s.slice(idx + 2));
-        if (m && REF_LIKE.test(s.slice(0, idx))) return { start: idx, end: idx + 2 + m[0].length };
+        if (m && SINGLE_REF_BODY.test(s.slice(0, idx))) return { start: idx, end: idx + 2 + m[0].length };
         idx = s.indexOf(CLOSE_HEAD, idx + 1);
     }
     return null;
