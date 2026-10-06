@@ -498,7 +498,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** The config-file surface of the #1884 re-sign arm (body-covering signatures; today Huawei CodeArts APIG's `SDK-HMAC-SHA256`). Detection is SHAPE-based, not a name whitelist (#2090): any `Authorization` scheme token naming an HMAC construction, or any request header ending in `-signature` / `-content-sha256`, marks the request as body-signed — every gateway invents its own header set (the dsh free-model plugin ships `x-ofm-signature`), and a closed list kept missing new shapes into silent upstream 401s that surfaced as "invalid credentials" in other plugins' UIs. What happens next depends on whether bili CAN re-sign the scheme:
   - **Built-in scheme with a resolvable credential** (dsh codearts account pool): the zero-config re-sign arm — on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box. The built-in key's defaults ARE that behavior, which is why keying by scheme does not make this a Huawei-shaped field.
-  - **Every other detected scheme** (SigV4, gateway-invented headers): there is NO credential source anywhere in bili and NO re-signer implementation, so bili **refuses it — always** (owner binary-contract ruling, #2090: signed requests are either RE-SIGNED+COMPRESSED or REFUSED, never passed through unsigned). The 403 names the scheme and says plainly that no configuration can make the link work yet; each refusal is remembered in `resign-pending.json` under the state dir (`~/.local/state/billion-context/`) and replayed as a `[resign] … UNRESOLVED` banner at every later start (the dsh agent lane warns at plugin load too) until bili ships the scheme's re-signer. `passthrough` settings are INERT for these schemes — the reminder clears itself only when the branch is un-deployed (`enabled: false` / `BILI_RESIGN=0`, restoring pre-resign rewrite handling where the upstream will likely 401 again).
+  - **Every other detected scheme** (SigV4, gateway-invented headers): there is NO credential source anywhere in bili and NO re-signer implementation, so bili **refuses it — always** (owner binary-contract ruling, #2090: signed requests are either RE-SIGNED+COMPRESSED or REFUSED, never passed through unsigned). The 403 names the scheme and says plainly that no configuration can make the link work yet; each refusal is remembered in `resign-pending.json` under the state dir (`~/.local/state/billion-context/`) and replayed as a `[resign] … UNRESOLVED` banner at every later start (the dsh agent lane warns at plugin load too) until bili ships the scheme's re-signer. `passthrough` settings are INERT for these schemes — the reminder clears itself only when the branch is un-deployed (`enabled: false` / `BILI_RESIGN=0`, restoring pre-resign rewrite handling where the upstream will likely 401 again). Since v0.1.186 (#2260) such dead keys are additionally named once per dead-key set by an `[acp-config]` warning at config load, so the 403 body is no longer the only signal.
 
   This block is for the failure/override paths — env vars win over the file for every field:
   - `enabled: boolean` — kill switch for that scheme; `false` unloads the arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Env `BILI_RESIGN=0` wins.
@@ -513,10 +513,10 @@ Top-level keys that control how the proxy listens and behaves globally.
 
   ```jsonc
   {
-    "resign": {
-      "sdk-hmac-sha256": { "passthrough": true },
-      "aws4-hmac-sha256": { "passthrough": true }
-    }
+     "resign": {
+       "sdk-hmac-sha256": { "passthrough": true },
+       "aws4-hmac-sha256": { "passthrough": true } // inert until bili ships its re-signer (#2090) — named once at config load
+     }
   }
   ```
 
