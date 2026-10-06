@@ -12,16 +12,23 @@
  * compression substrate (irreversible, unlike every cost of refusing).
  *
  * This guard identifies the call at the traffic level and refuses it locally:
- * never forwarded, kernel state untouched. Two-signal AND, per the
- * claudeSubagentSplit (#970) discipline — both signals must agree, and the
- * failure direction is "stop intercepting" (a reworded template degrades to
- * today's behavior; a normal turn can never match: multi-turn requests carry
- * far more messages than DSH_COMPACTION_MAX_MESSAGES):
- *   1. MARKER — the final user message STARTS with the versioned instruction
- *      prefix (machine-appended by the summarizer, never user-chosen);
- *   2. SHAPE — the whole request is ≤ DSH_COMPACTION_MAX_MESSAGES messages
- *      (replayed prefix collapsed + directive; observed live: 2 msgs at
- *      ~152K tokens in the #1729/#1727 logs).
+ * never forwarded, kernel state untouched. MARKER-DECISIVE (#2193): the final
+ * user message STARTS with the versioned instruction prefix (machine-appended
+ * by the summarizer, never user-chosen in practice) and that is sufficient on
+ * its own. The original two-signal AND carried a SHAPE bar (≤4 messages,
+ * pinned to rc.1-era observations — 2 msgs at ~152K tokens in the #1727/#1729
+ * logs); dsh-compaction-basic 0.2.0-rc.2 changed the summarize call to replay
+ * the ENTIRE shadowed region as the message prefix (~1100+ messages), which
+ * made SHAPE permanently false and the whole guard silently pass through — a
+ * landed checkpoint then durably shadowed the raw history of a live session
+ * (#2193). The failure direction of an extra shape signal is exactly what
+ * hurt: silent pass of an irreversible call. The cost asymmetry decides: one
+ * pass-through = permanent substrate loss, one refusal = dsh falls back to
+ * bili-owned compression (auto pressure, overflow recovery, and manual /compact
+ * all send the same envelope and all recover). A fully reworded template
+ * degrades to a miss (today's pre-#1729 behavior) — inherent to text matching;
+ * the tracked sentence is refreshed per dsh release like MAIN_SYSTEM_PREFIXES
+ * tracks Claude Code's system prompts (#970).
  *
  * Deliberately unconditional (auto pressure, context-overflow recovery, and
  * manual /compact all send the same envelope — the traffic layer cannot tell
@@ -38,11 +45,13 @@
 export const DSH_COMPACTION_INSTRUCTION_PREFIX =
     "You are now acting as a compaction engine for this AI coding assistant";
 
-/** The compaction call is a replayed prefix + directive: observed as 2
- * messages (~152K tokens) in the #1727 production logs. A normal turn —
- * including a user pasting the template into an existing conversation —
- * carries the full multi-message history and cannot fit under this bar. */
-export const DSH_COMPACTION_MAX_MESSAGES = 4;
+/** rc.1-era envelope size of the compaction call (replayed prefix collapsed +
+ * directive; observed as 2 msgs at ~152K tokens in the #1727/#1729 logs).
+ * Retained ONLY to flag shape drift in the refusal warn when a newer dsh
+ * release replays the full shadowed region (~1100+ msgs, #2193) — NEVER used
+ * for gating: that bar made the guard permanently blind on rc.2 while its
+ * pass-through stayed silent. */
+export const DSH_COMPACTION_SHAPE_MSGS = 4;
 
 type Rec = Record<string, unknown>;
 
@@ -77,12 +86,12 @@ function lastUserMessageText(protocol: string, parsed: unknown): string | undefi
     return undefined;
 }
 
-/** Two-signal test: marker in the final user message AND a compact
- * message count. `messageCount` is the wire messages-array length the
- * caller already computed (server.ts inboundMsgs). */
-export function isDshCompactionCall(protocol: string | null, parsed: unknown, messageCount: number | null): boolean {
+/** Marker-decisive test (#2193): the final user message starts with the
+ * versioned instruction prefix. Message count plays NO part — rc.2 replays
+ * the full shadowed region (~1100+ msgs) and the old ≤4 bar made the guard
+ * permanently blind while its pass-through stayed silent. */
+export function isDshCompactionCall(protocol: string | null, parsed: unknown): boolean {
     if (protocol !== "openai" && protocol !== "anthropic") return false;
-    if (messageCount === null || messageCount > DSH_COMPACTION_MAX_MESSAGES) return false;
     const finalUser = lastUserMessageText(protocol, parsed);
     if (finalUser === undefined) return false;
     return finalUser.trimStart().startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX);
