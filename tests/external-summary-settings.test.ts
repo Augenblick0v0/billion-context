@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import { once } from "node:events";
 import { parseExternalSummarySettings } from "../src/external-summary-settings.ts";
+import { configuredSummarySettings } from "../src/external-summary-config.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { parseCompressSettings, parseRouteEntry } from "../src/config.ts";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
@@ -38,6 +39,34 @@ test("small context and total budgets clamp defaults without changing explicit l
     const plan = parseExternalSummarySettings({ targets: [{ ...target, contextWindow: 2048 }], budget: { totalTimeoutMs: 500 } });
     assert.equal(plan.targets[0].outputTokens, 512);
     assert.equal(plan.budget.targetTimeoutMs, 500);
+});
+
+test("configured summary settings cache successful reads by path, mtime and size only", () => {
+    const path = join(root(), "config.json");
+    const previous = process.env.BILI_CONFIG_FILE;
+    const first = { compress: { externalSummary: { enabled: true, targets: [target] } } };
+    const second = { compress: { externalSummary: { enabled: true, targets: [{ ...target, name: "backup1", credentialRef: "secret:backup1" }] } } };
+    const timestamp = new Date("2020-01-01T00:00:00.000Z");
+    process.env.BILI_CONFIG_FILE = path;
+    try {
+        writeFileSync(path, JSON.stringify(first));
+        utimesSync(path, timestamp, timestamp);
+        assert.equal(configuredSummarySettings()?.targets[0]?.name, "primary");
+        writeFileSync(path, JSON.stringify(second));
+        utimesSync(path, timestamp, timestamp);
+        assert.equal(configuredSummarySettings()?.targets[0]?.name, "primary");
+
+        const invalidTimestamp = new Date("2020-01-01T00:00:01.000Z");
+        writeFileSync(path, "{");
+        utimesSync(path, invalidTimestamp, invalidTimestamp);
+        assert.throws(() => configuredSummarySettings(), /configuration unavailable/);
+        writeFileSync(path, JSON.stringify(second));
+        utimesSync(path, invalidTimestamp, invalidTimestamp);
+        assert.equal(configuredSummarySettings()?.targets[0]?.name, "backup1");
+    } finally {
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+    }
 });
 
 for (const invalid of [

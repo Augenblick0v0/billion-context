@@ -971,7 +971,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
-    deps = { ...deps, externalSummary: deps.externalSummary ?? configuredSummaryPlan() };
+    if (deps.externalSummary === undefined) {
+        try {
+            deps = { ...deps, externalSummary: configuredSummaryPlan() };
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
+        }
+    }
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.

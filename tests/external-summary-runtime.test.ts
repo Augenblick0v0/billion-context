@@ -193,6 +193,24 @@ test("external preflight uses configured summary model, not the main endpoint", 
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
+test("corrupt external summary configuration warns and falls back to legacy preflight", async () => {
+    const paths: string[] = [];
+    await fixture(async (base, path) => {
+        writeFileSync(path, "{");
+        const ctx = context();
+        ctx.config.modelContextLimit = 1000;
+        ctx.session.stats.lastInputTokens = 10000;
+        const logs: string[] = [];
+        const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
+            prompts: defaultPrompts, protocol: "responses", url: `${base}/legacy`, headers: {},
+            model: "main-model", log: (_level, message) => { logs.push(message); },
+        }, ctx.messages);
+        assert.ok(result.compressedRanges > 0, JSON.stringify(result));
+        assert.deepEqual(paths, ["/legacy"]);
+        assert.ok(logs.some((message) => message.includes("configuration unavailable") && message.includes("legacy preflight")), logs.join("\n"));
+    }, (req, res) => { paths.push(req.url ?? ""); success(res); });
+});
+
 test("MCP/native thin-plugin tool handler executes the same external summary contract", async () => {
     await fixture(async () => {
         const ctx = context();
