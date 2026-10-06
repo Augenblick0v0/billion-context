@@ -152,7 +152,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], notes?: string[], errorShape: "protocol" | "completion" = "protocol", cacheMarks?: Map<string, { type: "ephemeral" }>, absorbArmed?: boolean): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -284,6 +284,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // per prose field — text and thinking deltas interleave across one
             // stream, so a shared instance would hold a tag-shaped tail against
             // the wrong field's bytes.
+            // m00885: whole-field absorb-emission drop is armed only when this
+            // request instructed the model about absorb (server-side provenance).
+            const absorbArmedLocal = absorbArmed === true;
+            // m00885: the shipped request text lets the filter keep an
+            // emission-shaped span the user asked to be output verbatim.
+            const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
@@ -291,7 +297,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                    }),
+                    }, absorbArmedLocal, requestText),
                     createMarkerLineFilter((snippet) => {
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),

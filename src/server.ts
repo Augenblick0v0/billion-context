@@ -96,7 +96,7 @@ import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
-import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
@@ -7092,6 +7092,17 @@ async function forward(
     // opt-in #371 fake-completion backstop buffers + retries first, same as
     // proxy mode (#473).
     if (prepared?.pluginMode) {
+        // m00885 provenance gate: the request body is where the kernel
+        // injects its "[ACP absorb]" instruction, so only an absorb-instructed
+        // request may have its whole-field tool-call prose dropped. wireBody
+        // is the exact shipped bytes (string or Buffer — .includes(string)
+        // works on both).
+        const absorbInstructed = wireBody.includes(ABSORB_INSTRUCTION_MARKER);
+        // m00885: the shipped request text doubles as the echo provenance — a
+        // tool-call-shaped span the user asked to output verbatim sits in the
+        // request, so an identical span in the response is an echo, not a
+        // model-invented emission.
+        const wireBodyText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #411: clear the idle timer on every path — resolveFakeCompletion and
         // other failures still escape these pipes; without a finally each one
         // leaked a live idle timer. (#721: the SSE pipes themselves no longer
@@ -7140,6 +7151,8 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        absorbInstructed,
+                        wireBodyText,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -7164,10 +7177,12 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        absorbInstructed,
+                        wireBodyText,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
             }
         } finally {
             clearUpstreamTimer();
@@ -7384,7 +7399,7 @@ async function forward(
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
