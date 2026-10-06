@@ -119,6 +119,37 @@ test("#2187 never-healthy child fails after the FULL extended budget, not the in
     assert.ok(clock.ticks() >= 59, `the full budget (~${Math.ceil(SPAWN_BUDGET_MS / 1000)}s) must be consumed, got ${clock.ticks()}s`);
 });
 
+// #2260(A)/#2187: the timeout path is where the spawned child is still ALIVE.
+// Before the fix it was abandoned — a detached proxy per failed bring-up, and
+// dsh plan-time retries re-arming every 10s turned one persistently slow host
+// into ~1 zombie per ~70s (each also stranding the lane sticky-port ladder).
+test("#2260(A)/#2187 never-healthy child is hard-killed on timeout instead of leaking", async () => {
+    const clock = fakeClock();
+    const kills: Array<NodeJS.Signals | undefined> = [];
+    const spawnImpl: SpawnFn = () => ({
+        pid: 42462,
+        kill(signal) {
+            kills.push(signal);
+            return true;
+        },
+    });
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => ({ ok: false }),
+                spawnImpl,
+                now: clock.now,
+                sleep: clock.sleep,
+                readInstanceFile: () => undefined,
+            },
+        ),
+        new RegExp(`did not become healthy within ${SPAWN_BUDGET_MS}ms`),
+    );
+    assert.deepEqual(kills, ["SIGKILL"], "the abandoned child must be hard-killed exactly once");
+});
+
 test("#2187 cross-process waiter: instance appearing at ~45s attaches instead of double-spawning", async () => {
     try {
         claimStartingMarker({ token: "starter-2187", pid: process.pid, host: "127.0.0.1", port: 8788, startedAt: Date.now() });

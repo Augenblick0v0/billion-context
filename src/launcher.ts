@@ -4043,10 +4043,43 @@ export async function ensureProxyRunning(
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
+        // #2260(A)/#2187: the timeout is the ONE terminal path where the
+        // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
+        // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
+        // persistently slow host accumulated ~1 zombie per ~70s (each also
+        // stranding the lane sticky-port ladder). Hard-kill before failing.
+        killAbandonedChild(child);
+        console.error(
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — it never became ready and would otherwise outlive this failure (log: ${logPath})`,
+        );
         throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
+}
+
+/** #2260(A)/#2187: unconditional hard-kill of a spawned-but-abandoned proxy
+ *  child, all platforms. Deliberately NOT stopProxy(): its win32 path returns
+ *  without killing because the #414 design assumes THIS process exits ≤2s
+ *  later, letting the child's BILI_PARENT_PID watch run the graceful path —
+ *  an assumption that does not hold when the spawner keeps living (plugin
+ *  lane: long-lived desktop host), where the abandoned child would leak
+ *  forever. The victim never became healthy, so it served no traffic and
+ *  holds no sessions; SIGKILL loses nothing and reaches even a hung event
+ *  loop (SIGTERM would wait for a stuck loop to drain). Stale instance
+ *  records left behind are inert by the dead-pid checks in discovery. */
+function killAbandonedChild(child: SpawnChild | undefined): void {
+    if (!child || child.pid === undefined || child.pid <= 0) return;
+    if (process.platform !== "win32") {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+        } catch {
+            /* group already gone */
+        }
+    }
+    try {
+        child.kill?.("SIGKILL");
+    } catch {}
 }
 
 export function stopProxy(handle: ProxyHandle): void {
