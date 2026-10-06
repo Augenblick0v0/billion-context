@@ -120,7 +120,7 @@ async function startHarness(sessionId: string, reportUsage: boolean): Promise<{
     const relay = makeRelay(reportUsage);
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -141,7 +141,7 @@ async function startHarness(sessionId: string, reportUsage: boolean): Promise<{
     } as ProxyOptions);
     await once(proxy, "listening");
     return {
-        url: `http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
+        url: `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
         headers: { "content-type": "application/json", "x-acp-session": sessionId },
         base: baseConversation(),
         proxy, relay, logs,

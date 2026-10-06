@@ -141,12 +141,12 @@ test("#1819 receipt: an expanding fold reports the net growth instead of claimin
     const logs: string[] = [];
     const ctx = { core, config, messages: turn.messages, session, log: (msg: string) => { logs.push(msg); } };
 
-    const healthy = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never);
+    const healthy = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never).text;
     assert.match(healthy, /~(\d[\d,]*) tokens saved/, `base line stays parseable: ${healthy}`);
     assert.ok(!healthy.includes("[Net context change") && !healthy.includes("[No net shrink"),
         `a shrinking fold claims savings without correction: ${healthy}`);
 
-    const bloated = applyRanges(parseCompressInput({ content: [{ startId: "m00003", endId: "m00004", summary: "R".repeat(40_000) }] }), ctx as never);
+    const bloated = applyRanges(parseCompressInput({ content: [{ startId: "m00003", endId: "m00004", summary: "R".repeat(40_000) }] }), ctx as never).text;
     assert.match(bloated, /\[Compressed m00003–m00004 → 1 block\(s\)/, `the fold itself still lands: ${bloated.slice(0, 120)}`);
     assert.match(bloated, /~(\d[\d,]*) tokens saved/, "the base line pattern core.ts parses stays intact");
     assert.match(bloated, /\[Net context change: \+\d+ tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it\.\]/,
