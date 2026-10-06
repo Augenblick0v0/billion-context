@@ -258,9 +258,9 @@ curl -s http://localhost:8787/__bili/stats
 
 **能用网页查会话和配置吗?** 能 —— 打开 [http://localhost:8787](http://localhost:8787):总览仪表盘、会话列表(含逐会话详情)、实时日志、配置编辑器、上游连通性测试。全部功能同样以纯 JSON 提供(`/__bili/stats`、`/__bili/sessions`、`/__bili/config`、…),方便脚本化。
 
-**压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
+**压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(随窗口缩放的步长——窗口的 5%、夹在 [20k, 50k],即 ≥1M 窗口 50k、<400k 窗口 20k;用 `compress.nudgeGrowthTokens` 可钉住固定步长)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
-**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上增长 50k token 才触发第一次软压缩(`compress.nudgeGrowthTokens` 恒定步长、与窗口无关)。开机 100k 左右、或把 `compress.nudgeGrowthTokens` 设到 100k 左右时,可能都要到 ~200k 才发生第一次压缩。想更早压缩省 token:1.删减系统提示词、关闭不需要的工具、精简 skill;2.把 nudge 调小到 50k 左右;3.开启 lean 功能。完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
+**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上再增长一个步长才触发第一次软压缩(步长随窗口缩放:clamp(5% × 窗口, 20k, 50k)——≥1M 窗口 50k、<400k 窗口 20k;`compress.nudgeGrowthTokens` 可钉住固定步长)。在 ≥1M 窗口上开机 100k 左右、或把步长显式设到 100k 左右时,可能都要到 ~200k 才发生第一次压缩。想更早压缩省 token:1.删减系统提示词、关闭不需要的工具、精简 skill;2.调小 `compress.nudgeGrowthTokens`;3.开启 lean 功能。完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
 
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
