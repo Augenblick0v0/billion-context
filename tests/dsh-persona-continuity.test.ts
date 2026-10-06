@@ -201,8 +201,9 @@ test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); 
         });
         await r3.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        assert.ok(peekSession(fork), "review request still forks onto its own session");
-        assert.equal(peekSession(fork).stats.requests, 1, "forked session served the review");
+        const forkSession = peekSession(fork);
+        assert.ok(forkSession, "review request still forks onto its own session");
+        assert.equal(forkSession.stats.requests, 1, "forked session served the review");
         assert.equal(getSession(CONV).stats.requests, 2, "main session untouched by the review");
 
         // Switch BACK to model A (history continues) → migrate again, raw key.
