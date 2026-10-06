@@ -6366,17 +6366,25 @@ test("resolveClientCommand: antigravity/mcode honor the injectable platform para
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-home-"));
     const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-lad-"));
     const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
     try {
         process.env.HOME = home;
+        // os.homedir() reads USERPROFILE on win32, not HOME — seal it so the
+        // non-win32 expectations below hold on every host (CI runs on Windows).
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = home;
         // Before #2260 these branches read process.platform directly, so the
         // win32 layout was unreachable from tests (and wrong under any future
-        // platform-injection use).
+        // platform-injection use). Pin both layouts via EXPLICIT platform args
+        // so the test stays host-independent (a bare default-platform call
+        // resolves through the real host's os.homedir() and cannot hold one
+        // literal on both Windows and POSIX runners).
         assert.deepEqual(
             resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData }, "win32"),
             { command: path.join(localAppData, "agy", "bin", "agy"), prefixArgs: [] },
         );
         assert.deepEqual(
-            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }),
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "linux"),
             { command: path.join(home, ".local", "bin", "agy"), prefixArgs: [] },
         );
         const mdDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-plat-"));
@@ -6387,13 +6395,15 @@ test("resolveClientCommand: antigravity/mcode honor the injectable platform para
             { command: path.join(mdDir, "bin", "mcode.cmd"), prefixArgs: [] },
         );
         assert.deepEqual(
-            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }),
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "linux"),
             { command: path.join(mdDir, "bin", "mcode"), prefixArgs: [] },
         );
         rmrf(mdDir);
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
         rmrf(home);
         rmrf(localAppData);
     }
