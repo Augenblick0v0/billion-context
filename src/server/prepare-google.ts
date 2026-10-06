@@ -1,9 +1,11 @@
+import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { applyCompactionArchive, foldCoverage, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
@@ -58,6 +60,8 @@ export async function prepareGoogle(
     stream: boolean,
     visibilityMarkers: boolean,
     upstreamOrigin: string,
+    req: http.IncomingMessage,
+    decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
@@ -181,13 +185,41 @@ export async function prepareGoogle(
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
         }
         if (willInjectNudge && turn.nudge) {
-            try {
-                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = rendered.text;
-                if (rendered.text) {
-                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(renderedWithPayload), visibilityMarkers));
+            // #2228: model-decided timing (see prepareAnthropic for the policy):
+            // gentle/over-limit T1 arms ask the model first; EMERGENCY and
+            // tier>=2 keep the legacy advisory.
+            const useDecide = decide !== undefined && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+            if (useDecide && ladderMode(session.metadata) === "fallback") {
+                consumeFallback(session.metadata);
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(renderedWithPayload), visibilityMarkers));
+                    }
+                } catch {
                 }
-            } catch {
+            } else if (useDecide) {
+                const ranges = turn.nudge.compressibleRanges ?? [];
+                const sideBody: Record<string, unknown> = { ...parsed, contents: [...rebuiltContents, { role: "user", parts: [{ text: buildDecisionPrompt(ranges) }] }], tools: toolsOut, systemInstruction, generationConfig: { ...(parsed.generationConfig ?? {}), maxOutputTokens: decide.maxTokens } };
+                const outcome = await runNudgeDecision({ req, opts, protocol: "google", sideBody, session, log });
+                if (outcome.kind === "yes") {
+                    const span = resolveDecisionRange(outcome, ranges);
+                    if (span) {
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(buildDirectiveText(span.startRef, span.endRef, outcome.topic)), visibilityMarkers));
+                    } else {
+                        log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
+                    }
+                }
+            } else {
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(renderedWithPayload), visibilityMarkers));
+                    }
+                } catch {
+                }
             }
         }
         // [#1095] restore-channel guidance — ephemeral trailing note (see prepareAnthropic).

@@ -4,7 +4,8 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, stripKernelSummaries, warnAnthropicThinkingPairs, withReasoningDrop, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, withReasoningDrop, type Prepared } from "../server.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
@@ -41,6 +42,7 @@ export async function prepareAnthropic(
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
+    decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -253,13 +255,45 @@ export async function prepareAnthropic(
         // hard limit. Ephemeral user message: not persisted, never enters the
         // agent's re-sent history, safe for the prefix-cache anchor.
         if (willInjectNudge && turn.nudge) {
-            try {
-                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = rendered.text;
-                if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
+            // #2228: model-decided timing. Only gentle/over-limit T1 arms ask
+            // the model (a cheap side call over the session's cached prefix)
+            // whether compressing NOW serves the current task; a strict-JSON
+            // yes injects an explicit directive with a program-finalized span,
+            // anything else injects nothing this round. EMERGENCY arms and
+            // tier>=2 distillation keep the legacy advisory below.
+            const useDecide = decide !== undefined && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+            if (useDecide && ladderMode(session.metadata) === "fallback") {
+                consumeFallback(session.metadata);
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
+                    }
+                } catch {
                 }
-            } catch {
+            } else if (useDecide) {
+                const ranges = turn.nudge.compressibleRanges ?? [];
+                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                delete sideBody.prompt_cache_key;
+                const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
+                if (outcome.kind === "yes") {
+                    const span = resolveDecisionRange(outcome, ranges);
+                    if (span) {
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(buildDirectiveText(span.startRef, span.endRef, outcome.topic)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                    } else {
+                        log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
+                    }
+                }
+            } else {
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
+                    }
+                } catch {
+                }
             }
         }
         // [#1095] restore-channel guidance — ephemeral trailing user message
