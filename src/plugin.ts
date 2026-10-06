@@ -2178,9 +2178,13 @@ export async function pipePluginChatWithStrip(
                     args: "",
                 });
             } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
+            // #2248: raw exit — content_block_start payloads never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         if (ev["type"] !== "content_block_delta") {
+            // #2248: raw exit — non-delta events never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         const d = ev["delta"] as Record<string, unknown> | undefined;
@@ -2196,6 +2200,9 @@ export async function pipePluginChatWithStrip(
         }
         const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
         if (field === null || typeof d?.[field] !== "string") {
+            // #2248: raw exit — unmanaged delta types never enter the filter.
+            // input_json_delta excluded: tool-call arguments are user intent (#1039).
+            if (d?.["type"] !== "input_json_delta") auditRawForward(rawEvent);
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
@@ -2238,6 +2245,8 @@ export async function pipePluginChatWithStrip(
         if (ev["error"] !== undefined) sawTerminal = true;
         const candidates = ev["candidates"];
         if (!Array.isArray(candidates)) {
+            // #2248: raw exit — non-candidates frames never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         let rebuilt: Record<string, unknown> | null = null;
@@ -2361,6 +2370,10 @@ export async function pipePluginChatWithStrip(
             if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
             return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        // #2248: raw exit — text outside managed parts never enters the filter.
+        // Frames carrying non-text parts (functionCall/functionResponse, ...) hold
+        // structured or user data (#1039) and are excluded from the audit.
+        if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
@@ -2526,6 +2539,21 @@ function openaiFrameHasToolCalls(choices: unknown): boolean {
     for (const c of choices) {
         const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
         if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
+    }
+    return false;
+}
+
+// #2248 companion to auditRawForward (responses wire): tool-call argument
+// streams (response.function_call_arguments.*, response.custom_tool_call_input.*)
+// fall through the unrecognized-type exit and are user intent (#1039) — exclude.
+function responsesFrameHasToolCalls(ev: Record<string, unknown>): boolean {
+    const t = ev["type"];
+    if (typeof t === "string" && (t.includes("function_call") || t.includes("custom_tool_call"))) return true;
+    if (ev["arguments"] !== undefined) return true;
+    const item = ev["item"];
+    if (item && typeof item === "object") {
+        const it = (item as Record<string, unknown>)["type"];
+        if (it === "function_call" || it === "custom_tool_call") return true;
     }
     return false;
 }
@@ -3080,6 +3108,10 @@ export async function pipePluginResponsesWithStrip(
                         await write(flushArgTails() + rebuildEvent(rawEvent, { ...ev, [argField]: clean }));
                         continue;
                     }
+                    // #2248: raw exit — unrecognized event types never enter the
+                    // filter. Tool-call argument streams are user intent (#1039)
+                    // and are excluded from the audit.
+                    if (!responsesFrameHasToolCalls(ev)) auditRawForward(rawEvent);
                     await write(rawEvent + "\n\n");
                 }
             }
