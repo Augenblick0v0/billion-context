@@ -200,7 +200,15 @@ function makeFakePi(): FakePi {
         commands,
         providers,
         get registerCalls() { return registerCallCount; },
-        on: (event, handler) => events.set(event, handler as (event: unknown, ctx: unknown) => unknown),
+        on: (event, handler) => {
+            // Real pi dispatches each event to ALL registered handlers in
+            // registration order (the bili factory itself registers two
+            // session_start handlers, and #2186's wiring adds a third); a
+            // single-slot map would let the last registration shadow the rest.
+            const h = handler as (event: unknown, ctx: unknown) => unknown;
+            const prev = events.get(event);
+            events.set(event, prev ? ((e, c) => { prev(e, c); return h(e, c); }) : h);
+        },
         registerTool: (tool) => {
             registerCallCount++;
             const i = tools.findIndex((t) => t.name === tool.name);
