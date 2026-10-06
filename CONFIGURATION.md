@@ -513,10 +513,10 @@ Top-level keys that control how the proxy listens and behaves globally.
 
   ```jsonc
   {
-     "resign": {
-       "sdk-hmac-sha256": { "passthrough": true },
-       "aws4-hmac-sha256": { "passthrough": true } // inert until bili ships its re-signer (#2090) — named once at config load
-     }
+    "resign": {
+      "sdk-hmac-sha256": { "passthrough": true },
+      "aws4-hmac-sha256": { "passthrough": true } // inert until bili ships its re-signer (#2090) — named once at config load
+    }
   }
   ```
 
