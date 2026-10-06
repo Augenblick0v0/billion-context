@@ -76,9 +76,10 @@ const NAME = ACP_NAME_ALT;
 // and the #644 release rules. Close-side tails keep their {0,32} bound — that
 // one is load-bearing (#644: an unbounded close-side tail ate real content
 // after a malformed close).
-// A render tag wraps exactly one bare ref: the kernel emits <acp tokens="…"
+// A render tag wraps ONLY KERNEL REFS between its tags: the kernel emits <acp tokens="…"
 // type="…">mNNNNN</acp> and nothing else between the tags (#1720). Content that
-// is not a ref is prose wearing tags — the tags go, the content stays. No g
+// is not refs-only is prose wearing tags — the tags go, the content stays
+// (#1720/#2023). No g
 // flag: createTagEchoFilter drives it with exec() on a sliding buffer. It is
 // flag-free by construction — case folding lives inside ACP_NAME_ALT's letter
 // classes (#1731) — so every .source reconstruction below preserves behavior
@@ -86,14 +87,46 @@ const NAME = ACP_NAME_ALT;
 // Attrs are OPTIONAL: the kernel always emits them, but models imitate the
 // bare form <name>mNNNNN</name> (#1881) — whole-span strip must cover it or
 // the interior ref leaks as residue after the lone tags go.
-const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
-const REF_LIKE = /^\s*m\d{4,}\s*$/;
+const REF_TOKEN = "m\\d{4,}";
+// One kernel ref, or a run of them joined by whitespace / dash / comma — the
+// shapes the compress machinery prints (single ref, mNNNNN–mMMMMM ranges,
+// comma-separated range lists) that models imitate inside or beside render
+// tags (#2023). A bare run is never prose: prose cites ONE ref among words,
+// never a sequence of them.
+const REFS_RUN = REF_TOKEN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*" + REF_TOKEN + ")*";
+// Whole string is a refs run (optionally padded): tag content, not prose.
+const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
+// Body of a paired render tag: refs-only or empty (#1720/#2023). Anything
+// else is prose wearing tags — PAIRED must not match it.
+const PAIRED_BODY = "\\s*(?:" + REFS_RUN + ")?\\s*";
+const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(" + PAIRED_BODY + ")" + "\x3c\\/" + NAME + ">");
+// An orphan refs run sitting directly against a close tag: the open half was
+// consumed by another branch (or never came), and stripping the close alone
+// leaves the refs behind as residue (#2023). The unit — run plus close — is
+// dead markup; the lookbehind keeps word-like tokens (xm01233) and refs
+// adjacent to a tag terminator out of it — a run right after \x3e belongs to
+// tag structure (an over-cap-dropped opening, #644) and stays lossless.
+// Streaming: consulted only when no opening is live (the swallowing state
+// owns paired closes, #1720). Whole-text: applied to UNMATCHED closes only
+// (see orphanCloseSpans) so a ref cited inside a prose-wearing pair survives.
+const ORPHAN_REF_CLOSE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
+// Same unit anchored to the END of a string: the refs run immediately
+// preceding an unmatched close (whole-text orphan pass).
+const ORPHAN_RUN_BEFORE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*$");
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // A suffix of the buffer that could still grow into a render tag: either an
-// unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
-// ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
+// unterminated \x3c<name> … opening (attrs so far, no \x3e yet), a short
+// ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …, a trailing refs
+// run whose close may arrive in the next chunk (#2023 orphan unit) — alone or
+// already followed by the tag fragment that opens the split close — or a
+// partial ref prefix (a bare m or m + 1-3 digits) that may complete across
+// the boundary.
+// Refs right after a tag terminator (\x3e) are NOT held: they belong to tag
+// structure (over-cap-dropped openings, #644) and stay lossless. Held on the
+// small cap so a split unit can be stripped whole; a lone trailing ref with
+// no tag context is released at EOF, prose-safe.
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "|(?<![\\w>])m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
@@ -144,6 +177,34 @@ function looseCloseSpan(s: string): { start: number; end: number } | null {
 function looseCloseEnd(s: string): number {
     const span = looseCloseSpan(s);
     return span === null ? -1 : span.end;
+}
+
+/** Spans of every close tag in s with NO unmatched open before it (#2023).
+ *  Opens and closes are paired greedily in document order (echoed tags are
+ *  flat; kernel tags are well-nested), and only depth-zero closes count as
+ *  orphans — a close inside any pair protects the refs run it terminates
+ *  (#1720 prose-wearing pairs keep their content). */
+function orphanCloseSpans(s: string): { start: number; end: number }[] {
+    const events: { idx: number; open: boolean }[] = [];
+    const reO = new RegExp(LONE_OPEN.source, "g");
+    const reC = new RegExp(LONE_CLOSE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = reO.exec(s)) !== null) events.push({ idx: m.index, open: true });
+    while ((m = reC.exec(s)) !== null) events.push({ idx: m.index, open: false });
+    events.sort((a, b) => a.idx - b.idx);
+    const spans: { start: number; end: number }[] = [];
+    let depth = 0;
+    for (const ev of events) {
+        if (ev.open) {
+            depth++;
+        } else if (depth === 0) {
+            const cm = new RegExp(LONE_CLOSE.source).exec(s.slice(ev.idx));
+            if (cm) spans.push({ start: ev.idx, end: ev.idx + cm[0].length });
+        } else {
+            depth--;
+        }
+    }
+    return spans;
 }
 
 /** The span of one wrapped-turn imitation in `s`: where it starts, and the span
@@ -242,8 +303,23 @@ export function stripAcpTags(text: string): string {
         if (wrapped === null) break;
         out = out.slice(0, wrapped.start) + out.slice(wrapped.end);
     }
+    out = out.replace(new RegExp(PAIRED.source, "g"), "");
+    // #2023: a refs run sitting directly against an UNMATCHED close is residue
+    // (its open was consumed elsewhere or never came) and goes with the close.
+    // A close inside any pair — even a prose-wearing one — belongs to that
+    // pair's content and stays (#1720), so only depth-zero closes qualify.
+    // Delete right-to-left so earlier offsets stay valid.
+    {
+        const spans = orphanCloseSpans(out);
+        for (let i = spans.length - 1; i >= 0; i--) {
+            const sp = spans[i];
+            const pre = out.slice(0, sp.start);
+            const rm = ORPHAN_RUN_BEFORE.exec(pre);
+            if (!rm) continue;
+            out = out.slice(0, pre.length - rm[0].length) + out.slice(sp.end);
+        }
+    }
     out = out
-        .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
@@ -425,8 +501,14 @@ export function mayStartBiliInternal(s: string): boolean {
 // literal marker line, truncated internal-artifact open/header) is dead to the
 // host like an empty turn, so degenerate-turn detection counts it as residue;
 // plain prose (CJK leads included) is visible output, not residue.
+// #2023 review: the probe is PARTIAL_TAIL's \x3c -prefixed alternatives ONLY.
+// Its refs-run alternatives match genuine citations released at EOF; counting
+// those as residue made every bare-citation answer read as degenerate and fire
+// the one-shot retry (#732/#821) on a healthy turn. Tagged echoes need no help
+// here: their drop already sets sawStrippedEcho upstream.
+const TAG_PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 export function isOrphanMarkupText(s: string): boolean {
-    return mayStartRenderTag(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
+    return RENDER_TAG_DETECT.test(s) || TAG_PARTIAL_TAIL.test(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
 }
 
 function tailHoldLen(s: string): number {
@@ -525,6 +607,11 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
 
 export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
     let held = "";
+    /** Last character actually emitted ("" at stream start). Extends the
+     *  [\w>] orphan-unit lookbehind ACROSS chunk boundaries: a refs run
+     *  arriving at the buffer head was preceded by whatever was emitted
+     *  before, and a \x3e there marks tag-structure residue (#644). */
+    let lastEmitted = "";
     let swallowUntilClose = false;
     let swallowed = "";
     /** Which budget the current swallow answers to (SWALLOW_CAP or
@@ -550,6 +637,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             onDrop(snippet);
         }
     };
+    /** Character immediately before the refs run of an orphan-unit match —
+     *  within the buffer, or the last emitted char when the run sits at the
+     *  buffer head (chunk boundary). */
+    const charBeforeRun = (mm: RegExpExecArray, s: string): string => {
+        const lead = mm[0].match(/^\s*/)?.[0].length ?? 0;
+        const pos = mm.index + lead;
+        return pos === 0 ? lastEmitted : s[pos - 1];
+    };
     const process = (input: string): string => {
         let buf = input;
         let out = "";
@@ -558,12 +653,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 const combined = swallowed + buf;
                 const span = looseCloseSpan(combined);
                 if (span !== null) {
-                    // Only a ref-shaped body is tag content (#1720): a prose
-                    // body between paired tags is released and just the close
-                    // goes. An attested imitation (swallowReleases=false)
-                    // discards whatever the body is.
+                    // Only a refs-only body is tag content (#1720/#2023): a
+                    // prose body between paired tags is released and just the
+                    // close goes — a ref cited inside such a body survives.
+                    // An attested imitation (swallowReleases=false) discards
+                    // whatever the body is.
                     const inner = combined.slice(0, span.start);
-                    if (REF_LIKE.test(inner) || !swallowReleases) {
+                    if (REFS_ONLY.test(inner) || !swallowReleases) {
                         drop(combined.slice(0, span.end));
                     } else {
                         out += inner;
@@ -577,6 +673,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 if (combined.length > swallowLimit) {
                     swallowed = "";
                     if (swallowReleases) {
+                        // A refs-only tail past the #644 budget is an imitated
+                        // marker list, not prose — discard it. Mixed tails are
+                        // content and still release losslessly.
+                        if (REFS_ONLY.test(combined)) {
+                            drop(combined);
+                            return out;
+                        }
                         swallowUntilClose = false;
                         buf = combined;
                         continue;
@@ -592,8 +695,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             const p = PAIRED.exec(buf);
             const o = LONE_OPEN.exec(buf);
             const c = LONE_CLOSE.exec(buf);
+            // Orphan unit (#2023): only reached when no opening is live — a
+            // close inside a swallow belongs to that pair's content (#1720).
+            // The lookbehind class extends across the chunk boundary: a run at
+            // the buffer head preceded by an emitted word char is word-like
+            // (xm01233), and one preceded by \x3e is tag-structure residue
+            // (#644) — neither is an orphan.
+            let r = ORPHAN_REF_CLOSE.exec(buf);
+            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) r = null;
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, o, c]) {
+            for (const cand of [p, o, c, r]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -683,6 +794,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             const chunk = held + delta;
             held = "";
             const r = process(chunk);
+            if (r.length > 0) lastEmitted = r[r.length - 1];
             outputChars += r.length;
             return r;
         },
@@ -702,8 +814,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
-                // over-budget-or-EOF tail is content unless it is exactly a
-                // ref; only a truncated open/close tail is dead markup.
+                // over-budget-or-EOF tail is content unless it is refs-only —
+                // an imitated marker list (#2023), not a citation; only a
+                // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
                     drop(t[0]);
@@ -713,6 +826,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     if (tc) {
                         drop(tc[0]);
                         result = rest.slice(0, tc.index);
+                    } else if (REFS_ONLY.test(rest)) {
+                        drop(rest);
+                        result = "";
                     } else {
                         result = rest;
                     }
@@ -732,6 +848,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     }
                 }
             }
+            if (result.length > 0) lastEmitted = result[result.length - 1];
             outputChars += result.length;
             return result;
         },
