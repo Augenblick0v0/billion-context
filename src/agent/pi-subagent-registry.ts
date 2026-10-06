@@ -27,7 +27,7 @@ const MAX_PATH_BYTES = 4096;
 const MAX_SESSION_ID_BYTES = 256;
 
 type FrozenEntry = Readonly<{ readonly id: string; readonly path: string }>;
-export type FrozenSnapshot = readonly FrozenEntry[];
+type FrozenSnapshot = readonly FrozenEntry[];
 
 export interface SubagentRegistryRoot {
     version: number;
@@ -42,7 +42,7 @@ export interface SubagentSelfRegState {
     snapshot?: FrozenSnapshot;
 }
 
-export interface SelfRegisterOptions {
+interface SelfRegisterOptions {
     env: NodeJS.ProcessEnv;
     agent: string;
     sessionId?: string;

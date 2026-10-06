@@ -149,7 +149,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdp
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -191,7 +191,7 @@ export type SpawnFn = (
     options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean; windowsHide?: boolean },
 ) => SpawnChild;
 
-export interface LaunchOptions {
+interface LaunchOptions {
     host: string;
     port: number;
     passthrough: boolean;
@@ -225,7 +225,7 @@ export interface LaunchOptions {
     lane?: string;
 }
 
-export interface ProxyHandle {
+interface ProxyHandle {
     origin: string;
     port: number;
     child?: SpawnChild;
@@ -1776,7 +1776,7 @@ function recordSqliteOrigin(overlay: string, base: string): void {
  *     deletion): NOTHING can be claimed about this side's age; callers must
  *     fall back conservatively instead of assuming a winner.
  *  The same snapshot serves both sides because the copy is byte-exact. */
-export type SqliteSideState = "unchanged" | "changed" | "unknown";
+type SqliteSideState = "unchanged" | "changed" | "unknown";
 
 function sqliteSideVsOrigin(overlay: string, dir: string, base: string): SqliteSideState {
     const rec = readSqliteOrigin(overlay)[base];
@@ -1890,7 +1890,7 @@ function freeConflictName(dst: string): string {
  *  shared link is dropped here — its per-path -wal/-shm sidecars cannot be
  *  replayed against a main the other path may have advanced, so they are
  *  quarantined as conflicts, never merged (#1917). */
-export function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
+function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
     const members = sqliteSetMembers(base);
     const statFile = (dir: string, m: string): fs.Stats | undefined => {
         try {
@@ -2341,7 +2341,7 @@ export function piPluginInstalled(piHome: string): boolean {
  *  fallback — that leaves pi with no plugin at all: no /acp, no provider
  *  rewrites, and the traffic silently bypasses the proxy (#1318). Same
  *  discipline ompPluginLoadedFrom already applies to omp config entries. */
-export function piEntryLoadable(entry: string): boolean {
+function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
@@ -2456,7 +2456,7 @@ export function prepareDshHome(
     return overlay;
 }
 
-export interface GooseOverlay {
+interface GooseOverlay {
     root: string;
     realConfigDir: string;
     patchedFiles: Set<string>;
@@ -3307,7 +3307,7 @@ async function probeHealth(
     }
 }
 
-export interface HealthInfo {
+interface HealthInfo {
     ok: boolean;
     instanceId?: string;
     /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
@@ -3435,7 +3435,7 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-export function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
     if (attachExternal) return true;
     return health.watchdog?.armed === true;
 }
@@ -3571,7 +3571,7 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
     });
 }
 
-export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     return new Promise((resolve, reject) => {
         const srv = net.createServer();
         srv.once("error", reject);
@@ -4430,7 +4430,7 @@ export function resolveClientCommand(
     return { command: resolved ?? client, prefixArgs: [] };
 }
 
-export interface RunLaunchParams {
+interface RunLaunchParams {
     client: ClientName;
     clientArgs: string[];
     mitmDomains?: string[];
@@ -5130,7 +5130,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     process.exit(code ?? 0);
 }
 
-export interface RunTestPiParams {
+interface RunTestPiParams {
     overrides: Record<string, string | undefined>;
     mitmDomains?: string[];
 }

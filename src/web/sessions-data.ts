@@ -21,7 +21,7 @@ import * as path from "node:path";
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
  *  total corpus bytes; a single admin request's peak is one decoded file. */
 
-export interface WebSessionSummary {
+interface WebSessionSummary {
     id: string;
     title?: string;
     label?: string;
@@ -93,7 +93,7 @@ export interface WebSessionSummary {
     summaryCost?: number;
 }
 
-export interface WebOverview {
+interface WebOverview {
     sessions: number;
     live: number;
     requests: number;
@@ -130,7 +130,7 @@ export interface WebOverview {
     recent: WebSessionSummary[];
 }
 
-export interface WebSessionDetail extends WebSessionSummary {
+interface WebSessionDetail extends WebSessionSummary {
     lastInputTokens: number;
     compressCreditTokens: number;
     retrieveCalls: number;
@@ -603,9 +603,9 @@ export async function buildSessionList(): Promise<WebSessionSummary[]> {
     return vis;
 }
 
-export interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+interface SessionPageQuery { q?: string; page?: number; pageSize: number }
 
-export interface SessionPageResult {
+interface SessionPageResult {
     sessions: WebSessionSummary[];
     total: number;
     page: number;

@@ -21,7 +21,7 @@ type RegistryShape = Record<string, ModelEntry>;
 // providers.<host>.models.<id>.cost ($/Mtok). Only rows with a usable input
 // price are stored — without an input anchor there is nothing to normalize
 // against, and half-inventing a profile would misprice every fold.
-export type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
+type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
 type CostsShape = Record<string, CostRow>;
 type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 

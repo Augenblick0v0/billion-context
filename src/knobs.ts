@@ -108,7 +108,7 @@ export function exposureLogIntervalMs(): number {
     return Number.isInteger(v) ? Math.max(0, v) : 3_600_000;
 }
 
-export const STREAM_KEEPALIVE_DEFAULT_MS = 15_000;
+const STREAM_KEEPALIVE_DEFAULT_MS = 15_000;
 
 /** BILI_STREAM_KEEPALIVE_MS > network.streamKeepAliveMs > 15000 (0 disables the hold). */
 export function streamKeepAliveMs(): number {
@@ -116,7 +116,7 @@ export function streamKeepAliveMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : STREAM_KEEPALIVE_DEFAULT_MS;
 }
 
-export const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
+const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
 
 /** BILI_PREFLIGHT_HOLD_MS > network.preflightHoldMs > 30000. */
 export function preflightHoldGraceMs(): number {
@@ -124,7 +124,7 @@ export function preflightHoldGraceMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
 }
 
-export const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
+const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
 
 /** BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS > network.preflightDeadEndCooldownMs > 300000. */
 export function preflightDeadEndCooldownMs(): number {
@@ -140,7 +140,7 @@ export function proxyKeepAliveMaxMs(): number {
             : Number.isFinite(v) && v > 0 ? Math.floor(v) : PROXY_KEEPALIVE_MAX_MS;
 }
 
-export const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
+const POST_RESPONSE_LINGER_MS_DEFAULT = 5_000;
 
 /** BILI_POST_RESPONSE_LINGER_MS > network.postResponseLingerMs > 5000 (#1982
  *  post-response close linger budget; mirrors nginx lingering_time). Env tier
@@ -152,7 +152,7 @@ export function postResponseLingerMs(): number {
     return Number.isFinite(v) && v > 0 ? v : POST_RESPONSE_LINGER_MS_DEFAULT;
 }
 
-export const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
+const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
 
 /** BILI_MITM_HANDSHAKE_TIMEOUT_MS > mitm.handshakeTimeoutMs > 10000. */
 export function mitmHandshakeTimeoutMs(): number {
@@ -218,14 +218,14 @@ export function maxSessions(): number {
     return Math.max(1, v || 256);
 }
 
-export interface GcSettings {
+interface GcSettings {
     enabled: boolean;
     maxAgeMs: number;
     maxTokens: number;
     intervalMs: number;
 }
 
-export const GC_DAY_MS = 86_400_000;
+const GC_DAY_MS = 86_400_000;
 
 /** BILI_SESSION_GC{,_MAX_AGE_DAYS,_MAX_TOKENS,_INTERVAL_MS} > sessions.gc.* > off/7d/1M/1h. */
 export function gcSettings(): GcSettings {

@@ -129,7 +129,7 @@ interface LedgerLine {
     bs?: "head" | "append" | "mid" | "unknown";
 }
 
-export interface CacheLedger {
+interface CacheLedger {
     v: 1;
     lastBlockId: number;
     consumedFoldSeq: number;
@@ -279,7 +279,7 @@ const seamLastSent = new WeakMap<Session, SeamSlot>();
 const seamLastSettled = new WeakMap<Session, SeamSlot>();
 const lastClientAbort = new WeakMap<Session, number>();
 
-export interface ContextObservation {
+interface ContextObservation {
     sessionId: string;
     tokens: number;
     source: "usage" | "estimate";
@@ -381,7 +381,7 @@ export interface LearnedImageCostEntry {
     /** `${billing}:${cap}` fingerprint captured with the sample. */
     fp: string;
 }
-export interface ForwardedImageFacts {
+interface ForwardedImageFacts {
     nImages: number;
     /** Text-side estimate of the forwarded payload (messages + wire overhead) —
      *  whatever the usage total bills besides the images. */
@@ -1040,7 +1040,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
-export interface ModelSwitchEvent {
+interface ModelSwitchEvent {
     seq: number;
     at: number;
     from: string | null;
@@ -1052,13 +1052,13 @@ export interface ModelSwitchEvent {
     attributed: number;
 }
 
-export interface ModelSwitchStats {
+interface ModelSwitchStats {
     count: number;
     missedTokens: number;
     events: ModelSwitchEvent[];
 }
 
-export interface InvalidationTokenBreakdown {
+interface InvalidationTokenBreakdown {
     model: number;
     key: number;
     wire: number;
@@ -1073,7 +1073,7 @@ export interface InvalidationTokenBreakdown {
  *  previous settled request) plus the hit-rate context checks that separate
  *  provider-side cache behavior from bili-side rewrites. Computed at report
  *  time from the unbounded line set; no new hot-path state. */
-export interface BodyStability {
+interface BodyStability {
     /** Adjacent pairs where both bodies were captured (be defined). */
     paired: number;
     /** be=1: byte-identical resends (transport retries, re-requests). */
@@ -1094,7 +1094,7 @@ export interface BodyStability {
     gapSplit: { lowHitMedGapMs: number | null; highHitMedGapMs: number | null };
 }
 
-export interface BiliCacheReport extends CacheReport {
+interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
     lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "unknown"; keyFp?: string }>;

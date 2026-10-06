@@ -208,7 +208,7 @@ function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undef
  *  streak arms. The breaker NEVER refuses execution — it only changes what a
  *  FAILED call tells the model, so a legitimate call can always still succeed
  *  and reset the streak via clearCompressLoopStreak. */
-export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
+function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
@@ -224,7 +224,7 @@ export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): str
     return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed and further attempts will keep failing. STOP calling compress now: do not try other ranges, do not re-issue any previous range, and do not poll acp_status. Continue your actual task without compressing — compression happens again only when there is genuinely new content to fold.]`;
 }
 
-export function clearCompressLoopStreak(session: Session): void {
+function clearCompressLoopStreak(session: Session): void {
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
 }
 

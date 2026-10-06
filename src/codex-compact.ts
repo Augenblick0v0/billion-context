@@ -65,7 +65,7 @@ export function stripBiliCompactionItems<T>(input: T[]): T[] {
 }
 
 // The summary text a forged blob carries (sentinel-prefixed plaintext).
-export function extractBiliSummary(item: unknown): string | undefined {
+function extractBiliSummary(item: unknown): string | undefined {
     const it = item as { encrypted_content?: unknown } | null;
     if (!it || typeof it.encrypted_content !== "string") return undefined;
     if (!it.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL)) return undefined;

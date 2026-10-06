@@ -69,7 +69,7 @@ export function applyAbsorbView(messages: CoreMessage[], state: CompressionState
     return prompted.messages;
 }
 
-export type AbsorbExecCtx = {
+type AbsorbExecCtx = {
     config: Config;
     messages: CoreMessage[];
     session: Session;

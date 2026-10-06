@@ -18,7 +18,7 @@ import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION } from "./version.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
-export interface AcpStatusCtx {
+interface AcpStatusCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
