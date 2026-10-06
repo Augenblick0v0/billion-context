@@ -277,6 +277,64 @@ test("profile lane: repeated bundle failures back off per lane+version; new vers
     }
 });
 
+// — (d2) mixed outcome pins the lane semantics: ANY failed profile is a strike (#2192)
+
+test("a partial failure (some profiles refreshed, one broken) still records a lane strike (#2192)", { timeout: 60_000 }, async (t) => {
+    await _resetInstallBackoffForTest();
+    const base = mkdtempSync(path.join(root, "t4b-"));
+    t.after(() => {
+        setLogCapture(null);
+        _setDshRunnersForTest(undefined);
+        rmrf(base);
+    });
+    const dshHome = path.join(base, "dsh");
+    for (const name of ["a", "b"]) {
+        const pDir = path.join(dshHome, "profiles", name);
+        const install = path.join(pDir, "node_modules", "billion-context");
+        mkdirSync(install, { recursive: true });
+        writeFileSync(path.join(pDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^1.0.0" } }));
+        writeFileSync(path.join(install, "package.json"), JSON.stringify({ name: "billion-context", version: "1.0.0" }));
+    }
+    const env = { ...process.env, DSH_HOME: dshHome };
+    const calls: string[] = [];
+    const failingFor = (broken: string) => async (plan: DshPlan) => {
+        const target = plan.args[plan.args.indexOf("--profile") + 1];
+        calls.push(`${target}:${plan.args.join(" ")}`);
+        if (target === broken) throw Object.assign(new Error("exit 1"), { status: 1, stderr: "plugin channel down" });
+        return { stdout: "", stderr: "" };
+    };
+    try {
+        const { log } = captureAll();
+        const key = ownerLaneKey("dsh-profile", "2.0.0");
+        _setDshRunnersForTest({ async: failingFor("b") });
+
+        // converge #1: profile a converges, b fails — a PARTIAL failure must
+        // still count as a lane strike (runProfileBundlesRefresh strikes on any
+        // res.failed > 0; the PR-body claim "partial success → no strike" was
+        // wrong and this test pins the shipped semantics).
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 2, `both profiles attempted once: ${calls.join(" | ")}`);
+        assert.equal(_installBackoffStateForTest()[key]?.count, 1, "a partial failure (1 of 2 profiles) records a strike");
+
+        // strikes accumulate the same way as total failures; third strike arms
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(_installBackoffStateForTest()[key]?.count, 3, "third partial failure arms the cooldown");
+        // once armed the whole lane is gated — even healthy profile a stops spawning
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 6, "an armed lane must not spawn for ANY profile, healthy ones included");
+
+        // manual disarm + repairing b lets the lane run again and a clean pass clears the key
+        await clearOwnerLaneBackoff("dsh-profile", "2.0.0");
+        _setDshRunnersForTest({ async: failingFor("none") });
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 8, "a disarmed, repaired lane attempts both profiles again");
+        assert.equal(_installBackoffStateForTest()[key], undefined, "a clean run clears the lane key");
+    } finally {
+        _setDshRunnersForTest(undefined);
+    }
+});
+
 test("pi lane: bounded retries, existing manual-fix warn preserved, success clears, new version re-arms (#2192)", async (t) => {
     await _resetInstallBackoffForTest();
     const base = mkdtempSync(path.join(root, "t3b-"));
