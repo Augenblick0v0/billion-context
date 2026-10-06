@@ -1268,6 +1268,58 @@ export function resolveNonHttpProviders(env: NodeJS.ProcessEnv = process.env): s
     return [...out];
 }
 
+/** `pi.subagents` section of the config file (#2230 config-home): the home
+ *  for the built-in pi-lane acp_delegate surface. Fields map 1:1 onto the
+ *  standalone package's DelegateConfig (billion-context-pi-subagents); the
+ *  two renames vs the deprecated acp.json keys: `prompt` replaces
+ *  `delegatePrompt`, and `debug` is scoped to the sub-agent subsystem (the
+ *  top-level `debug` key stays the proxy's own). See CONFIGURATION.md. */
+export interface PiSubagentsFileConfig {
+    /** Master switch, default true. `false` (or the boolean shorthand
+     *  `"pi": {"subagents": false}`) removes the three tools, the
+     *  system-prompt section and the fleet shortcut (new session required). */
+    enabled?: boolean;
+    /** Keep acp_delegate active even when a project-scope pi-subagents
+     *  install is detected (#415 stand-down). Default false. Env
+     *  PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over the file. */
+    forceEnable?: boolean;
+    /** "separate" (default) — delegate tokens tracked in their own
+     *  accumulator; "merged" — folded into the main session totals. */
+    displayUsage?: "merged" | "separate";
+    /** Max nesting depth (default 2: main → child → grandchild). Propagated
+     *  to children via PI_ACP_DELEGATE_MAX_DEPTH; env wins over the file. */
+    maxDepth?: number;
+    /** Hard timeout for synchronous delegates, minutes (default 5);
+     *  0/null disables. Env PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES wins. */
+    syncTimeoutMinutes?: number | null;
+    /** Idle watchdog for async delegates, minutes (default 5); 0/null
+     *  disables (warns). Env PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES wins. */
+    idleTimeoutMinutes?: number | null;
+    /** Hard time limit for async delegates, minutes (default 30); 0/null
+     *  disables. Env PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES wins. */
+    asyncTimeoutMinutes?: number | null;
+    /** Cap on concurrent background delegates (default unlimited); extras
+     *  queue. Env PI_ACP_DELEGATE_MAX_CONCURRENT wins. */
+    maxConcurrent?: number;
+    /** Global default thinking level (off|minimal|low|medium|high|xhigh|max). */
+    thinkingLevel?: string;
+    /** Per-role defaults keyed by role (reviewer/researcher/worker/planner/
+     *  oracle or custom): { model: "provider/id", thinkingLevel: "…" }. */
+    agents?: Record<string, { model?: string; thinkingLevel?: string }>;
+    /** "skip" (default) — suppress the completion notification when the
+     *  model already read the result file; "always" — always inject. */
+    notifyIfRead?: "skip" | "always";
+    /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
+     *  disables keyboard registration (/acp-fleet still works). */
+    fleetShortcut?: string;
+    /** Replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS
+     *  system-prompt appendix. acp.json name: `delegatePrompt`. */
+    prompt?: string | null;
+    /** Debug-level events in the shared ACP log (~/.pi/acp.log), scoped to
+     *  the sub-agent subsystem. */
+    debug?: boolean;
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -1392,6 +1444,18 @@ type FileConfig = {
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
      *  Env BILI_CLAUDE_NATIVE_PORT wins over the file. */
     claude?: { nativePort?: number };
+    /** Built-in pi-lane sub-agents (#2230 config-home): the `pi.subagents`
+     *  section owns the acp_delegate surface for the pi lane (embedded wiring
+     *  src/agent/pi-subagents.ts; the standalone package
+     *  billion-context-pi-subagents reads the same section through its own
+     *  loader — the file format is the contract, not shared code). Fields map
+     *  1:1 onto the package's DelegateConfig; `prompt` replaces acp.json's
+     *  `delegatePrompt` and `debug` is scoped to the sub-agent subsystem (no
+     *  collision with the top-level proxy `debug`). Boolean shorthand:
+     *  `"pi": {"subagents": false}` disables the whole surface. The four
+     *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
+     *  deprecated fallback, read only while this section is absent. */
+    pi?: { subagents?: PiSubagentsFileConfig | boolean };
     /** Native-hook attach policy (#1335): set `true` to let native hooks
      *  attach to lifecycle-less listeners (a manually started `bili start`
      *  daemon — no session-lifecycle watchdog, outlives every session, often
@@ -1518,6 +1582,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
+    "pi",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",

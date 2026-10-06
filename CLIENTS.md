@@ -475,6 +475,16 @@ option 1); this section covers what the one-line table can't — **which model
 transports the native intercept actually covers**. Pi is the only host that
 brings WebSocket model traffic into the loop.
 
+**Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
+dele gate tools, roles, fleet inspector — wired by `bili pi` through the
+embedded extension) is configured in bili's own config file, the `pi.subagents`
+section of `~/.config/billion-context/billion-context.json` (boolean shorthand
+`"pi": {"subagents": false}` disables it). The four `~/.pi/acp.json` keys
+(`delegate` / `delegatePrompt` / `displayUsage` / `debug`) are a deprecated
+fallback — read only while the section is absent, ignored once it exists.
+Full field table and the `PI_ACP_DELEGATE_*` env overrides:
+CONFIGURATION.md → [`pi`](CONFIGURATION.md#pi).
+
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
 is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the

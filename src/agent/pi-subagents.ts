@@ -33,8 +33,10 @@ import {
     setDelegatePolicy,
     setDebugEnabled,
     type DelegatePolicy,
+    type SubagentsAdapterConfig,
 } from "billion-context-pi-subagents";
 import type { ExtensionAPI, ToolDefinition } from "./pi.js";
+import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
 
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 
@@ -55,6 +57,25 @@ function normalizeSystemPrompt(input: string | string[] | undefined): string {
     if (Array.isArray(input)) return input.join("\n");
     return input;
 }
+
+// #2230 config-home: map the `pi.subagents` section of billion-context.json
+// onto the package's adapter shape. Mirrors the package's
+// piSubagentsToAdapter deliberately — no shared code across the two loaders;
+// the FILE FORMAT (documented in CONFIGURATION.md) is the contract. Renames:
+// `prompt` replaces acp.json's delegatePrompt; `debug` is scoped to the
+// sub-agent subsystem (the top-level proxy `debug` is untouched).
+function piSubagentsAdapter(section: PiSubagentsFileConfig | boolean): SubagentsAdapterConfig {
+    if (section === false) return { delegate: { enabled: false } };
+    if (section === true) return {};
+    const { prompt, debug, ...delegate } = section;
+    const adapter: SubagentsAdapterConfig = {};
+    if (Object.keys(delegate).length > 0) adapter.delegate = delegate;
+    if (prompt !== undefined) adapter.delegatePrompt = prompt;
+    if (debug !== undefined) adapter.debug = debug;
+    return adapter;
+}
+
+let warnedAcpJsonFallback = false;
 
 export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
     // omp never gets the delegate surface: it lacks buildContextEntries, the
@@ -110,9 +131,22 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
         setDelegatePolicy(DEFAULT_DELEGATE_POLICY);
         state.stoodDown = false;
         try {
-            // Delegate config lives in pi's own acp.json (the package's
-            // loader) — deliberately NOT in bili's config surface.
-            const user = await loadSubagentsUserConfig(cwd);
+            // #2230 config-home: bili's own config file owns the delegate
+            // config — the `pi.subagents` section of billion-context.json,
+            // read through bili's loader so its validation/warning surface
+            // applies. The package's acp.json loader stays as a deprecated
+            // fallback for pre-move files (removal after a few releases).
+            const section = loadConfigFile().pi?.subagents;
+            let user: SubagentsAdapterConfig;
+            if (section !== undefined) {
+                user = piSubagentsAdapter(section);
+            } else {
+                user = await loadSubagentsUserConfig(cwd);
+                if (Object.keys(user).length > 0 && !warnedAcpJsonFallback) {
+                    warnedAcpJsonFallback = true;
+                    console.error("bili-plugin(pi): delegate config in acp.json is deprecated — move it to the \"pi\": {\"subagents\": {…}} section of billion-context.json (delegatePrompt renames to prompt); it will be removed in a future release");
+                }
+            }
             if (user.debug !== undefined) setDebugEnabled(user.debug === true);
             state.policy = resolveDelegate(user);
             state.delegatePrompt = user.delegatePrompt;

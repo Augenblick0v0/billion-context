@@ -134,6 +134,8 @@ Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发�
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
 
+**子代理配置(#2230)。** 内置 `acp_delegate` 面(三个 delegate 工具、角色、fleet 检查器——由 `bili pi` 经内嵌扩展接线)配置在 bili 自己的配置文件:`~/.config/billion-context/billion-context.json` 的 `pi.subagents` 段(布尔简写 `"pi": {"subagents": false}` 可整体关闭)。`~/.pi/acp.json` 的四键(`delegate` / `delegatePrompt` / `displayUsage` / `debug`)是已废弃的回退源——仅当段缺失时读取,段存在后完全忽略。完整字段表与 `PI_ACP_DELEGATE_*` 环境变量见 CONFIGURATION.zh-CN.md 的 [`pi`](CONFIGURATION.zh-CN.md#pi) 段。
+
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
 **WebSocket 覆盖(#2073,#2111 实现)。** WebSocket 连接从不经过 `globalThis.fetch`,所以原生扩展在加载时(首个模型连接之前)同时包装 `globalThis.WebSocket`(pi 的 Node 分支每次调用都读全局,Bun 分支首次调用时缓存子类——两个运行时的安装时序都因此安全)。只重写受支持的 Codex Responses 模型连接——其余 WebSocket(devtools、第三方库、已路由 URL)原样通过:
