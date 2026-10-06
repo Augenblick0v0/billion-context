@@ -15,7 +15,7 @@
         "version": "0.1.186",
         "date": "2026-10-06",
         "tier": "critical",
-        "summary": "Signed upstreams: unsigned pass-through is now BUILT-IN-scheme-only (#2090) — any other signature scheme (x-ofm-signature, SigV4…) is refused until bili ships its re-signer; inert passthrough keys are named at config load. dsh spawn retries no longer leak hung proxy children (#2187). 丨 签名上游：无签名放行现仅对内置方案有效（#2090）——其他签名方案在 bili 补上重签器前一律拒收，失效的 passthrough 键会在配置加载时被点名。另修：dsh 重试不再泄漏挂死的代理子进程（#2187）。"
+        "summary": "修复codex 启动器模式启动失败问题,修复claude code账号版本无法使用的问题,修复dsh重试不再泄漏挂死的代理子进程（#2187）。"
       },
       {
         "version": "0.1.185",
