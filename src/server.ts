@@ -46,7 +46,6 @@ import {
     injectResponsesDeveloperMessage,
     conversationIdentityResponses,
     conversationSignalResponses,
-    subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
@@ -111,7 +110,7 @@ import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
-import { dshPersonaNamespace } from "./persona-anchor.js";
+import { personaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
@@ -2281,7 +2280,7 @@ async function handle(
                     // (model switch) MIGRATES the anchor instead of forking
                     // the main lane off the raw key; only history-discontinuous
                     // requests (review blobs) still fork onto `|sub:<fp>`.
-                    ? dshPersonaNamespace(
+                    ? personaNamespace(
                           anthropicIdentity?.value ?? anthropicSignal,
                           personaSystemText,
                           (parsed as AnthropicRequestBody).messages,
@@ -2290,7 +2289,7 @@ async function handle(
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike
-                    ? dshPersonaNamespace(
+                    ? personaNamespace(
                           openaiIdentity?.value ?? openaiSignal,
                           personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
@@ -2326,9 +2325,18 @@ async function handle(
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
                       ? (!sideRequestLike
-                          ? subagentNamespace(
+                          ? // #2250: same continuity resolver as the dsh lanes
+                            // — an instructions drift whose history continues
+                            // the raw key's chain (model switch / AGENTS.md
+                            // edit / -c override / upgrade reassembly) MIGRATES
+                            // the anchor instead of forking the main lane off
+                            // its compression state; a genuinely fresh task
+                            // reusing the id (#150) still forks `|sub:<fp>`.
+                            personaNamespace(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).instructions,
+                                (parsed as ResponsesRequestBody).instructions ?? "",
+                                (parsed as ResponsesRequestBody).input,
+                                log,
                             )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));

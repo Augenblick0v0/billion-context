@@ -1,4 +1,5 @@
-// #2241: continuity-aware persona anchor for id-sharing dsh traffic.
+// #2241/#2250: continuity-aware persona anchor for id-sharing traffic
+// (dsh persona lanes, codex root threads / older builds, claude-over-Responses).
 //
 // The original dsh persona fingerprint (db21309d, #1916/#1307/#1314) keyed
 // dsh traffic by id + system-text hash with kernel subagentNamespace
@@ -78,18 +79,27 @@ export function resolvePersonaKey(rawId: string, systemText: string, messages: u
     return { key: `${rawId}|sub:${fp}`, action: "fork" };
 }
 
-/** server.ts wrapper: resolves the key and surfaces anchor migrations in
- *  the log (forks stay silent — they are the designed review path). */
-export function dshPersonaNamespace(
+/**
+ * server.ts wrapper: resolves the key and surfaces anchor migrations in the
+ * log (forks stay silent — they are the designed review path). Protocol
+ * neutral since #2250: `systemText` is the lane's persona carrier — the dsh
+ * main system text, or the Responses top-level `instructions` — and
+ * `messages` is the same list prefix-affinity hashes (system carriers are
+ * never part of it, so a pure persona drift cannot break the chain).
+ * Whitespace-only carriers pass through un-anchored (kernel subagentNamespace
+ * semantics, kept for the codex swap).
+ */
+export function personaNamespace(
     rawId: string,
     systemText: string,
     messages: unknown,
     log: (level: "info" | "warn" | "error", message: string) => void,
 ): string {
     const list = Array.isArray(messages) ? messages : [];
-    const res = resolvePersonaKey(rawId, systemText, list);
+    const text = typeof systemText === "string" && systemText.trim().length > 0 ? systemText : "";
+    const res = resolvePersonaKey(rawId, text, list);
     if (res.action === "migrate") {
-        log("info", `[persona] system text changed mid-conversation but the history continues ${rawId}'s chain — anchor migrated, compression state stays on the raw key (#2241)`);
+        log("info", `[persona] persona text changed mid-conversation but the history continues ${rawId}'s chain — anchor migrated, compression state stays on the raw key (#2241/#2250)`);
     }
     return res.key;
 }
