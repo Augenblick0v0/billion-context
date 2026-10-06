@@ -2855,9 +2855,10 @@ async function handle(
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
         const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
-        // #1729: dsh native compaction guard — a compaction summarize call
-        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
-        // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
+        // #1729/#2223: dsh native compaction guard — a compaction summarize call
+        // (replayed prefix of any span length — per-message replay envelopes
+        // exceed 4 messages — + COMPACTION_INSTRUCTION as the final user message)
+        // is refused BEFORE any pipeline work: not forwarded, kernel
         // state untouched. Active by default, explicitly opt-out-able (#2028) —
         // auto pressure, overflow recovery, and manual /compact share one
         // envelope, and a landed checkpoint durably shadows the raw history
