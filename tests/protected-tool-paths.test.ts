@@ -160,6 +160,17 @@ test("extractPlanState honors skill path patterns (extraPatterns [\"skill/*\"])"
     const st = extractPlanState(msgs, ["skill/*"]);
     assert.ok(st, "plan state extracted via skill path pattern");
     assert.ok(st!.terms.has("orchestrator"), "skill load terms present");
+    // Per-path mirroring of the kernel's latest-per-name grouping: two
+    // distinct skills each keep their own slot (a pattern-keyed map would
+    // collapse them into one global-latest entry).
+    const two: CoreMessage[] = [
+        { id: "s1", role: "assistant", contentType: "tool-call", toolName: "skill", text: JSON.stringify({ name: "release-orchestrator" }) },
+        { id: "s2", role: "assistant", contentType: "tool-call", toolName: "skill", text: JSON.stringify({ name: "audit-checklist" }) },
+    ];
+    const st2 = extractPlanState(two, ["skill/*"]);
+    assert.ok(st2, "plan state extracted for two skills");
+    assert.ok(st2!.terms.has("orchestrator"), "first skill's terms kept in its own slot");
+    assert.ok(st2!.terms.has("checklist"), "second skill's terms kept in its own slot");
 });
 
 // --- Non-anthropic wires: projection feeds the same path matcher -------------

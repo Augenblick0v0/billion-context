@@ -5,6 +5,7 @@ import {
     parseBoundary,
     retrieveByRef,
     retrievedMessageId,
+    toolPathOf,
     type CompressionBlock,
     type CompressionCore,
     type CompressionState,
@@ -523,8 +524,9 @@ function resolveDerivedDecompress(
 
 /** Extract the current plan state from the in-context message view: the LAST
  *  tool call matching each planning pattern (mirrors the kernel's
- *  collectLatestProtected latest-wins semantics) plus the most recent user
- *  turn. Returns null when nothing usable is in context. */
+ *  collectLatestProtected latest-wins semantics — per projected path for
+ *  slash patterns, so `skill/*` keeps one slot per skill, #1947) plus the
+ *  most recent user turn. Returns null when nothing usable is in context. */
 export function extractPlanState(messages: CoreMessage[], extraPatterns?: string[]): { terms: PlanTerms } | null {
     const patterns = [...new Set([...PLANNING_TOOL_PATTERNS, ...(extraPatterns ?? [])])];
     const start = Math.max(0, messages.length - PLAN_WINDOW_MESSAGES);
@@ -534,7 +536,13 @@ export function extractPlanState(messages: CoreMessage[], extraPatterns?: string
         const msg = messages[i];
         if (msg.contentType === "tool-call" && msg.toolName) {
             for (const p of patterns) {
-                if (matchToolMessagePattern(msg, p)) { latestByPattern.set(p, msg); break; }
+                if (matchToolMessagePattern(msg, p)) {
+                    // Slash patterns protect per projected path in the kernel;
+                    // keying by pattern would collapse every skill into one
+                    // global-latest slot (#1947).
+                    latestByPattern.set(p.includes("/") ? toolPathOf(msg) : p, msg);
+                    break;
+                }
             }
         } else if (msg.role === "user" && msg.contentType === "text" && msg.text) {
             lastUserText = msg.text;
