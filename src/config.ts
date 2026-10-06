@@ -187,38 +187,46 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
-    /** Tool-name patterns whose LATEST tool-call + paired result are never
-     *  compressed (kernel `protectedLatestTools`, acp-kernel >= 0.0.80).
-     *  Built for cumulative-snapshot tools (e.g. a client's todo/task list):
-     *  every newer result supersedes the older ones, so only the newest
-     *  instance is the source of truth — protecting ALL of them (via
-     *  `protectedTools`) would make that tool's history grow unboundedly,
-     *  while protecting the LATEST keeps the live snapshot in context and
-     *  lets every superseded instance fold normally. Patterns match like
-     *  kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`,
-     *  `"TodoWrite"`, `"todo*"`). Protection is a HARD exclusion: neither
-     *  suggested nor explicit compress ranges can cover the latest instance.
-     *  Deepest level wins (global → provider → model), whole-array replace.
-     *  Default: none — opt in per client/agent, since tool names are
-     *  client-specific. */
-    protectedLatestTools?: string[];
-    /** Tool-name patterns whose tool-calls AND paired results are NEVER
-     *  compressed — every instance, full history (kernel `protectedTools`,
-     *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
-     *  nor explicit compress ranges can cover them; applies identically in
-     *  both compression modes and on every wire). Built for low-frequency,
-     *  high-value tools whose instances are INDEPENDENT content rather than
-     *  cumulative snapshots (e.g. opencode/pi `skill` loads, one-shot
-     *  references): each load carries unique information that no later result
-     *  supersedes, so folding older loads loses it permanently (#1109).
-     *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
-     *  cumulative-snapshot tool makes its history grow unboundedly — use
-     *  `protectedLatestTools` for those instead. Patterns match like kernel
-     *  tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`).
-     *  Deepest level wins (global → provider → model), whole-array replace.
-     *  Default: none — opt in per client/agent, since tool names are
-     *  client-specific. */
-    protectedTools?: string[];
+     /** Tool-path patterns whose LATEST tool-call + paired result are never
+      *  compressed (kernel `protectedLatestTools`, acp-kernel >= 0.0.80;
+      *  path syntax since 0.0.105). Built for cumulative-snapshot tools
+      *  (e.g. a client's todo/task list): every newer result supersedes the
+      *  older ones, so only the newest instance is the source of truth —
+      *  protecting ALL of them (via `protectedTools`) would make that tool's
+      *  history grow unboundedly, while protecting the LATEST keeps the live
+      *  snapshot in context and lets every superseded instance fold normally.
+      *  Slash-free entries keep legacy semantics (exact name or `*` glob,
+      *  one latest across everything matched); entries containing `/` are
+      *  PATH patterns grouped by projected path — one latest per distinct
+      *  path (`"skill/*"` keeps each skill's newest load, #1947). Protection
+      *  is a HARD exclusion: neither suggested nor explicit compress ranges
+      *  can cover the latest instance. Deepest level wins (global → provider
+      *  → model), whole-array replace. Default: none — opt in per
+      *  client/agent, since tool names are client-specific. */
+     protectedLatestTools?: string[];
+     /** Tool-path patterns whose tool-calls AND paired results are NEVER
+      *  compressed — every instance, full history (kernel `protectedTools`,
+      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
+      *  nor explicit compress ranges can cover them; applies identically in
+      *  both compression modes and on every wire). Built for low-frequency,
+      *  high-value tools whose instances are INDEPENDENT content rather than
+      *  cumulative snapshots (e.g. opencode/pi `skill` loads, one-shot
+      *  references): each load carries unique information that no later result
+      *  supersedes, so folding older loads loses it permanently (#1109).
+      *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
+      *  cumulative-snapshot tool makes its history grow unboundedly — use
+      *  `protectedLatestTools` for those instead. Pattern syntax (#1947):
+      *  slash-free entries keep legacy semantics (exact name or trailing-`*`
+      *  glob on the tool name, case-insensitive); entries containing `/` are
+      *  PATH patterns over the canonical skill space — skill loads from any
+      *  client (opencode `skill({name})`, Claude/ZCode `Skill({skill})`, pi's
+      *  `<dir>/<name>/SKILL.md` reads) all project to `skill/<name>`, so
+      *  `"skill"` ≡ `"skill/*"` covers all of them and
+      *  `"skill/<name>"` / `"skill/review-*"` target specific skills; first
+      *  segment case-insensitive, deeper segments exact. Deepest level wins
+      *  (global → provider → model), whole-array replace. Default: none — opt
+      *  in per client/agent, since tool names are client-specific. */
+     protectedTools?: string[];
     /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
      *  matching tool results inside the recent zone become compressible
      *  immediately instead of aging out first (kernel

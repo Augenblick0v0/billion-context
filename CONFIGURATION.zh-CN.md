@@ -209,8 +209,8 @@
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
-| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。 |
-| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。 |
+ | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。支持 `skill/<name>` 路径模式（#1947）。 |
+ | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按路径各保最新一条（#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
@@ -1140,18 +1140,24 @@
 - **类型：** `string[]`（工具名模式，如 `["todo_list"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"todo_list"`、`"TodoWrite"`、`"todo*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`。
+- **说明：** 工具路径模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80；路径语法自 0.0.105 起）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式语法（与 `protectedTools` 相同）：不含 `/` 的条目维持旧语义 —— 按工具名做精确或 `*` 通配匹配，其匹配范围内**整体只保最新一条**（如 `"todo_list"`、`"todo*"`）；含 `/` 的条目是**路径模式**，按投影路径分组、每个不同路径各保最新一条 —— 因此 `"skill/*"` 保留每个 skill 的最新一次装载、更早的全部照常折叠（latest-per-name）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list"] } }` 或 `{ "compress": { "protectedLatestTools": ["skill/*"] } }`。
 
 #### `protectedTools`
 
 - **类型：** `string[]`（工具名模式，如 `["skill"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"skill"`、`"skill_*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedTools": ["skill"] } }`。
+- **说明：** 工具路径模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`；路径语法自 `acp-kernel` 0.0.105 起）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。跨层级整体替换（最深层胜出）。
+- **模式语法（#1947）：** 条目为工具路径，共三种形式：
+  - **`name`**（不含 `/`）—— 旧语义不变：工具名精确匹配或尾部 `*` 通配，大小写不敏感（`"todo_list"`、`"todo*"`、`"skill"`）。裸节点同时覆盖其下所有投影路径，因此 `"skill"` ≡ `"skill/*"`，保护**所有客户端**的 skill 装载。
+  - **`skill/<name>`** —— 指名保护某一个 skill 的每次装载，如 `"skill/release-orchestrator"`。各客户端的 skill 装载归一到同一空间：opencode 的 `skill({name})`、Claude Code/ZCode 的 `Skill({skill})`、pi 的 `<dir>/<name>/SKILL.md` 文件读取都投影为 `skill/<name>`；投影失败退化为纯工具名，非 skill 行为与旧版逐字节一致。
+  - **段内尾部通配** —— `*` 只出现在末段内部、不跨 `/`：`"skill/review-*"` 保护所有 `review-…` skill 而不影响其他。首段大小写不敏感，深层段大小写敏感（skill 名是标识符，按字面输入）。
+- **示例：** `{ "compress": { "protectedTools": ["skill"] } }`（所有客户端的全部 skill 装载）或指名 `{ "compress": { "protectedTools": ["skill/release-orchestrator"] } }`。
 - **⚠ 两个旋钮何时用哪个（配置前必读）：** 按工具的各次结果之间的关系选择：
   - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
+  - **按 skill 组合用法：** 编排类 skill 全历史硬保、其余每个 skill 各保最新一次装载：`{ "compress": { "protectedTools": ["skill/release-orchestrator"], "protectedLatestTools": ["skill/*"] } }`。
 
 #### `neverPreserveRecentTools`
 
