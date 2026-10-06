@@ -98,6 +98,9 @@ export function matchToolPattern(toolName: string, pattern: string): boolean {
 
 const SKILL_INPUT_FIELDS = ["skill", "name", "command"] as const;
 const SKILL_MD_PATH_RE = /[\/\\]([^\/\\]+)[/\\]SKILL\.md$/i;
+// Gate must stay case-consistent with SKILL_MD_PATH_RE (/i): a case-sensitive
+// pre-filter would silently drop inputs the regex itself would project.
+const SKILL_MD_GATE_RE = /skill\.md/i;
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
   try {
@@ -122,7 +125,7 @@ export function projectToolPath(msg: CoreMessage): string {
   if (typeof text !== "string" || text.length === 0) return name;
   const isSkillTool = name.toLowerCase() === "skill";
   // Cheap gate: only spend JSON work on inputs that can possibly project.
-  if (!isSkillTool && !text.includes("SKILL.md")) return name;
+  if (!isSkillTool && !SKILL_MD_GATE_RE.test(text)) return name;
   const obj = parseJsonObject(text);
   if (!obj) return name;
   if (isSkillTool) {

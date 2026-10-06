@@ -76,6 +76,21 @@ test("projectToolPath: pi agentskills file-read shapes (absolute / relative / ba
   );
 });
 
+test("projectToolPath: SKILL.md filename match is case-insensitive (gate consistent with regex)", () => {
+  assert.equal(
+    projectToolPath(
+      toolCall("m1", "read", "c1", '{"filePath":"/home/u/.claude/skills/pdf-tools/skill.md"}'),
+    ),
+    "skill/pdf-tools",
+  );
+  assert.equal(
+    projectToolPath(
+      toolCall("m1", "read", "c1", '{"file_path":"C:\\\\agents\\\\skills\\\\bar\\\\Skill.Md"}'),
+    ),
+    "skill/bar",
+  );
+});
+
 test("projectToolPath: degrades to tool name on failure or non-skill traffic", () => {
   assert.equal(projectToolPath(toolCall("m1", "skill", "c1", "not json")), "skill");
   assert.equal(projectToolPath(toolCall("m1", "skill", "c1", '{"other":"x"}')), "skill");
