@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isDesignBenign, isOpencodeAcpEntry, isSiblingConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -380,4 +380,66 @@ test("summarizeConflicts aggregates across sessions", () => {
     assert.equal(summary.latest.length, 1);
     assert.equal(summary.latest[0]?.sessionId, a.id);
     assert.equal(summarizeConflicts([b]).events, 0);
+});
+
+// #2261: display-time sibling classification — first-party siblings must never
+// be labeled "third-party" or commanded removed on any surface.
+
+test("isOpencodeAcpEntry recognizes every spec form, rejects lookalikes (#2261)", () => {
+    assert.ok(isOpencodeAcpEntry("opencode-acp"));
+    assert.ok(isOpencodeAcpEntry("npm:opencode-acp"));
+    assert.ok(isOpencodeAcpEntry("opencode-acp@stable"));
+    assert.ok(isOpencodeAcpEntry("/home/u/node_modules/opencode-acp/index.js"));
+    assert.ok(!isOpencodeAcpEntry("my-opencode-acp-fork"));
+    assert.ok(!isOpencodeAcpEntry("context-forge"));
+});
+
+test("isSiblingConflictDetail maps recorded details back to sibling entries (#2261)", () => {
+    assert.ok(isSiblingConflictDetail("pi: npm:billion-context-pi (/home/dog/.pi/agent/settings.json)"));
+    assert.ok(isSiblingConflictDetail("pi: billion-context-pi@0.1.75 (~/.pi/settings.json)"));
+    assert.ok(isSiblingConflictDetail("opencode: opencode-acp (global config)"));
+    assert.ok(isSiblingConflictDetail("opencode: npm:opencode-acp@1.2.3 (/u/.config/opencode/opencode.json)"));
+    assert.ok(!isSiblingConflictDetail("pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]"));
+    assert.ok(!isSiblingConflictDetail("dsh: dsh-context (profile/package.json) [suspected]"));
+    assert.ok(!isSiblingConflictDetail("event 5"), "non-plugin detail shapes never classify");
+});
+
+test("opencode scan: npm:-prefixed opencode-acp spec classifies as known sibling, not suspected keyword (#2261)", () => {
+    clearScanCache();
+    const root = tmp("bili-2261-oc-npm-");
+    const file = path.join(root, ".config", "opencode", "opencode.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({ plugin: ["npm:opencode-acp"] }));
+    const res = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd: root });
+    const f = res.findings.find((x) => x.entry === "npm:opencode-acp");
+    assert.ok(f, "npm:-prefixed spec must be found");
+    assert.equal(f?.match, "known");
+    assert.equal(f?.knownId, "opencode-acp");
+});
+
+test("summarizeConflicts counts sibling-tagged plugin events additively (#2261)", () => {
+    const a = makeSession();
+    recordConflict(a, "third-party-plugin", "pi: npm:billion-context-pi (/home/dog/.pi/agent/settings.json)");
+    recordConflict(a, "third-party-plugin", "pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]");
+    recordConflict(a, "orphan-reap", "1 block(s) deactivated: b1");
+    const s = summarizeConflicts([a]);
+    assert.equal(s.events, 3);
+    assert.equal(s.kinds["third-party-plugin"], 2);
+    assert.equal(s.sibling, 1, "only the bcp event classifies as sibling");
+});
+
+test("formatConflictSection: sibling-only ledgers drop the one-compressor command (#2261)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "pi: npm:billion-context-pi (/home/dog/.pi/agent/settings.json)");
+    recordConflict(s, "third-party-plugin", "opencode: opencode-acp (global config)");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("OWN sibling extension"), "names them as bili's own siblings");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no hard removal command for siblings");
+    assert.ok(text.includes("/__bili/conflicts/clear"), "points at the clear path");
+
+    const mixed = makeSession();
+    recordConflict(mixed, "third-party-plugin", "pi: npm:billion-context-pi (/home/dog/.pi/agent/settings.json)");
+    recordConflict(mixed, "third-party-plugin", "pi: npm:real-compressor-x (/home/dog/.pi/agent/settings.json)");
+    const mixedText = formatConflictSection(conflictEventsOf(mixed)).join("\n");
+    assert.ok(mixedText.toLowerCase().includes("keep exactly one compressor"), "any non-sibling event keeps the strong footer");
 });

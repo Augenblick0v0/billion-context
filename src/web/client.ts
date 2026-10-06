@@ -374,11 +374,17 @@ export const WEB_CLIENT = `(function () {
                 // #2102: attribute per kind family present; split active from historical
                 // stock; detail pointer must target a cross-session surface (acp_status
                 // renders conflicts for the CURRENT session only).
-                const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
-                const nativeN = c.events - pluginN;
-                const what = [pluginN > 0 ? t("conflict.what_plugin") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
-                const active = typeof c.active === "number" ? c.active : c.events;
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical")) + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                        // #2261: bili's own siblings (billion-context-pi / opencode-acp) are NOT
+                        // third-party plugins — the server counts them separately so the sentence
+                        // never mislabels them or commands removal of something that stands down.
+                        const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
+                        const siblingN = Math.max(0, Math.min(typeof c.sibling === "number" ? c.sibling : 0, pluginN));
+                        const tpN = pluginN - siblingN;
+                        const nativeN = c.events - pluginN;
+                        const what = [tpN > 0 ? t("conflict.what_plugin") : "", siblingN > 0 ? t("conflict.what_sibling") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
+                        const active = typeof c.active === "number" ? c.active : c.events;
+                        const risk = tpN === 0 && nativeN === 0 ? t("conflict.risk_sibling") : (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical"));
+                        cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 cb.classList.toggle("info", active === 0);
                 cb.classList.toggle("warn", active > 0);
                 const btn = $("conflicts-clear-btn");
