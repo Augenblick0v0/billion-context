@@ -260,6 +260,8 @@ curl -s http://localhost:8787/__bili/stats
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
+**为什么 262k 窗口不到 200k 就开始压缩?本地模型上为什么感觉一直在压缩?** 强制阈值作用在「有效窗口」上(原生窗口减去输出预留,预留默认封顶窗口的 25%),且软 nudge 每 +50k 增长触发一次、与窗口大小无关 —— 开机很重(工具+skill 100k+)时,一个长任务会经历多次增量压缩,本地模型每次都要整窗重新 prefill,任务时长可能被拖长 2–3 倍。对策:调大 `compress.nudgeGrowthTokens`、用 `lean` pack 减小开机占用,完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么大窗口下压缩比预期来得早)。
+
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。

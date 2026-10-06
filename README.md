@@ -338,6 +338,15 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Why does my 262k window start compacting before 200k — and why so often on a
+local model?** The forced threshold applies to the *effective* window (native
+window minus the output reserve, capped at 25% by default), and soft nudges
+fire every +50k of growth regardless of window size. With a heavy boot
+(100k+ of tools and skills) a long task sees several incremental compactions,
+each a full re-prefill on a local model. Raise `compress.nudgeGrowthTokens`,
+slim the boot (e.g. the `lean` pack) — worked example in
+[CONFIGURATION.md](CONFIGURATION.md#why-compaction-starts-earlier-than-expected-on-large-windows).
+
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher

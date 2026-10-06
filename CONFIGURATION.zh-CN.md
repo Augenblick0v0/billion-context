@@ -1305,6 +1305,26 @@
 - **状态：** ACTIVE
 - **说明：** 当使用率越过阈值时注入自动压缩 nudge 消息。设为 `false`（或 `ACP_COMPRESS_NUDGE=0`）可禁用 nudge 注入。同时禁用 `injectTool` 和 `injectNudge` 在功能上类似 `passthrough`，区别在于代理仍会跟踪 token 使用量。
 
+### 为什么大窗口下压缩比预期来得早
+
+两个默认值在大窗口场景下叠加起作用，都是设计行为而非 bug：
+
+1. **强制阈值作用在「有效窗口」而非原生窗口上。** 输出预留
+   （`min(max_tokens, outputHeadroomMaxPct × 窗口)`，cap 默认 `0.25`）先被扣掉，
+   nudge/truncate 档位位于 `窗口 − 预留` 之下（见
+   [`outputHeadroomMaxPct`](#outputheadroommaxpct)）。262,144 窗口 +
+   `max_tokens = 131072` 时预留 65,536 → 有效窗口 196,608 → 默认 75% 的
+   [`maxContextLimit`](#maxcontextlimit) 在 ≈147k 触发 —— **约为完整窗口的
+   56%**，而不是 ~200k。
+2. **[`nudgeGrowthTokens`](#nudgegrowthtokens) 按设计恒定。** 软 nudge 每 +50k
+   可压缩增长触发一次，与窗口大小无关。开机很重（工具+skill 众多，首条用户
+   消息前已有 100k–150k prefill）的 262k 窗口在一个 200k token 的任务里会经历
+   2–4 次增量压缩；本地模型每次压缩都是整窗重新 prefill —— 「一直在压缩、
+   任务时长 ×2–3」的体验正来源于此。
+
+对策：大窗口调大 `nudgeGrowthTokens`（100k+）；用 `lean` prompt pack 等方式
+减小开机占用；调参前先用 `/acp` 或网页界面看一眼实际开机/上下文占用。
+
 ### 软目标与弹性余量 (#1122)
 
 自主 agent 常常同时想要两件事：保持*活跃*上下文小（成本/延迟），又允许单个任务在确实需要时突发远超该目标（例如读一个大文件）。把 `modelContextLimit` 设到模型原生窗口之下表达不了这一点——一个字段同时扮演两个角色（使用率分母**兼**预检硬墙），任何超过它的载荷都会在中途被折叠或直接快速失败（#1122）。

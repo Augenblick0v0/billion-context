@@ -1300,6 +1300,29 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
 
+### Why compaction starts earlier than expected on large windows
+
+Two defaults interact on large-window setups; both are by design, not bugs:
+
+1. **The forced threshold applies to the *effective* window, not the native one.**
+   The output reserve (`min(max_tokens, outputHeadroomMaxPct × window)`, cap
+   default `0.25`) is subtracted before the nudge/truncate bands are placed
+   (see [`outputHeadroomMaxPct`](#outputheadroommaxpct)). On a 262,144-token
+   window with `max_tokens = 131072`, the reserve is 65,536 → effective window
+   196,608 → the default 75% [`maxContextLimit`](#maxcontextlimit) fires at
+   ≈147k tokens — **56% of the full window**, not at ~200k.
+2. **[`nudgeGrowthTokens`](#nudgegrowthtokens) is flat by design.** Soft nudges
+   fire every +50k of compressible growth regardless of window size. A heavy
+   boot (many tools and skills — 100k–150k of prefill before the first user
+   turn) on a 262k window therefore sees 2–4 incremental compactions over a
+   200k-token task. On local models every compaction is a full re-prefill, which
+   is exactly where the "it keeps compacting, my task took 2–3× longer"
+   experience comes from.
+
+Remedies: raise `nudgeGrowthTokens` (100k+ on large windows), slim the boot
+(e.g. the `lean` prompt pack), and check actual boot/context usage with `/acp`
+or the web UI before tuning.
+
 ### Soft target with elastic headroom (#1122)
 
 Autonomous agents often want two things at once: keep the *active* context small (cost/latency), while allowing a single task to burst well past that target when it genuinely needs to (e.g., reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — one field plays two roles at once (the usage-ratio denominator **and** the hard preflight wall), so any payload above it gets folded mid-task or fails fast (#1122).
