@@ -90,8 +90,10 @@ export function matchToolPattern(toolName: string, pattern: string): boolean {
 
 // No boundary class before the name: `/home/u/skills/review-loop/SKILL.md`
 // must capture `review-loop` (the segment immediately before the anchor), and
-// the preceding `/` is exactly the case a boundary class would break.
-const SKILL_MD_ANCHOR_RE = /([A-Za-z0-9][A-Za-z0-9._-]*)\/SKILL\.md/i;
+// the preceding `/` is exactly the case a boundary class would break. The
+// separator runs on RAW JSON text, where a Windows `\` arrives escaped as a
+// backslash PAIR — so accept `\\` (escaped pair), `\` (unescaped text) or `/`.
+const SKILL_MD_ANCHOR_RE = /([A-Za-z0-9][A-Za-z0-9._-]*)(?:\\\\|\\|\/)SKILL\.md/i;
 
 function isValidSkillName(name: string): boolean {
   return (

@@ -79,10 +79,22 @@ test("toolPathOf projects the three client shapes to skill/<name>", () => {
     "skill/review-loop",
   );
   // bash cat of a skill file projects too
-  assert.equal(
-    toolPathOf(toolCall("d", "c4", "bash", JSON.stringify({ command: "cat skills/audit-checklist/SKILL.md" }))),
-    "skill/audit-checklist",
-  );
+    assert.equal(
+      toolPathOf(toolCall("d", "c4", "bash", JSON.stringify({ command: "cat skills/audit-checklist/SKILL.md" }))),
+      "skill/audit-checklist",
+    );
+  // Windows pi shape: backslash separators (escaped in the raw JSON text)
+    assert.equal(
+      toolPathOf(
+        toolCall(
+          "e",
+          "c5",
+          "read",
+          JSON.stringify({ path: "C:\\Users\\u\\.pi\\skills\\release-notes\\SKILL.md" }),
+        ),
+      ),
+      "skill/release-notes",
+    );
 });
 
 test("toolPathOf degrades to the tool name when no skill identity is found", () => {
