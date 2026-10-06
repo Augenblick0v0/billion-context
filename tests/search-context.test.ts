@@ -122,6 +122,16 @@ test("executeSearchContext: clamp cut straddling an astral char leaves no lone s
     assert.ok(!hasUnpairedSurrogate(previewLine), "no lone high surrogate at the cut");
 });
 
+test("executeSearchContext: single-occurrence keyword in summary still matches (#2158)", () => {
+    const { core, state } = makeSessionWithBlock("probe alphaone, unique-marker-2026 and review_github_issues.py recorded once during the zebrafish run");
+    const hit = executeSearchContext({ query: "unique-marker-2026" }, core, state);
+    assert.match(hit.text, /^Found 1 block\(s\) for "unique-marker-2026":/);
+    assert.equal(hit.outcome, "success", "a positive search is not a failure (#1875)");
+    assert.match(executeSearchContext({ query: "alphaone" }, core, state).text, /^Found 1 block\(s\)/);
+    assert.match(executeSearchContext({ query: "review_github_issues.py" }, core, state).text, /^Found 1 block\(s\)/);
+    assert.match(executeSearchContext({ query: "zebrafish" }, core, state).text, /^Found 1 block\(s\)/);
+});
+
 test("executeSearchContext: astral char fully inside the prefix is kept (#816 control)", () => {
     const inside = "a".repeat(197) + "\u{1F980}" + "b".repeat(20);
     assert.equal(inside.length, 219);

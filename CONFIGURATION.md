@@ -110,6 +110,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
+| `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md. |
 
 **MITM lane**
 
@@ -492,13 +493,21 @@ Top-level keys that control how the proxy listens and behaves globally.
 
 ### `resign`
 
-- **Type:** `object` — scheme-keyed: `Record<scheme, { enabled?, passthrough?, credentialRef? }>` where each key is a lowercase signature scheme token as it appears on the wire's `Authorization` header (built-in: `"sdk-hmac-sha256"`)
-- **Default:** the built-in `"sdk-hmac-sha256"` key resolves out of the box — `enabled: true`, `passthrough: false`, `credentialRef` *(unset — account-pool discovery)*; any scheme the file does not mention keeps those defaults
+- **Type:** `object` — scheme-keyed: `Record<scheme, { enabled?, passthrough?, credentialRef? }>` where each key is a lowercase signature scheme token as detected on the wire (built-in: `"sdk-hmac-sha256"`; custom: an HMAC `Authorization` token like `"aws4-hmac-sha256"`, or a body-signature header name like `"x-ofm-signature"`)
+- **Default:** the built-in `"sdk-hmac-sha256"` key resolves out of the box — `enabled: true`, `passthrough: false`, `credentialRef` *(unset — account-pool discovery)*; any scheme the file does not mention keeps those defaults — which for NON-built-in schemes means a local 403 refusal that stays until bili ships the scheme's re-signer (binary contract, #2090); see Description
 - **Status:** ACTIVE
-- **Description:** The config-file surface of the #1884 re-sign arm (body-covering signatures; today Huawei CodeArts APIG's `SDK-HMAC-SHA256`). The arm itself is zero-config: on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box — the built-in key's defaults ARE that behavior, which is why keying by scheme does not make this a Huawei-shaped field. This block is for the failure/override paths — env vars win over the file for every field:
+- **Description:** The config-file surface of the #1884 re-sign arm (body-covering signatures; today Huawei CodeArts APIG's `SDK-HMAC-SHA256`). Detection is SHAPE-based, not a name whitelist (#2090): any `Authorization` scheme token naming an HMAC construction, or any request header ending in `-signature` / `-content-sha256`, marks the request as body-signed — every gateway invents its own header set (the dsh free-model plugin ships `x-ofm-signature`), and a closed list kept missing new shapes into silent upstream 401s that surfaced as "invalid credentials" in other plugins' UIs. What happens next depends on whether bili CAN re-sign the scheme:
+  - **Built-in scheme with a resolvable credential** (dsh codearts account pool): the zero-config re-sign arm — on dsh it discovers enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json` through the credentials service and re-signs every egress body it produces, so compression works on signed upstreams out of the box. The built-in key's defaults ARE that behavior, which is why keying by scheme does not make this a Huawei-shaped field.
+  - **Every other detected scheme** (SigV4, gateway-invented headers): there is NO credential source anywhere in bili and NO re-signer implementation, so bili **refuses it — always** (owner binary-contract ruling, #2090: signed requests are either RE-SIGNED+COMPRESSED or REFUSED, never passed through unsigned). The 403 names the scheme and says plainly that no configuration can make the link work yet; each refusal is remembered in `resign-pending.json` under the state dir (`~/.local/state/billion-context/`) and replayed as a `[resign] … UNRESOLVED` banner at every later start (the dsh agent lane warns at plugin load too) until bili ships the scheme's re-signer. `passthrough` settings are INERT for these schemes — the reminder clears itself only when the branch is un-deployed (`enabled: false` / `BILI_RESIGN=0`, restoring pre-resign rewrite handling where the upstream will likely 401 again).
+
+  This block is for the failure/override paths — env vars win over the file for every field:
   - `enabled: boolean` — kill switch for that scheme; `false` unloads the arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Env `BILI_RESIGN=0` wins.
-  - `passthrough: boolean` — opt-in verbatim forwarding for THAT scheme's requests when they cannot be re-signed (no credential, or a scheme bili cannot sign, like SigV4). The default is a **local 403 refusal** with an actionable message — no silent passthrough, because forwarding byte-untouched would silently disable compression for those requests (#1886 semantics are opt-in by design). Pinning the key pins the signature: opting `"aws4-hmac-sha256"` into passthrough never opens `"sdk-hmac-sha256"`, and vice versa. Env `BILI_RESIGN_PASSTHROUGH=1` wins.
+  - `passthrough: boolean` — verbatim forwarding for THAT scheme's requests when they cannot be re-signed. Applies to the BUILT-IN scheme ONLY (its refusal has a user-side fix — provide the credential — so opting into uncompressed forwarding there is a real decision; #1884). For every OTHER scheme this field is INERT: per the #2090 binary-contract ruling a signed request is re-signed+compressed or refused, so no value can turn a refusal into a pass-through. Pinning the key pins the signature: configuring one scheme never opens another. Env `BILI_RESIGN_PASSTHROUGH=1` wins (built-in effect only).
   - `credentialRef: string` — pin the dsh credentials-service ref used for re-signing instead of account-pool discovery. Env `BILI_CODEARTS_REF` wins.
+
+  Known-scheme registry & observability: bili ships labels + provenance for `sdk-hmac-sha256` (built-in, #1884), `aws4-hmac-sha256`, `hmac-sha256`, and `x-ofm-signature` (#2090). Registration is a COMMITMENT, not a capability: under the binary contract every registered scheme must eventually get a re-signer in bili — until then the scheme is loudly refused (the web UI marks it "awaiting re-signer support"), and a scheme nobody registered yet is caught by shape detection and refused the same way instead of being silently rewritten. Pending refusals, live per-scheme state, and the unresolved set are browsable in the web UI (`/__bili/` → Configuration → Signed upstreams (resign)) or read from the loopback-only `GET /__bili/resign`.
+
+  Built-in (CodeArts) prerequisites & temporary mitigation: the `sdk-hmac-sha256` re-sign arm is injected by bili's own dsh native lane — it walks `$DSH_HOME/jet-hub/state.json` (default `%USERPROFILE%\.dsh\jet-hub\state.json` on Windows) for accounts with `provider: "codearts"` that are not `enabled: false`, resolves each account's `credentialRef` through the host's credentials service (which must be exposed to native plugins), and uses the first one yielding `{access_key_id, secret_access_key}`. If any of those is missing in your host version (e.g. a DSH build that no longer injects the credentials service, or a changed state-file layout), every signed request is refused with `bili_resign_unavailable` even though the credentials themselves are valid — that is a host-side gap, not a bili misconfiguration; the exact minimum DSH version is tracked with the host, not pinned here. Until you upgrade the host, `BILI_RESIGN_PASSTHROUGH=1` restores the codearts link byte-untouched (built-in scheme only, no compression). Note the refusal message prints the exact resolved config path computed by the same function the config loader reads, so editing the file named in the error is always correct.
 
   The model-level knob is deliberately NOT a field here — see the three-level note below.
 
@@ -668,6 +677,49 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** `{}` (attach gate closed for lane'd instances)
 - **Status:** ACTIVE
 - **Description:** Native-hook attach policy (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog; an unarmed lane'd listener (a crashed session's orphan) is refused loudly instead of being silently ridden — a manually started `bili start` daemon (no lane) is user-zone and attachable by default (#1660). Set `attachExternal: true` to attach to *lane'd* unarmed listeners anyway (any code/lane-compatible listener becomes attachable regardless of watchdog state, including pre-#1330 builds). Overridden by `BILI_NATIVE_ATTACH_EXTERNAL` (`1` opens the gate even over a closed file; `0` closes it even over a permissive file). Full mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660).
+
+### `pi`
+
+- **Type:** `{ subagents?: PiSubagentsFileConfig | boolean }`
+- **Default:** `{}` (acp_delegate surface enabled with package defaults)
+- **Status:** ACTIVE (#2230 config-home)
+- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the standalone `billion-context-pi-subagents` package reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
+
+```jsonc
+"pi": {
+  "subagents": {
+    "enabled": true,              // master switch; false (or "subagents": false) removes tools+prompt+shortcut (new session)
+    "forceEnable": false,        // keep acp_delegate even when a project-scope pi-subagents install is detected (#415)
+    "displayUsage": "separate",  // "separate" (own footer block) | "merged" (folded into tool-result usage)
+    "maxDepth": 2,               // nesting depth cap, propagated to children
+    "syncTimeoutMinutes": 5,     // hard timeout for sync delegates; 0/null disables
+    "idleTimeoutMinutes": 5,     // idle watchdog for async delegates; 0/null disables (warns)
+    "asyncTimeoutMinutes": 30,   // hard limit for async delegates; 0/null disables
+    "maxConcurrent": 4,          // cap on concurrent background delegates (default unlimited; extras queue)
+    "thinkingLevel": "medium",   // off|minimal|low|medium|high|xhigh|max; priority per-call > role > this > pi default
+    "agents": {                  // per-role defaults: { model: "provider/id", thinkingLevel: "…" }
+      "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
+    },
+    "notifyIfRead": "skip",      // "skip" — no completion nudge if the model already read the result file
+    "fleetShortcut": "ctrl+alt+d", // "" disables the keyboard shortcut (/acp-fleet still works)
+    "prompt": null,              // replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS appendix
+    "debug": false               // debug events in ~/.pi/acp.log, scoped to sub-agents
+  }
+}
+```
+
+**Env overrides** (per-process spawn channels, propagate to delegate children; `PI_ACP_DELEGATE_*` > `pi.subagents` > deprecated acp.json > default):
+
+| Env var | Overrides | Notes |
+|---|---|---|
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents.forceEnable` | `true`/`false`; unparseable values warn and fall back to the file value. |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents.maxDepth` | Integer ≥ 1; invalid warns and falls back. |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents.syncTimeoutMinutes` | `0` disables; negative/non-numeric warns and falls back. |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents.idleTimeoutMinutes` | `0` disables (warns — hung children then need `acp_delegate_cancel`). |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` disables. |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | Integer ≥ 1; invalid falls through to the file value, then unlimited. |
+
+Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme).
 
 ### Process-level blocks (#2030)
 
@@ -1473,6 +1525,12 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
 <!-- /bili:gen -->
 
@@ -1490,7 +1548,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PREFLIGHT_HOLD_MS` | Grace period (ms) before a long preflight compression starts holding the client with keep-alive bytes (default `30000`; see #568). |
 | `BILI_STREAM_KEEPALIVE_MS` | Streaming-phase client hold (#1647): when an SSE response has written zero bytes to the client for this many milliseconds, bili emits one SSE comment line (`: bili-keepalive`, a spec-level no-op) so the client's undici `bodyTimeout` (default 300s; Node built-in fetch cannot override it per request) cannot kill long prefills whose upstream pings the rewriter/strip pipes swallow. Default `15000`; `0` disables. Sibling of `BILI_PREFLIGHT_HOLD_MS`, which covers compression-preflight silence — this covers upstream-caused silence during streaming. |
 | `BILI_RECLAIM_FETCH_PATCH` | Set to `0` to disable the native-mode fetch self-heal re-arm (#1158). By default the native fetch intercept installs `globalThis.fetch` as a guarded accessor, so a third-party patch that re-installs `globalThis.fetch` (e.g. dsh-http-proxy's settings refresh writing its frozen pre-bili `originalFetch`) is re-chained as the downstream and model traffic keeps routing through bili. With `0` the classic direct install stays: a third-party re-arm then wins and bili stops seeing model traffic for the session. **Egress note:** while the guard holds, claimed model traffic is dispatched by the bili proxy itself — it no longer rides the third-party chain's egress (e.g. a SOCKS5 proxy configured in dsh-http-proxy; bili's own upstream proxying supports HTTP proxies only). If you need the third-party egress back, set `0` and configure the egress at bili's level (`"proxy": "http://…"`). |
-| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A signed request that CANNOT be re-signed (no credential, or an unsupported scheme like SigV4) is refused locally with 403 and an actionable message — no silent passthrough: forwarding byte-untouched would silently disable compression. Opt in to verbatim no-compression forwarding with `BILI_RESIGN_PASSTHROUGH=1` (#1886 semantics). `enabled` / `passthrough` / `credentialRef` have config-file twins under the [`resign`](#resign) block, keyed by signature scheme (`resign["sdk-hmac-sha256"]`; `providers.<url>.resign["<scheme>"]` is the level-2 override) — env vars win over the file. Scheme keys pin the passthrough opt-in: only the scheme whose key sets it tunnels. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — wins over the whole three-level tree; file-side twin is the level-3 `models.<name>.benefit` boolean, unset falls back to the built-in `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
+| `BILI_RESIGN` | Set to `0` to un-deploy the #1884 re-sign arm end to end (pre-fix behavior: signed bodies ride the normal rewrite path and fail upstream with 401). Default: armed — a signed model request that can be re-signed (SDK-HMAC-SHA256 with a resolvable credential) tunnels with every egress body re-signed; the arm needs no configuration on dsh (account-pool discovery via the credentials service). A BUILT-IN-scheme request that CANNOT be re-signed (no resolvable credential) is refused locally with 403 and an actionable message — its fix (provide the credential) is actionable. Every OTHER detected scheme (SigV4, gateway-invented headers like `x-ofm-signature` — detection is shape-based, #2090) has no credential source anywhere in bili, so it is ALWAYS refused (binary contract: re-signed+compressed or refused, never passed through unsigned): a 403 naming the scheme, remembered in `resign-pending.json`, and re-warned at every startup (and shown in the web UI) until bili ships the scheme's re-signer. `BILI_RESIGN_PASSTHROUGH=1` turns on verbatim no-compression forwarding for the BUILT-IN scheme only — it is inert for every other scheme. `enabled` / `passthrough` / `credentialRef` have config-file twins under the [`resign`](#resign) block, keyed by signature scheme (`resign["sdk-hmac-sha256"]`; `providers.<url>.resign["<scheme>"]` is the level-2 override) — env vars win over the file. Scheme keys pin the passthrough opt-in: only the scheme whose key sets it tunnels. Related: `BILI_RESIGN_BENEFIT` (comma-separated list of CodeArts benefit models whose requests get the signed `maas_type: benefit` header — wins over the whole three-level tree; file-side twin is the level-3 `models.<name>.benefit` boolean, unset falls back to the built-in `glm-5.3-flash,deepseek-v4.1-flash`, mirroring the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK`) and `BILI_CODEARTS_REF` (force the dsh credentials-service ref used for re-signing instead of discovering enabled `codearts` accounts from `$DSH_HOME/jet-hub/state.json`). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
 | `ACP_HOST` | Override the listen host. |

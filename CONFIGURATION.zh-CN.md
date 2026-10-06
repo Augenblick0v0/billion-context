@@ -110,6 +110,7 @@
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
+| `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 
 **MITM 通道**
 
@@ -492,13 +493,21 @@
 
 ### `resign`
 
-- **类型：** `object` —— 按签名方案分键：`Record<方案, { enabled?, passthrough?, credentialRef? }>`,键 = 电线上 `Authorization` 头里出现的签名方案 token(小写；内置:`"sdk-hmac-sha256"`)
-- **默认值：** 内置 `"sdk-hmac-sha256"` 键开箱即用 —— `enabled: true`、`passthrough: false`、`credentialRef` *（未设置 —— 账号池发现）*；文件没提到的方案一律保持这些默认
+- **类型：** `object` —— 按签名方案分键：`Record<方案, { enabled?, passthrough?, credentialRef? }>`,键 = 电线上检测到的签名方案 token(小写；内置:`"sdk-hmac-sha256"`；自定义:HMAC `Authorization` token 如 `"aws4-hmac-sha256"`,或 body 签名头名如 `"x-ofm-signature"`)
+- **默认值：** 内置 `"sdk-hmac-sha256"` 键开箱即用 —— `enabled: true`、`passthrough: false`、`credentialRef` *（未设置 —— 账号池发现）*；文件没提到的方案一律保持这些默认 —— 对**非内置方案**，这意味着本地 403 拒收，且持续有效直到 bili 补上该方案的重签器（二元契约，#2090）；见说明
 - **状态：** ACTIVE
-- **说明：** #1884 重签臂的配置文件面（body 级签名；今天就是华为 CodeArts APIG 的 `SDK-HMAC-SHA256`）。重签臂本身零配置：在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用 —— 内置键的默认值**就是**这套行为，所以按方案分键并不把这个字段做成华为特殊设计。本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
+- **说明：** #1884 重签臂的配置文件面（body 级签名；今天就是华为 CodeArts APIG 的 `SDK-HMAC-SHA256`）。检测是**形状判定**而非名字白名单（#2090）：任何命名了 HMAC 构造的 `Authorization` 方案 token，或以 `-signature` / `-content-sha256` 结尾的请求头，都把该请求标记为 body 已签名 —— 每个网关都自造一套头（dsh 免费模型插件就是 `x-ofm-signature`），封闭名单会不断漏掉新形状，变成静默的上游 401，并在别的插件界面里显示成「凭据无效」。接下来发生什么取决于 bili 能否重签该方案：
+  - **内置方案且能解析出凭据**（dsh codearts 账号池）：零配置重签臂 —— 在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。内置键的默认值**就是**这套行为，所以按方案分键并不把这个字段做成华为特殊设计。
+  - **其他任何被检测到的方案**（SigV4、网关自造头）：bili 内部**既没有凭据来源，也没有重签器实现**，所以 bili **一律拒收**（owner 二元契约拍板，#2090：签名请求要么重签+压缩、要么拒绝，绝不无签名放行）。403 文案指明方案名并明说「目前没有任何配置能让这条链路工作」；每次拒收都会记进 state 目录下的 `resign-pending.json`（`~/.local/state/billion-context/`），此后每次启动 bili 都会打 `[resign] … UNRESOLVED` 横幅列出未解决项（dsh agent lane 在插件装载时也会警告），直到 bili 补上该方案的重签器。这些方案的 `passthrough` 设置**无效**——提醒只在分支被卸载（`enabled: false` / `BILI_RESIGN=0`，恢复 pre-resign 改写处理、上游大概率又 401）时自动清除。
+
+  本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
   - `enabled: boolean` —— 该方案的开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
-  - `passthrough: boolean` —— 对该方案的、无法重签的请求（拿不到凭据，或 SigV4 等签不了的方案）的 opt-in 原样转发。默认是**本地 403 拒收**并给出可操作提示 —— 不静默直发，因为逐字节原样转发等于静默关掉那些请求的压缩（#1886 语义设计上就是 opt-in）。**键定死签名**：给 `"aws4-hmac-sha256"` 开 passthrough 永远不会顺带放开 `"sdk-hmac-sha256"`，反之亦然。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先。
+  - `passthrough: boolean` —— 对该方案的、无法重签的请求的原样转发。**仅对内置方案有效**（其拒收有用户侧修复——提供凭据——所以在不压缩直送上做显式选择是真实决策；#1884）。对其他任何方案该字段**无效**：按 #2090 二元契约，签名请求要么重签+压缩、要么拒绝，没有任何取值能把拒收变成放行。**键定死签名**：配置一个方案永远不会顺带放开另一个方案。环境变量 `BILI_RESIGN_PASSTHROUGH=1` 优先（同样只影响内置方案）。
   - `credentialRef: string` —— 钉死重签用的 dsh credentials 服务 ref，而不是账号池发现。环境变量 `BILI_CODEARTS_REF` 优先。
+
+  已知方案注册表与可观测性：bili 自带 `sdk-hmac-sha256`（内置，#1884）、`aws4-hmac-sha256`、`hmac-sha256`、`x-ofm-signature`（#2090）的名称标签与出处。**登记是一种承诺而非能力**：按二元契约，每个已登记方案最终都必须在 bili 里补上重签器 —— 在此之前该方案被响亮拒绝（web UI 标记为「等待重签器」）；尚未注册的新方案由形状检测兜底，同样拒绝、绝不静默改写。待处理拒收、各方案实时状态与未解决集合可在 web UI（`/__bili/` → 配置 → 签名上游（resign））查看，或读回环限定的 `GET /__bili/resign`。
+
+  内置（CodeArts）前置条件与临时缓解：`sdk-hmac-sha256` 的重签 arm 由 bili 自己的 dsh native lane 注入 —— 它遍历 `$DSH_HOME/jet-hub/state.json`（Windows 默认 `%USERPROFILE%\.dsh\jet-hub\state.json`）中 `provider: "codearts"` 且未 `enabled: false` 的账号，用宿主凭据服务（必须暴露给 native 插件）逐个解析账号的 `credentialRef`，取第一个能解析出 `{access_key_id, secret_access_key}` 的。如果你的宿主版本缺了其中任何一环（例如某个 DSH 构建不再注入凭据服务、或状态文件布局变更），所有签名请求都会被拒收为 `bili_resign_unavailable`——即使凭据本身有效；这是宿主侧缺口而非 bili 配置错误，最低 DSH 版本随宿主跟踪、不在此钉死。升级宿主之前，`BILI_RESIGN_PASSTHROUGH=1` 可让 codearts 链路字节原样直通（仅内置方案，不压缩）。注意拒收消息打印的配置路径与配置加载器读取用的是同一个函数计算出的精确解析路径，按报错里写的文件改总是对的。
 
   模型级开关刻意不在本块里 —— 见下面三级说明。
 
@@ -668,6 +677,49 @@
 - **默认值：** `{}`（lane'd 实例的 attach 门关闭）
 - **状态：** ACTIVE
 - **说明：** native hook attach 策略（#1335）。lane'd native hook 仅在运行中的代理报告了已武装的会话生命周期看门狗时才 attach；未武装的 lane'd listener（崩溃会话的孤儿）被大声拒收而不是被静默搭车 —— 手动启动的 `bili start` 守护（无 lane）属用户区，默认可 attach（#1660）。设 `attachExternal: true` 仍可 attach 到 *lane'd* 未武装 listener（任何代码/lane 兼容的 listener 均可 attach，不论看门狗状态，包括 pre-#1330 构建）。可由 `BILI_NATIVE_ATTACH_EXTERNAL` 覆盖（`1` 即使文件关闭也开门；`0` 即使文件宽松也关门）。完整机制见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660)。
+
+### `pi`
+
+- **类型：** `{ subagents?: PiSubagentsFileConfig | boolean }`
+- **默认值：** `{}`（acp_delegate 面按包默认值启用）
+- **状态：** ACTIVE（#2230 配置搬家）
+- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
+
+```jsonc
+"pi": {
+  "subagents": {
+    "enabled": true,              // 总开关；false（或 "subagents": false）移除工具+提示词+快捷键（新会话生效）
+    "forceEnable": false,        // 检测到项目级 pi-subagents 安装时仍保留 acp_delegate（#415）
+    "displayUsage": "separate",  // "separate"（独立 footer 块）| "merged"（并入工具结果用量）
+    "maxDepth": 2,               // 嵌套深度上限，向子进程传播
+    "syncTimeoutMinutes": 5,     // 同步 delegate 硬超时；0/null 关闭
+    "idleTimeoutMinutes": 5,     // 异步 delegate 空闲看门狗；0/null 关闭（告警）
+    "asyncTimeoutMinutes": 30,   // 异步 delegate 硬时限；0/null 关闭
+    "maxConcurrent": 4,          // 后台并发上限（默认无限；超出排队）
+    "thinkingLevel": "medium",   // off|minimal|low|medium|high|xhigh|max；优先级 每次调用 > 角色 > 此处 > pi 默认
+    "agents": {                  // 角色默认：{ model: "provider/id", thinkingLevel: "…" }
+      "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
+    },
+    "notifyIfRead": "skip",      // "skip" —— 模型已读结果文件则不再补发完成通知
+    "fleetShortcut": "ctrl+alt+d", // "" 关闭快捷键（/acp-fleet 仍可用）
+    "prompt": null,              // 替换（字符串）或移除（null）ACP_DELEGATE NOTIFICATIONS 附录
+    "debug": false               // ~/.pi/acp.log 调试事件，仅限子代理子系统
+  }
+}
+```
+
+**环境变量覆盖**（进程级 spawn 通道，随子代理子进程传播；`PI_ACP_DELEGATE_*` > `pi.subagents` > 已废弃 acp.json > 默认）：
+
+| 环境变量 | 覆盖 | 说明 |
+|---|---|---|
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents.forceEnable` | `true`/`false`；非法值告警并回退到文件值。 |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents.maxDepth` | ≥1 整数；非法值告警并回退。 |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents.syncTimeoutMinutes` | `0` 关闭；负数/非数字告警并回退。 |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents.idleTimeoutMinutes` | `0` 关闭（告警 —— 挂死子进程需 `acp_delegate_cancel`）。 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` 关闭。 |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | ≥1 整数；非法值回落到文件值，再回落到无限。 |
+
+修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme)。
 
 ### 进程级配置块（#2030）
 
@@ -1478,6 +1530,12 @@
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
 <!-- /bili:gen -->
 
@@ -1494,7 +1552,7 @@
 | `BILI_PREFLIGHT_HOLD_MS` | 预压缩超过该宽限期（毫秒）后，代理提前提交响应并用保活字节挂住客户端（默认 `30000`；见 #568）。 |
 | `BILI_STREAM_KEEPALIVE_MS` | 流式阶段客户端保活（#1647）：SSE 响应连续该毫秒数没有向客户端写出任何字节时，bili 发一条 SSE 注释行（`: bili-keepalive`，协议层 no-op），防止客户端 undici `bodyTimeout`（默认 300s；Node 内置 fetch 无法按请求覆盖）在长 prefill 时断连——上游的 ping 注释会被重写器/剥离管道吞掉。默认 `15000`；`0` 关闭。与 `BILI_PREFLIGHT_HOLD_MS` 互补：后者覆盖压缩预检期的静默，本变量覆盖流式期上游导致的静默。 |
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。 |
-| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。无法重签的签名请求（拿不到凭据，或 SigV4 等不支持的方案）默认本地拒收 403 并给出可操作提示——不静默直发：逐字节原样转发等于静默关掉压缩。需要原样转发（不压缩）时显式设 `BILI_RESIGN_PASSTHROUGH=1`（即 #1886 语义）。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块——按签名方案分键（`resign["sdk-hmac-sha256"]`；`providers.<url>.resign["<方案>"]` 是二级覆盖）——环境变量优先于文件。方案键把 passthrough 钉死到具体签名：只有自己的键设了的方案才走隧道。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
+| `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。**内置方案**无法重签的请求（解析不出凭据）本地拒收 403 并给出可操作提示——其修复（提供凭据）是可操作的。其他任何被检测到的方案（SigV4、`x-ofm-signature` 等网关自造头——检测是形状判定，#2090）在 bili 内部没有凭据来源也没有重签器，因此**一律本地拒收**（二元契约：重签+压缩或拒绝，绝不无签名放行）：403 指明方案名，记入 `resign-pending.json`，每次启动（以及 web UI）反复提醒直到 bili 补上该方案的重签器。`BILI_RESIGN_PASSTHROUGH=1` 仅对内置方案开启原样转发（不压缩）——对其余方案无效。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块——按签名方案分键（`resign["sdk-hmac-sha256"]`；`providers.<url>.resign["<方案>"]` 是二级覆盖）——环境变量优先于文件。方案键把 passthrough 钉死到具体签名：只有自己的键设了的方案才走隧道。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |

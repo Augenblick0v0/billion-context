@@ -120,9 +120,21 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 
 自 ~0.156 起,Codex 可以附着到(或自动拉起)一台机器全局共享的后台 server,其模型流量用的是 **daemon 启动时**存在的环境变量,而不是会话启动时的。启动器的代理是会话级的(端口随进程消亡),所以长寿 daemon 没法安全地经它路由:若 codex 先于 bili env 启动,之后的 `bili codex` 会话会静默附着上去、**完全绕过压缩**;若 bili 先启动,幸存的 daemon 则一直指向死端口。因此启动器显式传 `--no-daemon` —— 先探测 `codex --help` 是否有该 flag(旧版本二进制原样启动),且仅当用户未自行钉死模式(`--no-daemon` 或 `--remote`)时。结果:确定性的 embedded 运行,无逐次启动的回退警告,无静默绕过。#321 的预算 `-c` 参数原样保留(embedded 模式同等生效)。想要共享后台 server 的话,直接跑原生 `codex` —— 没有压缩,但工具仍可通过 `bili plugin install codex` 使用。
 
+### Windows 启动路径:用户 argv 不再重新进入 cmd.exe(#2196)
+
+Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发会让每个用户参数再经 **cmd.exe 行解析器**解析一遍——该解析器没有任何转义机制:嵌入双引号拆词(`Please say "hello world" exactly` 到达时变成四个参数)、`%VAR%` 被展开、`&|<>^()` 成为命令操作符、空参数消失。普通带空格提示词恰好能幸存,所以 #679 的空格截断修复没有暴露它。#2196 让启动器拒绝把用户 argv 喂进这个解析器:
+
+- **解析顺序(win32 专属):** 每个 PATH 目录内原生 `codex.exe` 优先于 `codex.cmd`/`codex.bat`(最早目录仍整体优先);`.cmd`/`.bat` 命中若位于可信 npm 布局旁——`<dir>/node_modules/@openai/codex`,package.json name 为 `@openai/codex`、有可解析的 `"codex"` bin 条目、且 shim 文本引用该包(放在无关树旁的手写 `codex.cmd` 不得劫持启动)——则升级为 `node <官方 bin/codex.js>`。Node 下运行官方 wrapper 与 shim 行为完全一致——vendor 二进制查找、env 初始化、信号转发——而 Node 自己的 CreateProcess argv 编码逐字无损携带每个参数。未识别布局(yarn-classic `.bin` 树、无本地链接的 pnpm store shim……)保留旧 cmd 路径并遵循下述契约。
+- **透传契约:** 其余 cmd 包装启动——任何客户端的 `.cmd`/`.bat`/无扩展名二进制,加上 dsh-channel spawn——只接受行解析器能逐字携带的 argv;其余(嵌入引号、`%VAR%`、元字符、空参数、换行、奇数尾反斜杠)在**任何进程启动之前**以可操作的错误明确失败,而不是损坏到达或执行非预期命令。直接 spawn 的 `.exe` 不受影响:Node 自身无损编码其 argv。
+- **绕行 / power-user 旋钮:** `BILI_CLIENT_BIN=<path>` 仍最高优先——指向真实 `codex.exe`(或经 node 运行的脚本入口)即可完全绕开 shim。
+
+已在 windows-latest CI 上对真实全局 `@openai/codex` 安装验证(`tests/win-cmd-argv.test.ts`,`ci-windows-codex.yml` 硬门禁):完整语料——空参数、普通空格、嵌入引号、TOML `-c` 值、JSON、Unicode、尾反斜杠、`%COMSPEC%`、`!VAR!`、`&|<>^()`——逐项与调用方数组相等地到达子进程。
+
 ## Pi(pi.dev coding agent)
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
+
+**子代理配置(#2230)。** 内置 `acp_delegate` 面(三个 delegate 工具、角色、fleet 检查器——由 `bili pi` 经内嵌扩展接线)配置在 bili 自己的配置文件:`~/.config/billion-context/billion-context.json` 的 `pi.subagents` 段(布尔简写 `"pi": {"subagents": false}` 可整体关闭)。`~/.pi/acp.json` 的四键(`delegate` / `delegatePrompt` / `displayUsage` / `debug`)是已废弃的回退源——仅当段缺失时读取,段存在后完全忽略。完整字段表与 `PI_ACP_DELEGATE_*` 环境变量见 CONFIGURATION.zh-CN.md 的 [`pi`](CONFIGURATION.zh-CN.md#pi) 段。
 
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
@@ -146,6 +158,31 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 默认值 `"auto"` 先试 WS、握手失败才回退 SSE;旧布尔键 `"websockets": false` 会自动迁移。该键全局生效,但只有支持多传输的 provider(目前是 codex provider)消费它,纯 HTTP provider 不受影响。Windows + Pi 1.0.2 实机验证(#2063 owner 复现):显式 `sse` 携带正确会话 ID 进入 bili。
 
 该车道已经过端到端实证(`tests/e2e/e2e-pi-codex-ws.test.ts`,真实 pi 对确定性 mock 上游经真实代理):显式 websocket 与 auto 路由、升级握手上 stamp 与 `session-id` == 会话 ID 一致、compress/decompress 往返并反映到后续请求、`previous_response_id` 展开、上游拒绝行为、显式 sse 回归守卫,以及两个并发子代理式会话共享一个代理互不串扰。
+
+### 子代理(pi-subagents)— native 安装覆盖(#2185)
+
+pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**。#2185 之前,native 安装(`bili plugin install pi` / `pi install npm:billion-context`)下 bili 扩展并不能可靠地加载进这些子会话:
+
+- **前台 child** 在进程内运行且 ambient 扩展发现关闭(`noExtensions: true`)→ bili 扩展根本不加载;其流量只是借父进程的全局 fetch patch 到达代理,因此每个 child 被记成**匿名 proxy 模式 `pfa-*` 会话**:压缩成立,但没有具名 `x-bili-plugin-conversation` 身份、没有父会话血统,ACP 工具只以代理侧 wire 注入的形式存在;
+- **后台 async run** 派生独立 runner,其 child *可能*经 ambient 发现加载扩展——默认配置下靠运气生效,而 agent 定义一旦显式设置 `extensions`(哪怕是 `[]`)或 `denyExtensions`,或遇到 pi-subagents 版本漂移 / npm store 同步问题,就**静默回归直连**(代理侧零可见性)。
+
+**修法。** pi 扩展在 session_start 时向 pi-subagents 的全局 required-child-extension registry 自注册(对 `globalThis[Symbol.for("pi-subagents.required-child-extensions.v1")]` 做特征探测)。注册条目使 bili 成为**该父会话派生的每个 child 的必需扩展**;必需扩展经 `additionalExtensionPaths` 注入,pi 会把它载入 `cliEnabledExtensions` 桶——**即使 `noExtensions: true` 也加载**——所以下面每一格都是确定性加载。注册按父会话粒度,session_shutdown 时释放;同会话已有条目时让位(先写者胜)。刻意**不设置** `requireForAllRunners`:非 pi 的 runner 放置保持现状,而不是被拒绝。registry 不存在或形状不符(新旧 pi-subagents 版本漂移)时,扩展降级回修复前行为并记一次日志。kill switch `BILLION_CONTEXT_PLUGIN=0` / `BILI_NATIVE_PI=0` 同样会抑制注册。不引入任何新配置面。
+
+修复后矩阵(pi 0.83.6 + pi-subagents 0.76.0 实机验证,HTTP 传输;WS 行依据 #2073 记录,无实机格):
+
+| 格子 | 修复前 | 修复后 |
+|---|---|---|
+| native × 前台 × 默认配置 | 匿名 `pfa-*` proxy 模式;ACP 工具仅靠代理 wire 注入 | **具名 child-sid plugin 模式会话**;ACP 工具首个请求起本地注册;压缩记在 child 自己的 id 下 |
+| native × 后台 × 默认配置 | ambient 运气——settings packages 恰好加载时才是具名 plugin 模式 | 同上,但现在是确定性的(child launch-resolved extensions 里 `required: ["bili"]`) |
+| native × 后台 × agent 定义 `extensions: []` / `denyExtensions` | **静默直连**——代理零可见性、无压缩 | 确定性必需路径加载;具名 plugin 会话。(若运行时能力上限硬性拒绝扩展,pi-subagents 0.76.0 会让 child 启动大声失败——fail-fast 而非静默) |
+| launcher 模式(`bili pi`)× 后台 | child 继承 provider rewrite(#535),但 bili 加载同样靠 ambient 运气 | 注册生效(刻意**不受** `BILI_PROVIDER_REWRITES` 门控);父与子均为具名会话,经继承的 rewrite 路由 |
+| 任意 × 纯 WS 传输 | 不在范围——见上方 WS 缺口 | 不变:客户端侧 WS 拦截仍 owner-gated(#2073) |
+
+值得知道的注意事项:
+
+- **限制性 `tools:` 白名单会滤掉 ACP 工具。** frontmatter `tools:` 列表未包含 ACP 工具名的 agent 定义(如内建 `scout` 只列了 `read`/`bash`/…),child 里不会出现这些工具——尽管会话是具名的、压缩也成立。修复前的前台 child 恰好靠代理 wire 注入绕过了白名单拿到工具——所以这类 agent 升级后可用的工具变少了。恢复方式:省略 `tools:` 字段,或补上 `compress,decompress,search_context,acp_status,acp_cache`。该过滤是 pi-subagents 的既有行为,不是本修复引入的回归。
+- **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
+- **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 

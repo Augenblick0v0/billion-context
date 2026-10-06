@@ -753,7 +753,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
     if (terms.length === 0) return [];
     const scored = activeBlocks(state)
       .map((block) => ({ block, score: scoreRelevance(block, terms) }))
-      .filter((entry) => entry.score > 0.1)
+      // No relevance floor: precision comes from ranking + the caller's limit.
+      // A floor >= 0.04 would silently drop the scorer's minimum positive
+      // signal (one summary occurrence) — #2158.
+      .filter((entry) => entry.score > 0)
       .sort((left, right) => right.score - left.score);
     return scored.map((entry) => entry.block);
   }

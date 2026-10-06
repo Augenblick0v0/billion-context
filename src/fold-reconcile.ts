@@ -46,6 +46,31 @@ const MAX_ANCHORS = 16384;
  *  the cap — alignment is content-addressed, so a trimmed head only shifts
  *  where the exact-prefix run starts). */
 const MAX_ORDER = 32768;
+const METADATA_DRIFT_STREAK = "foldDriftStreak";
+const METADATA_DRIFT_SINCE = "foldDriftSince";
+const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
+/** #2193: total-loss drift (covered ids missing with ZERO reanchoring) across
+ *  this many consecutive passes means the fold state can never recover —
+ *  escalate once from warn to error and name the suspect cause instead of
+ *  letting the same warn print hundreds of times. */
+const FOLD_DRIFT_ESCALATE_PASSES = 3;
+/** Below this many permanently-missing ids the loss is small enough (a few
+ *  edited/deleted messages) to stay at warn level. */
+const FOLD_DRIFT_ESCALATE_MIN_UNMATCHED = 10;
+
+/** #2193 follow-up: clear the drift-episode state. The main path resets it on
+ *  every non-total-loss pass; the early exits of reconcileFoldCoverage must do
+ *  the same, or a stale foldDriftStreak survives an episode boundary (all fold
+ *  blocks archived away, reconcile toggled off) and inflates the next episode's
+ *  consecutive-pass count — the error line would claim more passes than the
+ *  episode actually had. */
+function resetFoldDriftState(session: Session): void {
+    const md = session.metadata;
+    if (!md) return;
+    delete md[METADATA_DRIFT_STREAK];
+    delete md[METADATA_DRIFT_SINCE];
+    delete md[METADATA_DRIFT_ESCALATED];
+}
 
 /** Per-covered-id anchor recorded from the last pass in which the id was seen.
  *  Stored in session.metadata.foldAnchors (persisted, free-form field). */
@@ -286,10 +311,16 @@ export interface ReconcileOptions {
  *  drift WARN only reports the honest residual). */
 export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opts: ReconcileOptions = {}): FoldReconcileResult {
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
-    if (mode === "off") return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (mode === "off") {
+        resetFoldDriftState(session);
+        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
-    if (covered.size === 0) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (covered.size === 0) {
+        resetFoldDriftState(session);
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
@@ -348,10 +379,38 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // The wire sites already schedule a save on every turn (state replacement
     // + markDirty); the metadata ride that existing save.
 
+    // #2193: escalate persistent TOTAL-loss drift. A single pass with
+    // unmatched ids is ordinary churn (edits, deletions, re-serialization
+    // gaps) — the per-pass warn below covers it. But when covered ids keep
+    // staying missing with ZERO reanchoring across consecutive passes, that
+    // slice of fold state can never recover: consistent with a host-native
+    // compaction landing outside
+    // bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-
+    // side history rewrite. One error line per episode names it instead of
+    // letting the identical warn print hundreds of times.
+    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+    const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0;
+    const prevStreak = (session.metadata[METADATA_DRIFT_STREAK] as number | undefined) ?? 0;
+    if (!totalDrift) {
+        if (prevStreak !== 0) resetFoldDriftState(session);
+    } else {
+        const streak = prevStreak + 1;
+        session.metadata[METADATA_DRIFT_STREAK] = streak;
+        if (prevStreak === 0) session.metadata[METADATA_DRIFT_SINCE] = Date.now();
+        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && plan.unmatched.length >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+                && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
+            session.metadata[METADATA_DRIFT_ESCALATED] = true;
+            const since = session.metadata[METADATA_DRIFT_SINCE] as number | undefined;
+            const span = typeof since === "number" ? `, ${Math.max(1, Math.round((Date.now() - since) / 60000))} min so far` : "";
+            if (opts.log !== undefined) {
+                opts.log("error", `${tag}[fold-reconcile] compression substrate appears destroyed: ${plan.unmatched.length} covered id(s) missing with NO anchor match for ${streak} consecutive passes${span} — consistent with a host-native compaction landing outside bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-side history rewrite; bili folds can no longer cover the resent history (#1921)`);
+            }
+        }
+    }
+
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
         return { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
     }
-    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",

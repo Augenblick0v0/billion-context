@@ -273,9 +273,9 @@ export const WEB_CLIENT = `(function () {
         const tr = document.createElement("tr");
         tr.title = s.id;
         if (compact) {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
         tr.addEventListener("click", (ev) => {
@@ -903,13 +903,31 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
         // is never read as a measured value (the ghost-denominator incident).
-        const ctxEstMark = d.contextTokensSource === "estimate" ? ' <span class="hint">' + t("common.ctx_est") + "</span>" : "";
+        // #2117: drive the bar from contextBest — provenance-picked by the server
+        // (usage > calibrated estimate > char-count upper bound) — so one value
+        // never mixes calibers; the bound itself stays visible, labeled as a BOUND
+        // on its own sub-line, and the calibration behind the estimate is shown
+        // with its evidence instead of an unexplained number.
+        const best = d.contextBest || null;
+        const ctxVal = best ? best.tokens : (d.contextTokens || 0);
+        const ctxMark = best
+            ? ' <span class="hint">' + (best.kind === "usage" ? t("common.ctx_meas") : best.kind === "estimate" ? (best.calibrated ? t("common.ctx_est_calib") : t("common.ctx_est_raw")) : t("common.ctx_upper")) + "</span>"
+            : (d.contextTokensSource === "estimate" ? ' <span class="hint">' + t("common.ctx_est") + "</span>" : "");
         if (d.contextWindow && d.contextWindow > 0) {
-            const pct = Math.min(100, Math.round((d.contextTokens / d.contextWindow) * 100));
+            const pct = Math.min(100, Math.round((ctxVal / d.contextWindow) * 100));
             const cls = pct >= 90 ? "bar-fill danger" : pct >= 70 ? "bar-fill warn" : "bar-fill";
-            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxEstMark + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(d.contextTokens) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)" + ctxEstMark + "</span></div>");
+            parts.push('<div class="bar-row"><span class="dim small">' + t("common.context") + ctxMark + " / " + t("common.window") + '</span><div class="bar-track"><div class="' + cls + '" style="width:' + pct + '%"></div></div><span class="mono small">' + fmtW(ctxVal) + " / " + fmtW(d.contextWindow) + " (" + pct + "%)" + ctxMark + "</span></div>");
+            const ctxSubBits = [];
+            if ((d.contextUpperTokens || 0) > 0 && (!best || best.kind !== "upper") && d.contextUpperTokens !== ctxVal) {
+                ctxSubBits.push(t("det.upper_bound", { v: fmtW(d.contextUpperTokens) }));
+            }
+            if (d.estimateCalibration) {
+                const c = d.estimateCalibration;
+                ctxSubBits.push('<span title="' + escapeHtml(t("det.calib_tip", { n: c.samples, spread: c.spread.toFixed(1), origin: c.origin || "", model: c.model || "" })) + '">' + t("det.calib_chip", { k: c.factor.toFixed(2), n: c.samples, spread: c.spread.toFixed(1), origin: c.origin ? hostOf(c.origin) : "" }) + "</span>");
+            }
+            if (ctxSubBits.length) parts.push('<div class="dim small" style="margin-top:4px">' + ctxSubBits.join(" · ") + "</div>");
         } else {
-            parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxEstMark + ": " + fmtW(d.contextTokens || 0) + "</div>");
+            parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
@@ -1354,8 +1372,80 @@ export const WEB_CLIENT = `(function () {
                 clearPt.hidden = true;
             }
             loadUpstream(cfg);
+            void loadResign();
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    // #2090 plan A: read-only "Signed upstreams" card — every known/observed
+    // signature scheme with its effective policy, remembered refusals, and —
+    // for the BUILT-IN scheme only — a copy-ready passthrough snippet (other
+    // schemes show an awaiting-re-signer hint: no config can pass them
+    // through, #2090 owner ruling).
+    async function loadResign() {
+        const box = $("resign-body");
+        if (!box) return;
+        let data;
+        try {
+            data = await json("/__bili/resign");
+        } catch (e) {
+            const el = document.createElement("div");
+            el.className = "dim small";
+            el.textContent = t("cfg.resign_none") + " (" + e.message + ")";
+            box.replaceChildren(el);
+            return;
+        }
+        box.innerHTML = "";
+        const schemes = data.schemes && typeof data.schemes === "object" ? data.schemes : {};
+        const pending = data.pending && typeof data.pending === "object" ? data.pending : {};
+        let anyPending = false;
+        for (const name of Object.keys(schemes).sort()) {
+            const s = schemes[name];
+            if (!s || typeof s !== "object") continue;
+            anyPending = anyPending || Boolean(pending[name]);
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+            const label = document.createElement("span");
+            label.className = "mono small";
+            label.textContent = s.builtIn && s.known ? t("cfg.resign_builtin", { scheme: name, label: s.known.label }) : name;
+            row.appendChild(label);
+            const badge = document.createElement("span");
+            badge.className = "badge ";
+            const effectivePassthrough = Boolean(s.builtIn && s.passthrough);
+            badge.textContent = !s.enabled ? t("cfg.resign_disabled") : effectivePassthrough ? t("cfg.resign_passthrough") : t("cfg.resign_refusing");
+            badge.classList.add(effectivePassthrough ? "ok" : s.enabled ? "warn" : "disk");
+            row.appendChild(badge);
+            const entry = pending[name];
+            if (entry && typeof entry === "object") {
+                const meta = document.createElement("span");
+                meta.className = "dim small";
+                meta.textContent = t("cfg.resign_row", { origin: entry.origin || "—", count: entry.count ?? 1, firstSeen: String(entry.firstSeen ?? "").slice(0, 10) });
+                row.appendChild(meta);
+                if (s.enabled && !effectivePassthrough) {
+                    if (s.builtIn) {
+                        const btn = document.createElement("button");
+                        btn.className = "btn sm copy-btn";
+                        btn.setAttribute("data-copy", JSON.stringify({ resign: { [name]: { passthrough: true } } }, null, 0));
+                        btn.setAttribute("title", t("cfg.resign_copy_hint"));
+                        const sp = document.createElement("span");
+                        sp.textContent = t("common.copy");
+                        btn.appendChild(sp);
+                        row.appendChild(btn);
+                    } else {
+                        const hint = document.createElement("span");
+                        hint.className = "dim small";
+                        hint.textContent = t("cfg.resign_awaiting");
+                        row.appendChild(hint);
+                    }
+                }
+            }
+            box.appendChild(row);
+        }
+        if (!anyPending && Object.keys(pending).length === 0) {
+            const el = document.createElement("div");
+            el.className = "dim small";
+            el.textContent = t("cfg.resign_none");
+            box.appendChild(el);
         }
     }
     function hydrateQuickConfig(cfg) {

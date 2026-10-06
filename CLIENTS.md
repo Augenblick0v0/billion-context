@@ -365,6 +365,46 @@ The #321 budget `-c` args are kept verbatim (embedded mode honors them
 identically). If you want the shared background server, run native `codex`
 directly — no compression, but tools still work via `bili plugin install codex`.
 
+### Windows launch path: user argv never re-enters cmd.exe (#2196)
+
+On Windows the default npm install puts a `codex.cmd` shim on PATH, and its
+`%*` forwarding re-parses every user argument through cmd.exe's LINE parser —
+which has no escape mechanism: embedded double quotes split tokens
+(`Please say "hello world" exactly` arrived as four arguments), `%VAR%`
+expands, `&|<>^()` act as command operators, and empty arguments vanish.
+Plain spaced prompts survived, which is why the #679 space-truncation fix did
+not expose it. #2196 makes the launcher refuse to feed user argv into that
+parser:
+
+- **Resolution order (win32 only):** within each PATH directory the native
+  `codex.exe` wins over `codex.cmd`/`codex.bat` (earliest directory still wins
+  overall); a `.cmd`/`.bat` hit is upgraded to `node <official bin/codex.js>`
+  when it sits beside a trusted npm layout — `<dir>/node_modules/@openai/codex`
+  whose package.json is named `@openai/codex` with a resolvable `"codex"` bin
+  entry, AND shim text referencing that package (a hand-written `codex.cmd`
+  placed beside an unrelated tree must not hijack the launch). Running the
+  official wrapper under Node reproduces exactly what the shim does — vendor
+  binary lookup, env init, signal forwarding — while Node's own CreateProcess
+  argv encoding carries every argument verbatim. Unrecognized layouts
+  (yarn-classic `.bin` trees, pnpm store shims without the local link, …) keep
+  the legacy cmd path under the contract below.
+- **Pass-through contract:** the remaining cmd-wrapped launches — any client's
+  `.cmd`/`.bat`/extensionless binary, plus dsh-channel spawns — accept only
+  argv the line parser can carry verbatim. Anything else (embedded quotes,
+  `%VAR%`, metacharacters, empty args, line breaks, odd trailing-backslash
+  runs) fails loudly with an actionable error *before* any process starts,
+  instead of arriving corrupted or executing unintended commands. Direct-spawn
+  `.exe` launches are unaffected: Node encodes their argv losslessly itself.
+- **Workaround / power-user knob:** `BILI_CLIENT_BIN=<path>` still outranks
+  everything — point it at the real `codex.exe` (or at a script entry run
+  under node) to bypass the shim entirely.
+
+Verified on windows-latest CI against the real global `@openai/codex` install
+(`tests/win-cmd-argv.test.ts`, hard gate in `ci-windows-codex.yml`): the full
+corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
+Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
+child process item-by-item identical to the caller array.
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
 Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of
@@ -435,6 +475,16 @@ option 1); this section covers what the one-line table can't — **which model
 transports the native intercept actually covers**. Pi is the only host that
 brings WebSocket model traffic into the loop.
 
+**Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
+delegate tools, roles, fleet inspector — wired by `bili pi` through the
+embedded extension) is configured in bili's own config file, the `pi.subagents`
+section of `~/.config/billion-context/billion-context.json` (boolean shorthand
+`"pi": {"subagents": false}` disables it). The four `~/.pi/acp.json` keys
+(`delegate` / `delegatePrompt` / `displayUsage` / `debug`) are a deprecated
+fallback — read only while the section is absent, ignored once it exists.
+Full field table and the `PI_ACP_DELEGATE_*` env overrides:
+CONFIGURATION.md → [`pi`](CONFIGURATION.md#pi).
+
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
 is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the
@@ -469,6 +519,71 @@ Windows + Pi 1.0.2 (#2063 owner repro): explicit `sse` enters bili with the
 correct session id.
 
 The lane is verified end-to-end (`tests/e2e/e2e-pi-codex-ws.test.ts`, real pi against a deterministic mock upstream through the real proxy): explicit-websocket and auto routing, upgrade-header stamps with `session-id` == conversation id, compress/decompress round trips reflected in subsequent requests, `previous_response_id` expansion, upstream-refusal behavior, the explicit-sse regression guard, and two concurrent subagent-style sessions sharing one proxy without cross-talk.
+
+### Subagents (pi-subagents) — native install coverage (#2185)
+
+pi-subagents (a pi.dev package) spawns **child sessions** for foreground and
+background subagent runs. Before #2185, a native install
+(`bili plugin install pi` / `pi install npm:billion-context`) did not reliably
+load the bili extension into those children:
+
+- **foreground children** run in-process with ambient extension discovery off
+  (`noExtensions: true`) → the bili extension never loaded; their traffic only
+  reached the proxy through the parent process's global fetch patch, so each
+  child was recorded as an **anonymous proxy-mode `pfa-*` conversation**:
+  compression worked, but there was no named `x-bili-plugin-conversation`
+  identity, no parent lineage, and ACP tools existed only as proxy-side wire
+  injection;
+- **background async runs** launch a detached runner whose child *may* load
+  extensions through ambient discovery — it worked by luck under default
+  config and silently regressed to a direct upstream connection (zero proxy
+  visibility) whenever the agent definition set `extensions` (even `[]`) or
+  `denyExtensions`, or on pi-subagents version drift / npm-store sync issues.
+
+**The fix.** At session start the pi extension self-registers itself into
+pi-subagents' global required-child-extension registry (feature-detected on
+`globalThis[Symbol.for("pi-subagents.required-child-extensions.v1")]`). The
+registry entry makes bili a **required extension of every child launched from
+that parent session**; required extensions travel through
+`additionalExtensionPaths`, which pi loads into its `cliEnabledExtensions`
+bucket **even under `noExtensions: true`** — so loading is deterministic in
+every cell below. Registration is per parent session, disposed at session
+shutdown, and yields to a pre-existing entry on same-session conflict
+(first writer wins). `requireForAllRunners` is deliberately **not** set:
+non-pi runner placements keep today's behavior instead of being rejected.
+When the registry is absent or has a foreign shape (older/newer
+pi-subagents), the extension degrades to the pre-fix behavior and logs once.
+Kill switches `BILLION_CONTEXT_PLUGIN=0` / `BILI_NATIVE_PI=0` also suppress
+registration. No new configuration surface.
+
+Post-fix matrix (real-machine verified: pi 0.83.6 + pi-subagents 0.76.0,
+HTTP transports; WS row documented from #2073, no live cell):
+
+| Cell | Pre-fix | Post-fix |
+|---|---|---|
+| native × foreground × default config | anonymous `pfa-*` proxy mode; ACP tools only via proxy wire injection | **named child-sid plugin-mode session**; ACP tools registered locally from the first request; compression recorded under the child's own id |
+| native × background × default config | ambient luck — named plugin mode when the settings packages happened to load | same, now deterministic (`required: ["bili"]` in the child's launch-resolved extensions) |
+| native × background × agent def `extensions: []` / `denyExtensions` | **silent direct connect** — zero proxy visibility, no compression | deterministic required-path load; named plugin session. (If a runtime capability ceiling hard-denies extensions, pi-subagents 0.76.0 fails the child launch loudly instead — fail-fast, not silent) |
+| launcher mode (`bili pi`) × background | children inherited the provider rewrite (#535) but loaded bili by ambient luck only | registration active (deliberately **not** gated by `BILI_PROVIDER_REWRITES`); parent and children are named sessions routing through the inherited rewrite |
+| any × WebSocket-only transport | out of scope — see the WS gap above | unchanged: client-side WS interception stays owner-gated (#2073) |
+
+Caveats worth knowing:
+
+- **Restrictive `tools:` allowlists filter ACP tools.** An agent definition
+  whose frontmatter `tools:` list omits the ACP tool names (e.g. the builtin
+  `scout` lists only `read`/`bash`/…) will not expose them in the child, even
+  though the session is named and compressed. Pre-fix foreground children
+  happened to have the tools via proxy wire injection regardless of the
+  allowlist — so such agents see fewer tools after the upgrade. Restore them
+  by omitting the `tools:` field or adding
+  `compress,decompress,search_context,acp_status,acp_cache`. The filtering is
+  pi-subagents' pre-existing behavior, not a regression of this fix.
+- **One-request registration race in background children** (ACP tools present
+  from the second request on) is pre-existing in all modes.
+- **Behavior change disclosure:** foreground children move from anonymous
+  proxy mode (`pfa-*`) to named plugin mode (child session id + parent
+  lineage). Strictly more information, but anything keyed on `pfa-*`
+  identities will observe different ids.
 
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 

@@ -15,6 +15,7 @@ import {
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
@@ -65,14 +66,54 @@ export type ProxyToolCtx = {
     log: (msg: string) => void;
 };
 
+/** #2204: classify a toFile target BEFORE touching the filesystem. Plain paths
+ *  (POSIX, Windows drive letters `C:\x`/`c:/x`, UNC) go through path.resolve as
+ *  before. A `scheme://` form whose scheme has ≥2 characters is a URI, not a
+ *  path — single-letter "schemes" are drive letters, never URIs (`C://x` stays
+ *  a path): `file://` resolves via fileURLToPath, every other scheme (host
+ *  virtual files, e.g. OMP's `local://`) is refused up front. bili has no
+ *  resolver for it and must not mkdir a directory named after its scheme. */
+function resolveToFileTarget(target: string): { resolved?: string; refusal?: string } {
+    const uri = target.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//);
+    if (uri && uri[1]!.length >= 2) {
+        const scheme = uri[1]!.toLowerCase();
+        if (scheme === "file") {
+            try {
+                return { resolved: fileURLToPath(new URL(target)) };
+            } catch (e) {
+                return { refusal: `malformed file:// URI "${target}" (${String(e)})` };
+            }
+        }
+        return { refusal: `unsupported virtual URI scheme "${scheme}" in toFile "${target}" — bili writes to the local filesystem only; pass an actual filesystem path (absolute, or relative to the proxy cwd) or a file:// URI` };
+    }
+    return { resolved: resolvePath(target) };
+}
+
+/** #2204: shared failure receipt for export paths. Starts with "[decompress
+ *  FAILED:" so the wire loop's repeat-failure guard (loop/core.ts) and the
+ *  plugin-mode success-header detection (plugin.ts) both read it as a failure;
+ *  labels the preview as NOT a completed export, keeps the OS reason, and gives
+ *  a recoverable retry. */
+function exportFailureReceipt(path: string, err: unknown, body: string): ProxyToolResult {
+    const preview = safePrefix(body, 4000);
+    const scope = preview.length < body.length ? `partial content follows (${preview.length} of ${body.length} chars)` : "full content follows";
+    return toolFail(
+        `[decompress FAILED: could not write export to ${path}: ${String(err)}]\n` +
+        `The export did NOT complete — ${scope}. Retry with a writable filesystem path, or omit toFile to restore inline.\n` +
+        preview,
+    );
+}
+
 /** #1691: honor the documented `toFile` argument. A non-empty string writes the
  *  restore to the caller's path regardless of body size (never inflates context;
  *  relative paths resolve against the proxy cwd). An explicit destination is an
  *  intentional artifact, so it is deliberately NOT pushed into trackedTempFiles —
  *  the reaper/beforeExit cleanup must never remove a file asked for by name.
- *  Returns the "written to" pointer text on success (degraded partial on write
- *  failure), or null when toFile was omitted so the caller uses its default. */
-function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header: string, body: string): string | null {
+ *  Returns null when toFile was omitted so the caller uses its default; otherwise
+ *  a status-carrying result (#2204) — success pointer on write, toolFail receipt
+ *  when the target is refused or the write fails. Never a bare string, so no
+ *  caller can re-wrap a failure as toolOk. */
+function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header: string, body: string): ProxyToolResult | null {
     const raw = args.toFile;
     if (raw === undefined || raw === null) return null;
     if (typeof raw !== "string") {
@@ -81,14 +122,19 @@ function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header:
     }
     const target = raw.trim();
     if (target === "") return null;
-    const resolved = resolvePath(target);
+    const t = resolveToFileTarget(target);
+    if (t.refusal !== undefined) {
+        ctx.log(`[acp-decompress] toFile refused before any file operation: ${t.refusal}`);
+        return toolFail(`[decompress FAILED: ${t.refusal}]`);
+    }
+    const resolved = t.resolved!;
     try {
         mkdirSync(dirname(resolved), { recursive: true });
         writeFileSync(resolved, body, { encoding: "utf8", mode: 0o600 });
-        return `${header}\nContent (${body.length} chars) written to: ${resolved}\nUse the read tool to access it.`;
+        return toolOk(`${header}\nContent (${body.length} chars) written to: ${resolved}\nUse the read tool to access it.`);
     } catch (e) {
         ctx.log(`[acp-decompress] toFile write failed: ${resolved} — ${String(e)}`);
-        return `${header}\n[Failed to write to ${resolved}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+        return exportFailureReceipt(resolved, e, body);
     }
 }
 
@@ -167,7 +213,7 @@ export function resolveDecompress(
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
     const toFileOut = toFilePointer(args, ctx, header, body);
-    if (toFileOut !== null) return toolOk(toFileOut);
+    if (toFileOut !== null) return toFileOut;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
     const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {
@@ -178,7 +224,7 @@ export function resolveDecompress(
             reapTempFiles();
             return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
         } catch (e) {
-            return toolOk(`${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`);
+            return exportFailureReceipt(outPath, e, body);
         }
     }
     // #398/#403 + #1294 P2 wiring (dedup of #1316 × #1298): a successful INLINE
@@ -325,7 +371,11 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const body = parts.join("\n\n");
     const toFileOut = toFilePointer(args, ctx, header, body);
     if (toFileOut !== null) {
-        injText = toFileOut;
+        // #2204: a refused or unwritable export is a hard failure — return the
+        // receipt directly. Nothing reached the channel, so no injection is
+        // queued and no restore is counted; the block stays untouched.
+        if (toFileOut.outcome === "failure") return toFileOut;
+        injText = toFileOut.text;
     } else if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
         // [#1207 review F4] Span in the filename (two spans of one block in the
@@ -339,7 +389,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
             reapTempFiles();
             injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
         } catch (e) {
-            injText = `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+            return exportFailureReceipt(outPath, e, body);
         }
     } else {
         injText = `${header}\n${body}`;
