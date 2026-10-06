@@ -374,4 +374,3 @@ The egress audit net (#2248) stays log-only: raw exits (unrecognized frames,
 parse failures) forward as-is and log `[tag-echo] raw exit` so new leak shapes
 become visible without changing the wire. Pinned by
 `tests/unified-acp-invariants.test.ts` (eight tests, both lanes).
-
