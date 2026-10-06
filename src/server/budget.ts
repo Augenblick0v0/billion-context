@@ -1,6 +1,7 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
 import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
+import { applyEstimateCalibration } from "../util.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
@@ -36,9 +37,15 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
  *  #1492: the reported baseline floors only when it is usage-grade — an
  *  estimate-grade baseline (raw-view poison from a transform-failure fallback
  *  arm) would mask the payload's own est through the max() and silently skip
- *  the #453 clamp (fail-open) while the poison persists. */
-export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string): number {
-    const est = estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
+ *  the #453 clamp (fail-open) while the poison persists.
+ *  #2122: the LOCAL side is scaled by the per-route estimator calibration k̂
+ *  (#1933 F1) before the max() — hosts/upstreams whose provider rendering runs
+ *  below bili's local view (e.g. DSH web mode with --no-reasoning-preserve:
+ *  raw chars/4 est ~137K vs provider-billed ~81K) used to win the max() raw
+ *  and starve the output clamp (32768 -> 3357 with ample actual headroom).
+ *  The usage-grade baseline is already provider-measured and is NEVER scaled. */
+export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string, kFactor?: number, kOrigin?: string, origin?: string): number {
+    const est = applyEstimateCalibration(estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools), kFactor, kOrigin, origin);
     const baseline = lastInputTokens > 0 && lastInputTokensSource === "usage" ? lastInputTokens : 0;
     return Math.max(baseline, est);
 }
@@ -215,8 +222,11 @@ export function clampOutgoingOutput(
      *  deliberately computed against nativeWindow (the true upstream constraint
      *  input+out <= window), never against this one: when max_tokens > 25% of the
      *  window the overflow boundary lies BELOW the headroom target, so capping
-     *  against it would no-op exactly when post-compression turns need the
-     *  guarantee most (#453). */ headroomWindow?: number },
+      *  against it would no-op exactly when post-compression turns need the
+      *  guarantee most (#453). */ headroomWindow?: number;
+     /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
+      *  side of estimateInputTokens so the clamp judges the payload on the same
+      *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
@@ -224,7 +234,7 @@ export function clampOutgoingOutput(
     if (typeof raw !== "number") return;
     // #488: images ride along in the rebuilt body but are invisible to the text model —
     // without them the cap is too generous and input+output can still overflow.
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource) + ctx.imageTokens;
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
