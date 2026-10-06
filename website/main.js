@@ -10,6 +10,7 @@
       "nav.install": "Install",
       "nav.paper": "Paper",
       "nav.docs": "Docs",
+      "nav.blog": "Blog",
       "hero.kicker_live": "runs on your machine, sees nothing else",
       "hero.t1": "Month-long sessions",
       "hero.t2": "on a 100K window.",
@@ -221,6 +222,7 @@
       "nav.install": "安装",
       "nav.paper": "论文",
       "nav.docs": "文档",
+      "nav.blog": "博客",
       "hero.kicker_live": "运行在你自己的机器上，不碰其他数据",
       "hero.t1": "月级长会话，",
       "hero.t2": "百 K 窗口就够。",
@@ -435,7 +437,12 @@
     var l = s.get("lang") || (h === "zh" || h === "en" ? h : null);
     if (l) { try { localStorage.setItem(KEY, l); } catch (e) {}
       history.replaceState(null, "", location.pathname); }
-    try { return localStorage.getItem(KEY) === "zh" ? "zh" : "en"; } catch (e) { return "en"; }
+    try {
+      var saved = localStorage.getItem(KEY);
+      if (saved === "zh" || saved === "en") return saved;
+      var nav = (navigator.languages && navigator.languages[0]) || navigator.language || "";
+      return nav.indexOf("zh") === 0 ? "zh" : "en";
+    } catch (e) { return "en"; }
   }
 
   function apply(lang) {
