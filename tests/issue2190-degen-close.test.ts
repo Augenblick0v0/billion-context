@@ -299,6 +299,104 @@ test("#2190 round 4 invariant: touching a well-formed pair always fires >=1 drop
     assert.ok(!r.out.includes(LT), "E: no tag markup survives");
 });
 
+// #2190 round 8: field replay — session-1f3d2c0f seq=22409, the exact 71
+// tokenizer shards of a turn whose fourth tag closes with the degenerate
+// name </ak> (k outside every acplike class). Proves the close side needs NO
+// list membership: the ref-anchored open-set rule (degenCloseAfterRef /
+// DEGEN_PAIR) strips it because the body is one bare ref. Output must be the
+// three inter-tag newlines only.
+test("#2190 round 8 field replay: 71 real shards ending in degenerate close strip fully", () => {
+    const AK_SHARDS = [
+        "<",
+        "ac",
+        "p",
+        " tokens",
+        "=\"",
+        "299",
+        "\"",
+        " type",
+        "=\"",
+        "text",
+        "\">",
+        "m",
+        "122",
+        "07",
+        "</",
+        "ac",
+        "p",
+        ">\n",
+        "<",
+        "ac",
+        "p",
+        " tokens",
+        "=\"",
+        "473",
+        "\"",
+        " type",
+        "=\"",
+        "text",
+        "\">",
+        "m",
+        "122",
+        "05",
+        "</",
+        "ac",
+        "p",
+        ">\n",
+        "<",
+        "ac",
+        "p",
+        " tokens",
+        "=\"",
+        "221",
+        "\"",
+        " type",
+        "=\"",
+        "text",
+        "\">",
+        "m",
+        "122",
+        "06",
+        "</",
+        "ac",
+        "p",
+        ">\n",
+        "<",
+        "ac",
+        "p",
+        " tokens",
+        "=\"",
+        "120",
+        "\"",
+        " type",
+        "=\"",
+        "text",
+        "\">",
+        "m",
+        "122",
+        "11",
+        "</",
+        "ak",
+        ">"
+    ];
+    let drops = 0;
+    const tagFilter = composeStreamFilters(
+        composeStreamFilters(createTagEchoFilter(() => { drops++; }), createMarkerLineFilter()),
+        createBiliArtifactFilter(),
+    );
+    let out = "";
+    for (const delta of AK_SHARDS) {
+        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDegenerateRenderTag(delta) && !tagFilter.pending()) {
+            out += delta;
+            continue;
+        }
+        out += tagFilter.push(delta);
+    }
+    out += tagFilter.flush();
+    assert.equal(out, "\n\n\n", "only the three inter-tag newlines may survive");
+    assert.ok(drops >= 1, "drop must be logged");
+});
+
 test("#2190 round 2 gate: drift-name heads engage the render-tag predicates once spaced", () => {
     assert.equal(mayStartRenderTag("\x3cacacp "), true);
     assert.equal(mayStartRenderTag("\x3caccessp x"), true);
