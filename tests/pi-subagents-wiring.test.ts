@@ -17,11 +17,14 @@ process.env.HOME = HOME;
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Handler>; tools: string[]; commands: string[]; shortcuts: string[] } {
+type CommandOptions = { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> };
+
+function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Handler>; tools: string[]; commands: string[]; shortcuts: string[]; commandOpts: Map<string, CommandOptions> } {
     const handlers = new Map<string, Handler>();
     const tools: string[] = [];
     const commands: string[] = [];
     const shortcuts: string[] = [];
+    const commandOpts = new Map<string, CommandOptions>();
     const pi = {
         on: (event: string, handler: Handler) => {
             handlers.set(event, handler);
@@ -29,19 +32,25 @@ function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Handler>; tools: st
         registerTool: (tool: { name: string }) => {
             tools.push(tool.name);
         },
-        registerCommand: (name: string) => {
+        registerCommand: (name: string, options?: CommandOptions) => {
             commands.push(name);
+            if (options !== undefined) commandOpts.set(name, options);
         },
         registerShortcut: (key: string) => {
             shortcuts.push(key);
         },
     } as unknown as ExtensionAPI;
-    return { pi, handlers, tools, commands, shortcuts };
+    return { pi, handlers, tools, commands, shortcuts, commandOpts };
 }
 
-function sessionCtx(): { sessionManager: { buildContextEntries: () => unknown; getSessionId: () => string }; cwd: string } {
+function sessionCtx(): { sessionManager: { buildContextEntries: () => unknown; getSessionId: () => string }; cwd: string; ui: { notifications: Array<[string, string?]>; notify: (message: string, type?: string) => void } } {
     const cwd = fs.mkdtempSync(path.join(HOME, "project-"));
-    return { sessionManager: { buildContextEntries: () => [], getSessionId: () => "sid-1" }, cwd };
+    const notifications: Array<[string, string?]> = [];
+    return {
+        sessionManager: { buildContextEntries: () => [], getSessionId: () => "sid-1" },
+        cwd,
+        ui: { notifications, notify: (message, type) => { notifications.push([message, type]); } },
+    };
 }
 
 function embeddedClaimed(): boolean {
@@ -127,16 +136,40 @@ test("session_shutdown disposes the status widget without a live session", () =>
     assert.ok(true);
 });
 
-test("acp-fleet command handler guards on policy.enabled", async () => {
-    const { pi, handlers, commands } = fakePi();
+test("acp-fleet command handler notifies instead of opening the inspector when delegate is disabled", async () => {
+    const { pi, handlers, tools, commands, commandOpts } = fakePi();
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
     wirePiSubagents(pi, "pi");
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
     const ctx = sessionCtx();
+    fs.mkdirSync(path.join(ctx.cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(ctx.cwd, ".pi", "acp.json"), JSON.stringify({ delegate: { enabled: false } }));
     await handlers.get("session_start")!(undefined, ctx);
+    assert.deepEqual(tools, []);
     assert.deepEqual(commands, ["acp-fleet"]);
-    // The wiring captured its own registerCommand closure; reaching it again
-    // would need the fake to store options — verified by command presence and
-    // the handler's no-crash behavior through the wiring above.
-    void {} as unknown as CommandCtx;
+    const opts = commandOpts.get("acp-fleet");
+    assert.ok(opts, "acp-fleet registered with options");
+    await opts.handler("", { ui: ctx.ui });
+    assert.equal(ctx.ui.notifications.length, 1);
+    assert.match(ctx.ui.notifications[0][0], /not enabled/);
+});
+
+test("project-scope pi-subagents install stands acp_delegate down (#415)", async () => {
+    const { pi, handlers, tools, commands, shortcuts } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    fs.mkdirSync(path.join(ctx.cwd, ".pi", "npm", "node_modules", "pi-subagents"), { recursive: true });
+    fs.writeFileSync(
+        path.join(ctx.cwd, ".pi", "npm", "node_modules", "pi-subagents", "package.json"),
+        JSON.stringify({ name: "pi-subagents", version: "1.0.0" }),
+    );
+    await handlers.get("session_start")!(undefined, ctx);
+    assert.deepEqual(tools, []);
+    assert.deepEqual(commands, ["acp-fleet"]);
+    assert.equal(shortcuts.length, 0);
+    assert.equal(ctx.ui.notifications.length, 1);
+    assert.match(ctx.ui.notifications[0][0], /pi-subagents detected/);
+    assert.equal(ctx.ui.notifications[0][1], "warning");
 });
