@@ -2780,7 +2780,7 @@ test("buildCodexArgs: #2260(D) last-wins holds across `--` — a user -c before 
     ]);
 });
 
-test("buildCodexArgs: #2289 resume — rewrites insert BEFORE the `resume` subcommand so the user's -c model=… survives codex's exec-resume parsing", () => {
+test("buildCodexArgs: #2281 resume — rewrites insert BEFORE the `resume` subcommand so the user's -c model=… survives codex's exec-resume parsing", () => {
     const rewrites: HttpRewrite[] = [
         { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
     ];
@@ -2793,7 +2793,7 @@ test("buildCodexArgs: #2289 resume — rewrites insert BEFORE the `resume` subco
     // rewrites sit ahead of `resume` — a -c AFTER the resume subcommand makes
     // codex-cli 0.147.0 drop the earlier `-c model=…` on exec resume (bisected
     // against the real binary: [-c model=B, resume, --last, -c provider…, prompt]
-    // still loses model=B; see issue #2289).
+    // still loses model=B; see issue #2281).
     assert.deepEqual(out, [
         "exec", "--skip-git-repo-check", "-c", "model=gpt-5-codex",
         "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
@@ -2801,7 +2801,7 @@ test("buildCodexArgs: #2289 resume — rewrites insert BEFORE the `resume` subco
     ]);
 });
 
-test("buildCodexArgs: #2289 never splits a value-taking flag from its value — trailing `-c <value>` keeps the legacy append", () => {
+test("buildCodexArgs: #2281 never splits a value-taking flag from its value — trailing `-c <value>` keeps the legacy append", () => {
     const rewrites: HttpRewrite[] = [
         { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
     ];
@@ -2817,7 +2817,7 @@ test("buildCodexArgs: #2289 never splits a value-taking flag from its value — 
     ]);
 });
 
-test("buildCodexArgs: #2289 flags-only tail and unknown-flag tails keep the append behavior", () => {
+test("buildCodexArgs: #2281 flags-only tail and unknown-flag tails keep the append behavior", () => {
     const rewrites: HttpRewrite[] = [
         { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
     ];
@@ -2827,7 +2827,7 @@ test("buildCodexArgs: #2289 flags-only tail and unknown-flag tails keep the appe
     );
 });
 
-test("buildCodexArgs: #2289 `resume` with no trailing prompt still anchors the rewrites before it", () => {
+test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the rewrites before it", () => {
     const rewrites: HttpRewrite[] = [
         { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
     ];

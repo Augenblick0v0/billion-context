@@ -1002,7 +1002,7 @@ const CODEX_BOOLEAN_FLAGS = new Set([
  * rewrites must land BEFORE it (appending turned them into prompt text and
  * silently bypassed the proxy).
  *
- * #2289: codex-cli 0.147.0 parses `exec resume` such that a `-c` flag placed
+ * #2281: codex-cli 0.147.0 parses `exec resume` such that a `-c` flag placed
  * AFTER the positional prompt silently DROPS an earlier `-c model=…` on the
  * same command line (bisected 2026-10-07: resume + trailing `-c` loses the
  * override; fresh exec, or resume without a trailing `-c`, both keep it).
