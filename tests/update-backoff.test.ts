@@ -43,7 +43,7 @@ function registryDoc(version: string): object {
 }
 
 test("checkForUpdate: a persistently failing install backs off instead of retrying every cycle", async () => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     const originalFetch = globalThis.fetch;
     const lines: string[] = [];
     setLogCapture((_level, msg) => {
@@ -76,7 +76,7 @@ test("checkForUpdate: a persistently failing install backs off instead of retryi
     } finally {
         globalThis.fetch = originalFetch;
         setLogCapture(null);
-        _resetInstallBackoffForTest();
+        await _resetInstallBackoffForTest();
         delete process.env.XDG_CACHE_HOME;
         delete process.env.BILI_UPDATE_CHECK_INTERVAL_MS;
         rmSync(root, { recursive: true, force: true });

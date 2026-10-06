@@ -159,6 +159,9 @@ const BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
 interface InstallBackoff {
     count: number;
     nextRetryAt: number;
+    /** When this entry was last touched — ages out stale below-threshold
+     *  streaks that never armed a cooldown (nextRetryAt stays 0 for them). */
+    updatedAt: number;
 }
 // #2192: one entry per key — the global lane and each owner lane carry
 // independent failure streaks, so a single shared slot could not serve them
@@ -166,9 +169,88 @@ interface InstallBackoff {
 const installBackoffs = new Map<string, InstallBackoff>();
 const installBackoffRemediatedKeys = new Set<string>();
 
-export function _resetInstallBackoffForTest(): void {
+// #2192 follow-up: streaks are shared across ALL bili copies on the machine
+// via a small JSON state file in the cache dir. The map alone is per-process,
+// so k running instances (global + one proxy per dsh profile) each carried an
+// independent 3-strike budget and multiplied the retry rate k×. The file is
+// the cross-process carrier; the in-memory map is a write-through cache, and
+// sharing is approximate (concurrent writers are last-write-wins — good
+// enough for bounding a retry loop). Every failure mode of the FILE biases
+// toward RETRYING, never toward silence: unreadable/corrupt → treated empty,
+// entries whose nextRetryAt is beyond now+cap (jumped clock, bit rot) →
+// dropped so the lane re-arms, stale entries → pruned. Bad state on disk can
+// never permanently stop an update lane.
+const BACKOFF_STATE_FILE = path.join(cacheDir(), ".install-backoff.json");
+// Entries untouched for a week are gone for good: every cooldown is capped at
+// 6 h, so a week-old entry can only be residue of a dead version key.
+const BACKOFF_PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
+let backoffsLoaded = false;
+
+async function ensureBackoffsLoaded(): Promise<void> {
+    if (backoffsLoaded) return;
+    backoffsLoaded = true;
+    let raw: string;
+    try {
+        raw = await readFile(BACKOFF_STATE_FILE, "utf-8");
+    } catch {
+        return; // absent or unreadable → start empty (bias: retry)
+    }
+    try {
+        const doc = JSON.parse(raw) as { v?: unknown; entries?: unknown };
+        if (!doc || typeof doc !== "object" || doc.v !== 1 || !doc.entries || typeof doc.entries !== "object" || Array.isArray(doc.entries)) return;
+        const now = Date.now();
+        for (const [key, val] of Object.entries(doc.entries as Record<string, unknown>)) {
+            const b = val as { count?: unknown; nextRetryAt?: unknown; updatedAt?: unknown };
+            if (typeof b?.count !== "number" || typeof b?.nextRetryAt !== "number" || typeof b?.updatedAt !== "number") continue;
+            if (!Number.isFinite(b.count) || b.count <= 0 || !Number.isFinite(b.nextRetryAt) || !Number.isFinite(b.updatedAt)) continue;
+            // clock-skew / corruption guard: a cooldown beyond now+cap can only
+            // come from a jumped clock or a damaged file. Drop it so the lane
+            // re-arms instead of going silent for weeks.
+            if (b.nextRetryAt > now + BACKOFF_CAP_MS) continue;
+            // stale: untouched for a week → residue of a dead key.
+            if (b.updatedAt < now - BACKOFF_PRUNE_MS) continue;
+            if (!installBackoffs.has(key)) installBackoffs.set(key, { count: b.count, nextRetryAt: b.nextRetryAt, updatedAt: b.updatedAt });
+        }
+    } catch {
+        return; // corrupt JSON → empty (bias: retry)
+    }
+}
+
+async function persistBackoffs(): Promise<void> {
+    try {
+        const now = Date.now();
+        const entries: Record<string, { count: number; nextRetryAt: number; updatedAt: number }> = {};
+        let live = 0;
+        for (const [key, b] of installBackoffs) {
+            if (b.updatedAt < now - BACKOFF_PRUNE_MS) continue; // prune stale on write
+            entries[key] = { count: b.count, nextRetryAt: b.nextRetryAt, updatedAt: b.updatedAt };
+            live += 1;
+        }
+        await mkdir(path.dirname(BACKOFF_STATE_FILE), { recursive: true });
+        if (live === 0) {
+            await rm(BACKOFF_STATE_FILE, { force: true });
+        } else {
+            await writeFile(BACKOFF_STATE_FILE, JSON.stringify({ v: 1, entries }), "utf-8");
+        }
+    } catch {
+        // best-effort: an unwritable cache dir degrades to per-process memory
+    }
+}
+
+export async function _resetInstallBackoffForTest(): Promise<void> {
     installBackoffs.clear();
     installBackoffRemediatedKeys.clear();
+    backoffsLoaded = false;
+    await rm(BACKOFF_STATE_FILE, { force: true });
+}
+
+/** Test-only: simulate a fresh process — forget the in-memory map and the
+ *  loaded flag WITHOUT touching the state file, so the next gate re-loads
+ *  from disk (cross-process sharing assertions). */
+export function _reloadBackoffsForTest(): void {
+    installBackoffs.clear();
+    installBackoffRemediatedKeys.clear();
+    backoffsLoaded = false;
 }
 
 /** Test-only snapshot of the live backoff entries (key → streak state). */
@@ -188,14 +270,23 @@ export function ownerLaneKey(lane: "dsh-desktop" | "dsh-profile" | "pi-npm", ver
     return `owner:${lane}:${version}`;
 }
 
-function backoffInCooldown(key: string): boolean {
+async function backoffInCooldown(key: string): Promise<boolean> {
+    await ensureBackoffsLoaded();
     const b = installBackoffs.get(key);
     return !!b && Date.now() < b.nextRetryAt;
 }
 
-function clearInstallBackoff(key: string): void {
-    installBackoffs.delete(key);
-    installBackoffRemediatedKeys.delete(key);
+async function clearInstallBackoff(key: string): Promise<void> {
+    await ensureBackoffsLoaded();
+    const had = (installBackoffs.delete(key) ? 1 : 0) | (installBackoffRemediatedKeys.delete(key) ? 1 : 0);
+    if (had) void persistBackoffs();
+}
+
+/** #2192: manual repair hook — `bili plugin update`'s dsh lane calls this on
+ *  a clean run so a successful manual fix immediately disarms the lane's
+ *  cooldown instead of waiting out the window (up to 6 h). */
+export async function clearOwnerLaneBackoff(lane: "dsh-desktop" | "dsh-profile" | "pi-npm", version: string): Promise<void> {
+    await clearInstallBackoff(ownerLaneKey(lane, version));
 }
 
 export function backoffMs(count: number): number {
@@ -232,17 +323,27 @@ function installDirNote(installDir: string | undefined): string {
 /** Record one failed attempt under `key`. `hint` overrides the generic
  *  remediationHint on the escalation line — owner lanes pass their own manual
  *  fix there (#2192); the global lane passes none and keeps today's wording. */
-function recordInstallFailure(key: string, error: string, installDir: string | undefined, hint?: string): void {
-    const b = installBackoffs.get(key) ?? { count: 0, nextRetryAt: 0 };
+async function recordInstallFailure(key: string, error: string, installDir: string | undefined, hint?: string): Promise<void> {
+    await ensureBackoffsLoaded();
+    const now = Date.now();
+    const b = installBackoffs.get(key) ?? { count: 0, nextRetryAt: 0, updatedAt: now };
     b.count += 1;
+    b.updatedAt = now;
+    if (b.count >= BACKOFF_THRESHOLD) {
+        // arm BEFORE persisting: persistBackoffs runs its snapshot
+        // synchronously, so a write scheduled earlier would freeze the
+        // pre-assignment nextRetryAt (=0, unarmed) into the state file.
+        b.nextRetryAt = now + backoffMs(b.count);
+    }
     installBackoffs.set(key, b);
+    void persistBackoffs(); // write-through even below threshold: crash-looping
+    // processes never reach 3 strikes in one life, so early strikes must
+    // survive restarts for the machine-wide budget to arm.
     const note = installDirNote(installDir);
     if (b.count < BACKOFF_THRESHOLD) {
         loggerLog("warn", `[update] install failed: ${error}${note}. Will retry next cycle.`);
         return;
     }
-    const now = Date.now();
-    b.nextRetryAt = now + backoffMs(b.count);
     const waitMin = Math.round(backoffMs(b.count) / 60_000);
     if (!installBackoffRemediatedKeys.has(key)) {
         installBackoffRemediatedKeys.add(key);
@@ -876,12 +977,12 @@ const PI_LANE_HINT = `run \`pi update --extension ${PI_NPM_SPEC}\` from a shell 
  *  stay consistent no matter which instance triggers the refresh. */
 async function runProfileBundlesRefresh(targetVersion: string, log: Logger, env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const key = ownerLaneKey("dsh-profile", targetVersion);
-    if (backoffInCooldown(key)) return;
+    if (await backoffInCooldown(key)) return;
     const res = await refreshDshProfileBundles(targetVersion, log, env);
     if (res.failed > 0) {
-        recordInstallFailure(key, `${res.failed} dsh profile bundle(s) failed to refresh to ${targetVersion}`, undefined, PROFILE_LANE_HINT);
+        await recordInstallFailure(key, `${res.failed} dsh profile bundle(s) failed to refresh to ${targetVersion}`, undefined, PROFILE_LANE_HINT);
     } else {
-        clearInstallBackoff(key);
+        await clearInstallBackoff(key);
     }
 }
 
@@ -954,29 +1055,29 @@ export async function refreshDshDesktopCopy(
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);
-        recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
+        await recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
         return;
     }
-    if (backoffInCooldown(bkey)) return; // #2192: inside the backoff window — no registry call, no download
+    if (await backoffInCooldown(bkey)) return; // #2192: inside the backoff window — no registry call, no download
     try {
         const doc = await fetchVersionDoc({ resolveProxy }, DSH_PACKAGE, targetVersion);
         if (!doc?.tarball) {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);
-            recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE}: no dist.tarball for ${targetVersion} on the registry`, undefined, DESKTOP_LANE_HINT);
+            await recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE}: no dist.tarball for ${targetVersion} on the registry`, undefined, DESKTOP_LANE_HINT);
             return;
         }
         const result = await installViaTarball(targetVersion, doc.tarball, flat, doc.integrity, doc.shasum, egressDispatcher({ resolveProxy }, doc.tarball), env, { bootSmoke: true });
         if (result.ok) {
-            clearInstallBackoff(bkey);
+            await clearInstallBackoff(bkey);
             log("info", `[update] refreshed dsh ${DSH_DESKTOP_PROFILE} profile copy in place (${diskVersion ?? "?"} \u2192 ${targetVersion}) \u2014 restart dsh to load it (the running app keeps the old code in memory; across the handoff bili tools may fail once until dsh restarts, #2082)`);
         } else {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed: ${result.error}; retrying next cycle`);
-            recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh to ${targetVersion} failed: ${result.error}`, undefined, DESKTOP_LANE_HINT);
+            await recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh to ${targetVersion} failed: ${result.error}`, undefined, DESKTOP_LANE_HINT);
         }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}; leaving the copy untouched`);
-        recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
+        await recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh check failed: ${msg}`, undefined, DESKTOP_LANE_HINT);
     }
 }
 
@@ -1018,7 +1119,7 @@ export async function refreshPiNpmCopy(
         log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
-    if (backoffInCooldown(ownerLaneKey("pi-npm", latest))) return; // #2192: inside the backoff window — no spawn
+    if (await backoffInCooldown(ownerLaneKey("pi-npm", latest))) return; // #2192: inside the backoff window — no spawn
     log("info", `[update] pi npm copy is stale (${currentVersion} → ${latest}) — refreshing via pi's update channel`);
     const lock = await tryAcquireLock();
     if (!lock) {
@@ -1027,12 +1128,12 @@ export async function refreshPiNpmCopy(
     }
     try {
         await runPiAsync(["update", "--extension", PI_NPM_SPEC], env);
-        clearInstallBackoff(ownerLaneKey("pi-npm", latest));
+        await clearInstallBackoff(ownerLaneKey("pi-npm", latest));
         log("info", `[update] pi npm copy refreshed to ${latest} — restart pi to load it`);
     } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         log("warn", `[update] pi npm copy refresh to ${latest} failed: ${detail} — manual fix: run \`pi update --extension ${PI_NPM_SPEC}\` from a shell where \`pi\` resolves (or point BILI_PI_BIN at pi's executable); retries next check cycle`);
-        recordInstallFailure(ownerLaneKey("pi-npm", latest), `pi npm copy refresh to ${latest} failed: ${detail}`, undefined, PI_LANE_HINT);
+        await recordInstallFailure(ownerLaneKey("pi-npm", latest), `pi npm copy refresh to ${latest} failed: ${detail}`, undefined, PI_LANE_HINT);
     } finally {
         await lock.release();
     }
@@ -1241,7 +1342,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
 
         const bkey = backoffKey(installDir, latest);
-        if (!force && backoffInCooldown(bkey)) {
+        if (!force && (await backoffInCooldown(bkey))) {
             return;
         }
 
@@ -1256,7 +1357,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         try {
             const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
-                clearInstallBackoff(bkey);
+                await clearInstallBackoff(bkey);
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -1266,7 +1367,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
                 notifyStaleInstall(opts, latest);
             } else {
-                recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
+                await recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
                 logInstallLocationOnce(installDir, opts.packageName, loggerLog);
             }
         } finally {

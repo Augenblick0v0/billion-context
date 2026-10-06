@@ -38,6 +38,8 @@ const {
     _resetInstallBackoffForTest,
     _resetUpdateThrottleForTest,
     _installBackoffStateForTest,
+    _reloadBackoffsForTest,
+    clearOwnerLaneBackoff,
     ownerLaneKey,
     ownerLaneIntervalMs,
 } = await import("../src/update.ts");
@@ -120,7 +122,7 @@ function captureAll(): { lines: string[]; log: CaptureLog } {
 // — (a)+(b) desktop lane —————————————————————————————————————————————————————————
 
 test("desktop lane: a persistently failing refresh backs off — silent no-op inside the window (#2192)", { timeout: 60_000 }, async (t) => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     const base = mkdtempSync(path.join(root, "t1-"));
     const prevDshHome = process.env.DSH_HOME;
     const originalFetch = globalThis.fetch;
@@ -163,7 +165,7 @@ test("desktop lane: a persistently failing refresh backs off — silent no-op in
 });
 
 test("desktop lane: success resets the owner-lane key, a fresh streak starts over (#2192)", { timeout: 60_000 }, async (t) => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     const base = mkdtempSync(path.join(root, "t2-"));
     const prevDshHome = process.env.DSH_HOME;
     const originalFetch = globalThis.fetch;
@@ -211,7 +213,7 @@ test("desktop lane: success resets the owner-lane key, a fresh streak starts ove
 // — (c) profile + pi lanes —————————————————————————————————————————————————————
 
 test("profile lane: repeated bundle failures back off per lane+version; new version re-arms; lanes independent (#2192)", { timeout: 60_000 }, async (t) => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     const base = mkdtempSync(path.join(root, "t3-"));
     t.after(() => {
         setLogCapture(null);
@@ -275,7 +277,7 @@ test("profile lane: repeated bundle failures back off per lane+version; new vers
 });
 
 test("pi lane: bounded retries, existing manual-fix warn preserved, success clears, new version re-arms (#2192)", async (t) => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     const base = mkdtempSync(path.join(root, "t3b-"));
     const originalFetch = globalThis.fetch;
     t.after(() => {
@@ -348,7 +350,7 @@ test("pi lane: bounded retries, existing manual-fix warn preserved, success clea
 // — (d) host-managed throttle marker ———————————————————————————————————————————
 
 test("host-managed instances throttle on their own marker with the owner-lane cadence (#2192)", async (t) => {
-    _resetInstallBackoffForTest();
+    await _resetInstallBackoffForTest();
     await _resetUpdateThrottleForTest();
     const base = mkdtempSync(path.join(root, "t4-"));
     const prevDshHome = process.env.DSH_HOME;
@@ -416,4 +418,132 @@ test("ownerLaneIntervalMs: 30 min floor, 15 min jitter ceiling (#2192)", () => {
     assert.equal(ownerLaneIntervalMs(() => 0), 30 * 60_000);
     assert.equal(ownerLaneIntervalMs(() => 1), 45 * 60_000);
     assert.equal(ownerLaneIntervalMs(() => 0.5), 37 * 60_000 + 30_000);
+});
+
+// — (e) cross-process streak sharing + manual-repair disarm (#2192 follow-up) —
+
+function stateFilePath(): string {
+    return path.join(process.env.XDG_CACHE_HOME!, "billion-context", ".install-backoff.json");
+}
+
+function readStateFile(): { entries: Record<string, { count: number; nextRetryAt: number }> } {
+    return JSON.parse(readFileSync(stateFilePath(), "utf-8")) as { entries: Record<string, { count: number; nextRetryAt: number }> };
+}
+
+test("streaks are shared across bili processes via the cache-dir state file; a manual fix disarms immediately (#2192)", { timeout: 60_000 }, async (t) => {
+    await _resetInstallBackoffForTest();
+    const base = mkdtempSync(path.join(root, "t5-"));
+    t.after(() => {
+        setLogCapture(null);
+        _setDshRunnersForTest(undefined);
+        rmrf(base);
+    });
+    const dshHome = path.join(base, "dsh");
+    const aDir = path.join(dshHome, "profiles", "a");
+    const installDir = path.join(aDir, "node_modules", "billion-context");
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(path.join(aDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^1.0.0" } }));
+    writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "1.0.0" }));
+    const env = { ...process.env, DSH_HOME: dshHome };
+
+    const calls: string[] = [];
+    const failing = async (plan: DshPlan) => {
+        calls.push(plan.args.join(" "));
+        throw Object.assign(new Error("exit 1"), { status: 1, stderr: "plugin channel down" });
+    };
+    const healthy = async (plan: DshPlan) => {
+        calls.push(plan.args.join(" "));
+        return { stdout: "", stderr: "" };
+    };
+    try {
+        _setDshRunnersForTest({ async: failing });
+        const { log } = captureAll();
+        const key = ownerLaneKey("dsh-profile", "2.0.0");
+
+        // arm the cooldown (3 strikes) in "process one"
+        for (let i = 0; i < 3; i++) await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 3);
+        assert.equal(_installBackoffStateForTest()[key]?.count, 3, "third strike arms the cooldown");
+        assert.ok(existsSync(stateFilePath()), "armed cooldown must be persisted to the cache-dir state file");
+        assert.equal(readStateFile().entries[key]?.count, 3, "the state file carries the armed streak");
+
+        // "process two" — fresh in-memory map, same state file on disk — honors
+        // the cooldown written by process one (pre-fix: k instances each burned
+        // their own 3-strike budget, multiplying the retry rate k×).
+        _reloadBackoffsForTest();
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 3, "a fresh process must honor the shared cooldown — no 4th spawn");
+
+        // a successful manual repair (`bili plugin update`) disarms the lane
+        // immediately instead of waiting out the ≤6 h window
+        await clearOwnerLaneBackoff("dsh-profile", "2.0.0");
+        assert.equal(_installBackoffStateForTest()[key], undefined, "manual clear wipes the armed entry");
+        _reloadBackoffsForTest();
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 4, "disarmed lane attempts again");
+
+        // and a healthy run clears the streak for good — the state file drops
+        // the key once nothing is cooling down
+        _setDshRunnersForTest({ async: healthy });
+        await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
+        assert.equal(calls.length, 5);
+        const persisted = existsSync(stateFilePath()) ? readStateFile().entries[key] : undefined;
+        assert.equal(persisted, undefined, "success must drop the key from the state file");
+    } finally {
+        _setDshRunnersForTest(undefined);
+    }
+});
+
+// — (f) the state file can never silence a lane (#2192 follow-up) —
+
+test("a corrupt or clock-skewed backoff state file biases toward retrying, never silence (#2192)", { timeout: 60_000 }, async (t) => {
+    await _resetInstallBackoffForTest();
+    const base = mkdtempSync(path.join(root, "t6-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        setLogCapture(null);
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        rmrf(base);
+    });
+    try {
+        const fx = buildDesktopFixture(base, "1.2.3", "2.0.0"); // healthy tarball
+        process.env.DSH_HOME = fx.dshHome;
+        const hits = { count: 0 };
+        stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz), hits);
+        const { lines, log } = captureAll();
+        const key = ownerLaneKey("dsh-desktop", "2.0.0");
+
+        // (1) garbage file — not even valid JSON: dropped, lane attempts
+        mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+        writeFileSync(stateFilePath(), "{{{not json at all");
+        _reloadBackoffsForTest();
+        await refreshDshDesktopCopy("2.0.0", log, process.env);
+        assert.ok(hits.count > 0, `a corrupt state file must not stop the lane: ${lines.join(" | ")}`);
+        assert.ok(lines.some((l) => l.startsWith("info:") && l.includes("in place")), `healthy refresh expected: ${lines.join(" | ")}`);
+        assert.equal(_installBackoffStateForTest()[key], undefined, "success clears the lane key");
+
+        // (2) clock-skew guard: an armed cooldown dated 90 days out can only be
+        // a jumped clock or bit rot — dropped so the lane re-arms instead of
+        // going silent for months
+        const far = Date.now() + 90 * 24 * 60 * 60 * 1000;
+        writeFileSync(stateFilePath(), JSON.stringify({ v: 1, entries: { [key]: { count: 9, nextRetryAt: far, updatedAt: Date.now() } } }));
+        // reset the disk to stale so the refresh actually has work to do
+        const fx2 = buildDesktopFixture(path.join(base, "again"), "1.2.3", "2.0.0");
+        process.env.DSH_HOME = fx2.dshHome;
+        stubRegistryFetch(fx2.tgz, "https://registry.test/bc2-2.0.0.tgz", "2.0.0", integrityField(fx2.tgz), hits);
+        const hitsBefore = hits.count;
+        _reloadBackoffsForTest();
+        await refreshDshDesktopCopy("2.0.0", log, process.env);
+        assert.ok(hits.count > hitsBefore, `a clock-skewed state entry must be dropped, not obeyed: ${lines.join(" | ")}`);
+        assert.ok(_installBackoffStateForTest()[key] === undefined, "the healthy run cleared the lane key");
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
 });
