@@ -121,6 +121,7 @@ import {
     type SpawnChild,
     type SpawnFn,
     runLaunch,
+    runTestPi,
     type ClientName,
     type ClientConfig,
     type HttpRewrite,
@@ -1805,6 +1806,227 @@ test("ensureProxyRunning: strictPort launcher refuses a different-port starter's
     } finally {
         removeStartingMarker();
         st.restore();
+    }
+});
+
+// #2177: an explicit ACP_PORT/--port must pin the launch to exactly that port.
+// Before the fix runLaunch/runTestPi omitted strictPort, so pickAttachable could
+// attach to a compatible proxy on ANY other port — a resident `bili start` is
+// exactly such a candidate (wildcard lane + user-zone exempt from the #1335
+// gate) — and the spawned child got no BILI_STRICT_PORT either, so an EADDRINUSE
+// on the requested port silently hopped +1. Either way the client dialed an
+// origin the user did not ask for. port === 0 (omitted) must keep the legacy
+// lane-zone/ephemeral selection untouched.
+function piLaunchEnv(): { fakePi: string; restore: () => void } {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-2177-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiBin = process.env.PI_BIN;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAcPort = process.env.ACP_PORT;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    delete process.env.ACP_PORT;
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    process.env.PI_BIN = fakePi;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: {} }));
+    return {
+        fakePi,
+        restore: () => {
+            if (prevHome === undefined) delete process.env.HOME;
+            else process.env.HOME = prevHome;
+            if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+            else process.env.USERPROFILE = prevUserProfile;
+            if (prevPiBin === undefined) delete process.env.PI_BIN;
+            else process.env.PI_BIN = prevPiBin;
+            if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+            else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+            if (prevAcPort === undefined) delete process.env.ACP_PORT;
+            else process.env.ACP_PORT = prevAcPort;
+        },
+    };
+}
+
+function stubProcessExit(): { calls: number[]; restore: () => void } {
+    const prev = process.exit;
+    const calls: number[] = [];
+    process.exit = ((code?: number) => {
+        calls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+    return {
+        calls,
+        restore: () => {
+            process.exit = prev;
+        },
+    };
+}
+
+function exitingFakeClient(seen: { proxy?: string }): SpawnFn {
+    return (_cmd, _args, options) => {
+        seen.proxy = options.env?.HTTPS_PROXY;
+        const child = makeFakeChild(0);
+        const orig = child.on!.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+}
+
+test("runLaunch: explicit ACP_PORT refuses a different-port compatible proxy and pins the exact port (#2177)", async () => {
+    const env = piLaunchEnv();
+    const st = isoStateDir();
+    const ex = stubProcessExit();
+    try {
+        // resident `bili start`: no lane, no launch token → user zone, exempt
+        // from the #1335 watchdog gate — the pre-fix attach target.
+        const W = liveRegistryInstance({ instanceId: "inst-2177-w", origin: "http://127.0.0.1:18787", port: 18787 });
+        registerInstanceAndWarn(W, () => {});
+        let spawnCalls = 0;
+        let proxyArgs: string[] | undefined;
+        let proxyEnv: NodeJS.ProcessEnv | undefined;
+        const clientSeen: { proxy?: string } = {};
+        const spawnImpl: SpawnFn = (cmd, args, options) => {
+            if (cmd === env.fakePi) return exitingFakeClient(clientSeen)(cmd, args, options);
+            spawnCalls++;
+            proxyArgs = [...args];
+            proxyEnv = options.env;
+            return makeFakeChild(42501);
+        };
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: { ACP_PORT: "8787" } },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) =>
+                    origin.endsWith(":18787")
+                        ? { ok: true, instanceId: "inst-2177-w", watchdog: { armed: false } }
+                        : { ok: true, pid: 42501 },
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 1, "must NOT attach to the other-port resident daemon");
+        assert.equal(proxyEnv?.BILI_STRICT_PORT, "1", "pinned port must be fail-loud in the spawned child");
+        const i = (proxyArgs ?? []).indexOf("--port");
+        assert.ok(i >= 0 && proxyArgs![i + 1] === "8787", "spawned proxy binds the exact requested port");
+        assert.equal(clientSeen.proxy, "http://127.0.0.1:8787", "client dials the requested origin");
+        assert.deepEqual(ex.calls, [0]);
+    } finally {
+        unregisterInstance("inst-2177-w");
+        st.restore();
+        ex.restore();
+        env.restore();
+    }
+});
+
+test("runLaunch: explicit ACP_PORT still attaches to a compatible proxy already bound to that exact port (#2177)", async () => {
+    const env = piLaunchEnv();
+    const st = isoStateDir();
+    const ex = stubProcessExit();
+    try {
+        const S = liveRegistryInstance({ instanceId: "inst-2177-s", origin: "http://127.0.0.1:8787", port: 8787, lane: "pi" });
+        registerInstanceAndWarn(S, () => {});
+        let spawnCalls = 0;
+        const clientSeen: { proxy?: string } = {};
+        const spawnImpl: SpawnFn = (cmd, args, options) => {
+            if (cmd === env.fakePi) return exitingFakeClient(clientSeen)(cmd, args, options);
+            spawnCalls++;
+            return makeFakeChild(42502);
+        };
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: { ACP_PORT: "8787" } },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-2177-s", watchdog: { armed: true } }),
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0, "exact-port compatible instance must be attached, not respawned");
+        assert.equal(clientSeen.proxy, "http://127.0.0.1:8787");
+        assert.deepEqual(ex.calls, [0]);
+    } finally {
+        unregisterInstance("inst-2177-s");
+        st.restore();
+        ex.restore();
+        env.restore();
+    }
+});
+
+test("runLaunch: omitted ACP_PORT keeps the legacy selection (still attaches a user-zone daemon on any port) (#2177)", async () => {
+    const env = piLaunchEnv();
+    const st = isoStateDir();
+    const ex = stubProcessExit();
+    try {
+        const W = liveRegistryInstance({ instanceId: "inst-2177-w2", origin: "http://127.0.0.1:18787", port: 18787 });
+        registerInstanceAndWarn(W, () => {});
+        let spawnCalls = 0;
+        const clientSeen: { proxy?: string } = {};
+        const spawnImpl: SpawnFn = (cmd, args, options) => {
+            if (cmd === env.fakePi) return exitingFakeClient(clientSeen)(cmd, args, options);
+            spawnCalls++;
+            return makeFakeChild(42503);
+        };
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-2177-w2", watchdog: { armed: false } }),
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0, "no explicit port → free to attach to the user-zone daemon (pre-existing behavior)");
+        assert.equal(clientSeen.proxy, "http://127.0.0.1:18787");
+        assert.deepEqual(ex.calls, [0]);
+    } finally {
+        unregisterInstance("inst-2177-w2");
+        st.restore();
+        ex.restore();
+        env.restore();
+    }
+});
+
+test("runTestPi: explicit ACP_PORT pins the spawned proxy to the exact port with BILI_STRICT_PORT (#2177)", async () => {
+    const env = piLaunchEnv();
+    const ex = stubProcessExit();
+    try {
+        let spawnCalls = 0;
+        let proxyEnv: NodeJS.ProcessEnv | undefined;
+        const clientSeen: { proxy?: string } = {};
+        const spawnImpl: SpawnFn = (cmd, args, options) => {
+            if (cmd === env.fakePi) return exitingFakeClient(clientSeen)(cmd, args, options);
+            spawnCalls++;
+            proxyEnv = options.env;
+            return makeFakeChild(42504);
+        };
+        await runTestPi(
+            { overrides: { ACP_PORT: "8787" } },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42504 }),
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.equal(proxyEnv?.BILI_STRICT_PORT, "1", "pinned port must be fail-loud in the spawned child");
+        assert.equal(clientSeen.proxy, "http://127.0.0.1:8787", "client dials the requested origin");
+        assert.deepEqual(ex.calls, [0]);
+    } finally {
+        ex.restore();
+        env.restore();
     }
 });
 
