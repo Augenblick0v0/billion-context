@@ -227,7 +227,10 @@ export function shouldStampRelayAffinityPck(
     if (clientPck !== undefined) return false;
     if (routeRewrittenUrl !== undefined) return true;
     try {
-        return isLoopbackAddress(new URL(upstreamOrigin).hostname);
+        const hostname = new URL(upstreamOrigin).hostname;
+        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
+        // only); a silent miss here would reproduce the zero-signal bug (#2218).
+        return hostname === "localhost" || isLoopbackAddress(hostname);
     } catch {
         return false;
     }

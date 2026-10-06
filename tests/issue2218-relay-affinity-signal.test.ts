@@ -112,6 +112,7 @@ test("#2218 unit: shouldStampRelayAffinityPck gate matrix", () => {
     // non-plugin identity sources (codex session-id header, plain clients) stay unstamped
     assert.equal(shouldStampRelayAffinityPck("session-id", undefined, loop, loop), false);
     assert.equal(shouldStampRelayAffinityPck(undefined, undefined, loop, loop), false);
+    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "http://localhost:7864/v1"), true);
     // unparseable origin is not a deliberate deployment → no stamp
     assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "not-a-url"), false);
 });
