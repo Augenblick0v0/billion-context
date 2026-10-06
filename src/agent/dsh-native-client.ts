@@ -11,13 +11,19 @@
 // serves the live origin at GET /bili/origin on the dsh webserver; this
 // section polls that route while unresolved so the entry upgrades without a
 // reload or app restart. Neither source known ⇒ degrade to a hint instead of
-// a dead link.
+// a dead link. The same panel is mounted at two slots (#2125): settings.section
+// (always present — the launcher posture has no bundle page) and
+// plugins.bundle.config (keyed by package name; the plugin detail page renders
+// it only when this package is installed as a profile bundle and draws the
+// title itself, so that registration drops the h3).
 
 import { createElement, useEffect, useState } from "react";
 
 type Dict = Record<string, string>;
 
-type SlotOptions = { name: string; id: string; order: number; label: () => string; locale: string };
+type SlotOptions =
+    | { name: string; id: string; order: number; label: () => string; locale: string }
+    | { name: string; key: string; locale: string };
 
 type ClientContext = {
     effect: (fn: () => void | (() => void), label?: string) => void;
@@ -35,12 +41,16 @@ export const inject = ["slots", "locale"];
 
 const NS = "bili";
 
-// #1809: live-origin probe cadence — first attempt immediate, then a retry
-// every POLL_INTERVAL_MS up to POLL_MAX_ATTEMPTS total (~30s of coverage for
-// a slow spawn-mode bootstrap, bounded so an absent host costs no more).
+// #1809/#2187: live-origin probe cadence — first attempt immediate, then a
+// retry every POLL_INTERVAL_MS for POLL_MAX_ATTEMPTS total (~30s), after
+// which probing CONTINUES at SLOW_POLL_INTERVAL_MS until the origin arrives
+// or the page unmounts. #2187: the server side now heals a failed spawn-mode
+// bootstrap in the background and a slow Windows boot can take minutes, so
+// stopping at ~30s stranded the entry on "not bound" for the whole session.
 const ORIGIN_PATH = "/bili/origin";
 const POLL_INTERVAL_MS = 3000;
 const POLL_MAX_ATTEMPTS = 10;
+const SLOW_POLL_INTERVAL_MS = 10000;
 
 const zh: Dict = {
     "nav": "bili设置",
@@ -69,9 +79,9 @@ function openExternal(url: string): void {
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
 }
 
-/** #1809: poll the host's live origin route until one arrives; returns the
- *  cancel used as the effect cleanup (no fetch ⇒ no-op, older hosts without
- *  the route simply stay degraded after the attempts are exhausted). */
+/** #1809/#2187: poll the host's live origin route until one arrives; returns
+ *  the cancel used as the effect cleanup (no fetch ⇒ no-op, older hosts
+ *  without the route simply stay degraded). */
 function probeOrigin(onOrigin: (origin: string) => void): () => void {
     if (typeof fetch !== "function") return () => {};
     let cancelled = false;
@@ -93,7 +103,10 @@ function probeOrigin(onOrigin: (origin: string) => void): () => void {
         }
         if (resolved) return;
         attempts += 1;
-        if (!cancelled && attempts < POLL_MAX_ATTEMPTS) timer = setTimeout(() => void poll(), POLL_INTERVAL_MS);
+        // #2187: fast phase for the first POLL_MAX_ATTEMPTS, then an endless
+        // slow phase — the origin can land at any time (background heal).
+        const delay = attempts < POLL_MAX_ATTEMPTS ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
+        if (!cancelled) timer = setTimeout(() => void poll(), delay);
     };
     void poll();
     return () => {
@@ -110,7 +123,7 @@ export function apply(ctx: ClientContext): void {
         "bili: dictionaries",
     );
     const t = ctx.locale.bind(NS);
-    const section = (): unknown => {
+    const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         useEffect(() => {
             if (origin !== undefined) return;
@@ -119,7 +132,7 @@ export function apply(ctx: ClientContext): void {
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-            createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")),
+            titled ? createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")) : null,
             origin === undefined
                 ? createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"))
                 : createElement(
@@ -147,6 +160,10 @@ export function apply(ctx: ClientContext): void {
     };
     ctx.slots.inject(
         "settings.section",
-        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, section),
+        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
+    );
+    ctx.slots.inject(
+        "plugins.bundle.config",
+        () => ctx.slots.register({ name: "plugins.bundle.config", key: "billion-context", locale: NS }, panel(false)),
     );
 }

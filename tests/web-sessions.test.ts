@@ -649,7 +649,7 @@ withSessionsDir("#1937 review: .tmp- mid-name (host label) stays indexed — ker
     assert.ok(det && det.id === "host-tmp", "detail resolves the same file instead of 404ing");
 });
 
-withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir without snapshot → empty (#2152)", async (dir) => {
+withSessionsDir("#1937/#2180: vanished dir serves stale snapshot; explicit missing dir rejects loudly", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -662,8 +662,69 @@ withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir without 
 
     process.env.BILI_SESSIONS_DIR = path.join(dir, "gone-subdir");
     _resetDiskCacheForTest();
-    const empty = await buildSessionList();
-    assert.deepEqual(empty, [], "no prior snapshot → empty index (#2152), loudness moves to the warn log");
+    await assert.rejects(buildSessionList(), "no prior snapshot → reject (→ HTTP 500), never silent empty");
+});
+
+// #2180: pristine default layout (BILI_SESSIONS_DIR unset AND the XDG data root
+// itself never created) must resolve to an EMPTY index, not the loud rejection
+// above — withSessionsDir can't express that (it always sets the env var), so
+// these drive XDG_DATA_HOME directly.
+
+function withPristineEnv<T>(name: string, fn: (xdg: string) => Promise<T>): void {
+    test(name, async () => {
+        const root = mkdtempSync(path.join(tmpdir(), "bili-web-pristine-"));
+        const xdg = path.join(root, "xdg");
+        mkdirSync(xdg);
+        const prevEnv = process.env.BILI_SESSIONS_DIR;
+        const prevXdg = process.env.XDG_DATA_HOME;
+        delete process.env.BILI_SESSIONS_DIR;
+        process.env.XDG_DATA_HOME = xdg;
+        try {
+            await fn(xdg);
+        } finally {
+            if (prevEnv === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevEnv;
+            if (prevXdg === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = prevXdg;
+            _resetSessionsForTest();
+            _resetDiskCacheForTest();
+            rmrf(root);
+        }
+    });
+}
+
+withPristineEnv("#2180: fresh install (data root never created) serves empty data, not 500", async (xdg) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    assert.deepEqual(await buildSessionList(), [], "pristine default layout resolves to an empty list");
+    assert.equal((await buildOverview()).sessions, 0, "overview aggregates zero sessions instead of 500ing");
+    assert.equal(await buildSessionDetail("never-existed"), null, "detail 404s instead of 500ing");
+
+    const sessDir = path.join(xdg, "billion-context", "sessions");
+    const store = new SessionStore({ dir: sessDir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("first-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    _resetDiskCacheForTest();
+    assert.deepEqual((await buildSessionList()).map((s) => s.id), ["first-1"], "first persisted session creates the dir and shows up");
+});
+
+withPristineEnv("#2180: existing data root without sessions dir stays loud (#1937)", async (xdg) => {
+    mkdirSync(path.join(xdg, "billion-context"), { recursive: true });
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    await assert.rejects(buildSessionList(), "data root present but sessions dir missing must reject loudly");
+});
+
+withPristineEnv("#2180/#1937: data root deleted AFTER sessions existed serves stale snapshot, not empty", async (xdg) => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const sessDir = path.join(xdg, "billion-context", "sessions");
+    const store = new SessionStore({ dir: sessDir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    _resetDiskCacheForTest();
+    assert.deepEqual((await buildSessionList()).map((s) => s.id), ["seed-1"], "session indexed while the data root exists");
+    rmrf(path.join(xdg, "billion-context"));
+    assert.deepEqual(
+        (await buildSessionList()).map((s) => s.id),
+        ["seed-1"],
+        "#1937: a vanished data root that once held sessions serves the stale index, never an empty one");
 });
 
 withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", async (dir) => {

@@ -50,7 +50,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -77,10 +77,10 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -152,7 +152,7 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
@@ -888,6 +888,22 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
             );
         }
+        // #2090 plan A: signed requests refused earlier that the user has not
+        // configured away yet — surface them at EVERY startup, not only at
+        // the next failure, with the exact opt-in line.
+        {
+            const unresolved = unresolvedRefusals();
+            const entries = Object.entries(unresolved);
+            if (entries.length > 0) {
+                const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
+                log(
+                    "warn",
+                    `[resign] ${entries.length} signed request scheme(s) were refused earlier and remain UNRESOLVED: ${list}. ` +
+                        "Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them — no configuration can pass a signed body through unsigned. Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). " +
+                        "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
+                );
+            }
+        }
         // #1723: residual zone drift is now an exception, not the norm — a
         // lane'd launch landing ABOVE its preferred port means that port was
         // held by something we must not wait on (foreign squatter, same-code
@@ -1091,6 +1107,11 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    /** #2189: the client's billing-attribution block captured from the INBOUND
+     *  anthropic system (pre-anchor). Preflight summary calls must carry it —
+     *  subscription-OAuth upstreams answer calls lacking it with 429
+     *  rate_limit_error "Error" (#2189). See extractBillingAttributionBlock. */
+    anthropicBillingBlock?: { type: "text"; text: string };
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
@@ -1270,6 +1291,8 @@ function adminTrustedHostnames(bindHost: string): Set<string> {
 // #924: one-time-per-model log for the output-budget fallback (request carries
 // no budget → configured/registry max output) — same pattern as windowSourceLogged.
 const headroomFallbackLogged = new Set<string>();
+// #2170 split-session canary: one log line per conversation base per process.
+const splitWarnedBases = new Set<string>();
 
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
@@ -1367,6 +1390,7 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
@@ -2297,6 +2321,20 @@ async function handle(
               ? (anthropicIdentity?.value ?? anthropicSignal)
               : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
+        // #2170 measure 4: stamp sessions deliberately namespaced onto a
+        // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
+        // fork reviews, codex/claude-over-Responses instructions personas —
+        // so the split-session canary can tell a DESIGNED split from the
+        // #2165 drift shape (see splitSessionWarnings in src/session.ts).
+        // personaForked covers the anthropic/openai wires; the responses wire
+        // needs its own check (codexTurn keys verbatim and must not count).
+        const designNamespaced = personaForked
+            || (protocol === "responses"
+                && codexTurn === undefined
+                && instructionsFingerprintApplies(req.headers)
+                && !sideRequestLike
+                && responsesIdentity !== undefined
+                && conversation !== responsesIdentity.value);
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -2433,6 +2471,7 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
         let publicForkPrefix = false;
         if (!countTokens && !responsesCompact && session.metadata.publicForkReceipt !== undefined) {
             acquireInFlight(session);
@@ -2789,9 +2828,12 @@ async function handle(
         // are identified by the #1699 persona header instead).
         const wsLaneEnvelope = req.headers["x-bili-ws-lane"] !== undefined;
         const requestAgent = pluginRequestAgentHeader(req.headers);
+        // #2170 measure 1: the gate conjuncts live in side-request.ts as the
+        // pure, truth-table-tested demoteGate(); the two request-body effects
+        // stay here and stay lazy — detectAcpArtifacts only runs when the cheap
+        // gate holds, the strip only when the artifact scan came back clean.
         // Explicit main intent and a verified public-fork prefix each veto heuristic demotion.
-        const demotedSide = !countTokens && !responsesCompact && protocol !== null && pluginMode
-            && requestAgent !== "main" && !wsLaneEnvelope && !publicForkPrefix
+        const demotedSide = demoteGate({ countTokens, responsesCompact, protocol, pluginMode, requestAgent, wsLaneEnvelope, publicForkPrefix })
             && detectAcpArtifacts(bodyBuffer, parsed) === null
             && stripLeakedBiliTools(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
@@ -2867,7 +2909,10 @@ async function handle(
         // header) can false-positive it — only intent-certain side
         // identification (declared side agent, or a tool-less tiny budget)
         // diverts under a receipt.
-        if (!countTokens && !responsesCompact && protocol !== null && (demotedSide || sideIntent)) {
+        // #2170 measure 1: the decision itself is resolveSideLane() (pure,
+        // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent });
+        if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -2898,7 +2943,7 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            const sideReason = demotedSide ? "leaked bili tools stripped (#1897)" : requestAgent !== undefined ? `agent=${requestAgent}` : `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`;
+            const sideReason = sideLane.reason;
             log("info", `[${session.id}] side request (${sideReason}) → passthrough + tag strip only, kernel state untouched`);
             // #1897: a demoted request was mutated (tools stripped) — re-serialize
             // the parsed body so the leak is actually gone from the wire.
@@ -2925,6 +2970,20 @@ async function handle(
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
+        }
+        // #2170 measure 4 (runtime canary): every legitimately side-shaped
+        // LANE-ELIGIBLE request returned inside the lane above. count_tokens,
+        // /responses/compact and session-less (protocol-less) requests are
+        // deliberately NOT lane-eligible — they route to their own handling
+        // below, so they are excluded here (ework review finding B). If a
+        // lane-eligible side-intent or demoted request reaches the full
+        // pipeline anyway, the lane contract is broken (the #2157/#2164
+        // regression class: side traffic touching kernel state). Count it on
+        // the session and say it loudly — with the pure resolveSideLane()
+        // this is unreachable by construction; any future drift trips it.
+        if (!countTokens && !responsesCompact && protocol !== null && (sideIntent || demotedSide)) {
+            session.metadata.sideEffectLeaks = (typeof session.metadata.sideEffectLeaks === "number" ? session.metadata.sideEffectLeaks : 0) + 1;
+            log("warn", `[${session.id}] SIDE-EFFECT LEAK (#2170 canary): ${sideLane.reason} request entered the full pipeline — expected the #388 side passthrough; kernel state pollution likely (cf. #2156/#2164)`);
         }
         // #987: the window is NEVER learned from traffic — no self-heal read
         // here. Only the one-shot emergency shrink (armed on the overflow
@@ -3262,20 +3321,25 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
-            // #1884 (un-armed signed traffic): a request that already carries a
-            // body-covering signature (SDK-HMAC-SHA256 family — CodeArts APIG)
-            // and arrives WITHOUT the re-sign arm cannot survive any body
-            // rewrite: prepare* injects the compress tool + system notes, and
-            // the compress loop re-sends rebuilt rounds, so the upstream
-            // rejects every mutated request with 401 (APIG.0301 body-hash
-            // mismatch). Default: REFUSE (403, actionable message) — silently
-            // forwarding byte-untouched would silently disable compression;
-            // the user opted into bili, not into a pass-through tunnel.
-            // BILI_RESIGN_PASSTHROUGH=1 opts in to byte-untouched forwarding
-            // (no session, no compression, signature intact — the /bili/-
-            // prefix twin of the native lane's #1886 fallback);
-            // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
-            // handling: the request rides the normal rewrite path).
+            // #1884/#2090 (un-armed signed traffic): a request that already
+            // carries a body-covering signature (SDK-HMAC-SHA256 family —
+            // CodeArts APIG, or any gateway-invented scheme the shape-based
+            // detector catches, e.g. x-ofm-signature) and arrives WITHOUT a
+            // working re-sign arm cannot survive any body rewrite: prepare*
+            // injects the compress tool + system notes, and the compress loop
+            // re-sends rebuilt rounds, so the upstream rejects every mutated
+            // request with 401 (APIG.0301 body-hash mismatch /
+            // SignatureDoesNotMatch). Without a working re-sign arm the
+            // request is REFUSED locally for EVERY scheme (403, actionable
+            // message naming the exact opt-in) — #2090 owner ruling: bili's
+            // contract is "installed = compressed, or the user explicitly
+            // knows a link runs uncompressed"; the explicit passthrough
+            // opt-in IS that acknowledgment (byte-untouched, no compression).
+            // Refusals are remembered (recordSignedRefusal) so bili startups
+            // keep listing unresolved schemes until configured away.
+            // BILI_RESIGN=0 / resign["<scheme>"].enabled=false un-deploy the
+            // guard (pre-#1884 handling: the request rides the normal
+            // rewrite path — and clears the scheme's refusal memory).
             const guardScheme = inboundSignedScheme(req.headers);
             const resignMarker = String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "");
             // An armed request is only ARMABLE when its credential marker decodes:
@@ -3294,18 +3358,29 @@ async function handle(
                 !resignArmable &&
                 guardResign.enabled
             ) {
-                if (guardResign.passthrough) {
-                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign["${guardScheme}"].passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
+                // #2090 owner ruling ("compress or refuse"): the only
+                // pass-through outcome left is the pre-existing #1884 escape
+                // hatch on the BUILT-IN scheme itself; every other scheme is
+                // ALWAYS refused — its refusal has no user-side fix yet, only
+                // bili shipping the re-signer. Passthrough settings are inert
+                // for those schemes.
+                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough) {
+                    clearSignedRefusal(guardScheme);
+                    log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign["${guardScheme}"].passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                recordSignedRefusal(guardScheme, upstreamOrigin);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing per the compress-or-refuse contract (${guardScheme === APIG_RESIGN_SCHEME ? "provide a signing credential to make bili re-sign, #1884" : "no re-signer exists for this scheme yet — it stays refused until bili ships one; passthrough settings do not apply"}). Remembered — bili will keep reminding at startup.`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
                 res.end(refusal.body);
                 return;
+            }
+            if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
+                clearSignedRefusal(guardScheme);
             }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
@@ -3866,6 +3941,10 @@ async function prepareAnthropic(
     // managed text and hides client-side drift (same rationale as the
     // responses site; keeps all four wires on one semantic).
     const clientSystem = parsed.system;
+    // #2189: from clientSystem (pre-anchor) — the anchor buildSystem below may
+    // collapse the block array, and subscription-OAuth upstreams 429 summary
+    // calls whose system lacks this block.
+    const anthropicBillingBlock = extractBillingAttributionBlock(clientSystem);
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -4096,7 +4175,7 @@ async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 async function prepareOpenai(
@@ -5989,6 +6068,7 @@ async function preflightCompressIfNeeded(
                 prompts: prepared.prompts ?? defaultPrompts,
                 surface: prepared.surface,
                 protocol: prepared.protocol,
+                billingBlock: prepared.anthropicBillingBlock,
                 url: upstreamUrl,
                 headers,
                 model,
@@ -6089,7 +6169,10 @@ async function preflightCompressIfNeeded(
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    // #2189: an explicit retryable=false from preflight (credential-shape
+    // rejection — deterministic for the identical payload) overrides the
+    // status-based heuristic below; every other path keeps today's mapping.
+    const retryable = f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
@@ -7678,7 +7761,35 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    const splitWarnings = splitSessionWarnings(listSessions());
+    for (const w of splitWarnings) {
+        if (!splitWarnedBases.has(w.base)) {
+            splitWarnedBases.add(w.base);
+            loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
+        }
+    }
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+}
+
+// #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
+// every known/observed signature scheme with its current effective policy,
+// plus the remembered refusals and which of them are still unresolved.
+function sendResignStatus(res: http.ServerResponse): void {
+    const names = new Set<string>([...Object.keys(KNOWN_SIGNATURE_SCHEMES), ...Object.keys(readPendingRefusals())]);
+    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }> = {};
+    for (const name of [...names].sort()) {
+        const st = resolveResignSettings(process.env, undefined, name);
+        schemes[name] = { known: KNOWN_SIGNATURE_SCHEMES[name], builtIn: name === APIG_RESIGN_SCHEME, enabled: st.enabled, passthrough: st.passthrough, passthroughApplies: name === APIG_RESIGN_SCHEME };
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        builtinScheme: APIG_RESIGN_SCHEME,
+        builtinCredentialSource: "dsh credentials service (jet-hub state.json) — the only scheme bili re-signs itself",
+        envOverrides: { BILI_RESIGN: process.env.BILI_RESIGN ?? null, BILI_RESIGN_PASSTHROUGH: process.env.BILI_RESIGN_PASSTHROUGH ?? null },
+        schemes,
+        pending: readPendingRefusals(),
+        unresolved: Object.keys(unresolvedRefusals()),
+    }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {

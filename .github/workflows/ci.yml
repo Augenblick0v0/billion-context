@@ -146,3 +146,40 @@ jobs:
         with:
           node-version: 22
       - run: node tools/gen-config-docs.mjs check-coverage
+
+  # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
+  # side-request.ts + the lane region of src/server.ts) is regression-critical
+  # (the #2156/#2157/#2164 chain). Changing it without touching its dedicated
+  # suites has silently shipped regressions before; this job makes the pairing
+  # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
+  lane-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Side-lane test discipline (#2170)
+        run: |
+          set -euo pipefail
+          LANE_SUITE_RE='tests/(fork-side-request-lane|side-lane-truth-table|side-lane-invariants|side-request-isolation)\.test\.ts'
+          # Lane logic = src/server/side-request.ts, or lane-symbol lines in src/server.ts.
+          LANE_DIFF=""
+          if git diff origin/master...HEAD -- src/server/side-request.ts | grep -qE '^[+-]'; then
+            LANE_DIFF="src/server/side-request.ts"
+          fi
+          if git diff origin/master...HEAD -- src/server.ts | grep -Eq '^[+-].*(demotedSide|sideIntent|sideRequestLike|demoteGate|resolveSideLane|SIDE_REQUEST_MAX_TOKENS|isSideRequest|stripLeakedBiliTools|side request|side passthrough|sidePassthrough|side-lane)'; then
+            LANE_DIFF="${LANE_DIFF:+$LANE_DIFF, }src/server.ts (lane symbols)"
+          fi
+          if [[ -z "$LANE_DIFF" ]]; then
+            echo "✓ no side-lane logic changes"
+            exit 0
+          fi
+          echo "side-lane logic changed: $LANE_DIFF"
+          if git diff --name-only origin/master...HEAD | grep -Eq "$LANE_SUITE_RE"; then
+            echo "✓ side-lane suites updated alongside lane logic"
+            exit 0
+          fi
+          echo "::error::Side-lane logic changed without updating any dedicated side-lane suite ($LANE_SUITE_RE)."
+          echo "The lane gates are truth-table-pinned (tests/side-lane-truth-table.test.ts) and behavior-pinned (tests/side-lane-invariants.test.ts, fork-side-request-lane, side-request-isolation) — a gate edit must land with the suite edit. See #2170."
+          exit 1

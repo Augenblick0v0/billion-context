@@ -14,6 +14,7 @@ import path from "node:path";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { resolveDshHome } from "./client-config.js";
+import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 export const DSH_PACKAGE = "billion-context";
 // The profile owned by dsh's own desktop app. Its billion-context copy is
@@ -262,6 +263,17 @@ export function planDshSpawn(
     const base = command.slice(Math.max(command.lastIndexOf("/"), command.lastIndexOf("\\")) + 1);
     const needsCmd = lower.endsWith(".cmd") || lower.endsWith(".bat") || !path.extname(base);
     if (!needsCmd) return { command, args: [...args] };
+    // #2196: same safe-set contract as the launcher's comspec path — profile
+    // names and specs are user-chosen strings that cmd.exe would otherwise
+    // mangle or interpret silently.
+    [command, ...args].forEach((token, i) => {
+        const reason = winCmdUnsafeToken(token);
+        if (reason) throw winCmdRefusalError(
+            i === 0 ? "resolved dsh command" : `argument #${i - 1}`,
+            reason,
+            "Set BILI_DSH_BIN to the dsh executable, or reword the argument.",
+        );
+    });
     const comspec = env.COMSPEC?.trim() || "cmd.exe";
     const line = `"${[command, ...args].map(quoteWinToken).join(" ")}"`;
     return { command: comspec, args: ["/d", "/s", "/c", line], windowsVerbatimArguments: true };

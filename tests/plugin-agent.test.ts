@@ -65,7 +65,7 @@ type FakeProxy = {
     close(): Promise<void>;
 };
 
-async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean } = {}): Promise<FakeProxy> {
+async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean; decompressFailure?: boolean } = {}): Promise<FakeProxy> {
     const toolCalls: FakeProxy["toolCalls"] = [];
     const registers: FakeProxy["registers"] = [];
     const runtimeInfos: FakeProxy["runtimeInfos"] = [];
@@ -75,6 +75,8 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ tools: { anthropic: [
                 { name: "compress", description: "Compress context ranges", input_schema: { type: "object", properties: { content: { type: "array" } }, required: ["content"] } },
+                // #2204: opt-in decompress slot so the business-failure lane can be exercised end-to-end.
+                ...(opts.decompressFailure ? [{ name: "decompress", description: "Restore", input_schema: { type: "object", properties: { blockId: { type: "string" }, toFile: { type: "string" } }, required: ["blockId"] } }] : []),
                 { name: "acp_status", description: "Status", input_schema: { type: "object", properties: {} } },
             ] } }));
             return;
@@ -88,6 +90,8 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
                 res.writeHead(200, { "content-type": "application/json" });
                 if (data.tool === "compress") {
                     res.end(JSON.stringify({ ok: true, result: "[Compressed m00001-m00002 -> b1]" }));
+                } else if (data.tool === "decompress" && opts.decompressFailure) {
+                    res.end(JSON.stringify({ ok: true, result: "[decompress FAILED: could not write export to /tmp/x.txt: ENOENT]", outcome: "failure" }));
                 } else {
                     res.end(JSON.stringify({ ok: false, error: "boom" }));
                 }
@@ -146,7 +150,8 @@ test("shared manifest/tool/status against a fake proxy", async () => {
         assert.equal(tools.length, 2);
         assert.equal(tools[0]!.name, "compress");
         const result = await forwardTool(proxy.origin, "conv-1", "compress", { content: [] });
-        assert.equal(result, "[Compressed m00001-m00002 -> b1]");
+        assert.equal(result.text, "[Compressed m00001-m00002 -> b1]");
+        assert.equal(result.failed, false, "legacy envelope (no outcome) is not a failure");
         await assert.rejects(forwardTool(proxy.origin, "conv-1", "acp_status", {}), /boom/);
         const status = await fetchStatus(proxy.origin, "conv-1");
         assert.equal(status?.contextTokens, 1234);
@@ -711,6 +716,27 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#2204: a business-failure receipt (ok:true + outcome:failure) reaches the host as isError with full text", async () => {
+    const proxy = await startFakeProxy({ decompressFailure: true });
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 3);
+        const decompress = pi.tools.find((t) => t.name === "decompress");
+        assert.ok(decompress, "manifest serves the decompress slot");
+        // The exact OMP shape from #2204: a toFile export that the proxy could
+        // not write. The endpoint says ok:true (the tool RAN) — only outcome
+        // marks it failed, and the host must render isError accordingly.
+        const out = await decompress!.execute("call-1", { blockId: "b2", toFile: "local://bili-investigation-b2.txt" }, undefined, undefined, fakeCtx(proxy));
+        assert.equal(out.isError, true, "business failure must surface as isError (the #2204 gap)");
+        assert.match(out.content[0]!.text, /^\[decompress FAILED:/, "the full receipt text is preserved");
+        assert.match(out.content[0]!.text, /could not write export/);
     } finally {
         await proxy.close();
     }

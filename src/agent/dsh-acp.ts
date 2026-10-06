@@ -80,7 +80,8 @@ async function cacheOutcome(): Promise<CommandOutcome> {
         };
     }
     try {
-        return { kind: "success", text: await forwardTool(base, cid, "acp_cache", {}, undefined, true) };
+        const out = await forwardTool(base, cid, "acp_cache", {}, undefined, true);
+        return out.failed ? { kind: "error", text: out.text } : { kind: "success", text: out.text };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {

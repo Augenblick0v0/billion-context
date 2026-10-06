@@ -72,7 +72,7 @@ import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion } from "./shared.js";
+import { fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -500,8 +500,9 @@ export function extractV1Outputs(cfg: V1Config): Map<string, number> {
 export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
-    /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<string>;
+    /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). #2204:
+     *  carries the business outcome so failures surface as host errors. */
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<ForwardedToolResult>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -681,7 +682,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        return forward(base, v1ctx.sessionID, name, args, true);
+                        const out = await forward(base, v1ctx.sessionID, name, args, true);
+                        // #2204: V1 tool results are plain strings — a business
+                        // failure throws so the host renders an error, not text.
+                        if (out.failed) throw new Error(out.text);
+                        return out.text;
                     },
                 };
             }
@@ -697,7 +702,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            return forward(base, v1ctx.sessionID, fn.name, args, true);
+                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true);
+                            // #2204: same as the legacy-lane slot above — plain-string
+                            // results have no error flag, so failures throw.
+                            if (out.failed) throw new Error(out.text);
+                            return out.text;
                         },
                     };
                 }

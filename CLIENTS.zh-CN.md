@@ -120,6 +120,16 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 
 自 ~0.156 起,Codex 可以附着到(或自动拉起)一台机器全局共享的后台 server,其模型流量用的是 **daemon 启动时**存在的环境变量,而不是会话启动时的。启动器的代理是会话级的(端口随进程消亡),所以长寿 daemon 没法安全地经它路由:若 codex 先于 bili env 启动,之后的 `bili codex` 会话会静默附着上去、**完全绕过压缩**;若 bili 先启动,幸存的 daemon 则一直指向死端口。因此启动器显式传 `--no-daemon` —— 先探测 `codex --help` 是否有该 flag(旧版本二进制原样启动),且仅当用户未自行钉死模式(`--no-daemon` 或 `--remote`)时。结果:确定性的 embedded 运行,无逐次启动的回退警告,无静默绕过。#321 的预算 `-c` 参数原样保留(embedded 模式同等生效)。想要共享后台 server 的话,直接跑原生 `codex` —— 没有压缩,但工具仍可通过 `bili plugin install codex` 使用。
 
+### Windows 启动路径:用户 argv 不再重新进入 cmd.exe(#2196)
+
+Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发会让每个用户参数再经 **cmd.exe 行解析器**解析一遍——该解析器没有任何转义机制:嵌入双引号拆词(`Please say "hello world" exactly` 到达时变成四个参数)、`%VAR%` 被展开、`&|<>^()` 成为命令操作符、空参数消失。普通带空格提示词恰好能幸存,所以 #679 的空格截断修复没有暴露它。#2196 让启动器拒绝把用户 argv 喂进这个解析器:
+
+- **解析顺序(win32 专属):** 每个 PATH 目录内原生 `codex.exe` 优先于 `codex.cmd`/`codex.bat`(最早目录仍整体优先);`.cmd`/`.bat` 命中若位于可信 npm 布局旁——`<dir>/node_modules/@openai/codex`,package.json name 为 `@openai/codex`、有可解析的 `"codex"` bin 条目、且 shim 文本引用该包(放在无关树旁的手写 `codex.cmd` 不得劫持启动)——则升级为 `node <官方 bin/codex.js>`。Node 下运行官方 wrapper 与 shim 行为完全一致——vendor 二进制查找、env 初始化、信号转发——而 Node 自己的 CreateProcess argv 编码逐字无损携带每个参数。未识别布局(yarn-classic `.bin` 树、无本地链接的 pnpm store shim……)保留旧 cmd 路径并遵循下述契约。
+- **透传契约:** 其余 cmd 包装启动——任何客户端的 `.cmd`/`.bat`/无扩展名二进制,加上 dsh-channel spawn——只接受行解析器能逐字携带的 argv;其余(嵌入引号、`%VAR%`、元字符、空参数、换行、奇数尾反斜杠)在**任何进程启动之前**以可操作的错误明确失败,而不是损坏到达或执行非预期命令。直接 spawn 的 `.exe` 不受影响:Node 自身无损编码其 argv。
+- **绕行 / power-user 旋钮:** `BILI_CLIENT_BIN=<path>` 仍最高优先——指向真实 `codex.exe`(或经 node 运行的脚本入口)即可完全绕开 shim。
+
+已在 windows-latest CI 上对真实全局 `@openai/codex` 安装验证(`tests/win-cmd-argv.test.ts`,`ci-windows-codex.yml` 硬门禁):完整语料——空参数、普通空格、嵌入引号、TOML `-c` 值、JSON、Unicode、尾反斜杠、`%COMSPEC%`、`!VAR!`、`&|<>^()`——逐项与调用方数组相等地到达子进程。
+
 ## Pi(pi.dev coding agent)
 
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。

@@ -9,12 +9,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetAdvisoryWatcherForTest, _setAdvisoryStateForTest } from "../src/advisory.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 
@@ -51,6 +55,12 @@ async function fetchWire(port: number, path: string): Promise<Wire> {
 }
 
 test("#2152: /__bili/overview carries the same advisory field as /__bili/status (banner data source)", async () => {
+    // Hermetic sessions dir: /__bili/overview walks the disk store, and a missing
+    // dir rejects loudly by design (#1937) — on a fresh CI runner the ambient
+    // default has never existed, so pin an existing temp dir (#2152 went red).
+    const prevSessionsDir = process.env.BILI_SESSIONS_DIR;
+    const sessionsDir = mkdtempSync(path.join(tmpdir(), "bili-advisory-parity-"));
+    process.env.BILI_SESSIONS_DIR = sessionsDir;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const upstreamPort = await freePort(); // never contacted — management endpoints only
@@ -119,6 +129,8 @@ test("#2152: /__bili/overview carries the same advisory field as /__bili/status 
         assert.equal(o.advisory!.id, "bc-2026-002");
         assert.equal(o.advisory!.targetFailed, true);
     } finally {
+        if (prevSessionsDir === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessionsDir;
+        rmrf(sessionsDir);
         _setAdvisoryStateForTest({});
         _resetAdvisoryWatcherForTest();
         await close(proxy);
