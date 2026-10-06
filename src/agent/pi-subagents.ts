@@ -136,8 +136,11 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
                     }
                 }
             }
-        } catch {
-            // Config load failure keeps the defaults — delegate stays enabled.
+        } catch (err) {
+            // Config load failure keeps the defaults — delegate stays enabled,
+            // but a broken acp.json must not vanish silently (the standalone
+            // package logs this via logThrow; bili's lane has no such channel).
+            console.error(`bili-plugin(pi): subagents user config unreadable, using defaults: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (state.policy.enabled && !state.stoodDown) {
             // The package's ToolDefinition carries typed params + its own
