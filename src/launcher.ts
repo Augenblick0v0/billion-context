@@ -4386,7 +4386,7 @@ export function resolveClientCommand(
         const resolved = resolveOnPath("mcode", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
         const binBase = path.join(resolveMcodeInstallDir(env), "bin", "mcode");
-        for (const ext of process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
             const candidate = binBase + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
@@ -4402,10 +4402,10 @@ export function resolveClientCommand(
         // %LOCALAPPDATA%\agy\bin\agy.exe).
         const resolved = resolveOnPath("agy", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
-        const base = process.platform === "win32"
+        const base = platform === "win32"
             ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "agy", "bin", "agy")
             : path.join(os.homedir(), ".local", "bin", "agy");
-        for (const ext of process.platform === "win32" ? [".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".exe", ""] : [""]) {
             const candidate = base + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };

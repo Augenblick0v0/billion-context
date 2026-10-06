@@ -6362,6 +6362,43 @@ test("resolveClientCommand: mcode resolves `mcode` on PATH, falls back to <insta
     }
 });
 
+test("resolveClientCommand: antigravity/mcode honor the injectable platform param (#2260)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-home-"));
+    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-lad-"));
+    const prevHome = process.env.HOME;
+    try {
+        process.env.HOME = home;
+        // Before #2260 these branches read process.platform directly, so the
+        // win32 layout was unreachable from tests (and wrong under any future
+        // platform-injection use).
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData }, "win32"),
+            { command: path.join(localAppData, "agy", "bin", "agy"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }),
+            { command: path.join(home, ".local", "bin", "agy"), prefixArgs: [] },
+        );
+        const mdDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-plat-"));
+        fs.mkdirSync(path.join(mdDir, "bin"), { recursive: true });
+        fs.writeFileSync(path.join(mdDir, "bin", "mcode.cmd"), "");
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "win32"),
+            { command: path.join(mdDir, "bin", "mcode.cmd"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }),
+            { command: path.join(mdDir, "bin", "mcode"), prefixArgs: [] },
+        );
+        rmrf(mdDir);
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        rmrf(home);
+        rmrf(localAppData);
+    }
+});
+
 test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS), discovered host whitelist, model windows (#1050)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-launch-"));
     const prevHome = process.env.HOME;
