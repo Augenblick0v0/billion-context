@@ -77,6 +77,45 @@ const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
+// #2189: subscription-OAuth credentials (Claude Code login) accept only
+// requests whose system carries the client's billing-attribution block; every
+// other call on the same credential gets 429 rate_limit_error "Error" (a
+// shape rejection wearing a rate-limit costume). The main forward lane has
+// preserved the client's block shape since #1876 — this extractor lets the
+// summary side-path carry it too. cache_control is dropped (it pinned the
+// client's own placement, not one in bili's summary system); scanning instead
+// of index-0-only survives a host relocating the block.
+export const BILLING_ATTRIBUTION_PREFIX = "x-anthropic-billing-header:";
+
+export function extractBillingAttributionBlock(
+    system: string | Array<Record<string, unknown>> | undefined,
+): { type: "text"; text: string } | undefined {
+    if (!Array.isArray(system)) return undefined;
+    for (const block of system) {
+        if (!block || typeof block !== "object" || block.type !== "text") continue;
+        const text = block.text;
+        if (typeof text === "string" && text.trimStart().startsWith(BILLING_ATTRIBUTION_PREFIX)) {
+            return { type: "text", text };
+        }
+    }
+    return undefined;
+}
+
+// #2189: 429 + error.type "rate_limit_error" + the BARE message "Error" is
+// upstream's credential-shape rejection (see above), not a rate limit — real
+// limits carry descriptive messages. Retrying the identical shape cannot
+// succeed, so callers fail fast on this signature instead of burning the
+// replay budget. Both halves are required so real-limit wording can't trip it.
+export function isCredentialShapeRejection(status: number, body: string): boolean {
+    if (status !== 429) return false;
+    try {
+        const parsed = JSON.parse(body) as { error?: { type?: unknown; message?: unknown } };
+        return parsed.error?.type === "rate_limit_error" && parsed.error.message === "Error";
+    } catch {
+        return false;
+    }
+}
+
 export interface PreflightDeps {
     core: CompressionCore;
     session: Session;
@@ -108,6 +147,8 @@ export interface PreflightDeps {
     upstreamOrigin?: string;
     /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
     forceStreamSummary?: boolean;
+    /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
+    billingBlock?: { type: "text"; text: string };
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -322,10 +363,14 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number): Record<string, unknown> {
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
-        return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
+        // #2189: carry the client's billing-attribution block as system[0] with
+        // the bili prompt as system[1]; subscription-OAuth upstreams reject
+        // calls lacking it. Absent → legacy string system byte-identical.
+        const systemOut = billingBlock ? [billingBlock, { type: "text", text: system }] : system;
+        return { model, max_tokens: maxOutputTokens, system: systemOut, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
         return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
@@ -781,9 +826,17 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
         } catch (err) {
             deps.signal?.throwIfAborted();
             const failure = err instanceof UpstreamHttpError ? err : new SummaryTransportError(stage, err, attempt);
-            const retryable = failure instanceof UpstreamHttpError
-                ? isTransientUpstreamError(failure.status, failure.body)
-                : failure.retryable;
+            // #2189: retrying the identical shape cannot succeed — name it and fail fast.
+            const shapeRejection = failure instanceof UpstreamHttpError
+                && isCredentialShapeRejection(failure.status, failure.body);
+            if (shapeRejection) {
+                deps.log("warn", `[preflight] summary rejected with HTTP 429 rate_limit_error "Error" — suspected credential-shape rejection rather than a rate limit (upstream requires a request attribute missing from this summary call, e.g. the client's billing-attribution system block; #2189); not retrying`);
+            }
+            const retryable = shapeRejection
+                ? false
+                : failure instanceof UpstreamHttpError
+                    ? isTransientUpstreamError(failure.status, failure.body)
+                    : failure.retryable;
             if (!retryable || attempt >= maxAttempts) {
                 if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
@@ -811,7 +864,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)));
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -1213,13 +1266,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // upstream said no — log it the way the main paths already do
                         // and carry a bounded snippet into the client-visible detail.
                         const transient = isTransientUpstreamError(err.status, err.body);
+                        const shapeRejection = isCredentialShapeRejection(err.status, err.body);
                         const bodySnippet = safePrefix(err.body.trim(), 200);
                         failure = {
                             kind: "upstream",
                             status: err.status,
-                            retryable: transient,
+                            // #2189: a shape-based rejection is deterministic for this
+                            // payload — a client retry hits the same wall, so do not
+                            // advertise retryability (and let the dead-end cooldown arm).
+                            retryable: shapeRejection ? false : transient,
                             detail: err.status === 429
-                                ? `the summarization call was rate-limited by the upstream (HTTP 429)`
+                                ? shapeRejection
+                                    ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (the upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block; #2189)`
+                                    : `the summarization call was rate-limited by the upstream (HTTP 429)`
                                 : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
                         };
                         deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);

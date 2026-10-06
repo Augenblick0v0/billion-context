@@ -77,7 +77,7 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
@@ -1107,6 +1107,11 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    /** #2189: the client's billing-attribution block captured from the INBOUND
+     *  anthropic system (pre-anchor). Preflight summary calls must carry it —
+     *  subscription-OAuth upstreams answer calls lacking it with 429
+     *  rate_limit_error "Error" (#2189). See extractBillingAttributionBlock. */
+    anthropicBillingBlock?: { type: "text"; text: string };
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
@@ -3936,6 +3941,10 @@ async function prepareAnthropic(
     // managed text and hides client-side drift (same rationale as the
     // responses site; keeps all four wires on one semantic).
     const clientSystem = parsed.system;
+    // #2189: from clientSystem (pre-anchor) — the anchor buildSystem below may
+    // collapse the block array, and subscription-OAuth upstreams 429 summary
+    // calls whose system lacks this block.
+    const anthropicBillingBlock = extractBillingAttributionBlock(clientSystem);
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -4166,7 +4175,7 @@ async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 async function prepareOpenai(
@@ -6022,6 +6031,7 @@ async function preflightCompressIfNeeded(
                 prompts: prepared.prompts ?? defaultPrompts,
                 surface: prepared.surface,
                 protocol: prepared.protocol,
+                billingBlock: prepared.anthropicBillingBlock,
                 url: upstreamUrl,
                 headers,
                 model,
@@ -6122,7 +6132,10 @@ async function preflightCompressIfNeeded(
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    // #2189: an explicit retryable=false from preflight (credential-shape
+    // rejection — deterministic for the identical payload) overrides the
+    // status-based heuristic below; every other path keeps today's mapping.
+    const retryable = f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
