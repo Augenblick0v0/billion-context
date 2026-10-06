@@ -567,3 +567,28 @@ test("#2176 degenerateRetrySummary aggregates the counters for /__bili/status", 
     const summary = degenerateRetrySummary([a, b, makeSession(), {}]);
     assert.deepEqual(summary, { sessions: 2, retries: 4, exhausted: 1 }, "untouched sessions are skipped, fires sum across sessions");
 });
+
+test("#2176 responses: exhaustion after two degenerate re-issues counts the tail and closes on its own completion", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    const calls: boolean[] = [];
+    const refetch = (escalated?: boolean) => {
+        calls.push(escalated === true);
+        return Promise.resolve(streamOf(responsesEchoOnlyTurn()));
+    };
+    const session = makeSession();
+    try {
+        await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), session, (m) => logs.push(m), refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls.length, DEGENERATE_RETRY_MAX_ATTEMPTS, "the escalation is bounded");
+    assert.deepEqual(calls, [false, true], "the second re-issue is the escalated one");
+    assert.equal(responsesDeltas(text), "", "no prose survives a fully degenerate turn");
+    assert.equal((text.match(/"type":"response\.completed"/g) ?? []).length, 1, "one turn, one terminal — the retry's own completion");
+    assert.equal(session.stats.degenerateRetries, 2);
+    assert.equal(session.stats.degenerateExhausted, 1, "the unrecoverable turn is visible in the counters");
+    assert.ok(logs.some((l) => l.includes("continuation nudges")), "the exhaustion log names the escalation");
+});
