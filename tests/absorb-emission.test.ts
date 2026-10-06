@@ -214,7 +214,7 @@ test("emissionEchoesRequest: JSON-escaped form of the same fragment", () => {
 // ─── streaming filter ───────────────────────────────────────────────────────
 
 test("streaming: armed filter drops an emission split across chunks (category 4)", () => {
-    const f = createTagEchoFilter(undefined, true);
+    const f = createTagEchoFilter(undefined, undefined, true);
     let out = "";
     for (let i = 0; i < EMISSION.length; i += 7) out += f.push(EMISSION.slice(i, i + 7));
     out += f.flush();
@@ -222,7 +222,7 @@ test("streaming: armed filter drops an emission split across chunks (category 4)
 });
 
 test("streaming: armed filter drops the emission and keeps the trailing prose", () => {
-    const f = createTagEchoFilter(undefined, true);
+    const f = createTagEchoFilter(undefined, undefined, true);
     let out = f.push(EMISSION.trim());
     out += f.push(` ${TAG("m00155")}ok`);
     out += f.flush();
@@ -231,7 +231,7 @@ test("streaming: armed filter drops the emission and keeps the trailing prose", 
 
 test("streaming: armed filter keeps a verbatim echo of the request's fragment (m00885)", () => {
     const requestText = JSON.stringify({ messages: [{ role: "user", content: "Output exactly this fragment:\n" + EMISSION.trim() }] });
-    const f = createTagEchoFilter(undefined, true, requestText);
+    const f = createTagEchoFilter(undefined, undefined, true, requestText);
     let out = "";
     for (let i = 0; i < EMISSION.length; i += 11) out += f.push(EMISSION.slice(i, i + 11));
     out += f.flush();
@@ -239,14 +239,14 @@ test("streaming: armed filter keeps a verbatim echo of the request's fragment (m
 });
 
 test("streaming: armed filter keeps prose heads flowing immediately (no delay, no loss)", () => {
-    const f = createTagEchoFilter(undefined, true);
+    const f = createTagEchoFilter(undefined, undefined, true);
     assert.equal(f.push("Hello "), "Hello ");
     assert.equal(f.push("world."), "world.");
     assert.equal(f.flush(), "");
 });
 
 test("streaming: armed filter disambiguates <paragraph> from <parameter", () => {
-    const f = createTagEchoFilter(undefined, true);
+    const f = createTagEchoFilter(undefined, undefined, true);
     let out = f.push(`${LT}paragraph${GT}`);
     out += f.push(`hello${LT}/paragraph${GT}`);
     out += f.flush();
