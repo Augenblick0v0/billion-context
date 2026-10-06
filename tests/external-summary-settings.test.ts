@@ -6,8 +6,8 @@ import { join } from "node:path";
 import http from "node:http";
 import { once } from "node:events";
 import { parseExternalSummarySettings } from "../src/external-summary-settings.ts";
-import { configuredSummarySettings } from "../src/external-summary-config.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
+import { mergeCompress } from "../src/compress-settings.ts";
 import { parseCompressSettings, parseRouteEntry } from "../src/config.ts";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -36,65 +36,70 @@ test("external summary defaults off and produces a bounded global plan", () => {
 });
 
 test("small context and total budgets clamp defaults without changing explicit limits", () => {
-    const plan = parseExternalSummarySettings({ targets: [{ ...target, contextWindow: 2048 }], budget: { totalTimeoutMs: 500 } });
+    const plan = parseExternalSummarySettings({ enabled: true, targets: [{ ...target, contextWindow: 2048 }], budget: { totalTimeoutMs: 500 } });
     assert.equal(plan.targets[0].outputTokens, 512);
     assert.equal(plan.budget.targetTimeoutMs, 500);
 });
 
-test("configured summary settings cache successful reads by path, mtime and size only", () => {
-    const path = join(root(), "config.json");
-    const previous = process.env.BILI_CONFIG_FILE;
-    const first = { compress: { externalSummary: { enabled: true, targets: [target] } } };
-    const second = { compress: { externalSummary: { enabled: true, targets: [{ ...target, name: "backup1", credentialRef: "secret:backup1" }] } } };
-    const timestamp = new Date("2020-01-01T00:00:00.000Z");
-    process.env.BILI_CONFIG_FILE = path;
-    try {
-        writeFileSync(path, JSON.stringify(first));
-        utimesSync(path, timestamp, timestamp);
-        assert.equal(configuredSummarySettings()?.targets[0]?.name, "primary");
-        writeFileSync(path, JSON.stringify(second));
-        utimesSync(path, timestamp, timestamp);
-        assert.equal(configuredSummarySettings()?.targets[0]?.name, "primary");
-
-        const invalidTimestamp = new Date("2020-01-01T00:00:01.000Z");
-        writeFileSync(path, "{");
-        utimesSync(path, invalidTimestamp, invalidTimestamp);
-        assert.throws(() => configuredSummarySettings(), /configuration unavailable/);
-        writeFileSync(path, JSON.stringify(second));
-        utimesSync(path, invalidTimestamp, invalidTimestamp);
-        assert.equal(configuredSummarySettings()?.targets[0]?.name, "backup1");
-    } finally {
-        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
-        else process.env.BILI_CONFIG_FILE = previous;
-    }
+test("external summary chains ride the three-level compress ladder (whole-chain replace)", () => {
+    const chain = (name: string) =>
+        parseExternalSummarySettings({ enabled: true, targets: [{ ...target, name, credentialRef: `secret:${name}` }] });
+    const global = chain("global-chain");
+    const provider = chain("provider-chain");
+    const model = chain("model-chain");
+    const off = parseExternalSummarySettings({ enabled: false, targets: [target] });
+    assert.equal(mergeCompress({ externalSummary: global }, { externalSummary: provider }, { externalSummary: model })?.externalSummary?.targets[0]?.name, "model-chain");
+    assert.equal(mergeCompress({ externalSummary: global }, { externalSummary: provider })?.externalSummary?.targets[0]?.name, "provider-chain");
+    assert.equal(mergeCompress({ externalSummary: global })?.externalSummary?.targets[0]?.name, "global-chain");
+    // A model-level `enabled: false` chain replaces (not merges with) the
+    // provider chain, exactly like `tiers` — no sub-field bleed-through.
+    const replaced = mergeCompress({ externalSummary: global }, { externalSummary: provider }, { externalSummary: off })?.externalSummary;
+    assert.equal(replaced?.enabled, false);
+    assert.deepEqual(replaced?.targets, off.targets);
 });
 
 for (const invalid of [
-    { enabled: "true" }, { enabled: true }, { targets: {} }, { targets: [target, target] },
-    { targets: [{ ...target, key: "do-not-echo" }] }, { apiKey: "do-not-echo" },
-    { targets: [{ ...target, url: "https://user:private@example.com/v1/responses" }] },
-    { targets: [{ ...target, url: "https://example.com/v1/responses?key=private" }] },
-    { targets: [{ ...target, url: "http://remote.example/v1/responses" }] },
-    { targets: [{ ...target, url: "https://example.com/bili/https://upstream.example/v1/responses" }] },
-    { targets: [{ ...target, credentialRef: "secret:../escape" }] },
-    { targets: [{ ...target, credentialRef: "env:KEY\nother" }] },
-    { targets: [{ ...target, protocol: "unknown" }] },
-    { targets: [{ ...target, contextWindow: 3000, outputTokens: 3000 }] },
-    { targets: [{ ...target, stream: "true" }] },
-    { budget: { totalTimeoutMs: 60_000 } }, { budget: { totalTimeoutMs: 100, targetTimeoutMs: 101 } },
-    { budget: { concurrency: 1000 } },
+    { enabled: "true" }, { enabled: true }, { apiKey: "do-not-echo" },
+    { enabled: true, targets: {} }, { enabled: true, targets: [target, target] },
+    { enabled: true, targets: [{ ...target, key: "do-not-echo" }] },
+    { enabled: true, targets: [{ ...target, url: "https://user:private@example.com/v1/responses" }] },
+    { enabled: true, targets: [{ ...target, url: "https://example.com/v1/responses?key=private" }] },
+    { enabled: true, targets: [{ ...target, url: "http://remote.example/v1/responses" }] },
+    { enabled: true, targets: [{ ...target, url: "https://example.com/bili/https://upstream.example/v1/responses" }] },
+    { enabled: true, targets: [{ ...target, credentialRef: "secret:../escape" }] },
+    { enabled: true, targets: [{ ...target, credentialRef: "env:KEY\nother" }] },
+    { enabled: true, targets: [{ ...target, protocol: "unknown" }] },
+    { enabled: true, targets: [{ ...target, contextWindow: 3000, outputTokens: 3000 }] },
+    { enabled: true, targets: [{ ...target, stream: "true" }] },
+    { enabled: true, budget: { totalTimeoutMs: 60_000 } },
+    { enabled: true, budget: { totalTimeoutMs: 100, targetTimeoutMs: 101 } },
+    { enabled: true, budget: { concurrency: 1000 } },
 ]) {
-    test(`invalid external summary plan is rejected: ${JSON.stringify(invalid)}`, () => {
+    test(`invalid external summary plan is rejected when enabled: ${JSON.stringify(invalid)}`, () => {
         assert.throws(() => parseExternalSummarySettings(invalid));
         assert.equal(parseCompressSettings({ externalSummary: invalid }), undefined);
     });
 }
 
-test("external summary target registry cannot be overridden by provider or model", () => {
+for (const inert of [
+    { targets: {} }, { targets: [target, target] },
+    { targets: [{ ...target, protocol: "unknown" }] }, { budget: { totalTimeoutMs: 60_000 } },
+]) {
+    test(`disabled external summary plans are inert instead of bricking compression: ${JSON.stringify(inert)}`, () => {
+        // P2: a `enabled !== true` chain never runs, so garbage targets must
+        // not refuse every compression — validation happens on enable.
+        const plan = parseExternalSummarySettings(inert);
+        assert.equal(plan.enabled, false);
+        assert.deepEqual(plan.targets, []);
+    });
+}
+
+test("external summary chains are configured per route like every other compress field", () => {
     const externalSummary = parseExternalSummarySettings({ targets: [target] });
-    assert.throws(() => parseRouteEntry({ compress: { externalSummary } }), /global-only/);
-    assert.throws(() => parseRouteEntry({ models: { model: { compress: { externalSummary } } } }), /global-only/);
+    assert.doesNotThrow(() => parseRouteEntry({ compress: { externalSummary } }));
+    assert.doesNotThrow(() => parseRouteEntry({ models: { model: { compress: { externalSummary } } } }));
     assert.doesNotThrow(() => parseRouteEntry({ compress: { tiers: false } }));
+    assert.deepEqual(parseCompressSettings({ externalSummary })?.externalSummary, externalSummary);
 });
 
 test("private store resolves, rotates and deletes keys without exposing arbitrary paths", () => {

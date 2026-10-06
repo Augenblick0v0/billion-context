@@ -132,7 +132,8 @@ export type ModelEntry = {
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
 export type CompressSettings = {
-    /** Global-only external summary chain. Not supported in provider/model overrides. */
+    /** External summary chain — three-level like every other compress field
+     *  (whole-chain replace at provider/model level, no sub-merge). */
     externalSummary?: ExternalSummarySettings;
     /** Effective context window used by the compression engine — this is the
      *  model's context size. It is the **denominator** the kernel uses for its
@@ -1916,9 +1917,6 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     if (v && typeof v === "object" && !Array.isArray(v)) {
         const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
         const route: ProviderRoute = { models: obj.models };
-        if (obj.compress?.externalSummary !== undefined || Object.values(obj.models ?? {}).some((model) => model?.compress?.externalSummary !== undefined)) {
-            throw new Error("externalSummary is global-only; configure compress.externalSummary at the file root");
-        }
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         const declaredProtocol = parseDeclaredWireProtocol(obj.protocol);
@@ -1981,7 +1979,14 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     const out: CompressSettings = {};
     if (obj.externalSummary !== undefined) {
         try { out.externalSummary = parseExternalSummarySettings(obj.externalSummary); }
-        catch { return undefined; }
+        catch (error) {
+            // Keep the "unparseable values reject the whole compress block"
+            // contract, but make the rejection VISIBLE with the specific
+            // reason — silently dropping the block also reverts custom
+            // prompts/knobs to defaults, which must never pass unnoticed.
+            loggerLog("warn", `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`);
+            return undefined;
+        }
     }
     const numberOrPercent = (value: unknown): value is number | string =>
         typeof value === "number" && Number.isFinite(value)

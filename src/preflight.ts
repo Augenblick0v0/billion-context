@@ -20,6 +20,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import type { ResolvedKernelConfig } from "./compress-settings.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -1024,7 +1025,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
-            deps = { ...deps, externalSummary: configuredSummaryPlan() };
+            // The plan rides the request Config rail: deps.config is this
+            // request's resolved Config (three-level cascade), so the plan
+            // always matches the settings the wire path itself resolved.
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary) };
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);

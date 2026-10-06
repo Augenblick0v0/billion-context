@@ -4,7 +4,7 @@ Design discussion: [#2163](https://github.com/ranxianglei/billion-context/issues
 
 ## Current Stage
 
-The implementation in PR #2167 wires the isolated executor in `src/external-summary.ts` into the host's compression paths through `src/external-summary-runtime.ts` and `src/external-summary-compress.ts`. Global `compress.externalSummary` settings are opt-in and disabled by default. This is a review-branch implementation, not a published release or production deployment; repository-owner approval of the configuration surface remains outstanding.
+The implementation in PR #2167 wires the isolated executor in `src/external-summary.ts` into the host's compression paths through `src/external-summary-runtime.ts` and `src/external-summary-compress.ts`. `compress.externalSummary` settings are opt-in and disabled by default; the chain is three-level like every other `compress` field (whole-chain replace at provider/model level, no sub-merge) and rides the request Config rail (`ctx.config` / `effectiveConfig`, #833) — there is no side configuration file. This is a review-branch implementation, not a published release or production deployment; repository-owner approval of the configuration surface remains outstanding.
 
 The executor accepts immutable task text, instructions and optional read-only reference text; an ordered list of injected asynchronous candidates; and explicit internal budgets. Wire protocols, authentication and range selection remain caller responsibilities. No provider request or fold occurs without a caller.
 

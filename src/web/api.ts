@@ -88,11 +88,22 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const rawCompress = config.compress && typeof config.compress === "object" ? config.compress as Record<string, unknown> : undefined;
     const credentialStatus: Record<string, boolean> = {};
     let hideInvalidSummary = false;
+    // Disabled chains skip strict target validation (an inert chain must not
+    // brick the config view), so surface credential status from the raw
+    // target list when the parsed chain carries no targets.
+    const rawCredentialRefs = (value: unknown): string[] => {
+        const targets = (value && typeof value === "object" ? (value as { targets?: unknown }).targets : undefined);
+        if (!Array.isArray(targets)) return [];
+        return [...new Set(targets.filter((item): item is { credentialRef: string } =>
+            !!item && typeof item === "object" && typeof (item as { credentialRef?: unknown }).credentialRef === "string")
+            .map((item) => item.credentialRef))];
+    };
     if (rawCompress?.externalSummary !== undefined) {
         try {
             const summary = parseExternalSummarySettings(rawCompress.externalSummary);
+            const refs = summary.targets.length > 0 ? summary.targets.map((target) => target.credentialRef) : rawCredentialRefs(rawCompress.externalSummary);
             const store = new SummaryCredentialStore();
-            for (const target of summary.targets) credentialStatus[target.credentialRef] = store.configured(target.credentialRef);
+            for (const ref of refs) credentialStatus[ref] = store.configured(ref);
         } catch {
             // A manually edited invalid block can contain inline credentials.
             // Never echo that block through either structured or raw config GET.

@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-PR #2167 已通过 `src/external-summary-runtime.ts` 和 `src/external-summary-compress.ts`，将 `src/external-summary.ts` 独立执行器接入宿主压缩路径。全局 `compress.externalSummary` 默认关闭，须显式启用。当前是评审分支中的实现，不是已发布版本，也未部署生产；配置面仍待仓库 owner 明确确认。
+PR #2167 已通过 `src/external-summary-runtime.ts` 和 `src/external-summary-compress.ts`，将 `src/external-summary.ts` 独立执行器接入宿主压缩路径。`compress.externalSummary` 默认关闭，须显式启用；该链与其余 `compress` 字段一样存在全部三个层级（provider/model 层整链替换，无子字段合并），且沿请求 Config 轨道（`ctx.config` / `effectiveConfig`，#833）流动，不再有旁路配置文件。当前是评审分支中的实现，不是已发布版本，也未部署生产；配置面仍待仓库 owner 明确确认。
 
 执行器接收不可变的任务文本、指令、可选只读参考，有序的异步候选调用及明确的内部预算。协议、鉴权和范围选择由调用方负责；没有调用方就不会请求供应商或折叠历史。
 

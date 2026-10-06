@@ -46,15 +46,24 @@ function text(value: unknown, limit: number): string {
     return value.trim();
 }
 
-/** Global-only policy. Provider/model overrides are deliberately not another target registry. */
+/** External summary chain. Three-level like every other `compress` field:
+ *  a deeper level (provider/model) replaces the whole chain — no per-target
+ *  or per-budget sub-merge. */
 export function parseExternalSummarySettings(value: unknown): ExternalSummarySettings {
     const settings = object(value);
     knownKeys(settings, ["enabled", "targets", "budget"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
+    if (!enabled) {
+        // A disabled chain never reads targets or budget — rejecting the
+        // whole compress block over a stale typo here would disable
+        // compression itself. Strict validation re-engages the moment the
+        // (possibly deeper-level) chain is enabled.
+        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
+    }
     if (settings.targets !== undefined && !Array.isArray(settings.targets)) throw new Error("External summary targets must be an array");
     const values = (settings.targets ?? []) as unknown[];
-    if (values.length > 16 || (enabled && values.length === 0)) throw new Error("External summary requires 1 to 16 targets when enabled");
+    if (values.length > 16 || values.length === 0) throw new Error("External summary requires 1 to 16 targets when enabled");
     const names = new Set<string>();
     const targets = values.map((value): ExternalSummaryTarget => {
         const target = object(value);

@@ -1,6 +1,7 @@
 import { collectBlockContent } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
+import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
@@ -30,8 +31,10 @@ function withOptionalSummaries(input: unknown): unknown {
 /** Called under the host session lock; generation is separate from kernel commit. */
 export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
     if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
+    // The plan rides the request Config rail (#833: ctx.config is the
+    // session's effective Config — same cascade that produced the wire).
     let plan;
-    try { plan = configuredSummaryPlan(); }
+    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary); }
     catch { return compressResult("[Compression FAILED: external summary configuration is invalid. Nothing compressed.]", "refused", 0); }
     if (!plan) return applyRanges(parseCompressInput(input, callId), ctx);
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);

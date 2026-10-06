@@ -743,7 +743,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
-    const externalSummary = externalSummaryEnabled();
+    const externalSummary = externalSummaryEnabled(config);
     const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
     const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —

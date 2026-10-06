@@ -1,6 +1,5 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Config, CoreMessage } from "acp-kernel";
@@ -211,10 +210,7 @@ test("loop #7: successful compress (real block) → re-request fires (model cont
 });
 
 test("loop external summary: streaming compress uses the configured model and credential", async () => {
-    const root = mkdtempSync(join(tmpdir(), "bili-loop-summary-"));
-    const configPath = join(root, "config.json");
     const summaryUrl = "http://127.0.0.1/summary";
-    const previousConfig = process.env.BILI_CONFIG_FILE;
     const previousKey = process.env.E2E_SUMMARY_KEY;
     const originalFetch = globalThis.fetch;
     const ctx = withRefs(makeCtx([
@@ -232,11 +228,12 @@ test("loop external summary: streaming compress uses the configured model and cr
         fcEvents(0, "call_external", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002" }] })),
         COMPLETED,
     ].join("");
-    writeFileSync(configPath, JSON.stringify({ compress: { externalSummary: {
+    // The chain rides the request config rail (#833): ctx.config is the
+    // session's effective resolved config, like the proxy serves it.
+    (ctx.config as Config & { externalSummary?: unknown }).externalSummary = {
         enabled: true,
         targets: [{ name: "dedicated", protocol: "responses", url: summaryUrl, model: "summary-model", credentialRef: "env:E2E_SUMMARY_KEY" }],
-    } } }));
-    process.env.BILI_CONFIG_FILE = configPath;
+    };
     process.env.E2E_SUMMARY_KEY = "dedicated-test-key";
     let summaryCalls = 0;
     try {
@@ -263,11 +260,8 @@ test("loop external summary: streaming compress uses the configured model and cr
         assert.ok(out.includes("response.completed"));
     } finally {
         globalThis.fetch = originalFetch;
-        if (previousConfig === undefined) delete process.env.BILI_CONFIG_FILE;
-        else process.env.BILI_CONFIG_FILE = previousConfig;
         if (previousKey === undefined) delete process.env.E2E_SUMMARY_KEY;
         else process.env.E2E_SUMMARY_KEY = previousKey;
-        rmSync(root, { recursive: true, force: true });
     }
 });
 

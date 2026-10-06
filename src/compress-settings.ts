@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import type { ExternalSummarySettings } from "./external-summary-settings.js";
 
 export type { CompressSettings } from "./config.js";
 
@@ -103,6 +104,10 @@ export function mergeCompress(
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         reconcile: pick("reconcile"),
         promptPack: pick("promptPack"),
+        // Whole-chain replace (same semantics as `tiers`/`rules`): an
+        // `externalSummary` object at a deeper level replaces the entire
+        // chain above it — there is no per-target or per-budget sub-merge.
+        externalSummary: pick("externalSummary"),
     };
 }
 
@@ -258,7 +263,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
 // (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[] };
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings };
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.
@@ -335,6 +340,9 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         neverPreserveRecentTools: s.neverPreserveRecentTools ?? base.neverPreserveRecentTools,
         // base is Config (0.0.92 lacks the field) — the cast keeps both kernel windows compiling.
         preserveRecentTools: s.preserveRecentTools ?? (base as ResolvedKernelConfig).preserveRecentTools,
+        // Host-only field, same inheritance pattern: never present on a raw
+        // kernel Config, carried through re-application unchanged.
+        externalSummary: s.externalSummary ?? (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
         ...(imageCompression !== undefined ? { imageCompression } : {}),

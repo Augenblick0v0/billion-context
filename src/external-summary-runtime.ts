@@ -1,5 +1,4 @@
 import { performance } from "node:perf_hooks";
-import { configuredSummarySettings } from "./external-summary-config.js";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -10,10 +9,14 @@ const executor = new ExternalSummaryExecutor(4);
 
 export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
+    private readonly settings: ExternalSummarySettings;
     readonly deadline: number;
 
-    constructor(private readonly settings: ExternalSummarySettings, store = new SummaryCredentialStore(), env: NodeJS.ProcessEnv = process.env) {
-        this.settings = parseExternalSummarySettings(settings);
+    // `raw` may be an already-parsed chain off the request rail or raw JSON
+    // from a hand-edited file — re-parse here so invalid settings fail
+    // loudly at plan build, never silently use main-model summaries.
+    constructor(raw: unknown, store = new SummaryCredentialStore(), env: NodeJS.ProcessEnv = process.env) {
+        this.settings = parseExternalSummarySettings(raw);
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
         this.deadline = performance.now() + this.settings.budget.totalTimeoutMs;
         this.candidates = this.settings.targets.map((target) => {
@@ -41,8 +44,13 @@ export class ConfiguredSummaryPlan {
     }
 }
 
-/** undefined means disabled; invalid settings must fail, never silently use main. */
-export function configuredSummaryPlan(): ConfiguredSummaryPlan | undefined {
-    const settings = configuredSummarySettings();
-    return settings?.enabled ? new ConfiguredSummaryPlan(settings) : undefined;
+/** Build the per-request plan from the RESOLVED settings riding the request
+ *  Config rail (`ResolvedKernelConfig.externalSummary`, merged by
+ *  `mergeCompress` with whole-chain-replace semantics). undefined/disabled →
+ *  undefined (legacy in-model summaries). Invalid settings throw — they must
+ *  fail loudly, never silently fall back to main-model summaries. */
+export function configuredSummaryPlan(settings: unknown): ConfiguredSummaryPlan | undefined {
+    if (!settings || typeof settings !== "object") return undefined;
+    if ((settings as { enabled?: unknown }).enabled !== true) return undefined;
+    return new ConfiguredSummaryPlan(settings);
 }

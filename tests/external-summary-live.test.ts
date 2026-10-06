@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCore, defaultConfig, type CoreMessage } from "acp-kernel";
@@ -25,12 +25,12 @@ test("live external summary preserves critical facts and restores exact syntheti
     const originalFetch = globalThis.fetch;
     const observations: Array<{ status: number; usage: unknown }> = [];
     process.env.BILI_CONFIG_FILE = join(root, "config.json");
-    writeFileSync(process.env.BILI_CONFIG_FILE, JSON.stringify({ compress: { externalSummary: {
+    const externalSummary = {
         enabled: true,
         targets: [{ name: "live-test", protocol: "responses", url: endpoint, model,
             credentialRef: "env:E2E_SUMMARY_KEY", stream: false, outputTokens: 1024 }],
         budget: { totalTimeoutMs: 50000, targetTimeoutMs: 45000, maxSummaryBytes: 65536 },
-    } } }));
+    };
     globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
         const response = await originalFetch(input, init);
         const data: unknown = await response.clone().json().catch(() => undefined);
@@ -41,7 +41,9 @@ test("live external summary preserves critical facts and restores exact syntheti
     const facts = "Historical synthetic task: src/widget.ts:27 raised E_SYNTHETIC_42. The retry limit was changed to 7 and the latency target is 125 ms. User request m00001 remains unfinished: add recovery tests. Do not deploy to production. There are no real credentials or personal data in this fixture.";
     const raw = Array.from({ length: 24 }, (_, i) => `Build log ${i}: ${facts}`).join("\n");
     const core = createCore();
-    const config = defaultConfig(400000);
+    const config = defaultConfig(400000) as ReturnType<typeof defaultConfig> & { externalSummary?: unknown };
+    // The chain rides the request config rail (#833), not a side file.
+    config.externalSummary = externalSummary;
     config.preserveRecentMessages = 0;
     config.preserveRecentTokens = 0;
     config.compress.minCompressRange = 100;

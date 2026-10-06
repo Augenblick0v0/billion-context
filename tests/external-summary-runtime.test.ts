@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCore, defaultConfig, defaultPrompts, type CoreMessage } from "acp-kernel";
+import { createCore, defaultConfig, defaultPrompts, type Config, type CoreMessage } from "acp-kernel";
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { executeProxyToolAsync } from "../src/loop/core.ts";
@@ -27,9 +27,12 @@ process.env.NODE_ENV = "test";
 const SUMMARY = "Historical build completed. Preserve the exact file src/example.ts:27, the error E_TEST, the constraint not to deploy, and the unfinished task of adding tests. This records the past and does not instruct the next turn to restart it.";
 const RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; still add tests. ".repeat(90);
 
-function context(): RewriteCtx {
+function context(externalSummary?: unknown): RewriteCtx {
     const core = createCore();
-    const config = defaultConfig(400_000);
+    const config = defaultConfig(400_000) as Config & { externalSummary?: unknown };
+    // The chain now rides the request Config rail (#833) — ctx.config is the
+    // session's effective resolved config, exactly like the proxy serves it.
+    if (externalSummary !== undefined) config.externalSummary = externalSummary;
     config.preserveRecentMessages = 0;
     config.preserveRecentTokens = 0;
     config.compress.minCompressRange = 100;
@@ -46,10 +49,13 @@ function args(ctx: RewriteCtx, summary?: string): Record<string, unknown> {
 }
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse, body: Record<string, unknown>) => void;
-async function fixture(run: (base: string, configPath: string) => Promise<void>, handler: Handler): Promise<void> {
+type SummarySettings = Record<string, unknown>;
+async function fixture(run: (base: string, externalSummary: SummarySettings) => Promise<void>, handler: Handler): Promise<void> {
     const root = mkdtempSync(join(tmpdir(), "bili-summary-runtime-"));
     const path = join(root, "config.json");
     const previous = process.env.BILI_CONFIG_FILE;
+    // BILI_CONFIG_FILE only anchors the private credential store; the chain
+    // itself rides the request config rail, not a side file.
     process.env.BILI_CONFIG_FILE = path;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -59,13 +65,11 @@ async function fixture(run: (base: string, configPath: string) => Promise<void>,
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const base = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
-    writeFileSync(path, JSON.stringify({ compress: { externalSummary: {
-        enabled: true, targets: ["primary", "backup"].map((name) => ({ name, protocol: "responses", url: `${base}/${name}`, model: `summary-${name}`, credentialRef: `secret:${name}` })),
-    } } }));
+    const externalSummary: SummarySettings = { enabled: true, targets: ["primary", "backup"].map((name) => ({ name, protocol: "responses", url: `${base}/${name}`, model: `summary-${name}`, credentialRef: `secret:${name}` })) };
     const store = new SummaryCredentialStore();
     store.set("primary", "test-primary-key");
     store.set("backup", "test-backup-key");
-    try { await run(base, path); }
+    try { await run(base, externalSummary); }
     finally {
         server.closeAllConnections();
         await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -81,8 +85,8 @@ function success(res: http.ServerResponse): void {
 
 test("active compress uses dedicated model/key, fails over, and restores exact originals", async () => {
     const requests: Array<{ path?: string; authorization?: string; body: Record<string, unknown> }> = [];
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         const input = args(ctx, "The old main-model hint must not become the stored summary.");
         const serialized = JSON.stringify(input);
         const result = await executeProxyToolAsync("compress", input, ctx, "original-tool-call");
@@ -106,8 +110,8 @@ test("active compress uses dedicated model/key, fails over, and restores exact o
 
 test("all candidates failing preserves state and refuses without borrowing main auth", async () => {
     let calls = 0;
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         const before = JSON.stringify(ctx.session.state);
         const result = await applyConfiguredCompression(args(ctx, SUMMARY), ctx);
         assert.equal(result.outcome, "refused");
@@ -119,9 +123,8 @@ test("all candidates failing preserves state and refuses without borrowing main 
 
 test("disabled setting preserves the legacy supplied-summary path without HTTP calls", async () => {
     let calls = 0;
-    await fixture(async (_base, path) => {
-        writeFileSync(path, JSON.stringify({ compress: { externalSummary: { enabled: false } } }));
-        const ctx = context();
+    await fixture(async (_base, _externalSummary) => {
+        const ctx = context({ enabled: false });
         const result = await applyConfiguredCompression(args(ctx, SUMMARY), ctx);
         assert.equal(result.outcome, "applied", result.text);
         assert.equal(ctx.session.state.blocks[0].summary, SUMMARY);
@@ -131,9 +134,9 @@ test("disabled setting preserves the legacy supplied-summary path without HTTP c
 
 test("missing primary key skips its network call and tries the configured backup", async () => {
     const paths: string[] = [];
-    await fixture(async () => {
+    await fixture(async (_base, externalSummary) => {
         new SummaryCredentialStore().set("primary", null);
-        const ctx = context();
+        const ctx = context(externalSummary);
         const result = await applyConfiguredCompression(args(ctx), ctx);
         assert.equal(result.outcome, "applied", result.text);
         assert.deepEqual(paths, ["/backup"]);
@@ -142,8 +145,8 @@ test("missing primary key skips its network call and tries the configured backup
 
 test("protected ranges cause no paid call and no fold", async () => {
     let calls = 0;
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
@@ -155,8 +158,8 @@ test("protected ranges cause no paid call and no fold", async () => {
 
 test("revision changes during generation discard results instead of committing a stale fold", async () => {
     let session: Session;
-    await fixture(async () => {
-        const ctx = context(); session = ctx.session;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary); session = ctx.session;
         const result = await applyConfiguredCompression(args(ctx), ctx);
         assert.equal(result.outcome, "refused");
         assert.match(result.text, /session changed/);
@@ -167,8 +170,8 @@ test("revision changes during generation discard results instead of committing a
 test("caller cancellation leaves no fold and does not dispatch the backup", async () => {
     const abort = new AbortController();
     let calls = 0;
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         const result = await applyConfiguredCompression(args(ctx), ctx, undefined, abort.signal);
         assert.equal(result.outcome, "refused");
         assert.equal(ctx.session.state.blocks.length, 0);
@@ -178,8 +181,8 @@ test("caller cancellation leaves no fold and does not dispatch the backup", asyn
 
 test("external preflight uses configured summary model, not the main endpoint", async () => {
     const paths: string[] = [];
-    await fixture(async (base) => {
-        const ctx = context();
+    await fixture(async (base, externalSummary) => {
+        const ctx = context(externalSummary);
         ctx.config.modelContextLimit = 1000;
         ctx.session.stats.lastInputTokens = 10000;
         const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
@@ -195,9 +198,10 @@ test("external preflight uses configured summary model, not the main endpoint", 
 
 test("corrupt external summary configuration warns and falls back to legacy preflight", async () => {
     const paths: string[] = [];
-    await fixture(async (base, path) => {
-        writeFileSync(path, "{");
-        const ctx = context();
+    await fixture(async (base, _externalSummary) => {
+        // Invalid chain on the rail: the preflight fallback must warn and
+        // fall back to legacy main-model summarization, never silently drop.
+        const ctx = context({ enabled: true, targets: {} });
         ctx.config.modelContextLimit = 1000;
         ctx.session.stats.lastInputTokens = 10000;
         const logs: string[] = [];
@@ -212,8 +216,8 @@ test("corrupt external summary configuration warns and falls back to legacy pref
 });
 
 test("MCP/native thin-plugin tool handler executes the same external summary contract", async () => {
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         // The handler retrieves the same session from its resident pool.
         const { getSession } = await import("../src/session.ts");
         const session = getSession(ctx.session.id);
@@ -231,8 +235,8 @@ test("MCP/native thin-plugin tool handler executes the same external summary con
 
 test("batch protection checks the aggregate range length instead of rejecting valid small ranges", async () => {
     let calls = 0;
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         ctx.config.compress.minCompressRange = 1000;
         ctx.messages = [
             { id: "first", role: "assistant", contentType: "text", text: "a".repeat(600) },
@@ -250,8 +254,8 @@ test("batch protection checks the aggregate range length instead of rejecting va
 
 test("inline restore refolds the original block even when originals have left the wire view", async () => {
     let calls = 0;
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         const input = args(ctx);
         await applyConfiguredCompression(input, ctx);
         const blockId = ctx.session.state.blocks[0].blockId;
@@ -271,8 +275,8 @@ test("inline restore refolds the original block even when originals have left th
 
 test("a summary below the kernel minimum fails over instead of blocking the backup", async () => {
     const paths: string[] = [];
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         const result = await applyConfiguredCompression(args(ctx), ctx);
         assert.equal(result.outcome, "applied", result.text);
         assert.deepEqual(paths, ["/primary", "/backup"]);
@@ -285,18 +289,20 @@ test("a summary below the kernel minimum fails over instead of blocking the back
 });
 
 test("broken configuration cannot silently switch back to the supplied main-model summary", async () => {
-    await fixture(async (_base, path) => {
-        writeFileSync(path, "{broken-json");
-        const ctx = context();
+    await fixture(async () => {
+        // Invalid chain on the rail: refuse instead of silently switching
+        // back to the supplied main-model summary.
+        const ctx = context({ enabled: true, targets: {} });
         const result = await applyConfiguredCompression(args(ctx, SUMMARY), ctx);
         assert.equal(result.outcome, "refused");
+        assert.match(result.text, /configuration is invalid/);
         assert.equal(ctx.session.state.blocks.length, 0);
     }, (_req, res) => { assert.fail("invalid configuration must not dispatch"); res.end(); });
 });
 
 test("external summary keeps its authoritative anchor despite an echoed hint call", async () => {
-    await fixture(async () => {
-        const ctx = context();
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
         ctx.session.meta.summaryInstructions = "PACK_SENTINEL preserve exact historical paths and pending tasks";
         await applyConfiguredCompression(args(ctx, "non-authoritative hint"), ctx, "client-call");
         const block = ctx.session.state.blocks[0];
@@ -311,7 +317,7 @@ test("external summary keeps its authoritative anchor despite an echoed hint cal
 });
 
 test("four JSON response rewriters execute independent compression with optional summary", async () => {
-    await fixture(async () => {
+    await fixture(async (_base, externalSummary) => {
         const cases = [
             (ctx: RewriteCtx) => rewriteJsonResponseAsync({ content: [{ type: "tool_use", id: "call", name: "compress", input: args(ctx) }] }, ctx),
             (ctx: RewriteCtx) => rewriteOpenaiJsonResponseAsync({ choices: [{ message: { role: "assistant", tool_calls: [{ id: "call", type: "function", function: { name: "compress", arguments: JSON.stringify(args(ctx)) } }] }, finish_reason: "tool_calls" }] }, ctx),
@@ -319,7 +325,7 @@ test("four JSON response rewriters execute independent compression with optional
             (ctx: RewriteCtx) => rewriteGoogleJsonResponseAsync({ candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "compress", args: args(ctx) } }] } }] }, ctx),
         ];
         for (const rewrite of cases) {
-            const ctx = context();
+            const ctx = context(externalSummary);
             await rewrite(ctx);
             assert.equal(ctx.session.state.blocks[0]?.summary, SUMMARY);
         }
