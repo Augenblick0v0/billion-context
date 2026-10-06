@@ -1300,28 +1300,44 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
 
-### Why compaction starts earlier than expected on large windows
+### Why the first compaction waits until 200k
 
-Two defaults interact on large-window setups; both are by design, not bugs:
+Compaction does **not** trigger on absolute window position — it triggers on
+**growth intervals**: by default the first soft compaction fires after the
+session grows **50k tokens past its boot content**
+([`nudgeGrowthTokens`](#nudgegrowthtokens), a flat step independent of window
+size). The absolute position of the first compaction is therefore ≈ **boot +
+50k**:
 
-1. **The forced threshold applies to the *effective* window, not the native one.**
-   The output reserve (`min(max_tokens, outputHeadroomMaxPct × window)`, cap
-   default `0.25`) is subtracted before the nudge/truncate bands are placed
-   (see [`outputHeadroomMaxPct`](#outputheadroommaxpct)). On a 262,144-token
-   window with `max_tokens = 131072`, the reserve is 65,536 → effective window
-   196,608 → the default 75% [`maxContextLimit`](#maxcontextlimit) fires at
-   ≈147k tokens — **56% of the full window**, not at ~200k.
-2. **[`nudgeGrowthTokens`](#nudgegrowthtokens) is flat by design.** Soft nudges
-   fire every +50k of compressible growth regardless of window size. A heavy
-   boot (many tools and skills — 100k–150k of prefill before the first user
-   turn) on a 262k window therefore sees 2–4 incremental compactions over a
-   200k-token task. On local models every compaction is a full re-prefill, which
-   is exactly where the "it keeps compacting, my task took 2–3× longer"
-   experience comes from.
+- boot 30k–50k (the dsh default) → first compaction at ~80k–100k;
+- boot 100k–150k (a heavy stack of tools and skills) → the first compaction
+  likely waits until **~200k**;
+- raising the growth step to 100k pushes it out to boot + 100k.
 
-Remedies: raise `nudgeGrowthTokens` (100k+ on large windows), slim the boot
-(e.g. the `lean` prompt pack), and check actual boot/context usage with `/acp`
-or the web UI before tuning.
+The forced threshold ([`maxContextLimit`](#maxcontextlimit), default 75%) is
+only a backstop, and it applies to the *effective* window — the output reserve
+`min(max_tokens, outputHeadroomMaxPct × window)` (cap default `0.25`, see
+[`outputHeadroomMaxPct`](#outputheadroommaxpct)) is subtracted first. The
+reserve is usually small and only maxes out at the 25% cap when the request
+carries a very large `max_tokens`: a 262,144-token window with
+`max_tokens = 131072` → effective window 196,608 → forced line ≈147k; the same
+window with an 8k reserve → forced line ≈190k — which is where the "it only
+compacts around 200k" experience comes from.
+
+After that the cadence stays growth-based: one incremental compaction per +50k
+of compressible growth. On local models each compaction is a full re-prefill —
+a heavy boot plus a large window puts several of them into one long task, which
+is how wall-clock ends up 2–3× longer.
+
+To improve, pick the angle that matches the goal:
+
+- **start saving tokens earlier**: lower `nudgeGrowthTokens` (e.g. 30k), or
+  lower `maxContextLimit` (e.g. `"60%"`) to pull the forced line in;
+- **fewer compactions**: raise `nudgeGrowthTokens` (100k+ on large windows);
+- **the root cause is a heavy boot**: `promptPack: "lean"` or trimming tools and
+  skills — boot size directly determines the absolute position of the first
+  compaction;
+- measure actual boot/context usage with `/acp` or the web UI before tuning.
 
 ### Soft target with elastic headroom (#1122)
 

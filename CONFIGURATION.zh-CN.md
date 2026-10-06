@@ -1305,25 +1305,36 @@
 - **状态：** ACTIVE
 - **说明：** 当使用率越过阈值时注入自动压缩 nudge 消息。设为 `false`（或 `ACP_COMPRESS_NUDGE=0`）可禁用 nudge 注入。同时禁用 `injectTool` 和 `injectNudge` 在功能上类似 `passthrough`，区别在于代理仍会跟踪 token 使用量。
 
-### 为什么大窗口下压缩比预期来得早
+### 为什么第一次压缩要到 200k 才触发？
 
-两个默认值在大窗口场景下叠加起作用，都是设计行为而非 bug：
+压缩触发时机**不是按绝对窗口位置，而是按增长区间**：默认在开机内容之上**增长
+5 万 token** 才触发第一次软压缩（[`nudgeGrowthTokens`](#nudgegrowthtokens)
+恒定步长，与窗口大小无关）。因此第一次压缩的绝对位置 ≈ **开机占用 + 50k**：
 
-1. **强制阈值作用在「有效窗口」而非原生窗口上。** 输出预留
-   （`min(max_tokens, outputHeadroomMaxPct × 窗口)`，cap 默认 `0.25`）先被扣掉，
-   nudge/truncate 档位位于 `窗口 − 预留` 之下（见
-   [`outputHeadroomMaxPct`](#outputheadroommaxpct)）。262,144 窗口 +
-   `max_tokens = 131072` 时预留 65,536 → 有效窗口 196,608 → 默认 75% 的
-   [`maxContextLimit`](#maxcontextlimit) 在 ≈147k 触发 —— **约为完整窗口的
-   56%**，而不是 ~200k。
-2. **[`nudgeGrowthTokens`](#nudgegrowthtokens) 按设计恒定。** 软 nudge 每 +50k
-   可压缩增长触发一次，与窗口大小无关。开机很重（工具+skill 众多，首条用户
-   消息前已有 100k–150k prefill）的 262k 窗口在一个 200k token 的任务里会经历
-   2–4 次增量压缩；本地模型每次压缩都是整窗重新 prefill —— 「一直在压缩、
-   任务时长 ×2–3」的体验正来源于此。
+- 开机 30k–50k（dsh 默认）→ 第一次压缩在 ~80k–100k；
+- 开机 100k–150k（工具/技能众多的重型启动）→ 第一次压缩很可能要到 **~200k**
+  才发生；
+- 把增长步长调到 100k → 同样推迟到 开机 + 100k。
 
-对策：大窗口调大 `nudgeGrowthTokens`（100k+）；用 `lean` prompt pack 等方式
-减小开机占用；调参前先用 `/acp` 或网页界面看一眼实际开机/上下文占用。
+强制压缩线（[`maxContextLimit`](#maxcontextlimit) 默认 75%）只是兑底，且作用在
+「有效窗口」上 —— 输出预留 `min(max_tokens, outputHeadroomMaxPct × 窗口)`
+（cap 默认 0.25，见 [`outputHeadroomMaxPct`](#outputheadroommaxpct)）先被
+扣除。预留通常很小，只有请求携带很大的 `max_tokens` 时才会被 25% 封顶拉满：
+262,144 窗口 + `max_tokens = 131072` → 有效窗口 196,608 → 强制线 ≈147k；
+262,144 窗口 + 预留 8k → 强制线 ≈190k —— 这就是「大约到 200k 才压缩」的来源。
+
+之后的节奏仍是增长制：每 +50k 可压缩增长一次增量压缩。本地模型每次压缩都是
+整窗重新 prefill —— 重型启动 + 大窗口的长任务会经历多次，任务时长可能被拖长
+2–3 倍。
+
+想改善，从这几个角度入手：
+
+- **想更早开始省 token**：调小 `nudgeGrowthTokens`（如 30k），或调低
+  `maxContextLimit`（如 `"60%"`）提前强制线；
+- **想减少压缩次数**：调大 `nudgeGrowthTokens`（大窗口 100k+）；
+- **开机太重是根源**：`promptPack: "lean"` 或精简工具/技能 —— 开机占用直接
+  决定第一次压缩的绝对位置；
+- 调参前先用 `/acp` 或网页界面实测开机/上下文占用。
 
 ### 软目标与弹性余量 (#1122)
 
