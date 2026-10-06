@@ -52,22 +52,21 @@
         <p class="doc-sub" data-i18n="d.sub">Everything you need to run billion-context locally and connect your agents. Exhaustive references live in the repository: CONFIGURATION.md, TECHNICAL-NOTES.md, PLUGIN.md, SESSION-IDENTITY.md.</p>
 
         <h2 id="quickstart" data-i18n="d.toc_qs">Quickstart</h2>
-        <p data-i18n="d.qs.p">One npm package, Node 22+. Install it, then launch your agent through bili — a dedicated compression proxy starts up alongside:</p>
+        <p data-i18n="d.qs.p">One npm package, Node 22+. Install it, then start the local compression proxy:</p>
         <div class="codebox">
-          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context&#10;bili &lt;your-agent&gt;" data-i18n="common.copy">Copy</button></div>
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context&#10;bili" data-i18n="common.copy">Copy</button></div>
           <pre class="mono"><code>npm install -g billion-context     # Node 22+
-bili &lt;your-agent&gt;                  # e.g. bili pi · bili claude · bili codex · bili omp · bili opencode · bili dsh …
-        </div>
+bili                               # start the proxy (or: bili pi / claude / codex / omp / … to launch an agent through it)</code></pre>
+</div>
         <p data-i18n="d.qs.p2">Everything binds loopback only — nothing is exposed externally. Every instance serves the same built-in dashboard under its own address:</p>
         <div class="codebox">
-          <div class="codebox-head"><span class="mono">browser</span><button class="copy-btn" type="button" data-copy="http://127.0.0.1:18787/__bili/&#10;http://127.0.0.1:8787/__bili/" data-i18n="common.copy">Copy</button></div>
-          <pre class="mono"><a href="http://127.0.0.1:18787/__bili/">http://127.0.0.1:18787/__bili/</a>       # any launcher agent above — lane ports start at 18787, sticky per agent
-<a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a>        # standalone `bili` daemon</pre>
+          <div class="codebox-head"><span class="mono">browser</span><button class="copy-btn" type="button" data-copy="http://127.0.0.1:8787/__bili/" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a></pre>
         </div>
         <p class="hint" data-i18n-html="d.qs.next">Next stop: the panel below — configuration, session stats, and live logs all live there.</p>
 
         <h2 id="webui" data-i18n="d.toc_webui">Web UI</h2>
-        <p class="hint" data-i18n-html="d.wu.access">Access: each instance serves the dashboard under its own loopback address — <a href="http://127.0.0.1:18787/__bili/">http://127.0.0.1:18787/__bili/</a> for launcher agents like <code>bili pi</code> (lane ports start at 18787 and stay sticky), <a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a> for the standalone daemon (ACP_PORT overrides either). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.</p>
+        <p class="hint" data-i18n-html="d.wu.access">Access: open <a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a> once the proxy is up — every instance serves this same built-in dashboard on its own loopback address (ACP_PORT overrides). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.</p>
         <p data-i18n-html="d.wu.p">Every running instance serves a built-in dashboard at <code>/__bili/</code>:</p>
         <ul class="wu-list">
           <li data-i18n="d.wu.ov">Overview — total sessions and requests, gross and net savings, global hit rate with miss breakdown, protocol distribution.</li>
@@ -170,7 +169,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <div class="codebox-head"><span class="mono">path</span><button class="copy-btn" type="button" data-copy="~/.config/billion-context/billion-context.json" data-i18n="common.copy">Copy</button></div>
           <pre class="mono"><code>~/.config/billion-context/billion-context.json     # { } is valid — defaults cover most setups</code></pre>
         </div>
-        <p class="hint" data-i18n-html="d.cf.panel_cta">Configure it in the panel instead of by hand: the <a href="http://127.0.0.1:18787/__bili/#/config">configuration page</a> (launcher instance; <a href="http://127.0.0.1:8787/__bili/#/config">here</a> on the standalone daemon) validates every edit, offers quick-config controls, and writes this same file — environment variables still win over it when set.</p>
+        <p class="hint" data-i18n-html="d.cf.panel_cta">Configure it in the panel instead of by hand: the <a href="http://127.0.0.1:8787/__bili/#/config">configuration page</a> (<a href="http://127.0.0.1:18787/__bili/#/config">here</a> on a launcher agent's instance) validates every edit, offers quick-config controls, and writes this same file — environment variables still win over it when set.</p>
 
         <h2 id="reference" data-i18n="d.toc_ref">Full parameter reference</h2>
         <p data-i18n="d.ref.intro">Every knob in detail. Generated from the same seed as the repository's CONFIGURATION.md (CI drift-guarded), so the site and the repo docs stay one copy.</p>
