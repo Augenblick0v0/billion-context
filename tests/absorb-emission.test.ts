@@ -398,6 +398,17 @@ test("openai adapter loop: verbatim echo of the user's fragment survives armed (
     assert.equal(contentOf(out), EMISSION.trim());
 });
 
+test("field-start release keeps a partial tag head held across the boundary (no wipe)", () => {
+    // Absorb-instructed: the first field bytes are prose, so the whole-field
+    // hold releases mid-chunk. A tag-head-shaped tail released that way must
+    // stay held for the next delta — clearing the shared buffer after
+    // processing would wipe it and leak the tag head as fresh prose.
+    const f = createTagEchoFilter(undefined, undefined, true);
+    assert.equal(f.push("Check <ac"), "Check ");
+    assert.equal(f.push("p tokens=\"2\" type=\"text\">m00001</acp>rest"), "rest");
+    assert.equal(f.flush(), "");
+});
+
 test("openai adapter loop: not-armed passes the emission through (shape alone never decides)", async () => {
     const adapter = createOpenaiAdapter({ model: "gpt" });
     const out = await drain(sseFromStrings(sseParts(EMISSION.trim())), adapter);

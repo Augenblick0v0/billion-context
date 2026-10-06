@@ -1067,8 +1067,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     else if (st === "none") tcHold = "off";
                 }
                 if (tcHold !== "off") return "";
-                const r = process(held);
+                // Clear BEFORE processing: process() can stash a partial tag-head
+                // tail into the shared held buffer (PARTIAL_TAIL hold); clearing
+                // after would wipe it and re-emit the tag head as fresh prose on
+                // the next delta (#2267 review fix, mirrors normal-push/flush paths).
+                const chunk = held;
                 held = "";
+                const r = process(chunk);
                 outputChars += r.length;
                 return r;
             }
