@@ -40,7 +40,7 @@
  * landed checkpoint is equally destructive from any of them. Not gated on the dsh plugin marker: a dsh host routed through
  * a global bili proxy without the plugin bundle must be covered too. Refusal
  * message text intentionally rides into dsh's own warn line
- * (\x22step compaction failed: <message>; continuing the turn\x22).
+  * ("step compaction failed: <message>; continuing the turn").
  */
 
 /** Stable opening sentence of dsh's COMPACTION_INSTRUCTION template
