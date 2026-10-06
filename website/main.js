@@ -153,7 +153,7 @@
     "tt.advisory": "<code>advisoryCheck</code> / <code>advisoryUrl</code> — critical-defect advisory watcher (on by default; force-installs the recommended fix when your version is affected).",
     "tt.rnotes": "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> — release-notes feed for the panel (on by default; fetch + cache only, never installs).",
 /* /bili:gen */
-    "d.wu.access": "Access: each instance serves the dashboard under its own loopback address — <code>http://127.0.0.1:18787/__bili/</code> for launcher agents like <code>bili pi</code> (lane ports start at 18787 and stay sticky), <code>http://127.0.0.1:8787/__bili/</code> for the standalone daemon (ACP_PORT overrides either). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.",
+    "d.wu.access": "Access: each instance serves the dashboard under its own loopback address — <a href=\"http://127.0.0.1:18787/__bili/\">http://127.0.0.1:18787/__bili/</a> for launcher agents like <code>bili pi</code> (lane ports start at 18787 and stay sticky), <a href=\"http://127.0.0.1:8787/__bili/\">http://127.0.0.1:8787/__bili/</a> for the standalone daemon (ACP_PORT overrides either). Or just type <code>/acp</code> in your agent — the panel footer carries a direct link to the current session.",
     "fa.panel.q": "I can't reach the dashboard?",
     "fa.panel.a": "Check the daemon is running (<code>bili doctor</code>) and the port isn't changed (default 8787 for the standalone daemon; launcher lanes start at 18787). The dashboard binds <code>127.0.0.1</code> only — from another machine or phone you need an SSH port-forward or an explicit ACP_HOST setting.",
     "d.toc_ref": "Full parameter reference",
@@ -382,7 +382,7 @@
     "tt.advisory": "<code>advisoryCheck</code> / <code>advisoryUrl</code> —— 关键缺陷公告监视器（默认开；本机版本命中受影响范围时装填推荐修复版本）。",
     "tt.rnotes": "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> —— 面板里的发布说明源（默认开；只抓取缓存、从不安装）。",
 /* /bili:gen */
-    "d.wu.access": "访问方式：每个实例都在自己的回环地址下提供面板——<code>bili pi</code> 这类启动器代理是 <code>http://127.0.0.1:18787/__bili/</code>（lane 端口从 18787 起、按客户端固定），独立守护进程是 <code>http://127.0.0.1:8787/__bili/</code>（ACP_PORT 可覆盖）。也可以直接在 agent 里输入 <code>/acp</code>——面板底部有当前会话的直达链接。",
+    "d.wu.access": "访问方式：每个实例都在自己的回环地址下提供面板——<code>bili pi</code> 这类启动器代理是 <a href=\"http://127.0.0.1:18787/__bili/\">http://127.0.0.1:18787/__bili/</a>（lane 端口从 18787 起、按客户端固定），独立守护进程是 <a href=\"http://127.0.0.1:8787/__bili/\">http://127.0.0.1:8787/__bili/</a>（ACP_PORT 可覆盖）。也可以直接在 agent 里输入 <code>/acp</code>——面板底部有当前会话的直达链接。",
     "fa.panel.q": "打不开面板怎么办？",
     "fa.panel.a": "先确认守护进程在跑（<code>bili doctor</code>）、端口没被改（独立守护进程默认 8787；启动器 lane 从 18787 起）。面板只绑定 <code>127.0.0.1</code>——在别的机器或手机上看需要 SSH 端口转发，或显式设置 ACP_HOST。",
     "d.toc_ref": "参数全参考",
