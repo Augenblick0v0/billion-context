@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { wirePiSubagents } from "../src/agent/pi-subagents.ts";
+import { piSubagentsAdapter, wirePiSubagents } from "../src/agent/pi-subagents.ts";
 import type { ExtensionAPI, CommandCtx } from "../src/agent/pi.ts";
 
 // #2186: hermetic wiring tests for the inlined acp_delegate surface. The
@@ -249,13 +249,26 @@ test("pi.subagents prompt rename replaces the delegate appendix", async () => {
     assert.ok(!prompt.systemPrompt.includes("ACP_DELEGATE"), "built-in appendix replaced");
 });
 
-test("pi.subagents scoped debug flag reaches setDebugEnabled (adapter passthrough)", async () => {
+test("pi.subagents section values flow through session_start without breaking registration", async () => {
     writeBiliConfig({ pi: { subagents: { debug: true, maxConcurrent: 2 } } });
     const { pi, handlers, tools } = fakePi();
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
     wirePiSubagents(pi, "pi");
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
     await handlers.get("session_start")!(undefined, sessionCtx());
-    // The policy resolved from the section must carry the section values.
     assert.equal(tools.length, 3);
+});
+
+// The mapper is the single translation point onto the package adapter shape
+// (cross-repo file-format contract); debug/maxConcurrent have no hermetically
+// observable wiring-level effect, so the mapping is pinned here directly.
+test("piSubagentsAdapter maps the pi.subagents section onto the package adapter shape", () => {
+    assert.deepEqual(piSubagentsAdapter(false), { delegate: { enabled: false } });
+    assert.deepEqual(piSubagentsAdapter(true), {});
+    assert.deepEqual(piSubagentsAdapter({}), {});
+    assert.deepEqual(piSubagentsAdapter({ enabled: false }), { delegate: { enabled: false } });
+    assert.deepEqual(
+        piSubagentsAdapter({ debug: true, maxConcurrent: 2, displayUsage: "merged", prompt: "P", thinkingLevel: "low" }),
+        { delegate: { maxConcurrent: 2, displayUsage: "merged", thinkingLevel: "low" }, delegatePrompt: "P", debug: true },
+    );
 });

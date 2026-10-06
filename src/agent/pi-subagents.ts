@@ -64,7 +64,7 @@ function normalizeSystemPrompt(input: string | string[] | undefined): string {
 // the FILE FORMAT (documented in CONFIGURATION.md) is the contract. Renames:
 // `prompt` replaces acp.json's delegatePrompt; `debug` is scoped to the
 // sub-agent subsystem (the top-level proxy `debug` is untouched).
-function piSubagentsAdapter(section: PiSubagentsFileConfig | boolean): SubagentsAdapterConfig {
+export function piSubagentsAdapter(section: PiSubagentsFileConfig | boolean): SubagentsAdapterConfig {
     if (section === false) return { delegate: { enabled: false } };
     if (section === true) return {};
     const { prompt, debug, ...delegate } = section;
