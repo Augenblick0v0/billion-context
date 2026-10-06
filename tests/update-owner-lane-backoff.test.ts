@@ -298,8 +298,13 @@ test("a partial failure (some profiles refreshed, one broken) still records a la
     const env = { ...process.env, DSH_HOME: dshHome };
     const calls: string[] = [];
     const failingFor = (broken: string) => async (plan: DshPlan) => {
-        const target = plan.args[plan.args.indexOf("--profile") + 1];
-        calls.push(`${target}:${plan.args.join(" ")}`);
+        // windows wraps the whole invocation into one cmd.exe line token
+        // (planDshSpawn → ["/d","/s","/c","\"…dsh.cmd\" plugin --profile b …"]),
+        // so match on the joined string instead of indexing the args array
+        const joined = plan.args.join(" ");
+        const m = /--profile (\S+)/.exec(joined);
+        const target = m?.[1] ?? "?";
+        calls.push(`${target}:${joined}`);
         if (target === broken) throw Object.assign(new Error("exit 1"), { status: 1, stderr: "plugin channel down" });
         return { stdout: "", stderr: "" };
     };
