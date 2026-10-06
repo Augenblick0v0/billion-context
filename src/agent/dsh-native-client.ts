@@ -8,10 +8,16 @@
 // injects globalThis.__BILI__ = {origin} into the web index at render time —
 // a boot-time snapshot that a page loaded before spawn-mode bootstrap (or a
 // desktop boot payload, captured once per app launch) never carries — and it
-// serves the live origin at GET /bili/origin on the dsh webserver; this
-// section polls that route while unresolved so the entry upgrades without a
-// reload or app restart. Neither source known ⇒ degrade to a hint instead of
-// a dead link. The same panel is mounted at two slots (#2125): settings.section
+// serves the live origin at GET /bili/origin on the dsh webserver. The
+// snapshot is only a FIRST-PAINT HINT (#2288): attach-mode presets publish
+// the env origin at startup while the host re-binds it at runtime (dead-attach
+// fallback spawn, routed-origin convergence), so freezing on whatever the page
+// captured left the button pointing at a dead URL for the whole session. This
+// section therefore keeps polling the live route for the whole mount (fast
+// until the first resolution, slow after) and the entry follows wherever the
+// proxy actually listens — no reload or app restart. Neither source known ⇒
+// degrade to a hint instead of a dead link. The same panel is mounted at two
+// slots (#2125): settings.section
 // (always present — the launcher posture has no bundle page) and
 // plugins.bundle.config (keyed by package name; the plugin detail page renders
 // it only when this package is installed as a profile bundle and draws the
@@ -41,12 +47,15 @@ export const inject = ["slots", "locale"];
 
 const NS = "bili";
 
-// #1809/#2187: live-origin probe cadence — first attempt immediate, then a
-// retry every POLL_INTERVAL_MS for POLL_MAX_ATTEMPTS total (~30s), after
-// which probing CONTINUES at SLOW_POLL_INTERVAL_MS until the origin arrives
-// or the page unmounts. #2187: the server side now heals a failed spawn-mode
-// bootstrap in the background and a slow Windows boot can take minutes, so
-// stopping at ~30s stranded the entry on "not bound" for the whole session.
+// #1809/#2187/#2288: live-origin probe cadence — first attempt immediate,
+// then a retry every POLL_INTERVAL_MS for POLL_MAX_ATTEMPTS total (~30s),
+// after which probing CONTINUES at SLOW_POLL_INTERVAL_MS until the page
+// unmounts. #2187: the server side now heals a failed spawn-mode bootstrap
+// in the background and a slow Windows boot can take minutes, so stopping at
+// ~30s stranded the entry on "not bound" for the whole session. #2288: the
+// slow phase also runs AFTER the first resolution — the host re-binds the
+// origin mid-session (runtime re-spawn, routed-origin convergence), so the
+// entry keeps following the live route instead of freezing on the first value.
 const ORIGIN_PATH = "/bili/origin";
 const POLL_INTERVAL_MS = 3000;
 const POLL_MAX_ATTEMPTS = 10;
@@ -79,33 +88,36 @@ function openExternal(url: string): void {
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
 }
 
-/** #1809/#2187: poll the host's live origin route until one arrives; returns
- *  the cancel used as the effect cleanup (no fetch ⇒ no-op, older hosts
- *  without the route simply stay degraded). */
+/** #1809/#2187/#2288: follow the host's live origin route for the lifetime
+ *  of the mount; returns the cancel used as the effect cleanup (no fetch ⇒
+ *  no-op, older hosts without the route simply stay on the snapshot or
+ *  degrade). The snapshot is only a first-paint hint — the host re-binds the
+ *  origin at runtime, so polling never stops after a resolution. */
 function probeOrigin(onOrigin: (origin: string) => void): () => void {
     if (typeof fetch !== "function") return () => {};
     let cancelled = false;
+    let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     const poll = async (): Promise<void> => {
-        let resolved = false;
         try {
             const res = await fetch(ORIGIN_PATH);
             if (res.ok) {
                 const data = (await res.json()) as { origin?: unknown };
                 if (typeof data.origin === "string" && data.origin.length > 0 && !cancelled) {
                     onOrigin(data.origin);
-                    resolved = true;
+                    settled = true;
                 }
             }
         } catch {
             // host without the route (older builds) or transient error: retry below
         }
-        if (resolved) return;
+        if (cancelled) return;
         attempts += 1;
-        // #2187: fast phase for the first POLL_MAX_ATTEMPTS, then an endless
-        // slow phase — the origin can land at any time (background heal).
-        const delay = attempts < POLL_MAX_ATTEMPTS ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
+        // #2187/#2288: fast phase until the first resolution, then an endless
+        // slow phase — the origin can land (background heal) or move
+        // (runtime re-bind) at any time.
+        const delay = !settled && attempts < POLL_MAX_ATTEMPTS ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
         if (!cancelled) timer = setTimeout(() => void poll(), delay);
     };
     void poll();
@@ -125,10 +137,9 @@ export function apply(ctx: ClientContext): void {
     const t = ctx.locale.bind(NS);
     const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
-        useEffect(() => {
-            if (origin !== undefined) return;
-            return probeOrigin(setOrigin);
-        }, [origin]);
+        // #2288: no guard on the snapshot — the live route is authoritative
+        // for the whole mount, so a stale boot value is corrected in place.
+        useEffect(() => probeOrigin(setOrigin), []);
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
