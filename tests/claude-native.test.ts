@@ -491,6 +491,17 @@ test("resolveClaudeHostPid: full walk over a ps-backed table", () => {
     assert.equal(resolveClaudeHostPid({ read: psRead, startPid: 100 }), 300);
 });
 
+// #2242: Node picks an extensionless entry's module system from the NEAREST
+// package.json. When TMPDIR sits inside this repo's workspace tree that is
+// the root manifest ("type":"module") and the CJS fake-claude fixtures below
+// die with `require is not defined in ES module scope`. Pin CJS beside each
+// fixture instead of renaming to .cjs — the resolver under test matches the
+// exact basename `claude` (src/claude-native-bootstrap.ts:245), so the script
+// name must not change.
+function pinCommonJs(dir: string): void {
+    fs.writeFileSync(path.join(dir, "package.json"), '{"type":"commonjs"}\n');
+}
+
 // Live mechanism check for the fallback path: a real `ps` subprocess, real
 // ppid chain, real match — everything except /proc itself.
 test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout: 30_000, skip: LIVE_E2E ? process.platform === "win32" : liveSkip }, async () => {
@@ -509,6 +520,7 @@ test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout
         "",
     ].join("\n"));
     fs.chmodSync(claudeBin, 0o755);
+    pinCommonJs(dir);
     let leafPid = 0;
     let claude: ReturnType<typeof spawn> | null = null;
     try {
@@ -1201,6 +1213,7 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
+    pinCommonJs(binDir);
     const claudeProc = spawn(claudeBin, [], {
         env: {
             PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -1473,6 +1486,7 @@ test("hook e2e: shared proxy survives the first session's exit, dies after the l
             "setInterval(() => {}, 60000);\n",
     );
     fs.chmodSync(claudeBin, 0o755);
+    pinCommonJs(binDir);
     const sessionEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
