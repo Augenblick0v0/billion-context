@@ -6,7 +6,11 @@ import type {
 } from "./types.js";
 import { refForRaw, BLOCKED_REF } from "./refs.js";
 import { ACP_TOOL_NAMES } from "./compress-tools.js";
-import { isMessageProtected, matchToolPattern } from "./protected.js";
+import {
+  collectProtectedToolCallIds,
+  isMessageProtectedWithPairing,
+  matchToolPattern,
+} from "./protected.js";
 import { retrieveByRef, storeOriginal } from "./content-store.js";
 import type {
   MessageContentStore,
@@ -461,6 +465,10 @@ export function storeLargeResults(
       callById.set(message.toolCallId, message);
     }
   }
+  const protectedCallIds = collectProtectedToolCallIds(
+    input.messages,
+    input.config,
+  );
 
   const updated = input.messages.map((message) => {
     if (message.contentType !== "tool-result") return message;
@@ -487,7 +495,8 @@ export function storeLargeResults(
     ) {
       return message;
     }
-    if (isMessageProtected(message, input.config)) return message;
+    if (isMessageProtectedWithPairing(message, input.config, protectedCallIds))
+      return message;
     if (!ref || ref === BLOCKED_REF) return message;
     const existing = current.byRef[ref];
     if (existing) {

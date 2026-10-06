@@ -60,7 +60,7 @@ import {
   isAbsorbCandidate,
   resolveAbsorbConfig,
 } from "./absorb.js";
-import { matchToolPattern } from "./protected.js";
+import { collectProtectedToolCallIds, matchToolPattern } from "./protected.js";
 import { defaultCountTokens, type TokenCountFn } from "./tokenize.js";
 import type {
   AbsorbConfig,
@@ -1794,12 +1794,13 @@ export function applyCrushToMessages(
 ): ApplyCrushResult {
   const absorb = resolveAbsorbConfig(config);
   const crush = resolveCrushConfig(config);
+  const protectedCallIds = collectProtectedToolCallIds(messages, config);
   let crushedCount = 0;
   let distilledCount = 0;
   let changed = false;
   const out: CoreMessage[] = [];
   for (const msg of messages) {
-    if (!isAbsorbCandidate(msg, config)) {
+    if (!isAbsorbCandidate(msg, config, undefined, protectedCallIds)) {
       out.push(msg);
       continue;
     }

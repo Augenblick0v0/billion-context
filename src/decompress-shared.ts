@@ -1,7 +1,7 @@
 import {
     collectBlockContent,
     markBlockRestoredInline,
-    matchToolPattern,
+    matchToolMessagePattern,
     parseBoundary,
     retrieveByRef,
     retrievedMessageId,
@@ -534,7 +534,7 @@ export function extractPlanState(messages: CoreMessage[], extraPatterns?: string
         const msg = messages[i];
         if (msg.contentType === "tool-call" && msg.toolName) {
             for (const p of patterns) {
-                if (matchToolPattern(msg.toolName, p)) { latestByPattern.set(p, msg); break; }
+                if (matchToolMessagePattern(msg, p)) { latestByPattern.set(p, msg); break; }
             }
         } else if (msg.role === "user" && msg.contentType === "text" && msg.text) {
             lastUserText = msg.text;
