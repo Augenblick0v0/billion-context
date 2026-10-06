@@ -98,6 +98,18 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "详情见下方 Sessions 页或 GET /__bili/stats → conflicts。",
         "conflict.clear_btn": "清除记录",
         "conflict.cleared": "冲突记录已清除",
+        // #2219: per-client remediation — one actionable line per client; text
+        // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
+        // BILI_CODEX_COMPACT / pi·omp 接管证据 #851/#1382), full matrix in the docs.
+        "conflict.hint_label": "处置方法（按客户端）：",
+        "conflict.hint.opencode": "opencode：在 opencode 配置里设 \"compaction\": { \"auto\": false }，或用 bili opencode / bili plugin install opencode（会自动设置）",
+        "conflict.hint.claude": "claude：用 bili claude 启动（自动对齐 CLAUDE_CODE_AUTO_COMPACT_WINDOW），或自行把 CLAUDE_CODE_AUTO_COMPACT_WINDOW 设为 bili 的有效窗口",
+        "conflict.hint.codex": "codex：bili 默认拦截原生压缩（BILI_CODEX_COMPACT=intercept）——若你设了 pass，去掉该覆盖即可；否则请报告你的 bili 版本",
+        "conflict.hint.pi": "pi：bili 扩展在接管会话时会自动取消客户端原生自动压缩——仍出现说明缺少接管证据或版本过旧，请报告客户端与 bili 版本",
+        "conflict.hint.omp": "omp：bili 扩展在接管会话时会自动取消客户端原生自动压缩——仍出现说明缺少接管证据或版本过旧，请报告客户端与 bili 版本",
+        "conflict.hint.generic": "关闭客户端自身的自动压缩（或让本会话绕过 bili），然后开新会话——台账按会话隔离，旧记录随旧会话消失",
+        "conflict.hint_more": "另有 {n} 个客户端，详见下方 Sessions 页",
+        "conflict.docs": "完整矩阵：CONFIGURATION.md「Detecting other compression plugins (#1206)」",
         "advisory.on": "严重缺陷公告",
         "advisory.desc": "：当前版本存在重大缺陷，bili 正在自动升级到安全版本。原因：",
         "advisory.hint": "。若未自动完成，请手动执行：",
@@ -460,6 +472,18 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.where": "Details: Sessions page below or GET /__bili/stats → conflicts.",
         "conflict.clear_btn": "Clear records",
         "conflict.cleared": "Conflict records cleared",
+        // #2219: per-client remediation — one actionable line per client; text
+        // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
+        // BILI_CODEX_COMPACT / pi·omp carriage evidence #851/#1382), full matrix in the docs.
+        "conflict.hint_label": "What to do (per client):",
+        "conflict.hint.opencode": "opencode: set \"compaction\": { \"auto\": false } in your opencode config (or use bili opencode / bili plugin install opencode, which set it for you)",
+        "conflict.hint.claude": "claude: launch through bili claude (it aligns CLAUDE_CODE_AUTO_COMPACT_WINDOW automatically), or set CLAUDE_CODE_AUTO_COMPACT_WINDOW to bili's effective window yourself",
+        "conflict.hint.codex": "codex: bili intercepts native compaction by default (BILI_CODEX_COMPACT=intercept) — if you set pass, remove the override to stop; otherwise report your bili version",
+        "conflict.hint.pi": "pi: the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version",
+        "conflict.hint.omp": "omp: the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version",
+        "conflict.hint.generic": "disable the client's own auto-compaction (or route this session around bili), then start a fresh session — the ledger is per-session, so old entries clear with the old session",
+        "conflict.hint_more": "{n} more client(s) — see the Sessions page below",
+        "conflict.docs": "full matrix: CONFIGURATION.md → \"Detecting other compression plugins (#1206)\"",
         "advisory.on": "Critical defect advisory",
         "advisory.desc": ": the current version has a major defect; bili is upgrading it automatically to a safe version. Reason:",
         "advisory.hint": ". If it did not complete automatically, run manually:",

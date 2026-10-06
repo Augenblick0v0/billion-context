@@ -10,6 +10,7 @@
 // no conversation data — only the evidence notes.
 
 import { markDirty, type Session } from "./session.js";
+import { isCodexClient } from "./codex-compact.js";
 import { isSiblingConflictDetail } from "./thirdparty-scan.js";
 
 export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
@@ -55,6 +56,49 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
     markDirty(session);
 }
 
+// #2219: resolve which CLIENT a conflicting session belongs to, so the conflict
+// surfaces (acp_status / web banner / launcher) can show per-client remediation
+// instead of stopping at the bare imperative "keep exactly one compressor".
+// Identity is already recorded at request time (#1426): pluginAgent wins when
+// present ("mcp" is not a client name — MCP evidence flip, #760b — so fall
+// through), then clientHint, which is either an exact sniffScanClient value or
+// a UA truncation; codex UA shapes normalize back to "codex" and clean single
+// tokens pass through as-is (unknown ones simply get the generic hint).
+export function conflictClientOf(session: Session): string | undefined {
+    const pa = session.metadata.pluginAgent;
+    if (typeof pa === "string" && pa.length > 0 && pa !== "mcp") return pa;
+    const hint = session.metadata.clientHint;
+    if (typeof hint !== "string" || !hint) return undefined;
+    if (/^[a-z][a-z0-9-]*$/.test(hint)) return hint;
+    if (isCodexClient({ "user-agent": hint })) return "codex";
+    return undefined;
+}
+
+/** #2219: where the full client×mechanism matrix lives — every hint surface
+ *  points here instead of duplicating the matrix. */
+export const CONFLICT_DOCS_POINTER = 'CONFIGURATION.md → "Detecting other compression plugins (#1206)"';
+
+// #2219: one-line per-client remediation for the conflict surfaces. Each entry
+// mirrors its doc anchor (README opencode section / CONFIGURATION.md claude
+// auto-compact alignment + BILI_CODEX_COMPACT / pi·omp carriage evidence
+// #851/#1382); keep each entry ONE line — these render inline in acp_status
+// text, the web banner, and launcher stderr.
+export function conflictRemediation(client: string | undefined): string {
+    switch (client) {
+        case "opencode":
+            return 'set "compaction": { "auto": false } in your opencode config (or use bili opencode / bili plugin install opencode, which set it for you)';
+        case "claude":
+            return "launch through bili claude (it aligns CLAUDE_CODE_AUTO_COMPACT_WINDOW automatically), or set CLAUDE_CODE_AUTO_COMPACT_WINDOW to bili's effective window yourself";
+        case "codex":
+            return "bili intercepts native compaction by default (BILI_CODEX_COMPACT=intercept) — if you set pass, remove the override to stop; otherwise report your bili version";
+        case "pi":
+        case "omp":
+            return "the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version";
+        default:
+            return "disable the client's own auto-compaction (or route this session around bili), then start a fresh session — the ledger is per-session, so old entries clear with the old session";
+    }
+}
+
 function fmtTime(at: number): string {
     return new Date(at).toISOString().replace("T", " ").slice(0, 19) + "Z";
 }
@@ -63,7 +107,7 @@ function isSuspectedEvent(e: ConflictEvent): boolean {
     return e.kind === "third-party-plugin" && e.detail.endsWith("[suspected]");
 }
 
-export function formatConflictSection(events: ConflictEvent[], now: number = Date.now()): string[] {
+export function formatConflictSection(events: ConflictEvent[], now: number = Date.now(), client?: string): string[] {
     const lines: string[] = [];
     // #2102: label the age split up front — an all-historical section must not
     // read as a live alarm (it previously said "two compressors ..." imperatively
@@ -93,6 +137,15 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
             : allSuspected
                 ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
                 : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+    // #2219: actionable per-client remediation — the surfaces used to stop at
+    // WHAT happened; answering HOW required digging out four separate doc
+    // locations, none linked from any conflict surface. Skipped for the #2261
+    // siblings-only ledger: its footer already says no second compressor is
+    // active, so a per-client fix command would contradict it.
+    if (!siblingsOnly) {
+        lines.push("", `Fix${client ? ` (${client})` : ""}: ${conflictRemediation(client)}`);
+        lines.push(CONFLICT_DOCS_POINTER);
+    }
     return lines;
 }
 
@@ -111,15 +164,20 @@ export interface ConflictSummary {
      *  to `kinds`, so surfaces can stop calling first-party siblings "third-party". */
     sibling: number;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
+    /** #2219: distinct resolved clients of sessions carrying events (first-seen
+     *  order) — lets the web banner show per-client remediation hints. */
+    clients: string[];
 }
 
 export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0 };
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, clients: [] };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
         summary.sessions += 1;
         summary.events += events.length;
+        const c = conflictClientOf(s);
+        if (c && !summary.clients.includes(c)) summary.clients.push(c);
         for (const e of events) {
             summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
             if (e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)) summary.sibling += 1;

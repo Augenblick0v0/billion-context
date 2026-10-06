@@ -144,6 +144,7 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
@@ -4475,6 +4476,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     ? "It is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs."
                     : "Its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs.";
                 console.error(`bili: WARNING: co-resident compression plugin on ${base}: ${f.entry} (${f.source}). ${risk} (#1206) — disable the other plugin, or don't route this client through bili.`);
+                // #2219: actionable follow-up — how to stop THIS client's own
+                // compaction (same per-client map as acp_status / web banner).
+                console.error(`bili:   fix (${base}): ${conflictRemediation(base)}`);
             }
         } catch {
             // The scan is diagnostic only — never block client startup on it.

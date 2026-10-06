@@ -7,7 +7,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
@@ -137,8 +137,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // user sees it while the session is still recoverable.
     const cevents = conflictEventsOf(ctx.session);
     if (cevents.length > 0) {
+        // #2219: key the remediation hint on THIS session's resolved client so
+        // the model can relay per-client steps without digging out the docs.
         extra.push("");
-        extra.push(...formatConflictSection(cevents));
+        extra.push(...formatConflictSection(cevents, Date.now(), conflictClientOf(ctx.session)));
     }
     const adv = getAdvisoryState();
     if (adv.active) {
