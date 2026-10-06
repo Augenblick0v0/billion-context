@@ -207,7 +207,7 @@
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
-| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留。 |
+| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。 |
@@ -1323,14 +1323,14 @@
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** 可选的历史图像载荷移除。设为 `true` 时，除最近 `stripImagesKeepRecent` 条消息外，所有消息在重建 wire 前都会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。最近 N 条的图像逐字转发，且新发送的图像在其到达的那一轮必然落在该窗口内。默认关闭 —— 关闭期间，#488 图像 token 下限及其溢出 `502` 仍是图像密集型载荷的显式信号。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617。
+- **说明：** 可选的历史图像载荷移除。设为 `true` 时，老化消息在重建 wire 前会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。**剥离边界（#1995）：** anthropic 会话存在活跃压缩折叠时，边界为折叠锚定——只剥离被活跃折叠覆盖的 wire 消息，边界仅在压缩事件时移动，被剥离的前缀在两次折叠之间保持字节稳定（prompt cache 不再每轮重复计费），未折叠的图像保持可见。无活跃折叠时（以及其他 wire——其剥离占位符会翻转 kernel 消息 id）沿用经典滑动窗口：除最近 `stripImagesKeepRecent` 条外全部剥离。新发送的图像在其到达的那一轮必然落在未剥离尾部。**恢复：** 被剥离的像素可通过 `decompress({ imageRef })` 恢复——每个被剥离图像按 `mNNNNN` 引用建索引并 spill 到 `<state>/retrieve/img/<session>/`（尽力而为的 7 天 TTL）；preflight 折叠摘要的注释携带引用（`[image: png 1024x768 · m00042]`）。默认关闭 —— 关闭期间，#488 图像 token 下限及其溢出 `502` 仍是图像密集型载荷的显式信号。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617。
 
 #### `stripImagesKeepRecent`
 
 - **类型：** `number`
 - **默认值：** `5`
 - **状态：** ACTIVE
-- **说明：** 在 `stripImages: true` 时，末尾多少条消息保留其图像逐字转发。仅在启用 `stripImages` 时生效。
+- **说明：** 在 `stripImages: true` 时，末尾多少条消息保留其图像逐字转发。仅在启用 `stripImages` 时生效。**回退角色（#1995）：** anthropic 会话存在活跃折叠时剥离边界改为折叠锚定；此窗口在无折叠锚定时（以及所有其他 wire 上）生效。
 
 #### `visibilityMarkers`
 
