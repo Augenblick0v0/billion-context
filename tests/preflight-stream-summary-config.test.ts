@@ -269,3 +269,55 @@ test("e2e #2133 (per-provider scope): only the route carrying compress.streamSum
         await closeAll([proxy, upstreamA, upstreamB]);
     }
 });
+
+test("e2e #2155/#2133 (stale learned flag): explicit OFF ignores a flag learned under the unset default", async () => {
+    // The disclosed opt-out contract has a third clause beyond the two learn
+    // paths: an ALREADY-learned metadata.preflightStreamSummary (acquired under
+    // the #2155 first-hit default while the cascade was unset) must be inert
+    // once the operator sets an explicit streamSummary:false on the route. The
+    // flag is seeded directly on the live session to simulate that prior
+    // learning; a failed preflight would arm the #726 dead-end cooldown for
+    // identical bodies, so the session is warmed with an in-window request
+    // instead of a failed long one.
+    const calls: Call[] = [];
+    const forwardBodies: string[] = [];
+    const upstream = makeCloudflareUpstream(calls, forwardBodies);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = await startProxy(
+        { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: false } } },
+        {},
+    );
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const warm = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "s2155-stale-flag" },
+            body: JSON.stringify({ model: "gpt-6-astra", stream: true, input: [{ type: "message", role: "user", content: "warmup" }] }),
+        });
+        assert.equal(warm.status, 200, `warmup must pass through, got ${warm.status}`);
+        const forwardedAfterWarmup = forwardBodies.length;
+
+        const sess = listSessions().find((s) => s.id.includes("s2155-stale-flag"));
+        assert.ok(sess, "session recorded by the warmup");
+        assert.equal(sess?.metadata?.preflightStreamSummary, undefined, "no flag before seeding");
+        sess!.metadata.preflightStreamSummary = true;
+
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s2155-stale-flag");
+        assert.equal(r.status, 502, `explicit OFF must ignore the stale flag and fail fast, got ${r.status}; calls=${JSON.stringify(calls)}`);
+        const summaries = calls.filter((c) => c.summary);
+        assert.ok(summaries.length >= 1, "a summary call must have been made");
+        assert.ok(
+            summaries.every((c) => !c.stream),
+            `explicit OFF keeps every attempt non-stream even with a learned flag, got ${JSON.stringify(calls)}`,
+        );
+        assert.equal(forwardBodies.length, forwardedAfterWarmup, "the over-window payload was never forwarded (its preflight failed)");
+        assert.equal(sess?.metadata?.preflightStreamSummary, true, "the opt-out leaves the stale flag set but inert");
+    } finally {
+        await closeAll([proxy, upstream]);
+    }
+});
