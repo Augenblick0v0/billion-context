@@ -55,7 +55,10 @@ test("demoteGate: the #2164 fork veto is structural — publicForkPrefix=true al
 test("resolveSideLane: exhaustive over every signal combination vs the reference expression", () => {
     for (const countTokens of [false, true]) {
         for (const responsesCompact of [false, true]) {
-            for (const protocol of [null, "anthropic"] as const) {
+            // #2203: "responses" added — the dsh persona split now consumes this
+            // gate's verdict on the Responses wire (sideRequestLike conjunct in
+            // src/server.ts), so every cell there must be table-covered.
+            for (const protocol of [null, "anthropic", "responses"] as const) {
                 for (const stripApplied of [false, true]) {
                     for (const sideIntent of [false, true]) {
                         for (const requestAgent of AGENT_STATES) {
@@ -106,4 +109,16 @@ test("isSideRequest sanity anchors for the table above (agent wins, main never d
     assert.equal(isSideRequest({ max_tokens: 64 }, undefined), true);
     assert.equal(isSideRequest({ max_tokens: 1024 }, undefined), false);
     assert.equal(isSideRequest({ tools: [{ name: "bili_compact" }] }, undefined), false);
+});
+
+test("isSideRequest: dsh auto-review shape over the Responses wire stays off the side lane (#2203)", () => {
+    // Production shape from #2203: fixed REVIEW_POLICY instructions + one
+    // flattened user blob, NO tools, budget either explicit-large (the client
+    // clamps to the model default ~384K) or absent entirely. Both must stay
+    // OFF the side lane — the Responses-wire persona split keys these requests
+    // by fingerprint instead, which requires sideRequestLike=false in
+    // src/server.ts. A regression here would silently re-route reviews to the
+    // passthrough — the exact opposite of the fix's intent.
+    assert.equal(isSideRequest({ max_output_tokens: 384_000 }, undefined), false);
+    assert.equal(isSideRequest({}, undefined), false);
 });
