@@ -5,6 +5,7 @@ import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../p
 import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
@@ -91,6 +92,13 @@ export interface WebSessionSummary {
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
     summaryCost?: number;
+    /** #2202: folds whose covered ids were verified on the wire and have since
+     *  vanished (host shadowing / native compaction outside bili's knowledge) —
+     *  their avoided-token accrual is frozen; count + frozen share below. */
+    coverageLostFolds?: number;
+    /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
+     *  grossSaved that is frozen rather than accruing. */
+    coverageLostFrozenTokens?: number;
 }
 
 export interface WebOverview {
@@ -114,6 +122,12 @@ export interface WebOverview {
     repayTotal: number;
     /** Σ summary generation cost (output tokens) across ledger sessions. */
     summaryCostTotal: number;
+    /** #2202: Σ coverage-lost fold count across sessions (0 when none). */
+    coverageLostFoldTotal: number;
+    /** #2202: Σ frozen avoided tokens over coverage-lost folds — a subset of
+     *  grossSavedTotal whose accrual has stopped (host shadowed the covered
+     *  bytes outside bili's knowledge, #2193/#2202). 0 when none. */
+    coverageLostFrozenTotal: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
     /** Σ compression re-read missed tokens across ledger sessions. */
@@ -488,8 +502,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // getCacheLedger() would bootstrap/mutate session.metadata instead.
     const led = s.metadata["cacheLedger"] as {
         agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number; switches?: number; switchMissed?: number; keySwitches?: number; keySwitchMissed?: number };
-        folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }>;
+        folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number; bid?: string }>;
     } | undefined;
+    // #2202: per-block coverage evidence (reconcileFoldCoverage's record) — a
+    // fold is coverage-lost iff it was VERIFIED present at least once and its
+    // covered ids are now entirely off the wire. Live state: self-heals when
+    // the host resends the originals again.
+    const covAll = s.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
     const agg = led;
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
@@ -500,6 +519,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // mirrors acp-kernel summarizeFoldEconomics() so the dashboard can split
     // "compressed away" (gross) from "net saving after re-pay & summary cost".
     let hasFolds = false, grossSaved = 0, netSaved = 0, repayCost = 0, summaryCost = 0, foldCount = 0;
+    let coverageLostFolds = 0, coverageLostFrozenTokens = 0;
     for (const f of led?.folds ?? []) {
         hasFolds = true;
         foldCount += 1;
@@ -509,6 +529,11 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         netSaved += avoided - rep - sig;
         repayCost += rep;
         summaryCost += sig;
+        const cov = f.bid !== undefined ? covAll?.[f.bid] : undefined;
+        if (cov !== undefined && cov.e === 1 && (cov.p ?? 0) + (cov.r ?? 0) === 0) {
+            coverageLostFolds += 1;
+            coverageLostFrozenTokens += Math.max(0, avoided);
+        }
     }
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
@@ -558,6 +583,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
+        ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
             ? {
@@ -641,6 +667,7 @@ export async function buildOverview(): Promise<WebOverview> {
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
+    let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
     for (const s of all) {
@@ -681,6 +708,8 @@ export async function buildOverview(): Promise<WebOverview> {
             netSavedTotal += s.netSaved ?? 0;
             repayTotal += s.repayCost ?? 0;
             summaryCostTotal += s.summaryCost ?? 0;
+            coverageLostFoldTotal += s.coverageLostFolds ?? 0;
+            coverageLostFrozenTotal += s.coverageLostFrozenTokens ?? 0;
         } else if (s.tokensSaved > 0) {
             // Pre-tagging sessions: their local estimate counts toward the compressed side only.
             grossSavedTotal += s.tokensSaved;
@@ -700,6 +729,8 @@ export async function buildOverview(): Promise<WebOverview> {
         hasFoldData,
         repayTotal,
         summaryCostTotal,
+        coverageLostFoldTotal,
+        coverageLostFrozenTotal,
         missNewTotal,
         missCompTotal,
         missTtlTotal,

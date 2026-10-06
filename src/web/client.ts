@@ -239,8 +239,13 @@ export const WEB_CLIENT = `(function () {
     // to the local tokensSaved estimate; neither present => honest dash, never fake 0.
     function savedTd(x) {
         const v = x.netSaved != null ? x.netSaved : (x.tokensSaved || 0);
-        if (v > 0) return '<td class="num good-num">' + fmtW(v) + "</td>";
-        if (v) return '<td class="num" title="' + escapeHtml(t("ov.saved_neg_tip")) + '">' + fmtW(v) + "</td>";
+        // #2202: name the frozen share in the tooltip when any fold lost
+        // coverage — the number is honest now, but the operator must see it.
+        const clTip = x.coverageLostFolds
+            ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
+            : "";
+        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
+        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
@@ -306,7 +311,7 @@ export const WEB_CLIENT = `(function () {
             $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
             $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
-            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") : "";
+            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
             if (hs) {
@@ -906,7 +911,8 @@ export const WEB_CLIENT = `(function () {
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
-        mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0);
+        mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
+            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate

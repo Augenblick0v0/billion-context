@@ -12,6 +12,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
+import { METADATA_FOLD_COVERAGE } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -36,6 +37,11 @@ const WARM_HIT_PCT = 85;
 // #2131: input-size bucket width for the hit-rate stratification diagnostic.
 const SIZE_BUCKET_TOK = 20000;
 
+// #2202: blockIds whose coverage-lost transition was already logged — one warn
+// per loss episode per fold instead of one per usage sample; the entry is
+// dropped again when coverage returns (a flapping client logs once per flip).
+const LOST_LOGGED_KEY = "foldCoverageLostLogged";
+
 function median(xs: number[]): number | null {
     if (xs.length === 0) return null;
     const s = [...xs].sort((x, y) => x - y);
@@ -55,6 +61,12 @@ interface LedgerFold {
     hPct: number | null;
     requestsAfter: number;
     k: number | null;
+    /** #2202: kernel blockId the fold was cut from — links the entry to
+     *  reconcileFoldCoverage's per-block coverage evidence (foldCoverageByBlock)
+     *  so avoided-token accrual can be conditioned on measured wire presence.
+     *  Sparse: absent on ledgers persisted before #2202 (unverifiable → status
+     *  quo booking, byte-identical to pre-#2202 behavior). */
+    bid?: string;
 }
 
 interface LedgerLine {
@@ -635,6 +647,7 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             X: b.startRef ? prefixTokensBeforeRef(session, b.startRef) : undefined,
             V: geo?.V,
             Vp: geo?.Vp,
+            bid: b.blockId,
         });
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
@@ -730,12 +743,47 @@ export function recordCacheSample(
     // elapsed fold counts EVERY later sample, matching buildCacheReport's
     // full post-fold requestsAfter window. hPct seeds from the first KNOWN
     // post-fold sample only (unknown samples carry no measurable hit rate).
+    // #2202: condition the benefit claim on measured coverage. requestsAfter
+    // multiplies (S−σ) into the avoided-token projection — booking a request
+    // against a fold whose covered bytes are no longer on the wire bills a
+    // saving that stopped happening (#2193: netSaved climbed through a
+    // destroyed substrate). The fraction comes from reconcileFoldCoverage's
+    // per-block record, measured on THIS request's inbound (the wire sites'
+    // reconcile pass precedes the usage report that settles here):
+    //   1 — full coverage, legacy entries without a block link, or the
+    //       never-present class (structural absence, unverifiable) → identical
+    //       to the pre-#2202 counter;
+    //   f — partial coverage → proportional accrual;
+    //   0 — verified coverage-lost → accrual frozen until coverage returns.
+    const covAll = session.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
+    const lostLogged = (session.metadata[LOST_LOGGED_KEY] as Record<string, true> | undefined) ?? {};
+    let lostDirty = false;
     for (const f of led.folds) {
         if (f.at <= s.at) {
-            f.requestsAfter += 1;
+            const cov = f.bid !== undefined ? covAll?.[f.bid] : undefined;
+            let frac = 1;
+            let lost: boolean | null = null;
+            if (cov !== undefined && cov.e === 1 && typeof cov.t === "number" && cov.t > 0) {
+                const present = (cov.p ?? 0) + (cov.r ?? 0);
+                frac = Math.min(1, present / cov.t);
+                lost = present === 0;
+            }
+            f.requestsAfter += frac;
             if (known && f.hPct === null) f.hPct = hitPct;
+            if (lost !== null && f.bid !== undefined) {
+                if (lost && lostLogged[f.bid] !== true) {
+                    lostLogged[f.bid] = true;
+                    lostDirty = true;
+                    loggerLog("warn", `[${session.id}] [cache-ledger] fold seq ${f.seq} (block ${f.bid}) coverage-lost: covered id(s) no longer on the resent wire — avoided-token accrual frozen at requestsAfter=${f.requestsAfter.toFixed(1)} (#2202)`);
+                } else if (!lost && lostLogged[f.bid] === true) {
+                    delete lostLogged[f.bid];
+                    lostDirty = true;
+                    loggerLog("info", `[${session.id}] [cache-ledger] fold seq ${f.seq} (block ${f.bid}) coverage restored — avoided-token accrual resumes (#2202)`);
+                }
+            }
         }
     }
+    if (lostDirty) session.metadata[LOST_LOGGED_KEY] = lostLogged;
     if (foldSeq !== null) {
         const owner = led.folds.find((f) => f.seq === foldSeq);
         if (owner) owner.T += dec.compRepay;

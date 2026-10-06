@@ -7,7 +7,9 @@ import {
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
+    METADATA_FOLD_COVERAGE,
     type FoldAnchor,
+    type FoldBlockCoverage,
     type ReconcileOptions,
 } from "../src/fold-reconcile.ts";
 import type { CoreMessage } from "acp-kernel";
@@ -185,42 +187,54 @@ describe("reconcileFoldCoverage (#1921)", () => {
         assert.equal(JSON.stringify(session.state.blocks), before);
     });
 
+    // #2202: passes carry a conversation-sized payload (>=10 msgs) — real hosts
+    // resend their full history every turn; side-request-shaped short passes take
+    // no evidence at all (see the guard in reconcileFoldCoverage).
+    const tenMsgs = (prefix: string, text: (i: number) => string): CoreMessage[] =>
+        Array.from({ length: 10 }, (_, i) => msg(`${prefix}${i}`, "user", text(i)));
+
     test("repair rewrites block ids and refreshes anchors", () => {
-        const original = msg("a", "user", "stable words");
-        const session = fakeSession([{ effectiveMessageIds: ["a"], directMessageIds: ["a"] }]);
+        const originals = tenMsgs("a", (i) => `stable context words ${i}`);
+        const allIds = originals.map((m) => m.id!);
+        const session = fakeSession([{ effectiveMessageIds: allIds, directMessageIds: allIds }]);
         // real sequence: one clean pass seeds anchors+order, the next pass churns
-        reconcileFoldCoverage(session, [original], opts("repair"));
-        const churned = msg("a-new", "user", "stable  words\r\n");
-        const result = reconcileFoldCoverage(session, [churned], opts("repair"));
+        reconcileFoldCoverage(session, originals, opts("repair"));
+        const churned = originals.map((m, i) => (i === 4 ? msg("a4-new", "user", "stable context  words 4\r\n") : m));
+        const result = reconcileFoldCoverage(session, churned, opts("repair"));
         assert.equal(result.kind, "reanchored");
         assert.equal(result.byNorm, 1);
-        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, ["a-new"]);
-        assert.deepEqual(session.state.blocks[0].directMessageIds, ["a-new"]);
+        const rewritten = allIds.map((id, i) => (i === 4 ? "a4-new" : id));
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, rewritten);
+        assert.deepEqual(session.state.blocks[0].directMessageIds, rewritten);
         // claimed ids land in lastPassIds so the kernel's remint node
         // (reconcileLiveIdsNode) does not re-mint them before prune
-        assert.deepEqual((session.state as { lastPassIds?: string[] }).lastPassIds, ["a-new"]);
+        assert.deepEqual((session.state as { lastPassIds?: string[] }).lastPassIds, ["a4-new"]);
         const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
-        assert.ok(anchors["a-new"] !== undefined, "anchor keyed by the new id");
-        assert.ok(anchors["a"] === undefined, "old anchor dropped");
-        assert.deepEqual(session.metadata.foldAnchorOrder, ["a-new"]);
+        assert.ok(anchors["a4-new"] !== undefined, "anchor keyed by the new id");
+        assert.ok(anchors["a4"] === undefined, "old anchor dropped");
+        assert.deepEqual(session.metadata.foldAnchorOrder, rewritten);
     });
 
     test("warn mode computes but never rewrites", () => {
-        const session = fakeSession([{ effectiveMessageIds: ["a"] }]);
-        reconcileFoldCoverage(session, [msg("a", "user", "stable words")], opts("warn"));
-        const churned = msg("a-new", "user", "stable words");
-        const result = reconcileFoldCoverage(session, [churned], opts("warn"));
+        const originals = tenMsgs("w", (i) => `warn mode context ${i}`);
+        const allIds = originals.map((m) => m.id!);
+        const session = fakeSession([{ effectiveMessageIds: allIds }]);
+        reconcileFoldCoverage(session, originals, opts("warn"));
+        const churned = originals.map((m, i) => (i === 2 ? msg("w2-new", "user", "warn mode context 2 ") : m));
+        const result = reconcileFoldCoverage(session, churned, opts("warn"));
         assert.equal(result.claims, 1);
-        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, ["a"]);
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, allIds);
     });
 
     test("clean resend seeds anchors without touching blocks", () => {
-        const original = msg("a", "user", "stable words");
-        const session = fakeSession([{ effectiveMessageIds: ["a"] }]);
-        const result = reconcileFoldCoverage(session, [original], opts("repair"));
+        const originals = tenMsgs("c", (i) => `clean resend words ${i}`);
+        const allIds = originals.map((m) => m.id!);
+        const session = fakeSession([{ effectiveMessageIds: allIds }]);
+        const result = reconcileFoldCoverage(session, originals, opts("repair"));
         assert.equal(result.kind, "resend");
-        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, ["a"]);
-        assert.ok((session.metadata.foldAnchors as Record<string, FoldAnchor>)["a"] !== undefined);
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, allIds);
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        for (const id of allIds) assert.ok(anchors[id] !== undefined, `anchor seeded for ${id}`);
     });
 
     test("system-only fingerprint: change logs, absence does not", () => {
@@ -249,6 +263,11 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         return { sessionId: "s1", mode: "repair", log: (level: string, m: string) => logs.push({ level, msg: m }) };
     }
     const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
+    // #2202: post-compaction passes carry conversation-sized payloads — real
+    // hosts replay their full (shadowed) history, they don't send one message;
+    // sub-10-message passes are side-request-shaped and take no evidence.
+    const freshPass = (tag: string): CoreMessage[] =>
+        Array.from({ length: 10 }, (_, i) => msg(`${tag}${i}`, "assistant", `post-compaction turn ${tag} message ${i} padding`));
 
     test("persistent total-loss drift escalates to exactly one error naming the suspect cause", () => {
         // #2193 incident shape: a host-native compaction lands outside bili's
@@ -265,7 +284,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.equal(errorLines(logs).length, 0);
 
         for (let pass = 1; pass <= 5; pass++) {
-            reconcileFoldCoverage(session, [msg(`post${pass}`, "assistant", `fresh turn ${pass} after native compaction landed`)], opts);
+            reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
         }
         const errs = errorLines(logs);
         assert.equal(errs.length, 1, "exactly ONE error for the whole episode");
@@ -282,14 +301,14 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         const logs: LogLine[] = [];
         const opts = makeOpts(logs);
         reconcileFoldCoverage(session, originals, opts);
-        reconcileFoldCoverage(session, [msg("p1", "assistant", "drift pass one")], opts);
-        reconcileFoldCoverage(session, [msg("p2", "assistant", "drift pass two")], opts);
+        reconcileFoldCoverage(session, freshPass("p1"), opts);
+        reconcileFoldCoverage(session, freshPass("p2"), opts);
         assert.equal(errorLines(logs).length, 0, "streak below threshold stays at warn");
         reconcileFoldCoverage(session, originals, opts);
         assert.equal(session.metadata.foldDriftStreak, undefined, "recovery clears the streak state");
-        reconcileFoldCoverage(session, [msg("q1", "assistant", "episode two pass one")], opts);
-        reconcileFoldCoverage(session, [msg("q2", "assistant", "episode two pass two")], opts);
-        reconcileFoldCoverage(session, [msg("q3", "assistant", "episode two pass three")], opts);
+        reconcileFoldCoverage(session, freshPass("q1"), opts);
+        reconcileFoldCoverage(session, freshPass("q2"), opts);
+        reconcileFoldCoverage(session, freshPass("q3"), opts);
         assert.equal(errorLines(logs).length, 1, "a new episode may escalate again");
     });
 
@@ -300,7 +319,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         const opts = makeOpts(logs);
         reconcileFoldCoverage(session, originals, opts);
         for (let pass = 1; pass <= 4; pass++) {
-            reconcileFoldCoverage(session, [msg(`s${pass}`, "assistant", `surviving turn ${pass}`)], opts);
+            reconcileFoldCoverage(session, freshPass(`s${pass}`), opts);
         }
         assert.equal(errorLines(logs).length, 0, "5 permanently-missing ids never reach the error floor");
         assert.ok(logs.some((l) => l.level === "warn"));
@@ -316,8 +335,8 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         const logs: LogLine[] = [];
         const opts = makeOpts(logs);
         reconcileFoldCoverage(session, originals, opts);
-        reconcileFoldCoverage(session, [msg("p1", "assistant", "drift pass one")], opts);
-        reconcileFoldCoverage(session, [msg("p2", "assistant", "drift pass two")], opts);
+        reconcileFoldCoverage(session, freshPass("p1"), opts);
+        reconcileFoldCoverage(session, freshPass("p2"), opts);
         assert.equal(session.metadata.foldDriftStreak, 2, "two total-loss passes build a streak");
 
         // Boundary A: every fold block disappears (e.g. native-compaction
@@ -330,16 +349,123 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
 
         // Boundary B: reconcile toggled off mid-episode also resets.
         state.blocks = origBlocks;
-        reconcileFoldCoverage(session, [msg("q0", "assistant", "episode two pre-pass")], opts);
+        reconcileFoldCoverage(session, freshPass("q0"), opts);
         assert.equal(session.metadata.foldDriftStreak, 1);
         reconcileFoldCoverage(session, [msg("q1", "assistant", "x")], { ...opts, mode: "off" });
         assert.equal(session.metadata.foldDriftStreak, undefined, "mode=off pass clears the streak");
 
         // The fresh episode escalates on its OWN third total-loss pass.
-        reconcileFoldCoverage(session, [msg("q2", "assistant", "episode two pass one")], opts);
-        reconcileFoldCoverage(session, [msg("q3", "assistant", "episode two pass two")], opts);
+        reconcileFoldCoverage(session, freshPass("q2"), opts);
+        reconcileFoldCoverage(session, freshPass("q3"), opts);
         assert.equal(errorLines(logs).length, 0, "stale streak must not pull escalation forward");
-        reconcileFoldCoverage(session, [msg("q4", "assistant", "episode two pass three")], opts);
+        reconcileFoldCoverage(session, freshPass("q4"), opts);
         assert.equal(errorLines(logs).length, 1, "fresh episode escalates on its own third pass");
+    });
+});
+
+describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)", () => {
+    type LogLine = { level: string; msg: string };
+    function blockSession(blockId: string, ids: string[]): Session {
+        return {
+            state: { blocks: [{ active: true, blockId, effectiveMessageIds: ids }] },
+            metadata: {},
+        } as unknown as Session;
+    }
+    function makeOpts(logs?: LogLine[]): ReconcileOptions & { mode: "repair" } {
+        return {
+            sessionId: "s2",
+            mode: "repair",
+            log: logs ? (level: string, m: string) => logs.push({ level, msg: m }) : undefined,
+        };
+    }
+    const covOf = (s: Session) => s.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage>;
+    const filler = (tag: string, n = 12): CoreMessage[] =>
+        Array.from({ length: n }, (_, i) => msg(`${tag}${i}`, "user", `filler turn ${tag} index ${i} padding words`));
+
+    test("records split present/reclaimed/unmatched per block; ever flag latches once verified", () => {
+        const session = blockSession("blk1", ["x1", "x2", "x3", "x4", "x5"]);
+        const x = (i: number) => msg(`x${i}`, "user", `covered payload ${i} words here`);
+        const first = [x(1), x(2), x(3), x(4), x(5), ...filler("f1")];
+        reconcileFoldCoverage(session, first, makeOpts());
+        let cov = covOf(session)["blk1"];
+        assert.ok(cov, "record written on the first qualifying pass");
+        assert.deepEqual(cov, { p: 5, r: 0, t: 5, e: 1 });
+        // Pass 2: x2 churns (claimable via normalized identity), x3 is genuinely
+        // edited (unmatchable), the rest ride along verbatim.
+        const second = [
+            x(1),
+            msg("x2-new", "user", "covered payload  2 words here"),
+            msg("x3-edited", "user", "completely different content"),
+            x(4),
+            x(5),
+            ...filler("f2"),
+        ];
+        reconcileFoldCoverage(session, second, makeOpts());
+        cov = covOf(session)["blk1"];
+        assert.ok(cov);
+        assert.equal(cov.p, 3, "x1/x4/x5 present verbatim");
+        assert.equal(cov.r, 1, "x2 reclaimed through a claim");
+        assert.equal(cov.e, 1);
+        // Pass 3: total loss — nothing covered rides the wire anymore.
+        reconcileFoldCoverage(session, filler("f3"), makeOpts());
+        cov = covOf(session)["blk1"];
+        assert.ok(cov);
+        assert.deepEqual(cov, { p: 0, r: 0, t: 5, e: 1 });
+    });
+
+    test("never-present class stays unverifiable (structural absence keeps status quo)", () => {
+        const session = blockSession("blk2", ["y1", "y2", "y3"]);
+        // A host whose resends never carry raw originals: the very first evidence
+        // pass already shows everything missing, so the fold can never be
+        // verified — booking must stay status quo rather than silently freezing.
+        reconcileFoldCoverage(session, filler("g1"), makeOpts());
+        const cov = covOf(session)["blk2"];
+        assert.ok(cov, "record exists");
+        assert.equal(cov.e, undefined, "never observed present → unverifiable");
+        assert.equal(cov.p + cov.r, 0);
+    });
+
+    test("side-request passes take no evidence, advance no streak, reset nothing", () => {
+        const ids = Array.from({ length: 12 }, (_, i) => `z${i}`);
+        const session = blockSession("blk3", ids);
+        const originals = ids.map((id, i) => msg(id, "user", `shadowable original ${i} words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        // Two conversation-sized total-loss passes build a streak of 2.
+        reconcileFoldCoverage(session, filler("h1"), opts);
+        reconcileFoldCoverage(session, filler("h2"), opts);
+        assert.equal(session.metadata.foldDriftStreak, 2);
+        const covBefore = JSON.stringify(session.metadata[METADATA_FOLD_COVERAGE]);
+        const anchorsBefore = JSON.stringify(session.metadata.foldAnchors);
+        const orderBefore = JSON.stringify(session.metadata.foldAnchorOrder);
+        // Title-gen shaped pass: same session id, a handful of messages.
+        const result = reconcileFoldCoverage(session, [msg("t1", "user", "hi"), msg("t2", "assistant", "title"), msg("t3", "user", "more")], opts);
+        assert.equal(result.kind, "noop");
+        assert.equal(session.metadata.foldDriftStreak, 2, "short pass neither advances nor resets the streak");
+        assert.equal(JSON.stringify(session.metadata[METADATA_FOLD_COVERAGE]), covBefore, "coverage records untouched");
+        assert.equal(JSON.stringify(session.metadata.foldAnchors), anchorsBefore, "anchors untouched");
+        assert.equal(JSON.stringify(session.metadata.foldAnchorOrder), orderBefore, "backbone untouched");
+        // The next conversation-sized total-loss pass escalates on its own merit.
+        reconcileFoldCoverage(session, filler("h3"), opts);
+        assert.equal(logs.filter((l) => l.level === "error").length, 1);
+    });
+
+    test("short passes do not skew the next pass's alignment", () => {
+        const ids = Array.from({ length: 10 }, (_, i) => `k${i}`);
+        const session = blockSession("blk4", ids);
+        const originals = ids.map((id, i) => msg(id, "user", `alignment context ${i} words`));
+        const opts = makeOpts();
+        reconcileFoldCoverage(session, originals, opts);
+        // A title-gen pass sneaks in between two real turns. Without the guard
+        // the backbone would roll onto tg1/tg2 and k4 would land outside the
+        // aligned churn region → straight to unmatched instead of claimed.
+        reconcileFoldCoverage(session, [msg("tg1", "user", "x"), msg("tg2", "assistant", "y")], opts);
+        const drifted = originals.map((m, i) => (i === 4 ? msg("k4-new", "user", "alignment context  4 words\r\n") : m));
+        const result = reconcileFoldCoverage(session, drifted, opts);
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.claims, 1);
+        assert.equal(result.unmatched, 0);
+        assert.equal(session.state.blocks[0].effectiveMessageIds[4], "k4-new");
     });
 });

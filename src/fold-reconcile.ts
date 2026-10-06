@@ -57,6 +57,16 @@ const FOLD_DRIFT_ESCALATE_PASSES = 3;
 /** Below this many permanently-missing ids the loss is small enough (a few
  *  edited/deleted messages) to stay at warn level. */
 const FOLD_DRIFT_ESCALATE_MIN_UNMATCHED = 10;
+/** #2202: per-block coverage evidence, consumed by the cache ledger's
+ *  conditional avoided-token accrual (src/cache-ledger.ts). */
+export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
+/** #2202: passes carrying fewer inbound messages than this are auxiliary
+ *  side-requests (#1075: title-gen / WebSearch refinement "carry only a
+ *  handful of brand-new messages") — no drift evidence is taken from them.
+ *  Same value as REWRITE_MIN_INCOMING_TOTAL (src/session.ts), which the #1195
+ *  sibling warn guards with; kept local so this module stays dependency-free
+ *  beyond its type import. */
+const SIDE_REQUEST_MAX_MSGS = 10;
 
 /** #2193 follow-up: clear the drift-episode state. The main path resets it on
  *  every non-total-loss pass; the early exits of reconcileFoldCoverage must do
@@ -104,6 +114,26 @@ export interface FoldReconcileResult {
     unmatched: number;
 }
 
+/** #2202: last qualifying pass's per-block coverage evidence — how much of the
+ *  block's covered set is still on the resent wire. The cache ledger books a
+ *  fold's avoided tokens as (S−σ)×requestsAfter and may only grow that counter
+ *  while the covered bytes are actually still being spared; this record is the
+ *  cross-check that conditions the accrual (src/cache-ledger.ts). */
+export interface FoldBlockCoverage {
+    /** Covered ids present verbatim in the pass. */
+    p: number;
+    /** Covered ids reclaimed via reanchor onto churned bytes in the pass
+     *  (still spared — honest coverage, not loss). */
+    r: number;
+    /** Total covered ids of the block when recorded. */
+    t: number;
+    /** 1 once ANY covered id was observed present-or-reclaimed since tracking
+     *  began. Distinguishes VERIFIED loss (was present, now gone → freeze the
+     *  accrual) from structural absence (view-folding hosts whose resends never
+     *  carry raw originals → unverifiable, keep status-quo booking). */
+    e?: 1;
+}
+
 const seenInvalidEnv = new Set<string>();
 
 export function resolveFoldReconcileMode(env: NodeJS.ProcessEnv, configured?: FoldReconcileMode): FoldReconcileMode {
@@ -146,6 +176,7 @@ function anchorFrom(message: CoreMessage): FoldAnchor {
 }
 
 interface BlockLike {
+    blockId?: string;
     effectiveMessageIds?: string[];
     directMessageIds?: string[];
 }
@@ -321,6 +352,19 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         resetFoldDriftState(session);
         return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
     }
+    // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
+    // share the conversation id but do not carry the conversation. Reconciling
+    // one would roll the order backbone onto their few ids, so the NEXT real
+    // pass anchors against the wrong tail: its missing covered ids land outside
+    // the aligned churn region, skip both claim passes (which iterate the
+    // middle only) and fall straight into unmatched — phantom total-loss that
+    // would feed the #2193 drift streak and the #2202 coverage records. No
+    // evidence is taken from such a pass; skipping is NOT recovery either, so
+    // the episode state is left exactly as found (the resets above stay
+    // reserved for true episode boundaries: reconcile off / no folds at all).
+    if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
@@ -359,6 +403,33 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         else anchorCount++;
     }
     const nextOrder = msgs.map((m) => m.id).filter((id): id is string => id !== undefined).slice(-MAX_ORDER);
+
+    // #2202: per-block coverage evidence for the ledger's conditional accrual
+    // (METADATA_FOLD_COVERAGE). Present = verbatim on this pass's wire;
+    // reclaimed = matched onto churned bytes (still spared — honest coverage).
+    // Computed BEFORE the repair rewrite below so old ids classify against the
+    // plan instead of post-rewrite bytes. The cumulative ever-present flag is
+    // what lets the ledger tell verified loss from structural absence.
+    const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
+    const nextCov: Record<string, FoldBlockCoverage> = {};
+    let covCount = 0;
+    for (const block of blocks) {
+        const bid = block.blockId;
+        if (bid === undefined || bid === "") continue;
+        const ids = block.effectiveMessageIds ?? [];
+        if (ids.length === 0) continue;
+        let p = 0, r = 0;
+        for (const id of ids) {
+            if (byId.has(id)) p++;
+            else if (plan.claims.has(id)) r++;
+        }
+        const rec: FoldBlockCoverage = { p, r, t: ids.length };
+        if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
+        if (covCount >= MAX_ANCHORS) continue;
+        nextCov[bid] = rec;
+        covCount++;
+    }
+    session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
 
     if (plan.claims.size > 0 && mode === "repair") {
         rewriteBlocks(blocks, plan.claims);
