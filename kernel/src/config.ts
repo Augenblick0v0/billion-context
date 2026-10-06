@@ -13,7 +13,16 @@ export function defaultConfig(
       iterationThreshold: 15,
       force: "soft",
       growthRatio: 0.05,
-      growthFloor: 50000,
+      // #2110: the default band is window-relative again — resolveAdaptiveGrowth
+      // clamps growthRatio × modelContextLimit into [growthFloor, growthCap],
+      // so ≥1M windows keep the flat 50k step byte-identical while smaller
+      // windows scale down (floored at 20k below 400k). The old floor=cap=50k
+      // (#379/#380) pinned EVERY window to a 50k step: ~24% of a 204k budget
+      // line, so quiet-turn growth never re-armed the nudge cadence and
+      // compressible mass sat idle turn after turn (issue #2110: pending
+      // 43–52k against a 50k gate for 66 straight requests). Explicit
+      // `compress.nudgeGrowthTokens` still flattens the band to a fixed step.
+      growthFloor: 20000,
       growthCap: 50000,
       minGrowthFloor: 20000,
       minGrowthRatio: 0.45,

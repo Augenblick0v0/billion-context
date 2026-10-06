@@ -333,19 +333,21 @@ connectivity test. Everything is also plain JSON for scripting
 (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context
-tools are called by the model as context grows, gentle growth nudges
-(~50K-token steps by design, adjustable via `compress.nudgeGrowthTokens`)
+tools are called by the model as context grows, gentle growth nudges (a
+window-scaled step — 5% of the window clamped to [20k, 50k], so 50k at ≥1M
+windows and 20k below 400k; pin a flat step with `compress.nudgeGrowthTokens`)
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
-first soft compaction fires 50k tokens past the boot content
-(`compress.nudgeGrowthTokens`, flat and window-independent). With a boot around
-100k — or with the growth step set to ~100k — the first compaction may wait
-until ~200k. To make it fire earlier: 1) trim the system prompt, disable
-unneeded tools, prune skills; 2) lower `compress.nudgeGrowthTokens` to ~50k;
-3) enable lean mode. Worked example in
+first soft compaction fires one growth step past the boot content
+(clamp(5% × window, 20k, 50k) — 50k on ≥1M windows, 20k below 400k;
+[`nudgeGrowthTokens`](CONFIGURATION.md#nudgegrowthtokens) pins a flat step).
+With a boot around 100k on a ≥1M window — or with the growth step set to
+~100k — the first compaction may wait until ~200k. To make it fire earlier:
+1) trim the system prompt, disable unneeded tools, prune skills; 2) lower
+`compress.nudgeGrowthTokens`; 3) enable lean mode. Worked example in
 [CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
 
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward

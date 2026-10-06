@@ -78,12 +78,12 @@ test("#1595 unit A: usage-grade drop beyond one interval retires a stale-high sh
     assert.equal(s.state.nudge.lastPerMessageNudgeTokens, 100_000, "baseline re-anchored to the real value");
     assert.deepEqual(s.state.nudge.lastShownByTier, {}, "per-tier stamps cleared");
     assert.ok(lines.some((l) => l.includes("nudge reference re-anchored 600000 -> 100000")), `re-anchor log missing: ${JSON.stringify(lines)}`);
-    assert.ok(lines.some((l) => l.includes("(margin 50000)")), "default flat 50k margin");
+    assert.ok(lines.some((l) => l.includes("(margin 20000)")), "#2110: unstamped-config margin is the kernel growthFloor default (20k, window-scaled band bottom)");
 });
 
 test("#1595 unit B: a drop within one growth interval leaves the reference alone", () => {
     const s = makeSession();
-    s.stats.lastInputTokens = 570_000; // 30k below the reference — inside the 50k margin
+    s.stats.lastInputTokens = 585_000; // 15k below the reference — inside the 20k margin (#2110 band bottom)
     s.state.nudge.lastNudgeShownTokens = PHANTOM;
     s.state.nudge.lastPerMessageNudgeTokens = 135_000;
     const { lines } = captureLogs(() => reanchorNudgeOnUsageDrop(s));
@@ -103,13 +103,15 @@ test("#1595 unit C: no live reference is a no-op", () => {
 test("#1595 unit D: margin follows the owner-flattened stamped config", () => {
     const s = makeSession();
     const cfg = defaultConfig(272_000);
-    cfg.nudge.growthFloor = cfg.nudge.growthCap = 20_000; // compress.nudgeGrowthTokens-style flatten
+    // #2110: the 272k window now scales the default band to a 20k floor, so
+    // flatten BELOW the scaled default to keep this a tightening test.
+    cfg.nudge.growthFloor = cfg.nudge.growthCap = 10_000; // compress.nudgeGrowthTokens-style flatten
     storeEffectiveConfig(s, cfg);
-    s.stats.lastInputTokens = 575_000; // 25k below — beyond the 20k margin, inside the default 50k
+    s.stats.lastInputTokens = 575_000; // 25k below — beyond the 10k flattened margin, inside the 20k scaled default
     s.state.nudge.lastNudgeShownTokens = PHANTOM;
     const { lines } = captureLogs(() => reanchorNudgeOnUsageDrop(s));
     assert.equal(s.state.nudge.lastNudgeShownTokens, 0, "flattened margin must tighten the trigger");
-    assert.ok(lines.some((l) => l.includes("(margin 20000)")), `expected 20k margin in log: ${JSON.stringify(lines)}`);
+    assert.ok(lines.some((l) => l.includes("(margin 10000)")), `expected 10k margin in log: ${JSON.stringify(lines)}`);
 });
 
 test("#1595 unit E: success-without-usage diagnostic warns once per session", () => {

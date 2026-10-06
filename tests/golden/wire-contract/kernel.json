@@ -1628,7 +1628,7 @@
         "iterationThreshold": 15,
         "force": "soft",
         "growthRatio": 0.05,
-        "growthFloor": 50000,
+        "growthFloor": 20000,
         "growthCap": 50000,
         "minGrowthFloor": 20000,
         "minGrowthRatio": 0.45,

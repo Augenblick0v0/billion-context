@@ -200,7 +200,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | Forced-compression nudge threshold: once history passes this share of the window the nudge fires immediately, bypassing growth gates. Not a hard cap. |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
-| `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
+| `compress.nudgeGrowthTokens` | number | *(unset — window-scaled: clamp(5% × window, 20k, 50k))* | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens. Default scales with the window (50k at ≥1M, 20k below 400k — #2110); set a number to pin a flat window-independent step. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 "stream required" rejections and never arms on gateway timeouts. |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
@@ -1094,9 +1094,9 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 #### `nudgeGrowthTokens`
 
 - **Type:** `number`
-- **Default:** `50000`
+- **Default:** *(unset — window-scaled step `clamp(5% × window, 20000, 50000)`: 50k at ≥1M windows, 20k below 400k; #2110)*
 - **Status:** ACTIVE
-- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
+- **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step; when unset the band defaults to [20k, 50k] and the step scales with the window).
 
 #### `preserveRecentMessages`
 
@@ -1356,14 +1356,16 @@ These two toggles are honoured only at the **global** level. Setting them inside
 
 Compaction does **not** trigger on absolute window position — it triggers on
 **growth intervals**: by default the first soft compaction fires after the
-session grows **50k tokens past its boot content**
-([`nudgeGrowthTokens`](#nudgegrowthtokens), a flat step independent of window
-size). The absolute position of the first compaction is therefore ≈ **boot +
-50k**:
+session grows **one growth step past its boot content**
+([`nudgeGrowthTokens`](#nudgegrowthtokens), default window-scaled
+`clamp(5% × window, 20k, 50k)` — 50k at ≥1M windows, 20k below 400k, #2110).
+The absolute position of the first compaction is therefore ≈ **boot + step**
+(boot + 50k on a ≥1M window, boot + 20k on a ≤400k window):
 
-- boot 30k–50k (the dsh default) → first compaction at ~80k–100k;
-- a boot around 100k, or a growth step set to ~100k → the first compaction may
-  wait until **~200k**.
+- boot 30k–50k (the dsh default) on a ≥1M window → first compaction at
+  ~80k–100k;
+- a boot around 100k on a ≥1M window, or a growth step set to ~100k → the
+  first compaction may wait until **~200k**.
 
 The forced threshold ([`maxContextLimit`](#maxcontextlimit), default 75%) is
 only a backstop, and it applies to the *effective* window — the output reserve
@@ -1374,16 +1376,16 @@ carries a very large `max_tokens`: a 262,144-token window with
 `max_tokens = 131072` → effective window 196,608 → forced line ≈147k; the same
 window with an 8k reserve → forced line ≈190k.
 
-After that the cadence stays growth-based: one incremental compaction per +50k
-of compressible growth. On local models each compaction is a full re-prefill —
-a heavy boot plus a large window puts several of them into one long task, which
-is how wall-clock ends up 2–3× longer.
+After that the cadence stays growth-based: one incremental compaction per
+growth step of compressible growth. On local models each compaction is a full
+re-prefill — a heavy boot plus a large window puts several of them into one
+long task, which is how wall-clock ends up 2–3× longer.
 
 To make the first compaction fire earlier (and save tokens), in this order:
 
 1. **trim the system prompt, disable unneeded tools, prune skills** — boot
    size directly determines the absolute position of the first compaction;
-2. **lower `nudgeGrowthTokens` to ~50k** (especially if it was raised to 100k);
+2. **lower `nudgeGrowthTokens`** (especially if it was raised to 100k);
 3. **enable lean mode** (`promptPack: "lean"`).
 
 Measure actual boot/context usage with `/acp` or the web UI before tuning.
@@ -1406,7 +1408,7 @@ Express it with the existing soft bands instead: keep the limit at the native wi
 
 How compression actually decides (acp-kernel, verified):
 
-1. **Growth layer (day-to-day driver, absolute tokens):** a proactive nudge fires once cumulative growth since the last anchor (session start / last nudge / post-compression reset) reaches the growth gate **and** enough compressible mass has accumulated. Both numbers are absolute and window-independent by design: the growth step is flat 50k at every window size (kernel `nudge.growthFloor == nudge.growthCap == 50000`, golden-pinned; window-percentage scaling was deliberately removed — #379/#380; override with `nudgeGrowthTokens`); the growth gate is `max(20k, 0.45 × step)` ≈ 22.5k, and the T1 path additionally needs ≥ one step (50k) of compressible mass. This layer keeps compressing long sessions even far below any percentage band.
+1. **Growth layer (day-to-day driver):** a proactive nudge fires once cumulative growth since the last anchor (session start / last nudge / post-compression reset) reaches the growth gate **and** enough compressible mass has accumulated. The growth step scales with the window by default — `clamp(5% × window, 20k, 50k)`: flat 50k at every window ≥1M (byte-identical to the old #379/#380 calibration), 20k below 400k; the flat-at-every-window behavior of #379/#380 was reverted for sub-1M windows because a 50k step on a 204k budget line (~24% of the window) starved the nudge cadence — #2110 (override with a flat step via `nudgeGrowthTokens`). The growth gate is `max(20k, 0.45 × step)` — 22.5k at the 50k step, exactly 20k at smaller steps — and the T1 path additionally needs ≥ one step of compressible mass. This layer keeps compressing long sessions even far below any percentage band.
 2. **Pressure layer (percent of the window):** `usage ≥ maxContextLimit` (default 75%) → a nudge is injected every turn until context drops back under; `usage ≥ emergencyThresholdPercent` (default 95%) → forced nudge + emergency truncation.
 3. **Qualification layer (kernel default 45%, not exposed):** gates only the turn-1 cold-start ticket and the block-count floor for T2/T3 tier escalation — not part of the day-to-day path.
 

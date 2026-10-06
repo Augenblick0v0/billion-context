@@ -316,9 +316,9 @@ export interface NudgeConfig {
   iterationThreshold: number;
   force: "soft" | "strong";
   growthRatio: number;
-  /** Adaptive growth threshold = modelContextLimit × this ratio, clamped to [growthFloor, growthCap]. Default 0.05 (5%). */
+  /** Lower clamp for the adaptive growth step = modelContextLimit × growthRatio. Default 20000 (#2110: sub-400k windows get a 20k step instead of #379/#380's flat 50k, which starved small-window nudge cadence). */
   growthFloor: number;
-  /** Upper clamp for adaptive growth threshold. Default 50000. */
+  /** Upper clamp for the adaptive growth step. Default 50000 — reached at ≥1M windows (0.05 × 1M); smaller windows scale below it. */
   growthCap: number;
   /** Anti-thrashing: suppress nudge unless growth ≥ max(minGrowthFloor, minGrowthRatio × growthTokens). Default 5000. */
   minGrowthFloor: number;
