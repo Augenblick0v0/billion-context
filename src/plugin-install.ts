@@ -38,7 +38,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort } from "./instance.js";
+import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
@@ -2143,6 +2143,34 @@ export function pluginInstall(agent: PluginAgent, opts: { withMcp?: boolean } = 
 
 export function pluginRemove(agent: PluginAgent): string {
     return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
+}
+
+/** #2155 uninstall guardrail (advisory half): `bili plugin remove <agent>`
+ * should tell the user that already-open client windows keep talking to the
+ * proxy as zombie plugin sessions (their MCP subprocess died with the remove,
+ * but the session binding is sticky). The proxy side self-heals those sessions
+ * (degrade to proxy mode); this note closes the loop for the human. Best-effort:
+ * any failure (no proxy, endpoint down, odd shape) stays silent. */
+export async function warnActivePluginSessions(agent: PluginAgent): Promise<string> {
+    try {
+        const inst = readProxyInstanceFile();
+        if (inst === undefined) return "";
+        const res = await fetch(inst.origin.replace(/\/$/, "") + "/__bili/sessions", { signal: AbortSignal.timeout(2500), headers: { accept: "application/json" } });
+        if (!res.ok) return "";
+        const data = (await res.json()) as { sessions?: Array<Record<string, unknown>> };
+        const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        let live = 0;
+        for (const s of sessions) {
+            const hint = typeof s["clientHint"] === "string" ? s["clientHint"] : "";
+            const seen = typeof s["lastSeen"] === "string" ? Date.parse(s["lastSeen"]) : Number.NaN;
+            if (hint === agent && Number.isFinite(seen) && seen >= cutoff) live += 1;
+        }
+        if (live === 0) return "";
+        return `note: ${live} active ${agent} session(s) seen in the last 10 minutes — already-open client windows keep running; their plugin lane is gone and the proxy self-heals them to proxy mode (#2155). Reload/restart the client to fully detach.`;
+    } catch {
+        return "";
+    }
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {

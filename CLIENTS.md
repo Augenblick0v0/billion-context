@@ -213,6 +213,18 @@ two small node scripts that do the work around the client:
   happens per session. Remove with `bili plugin remove zcode` (strips only
   bili's entries, reverts `hooks.enabled` when it was the one to enable it,
   and restores the provider store from its snapshot).
+- **Open sessions after removal (#2155):** `bili plugin remove zcode` cannot
+  reach into already-open client windows — their MCP child is gone but the
+  proxy-side binding (session metadata) survives. Such zombie sessions are
+  detected after 5 consecutive nudged rounds with no plugin header, no bili
+  tools on the wire, and no compression: the session self-heals by
+  **degrading to proxy mode** — the ACP tools are re-injected wire-side and
+  the proxy owns compression again (the nudge stays). When wire injection is
+  unavailable (`compress.injectTool=false`) the nudge is suppressed instead
+  until a compression reduction resumes. A returning plugin header (client
+  restarted / reinstalled) restores plugin mode on the first request. The
+  remove command prints a note when live sessions were seen in the last 10
+  minutes; the web UI badges such sessions ("heal").
 - **Per-session bootstrap:** each ZCode session spawns the MCP child as a
   direct process; at startup it attaches to a healthy proxy
   (`BILLION_CONTEXT_PROXY`) or spawns its own on an ephemeral port, then

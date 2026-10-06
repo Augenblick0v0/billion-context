@@ -185,7 +185,7 @@ test("e2e #2133 (global config ON): 524 gateway → SSE forced first-shot, fold 
     }
 });
 
-test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no self-heal, fail-fast 502", async () => {
+test("e2e #2133/#2155 (explicit OFF): 524 gateway → legacy non-stream retries, no learn, fail-fast 502", async () => {
     const calls: Call[] = [];
     const forwardBodies: string[] = [];
     const upstream = makeCloudflareUpstream(calls, forwardBodies);
@@ -193,19 +193,23 @@ test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
+    // #2155 flipped the UNSET default to first-hit SSE learn on 524/504; an
+    // explicit cascade FALSE is now the operator's "never stream summaries"
+    // opt-out and must keep the legacy behavior: no learn path arms, every
+    // attempt stays non-stream, preflight fails fast.
     const proxy = await startProxy(
         { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-6-astra": { context: 10_000 } } } },
-        {},
+        { streamSummary: false },
     );
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s2133-off-1");
-        // Pins the UNCHANGED default behavior: without the knob the gateway
-        // timeout never arms the learn path, so preflight fails fast instead
-        // of folding (the exact symptom reported in #2133).
-        assert.equal(r.status, 502, `default behavior must still fail fast behind the 524 gateway, got ${r.status}`);
+        // Pins the explicit-OFF behavior (#2155): the operator opted this
+        // route out of streaming summaries, so the gateway timeout must not
+        // arm the 524 learn path — preflight fails fast instead of folding.
+        assert.equal(r.status, 502, `explicit OFF must still fail fast behind the 524 gateway, got ${r.status}`);
         const body = await r.json() as { error?: { code?: string; retryable?: boolean } };
         assert.equal(body.error?.code, "preflight_compress_failed");
         assert.equal(body.error?.retryable, true);
@@ -214,7 +218,7 @@ test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no
         assert.ok(summaries.length >= 1, "a summary call must have been made");
         assert.ok(
             summaries.every((c) => !c.stream),
-            `without the knob every summary attempt stays non-stream (the 524 never matches the learn regex), got ${JSON.stringify(calls)}`,
+            `explicit OFF keeps every summary attempt non-stream (no learn path arms), got ${JSON.stringify(calls)}`,
         );
         assert.equal(forwardBodies.length, 0, "nothing was forwarded — the payload could not be brought under the window");
     } finally {
@@ -243,7 +247,7 @@ test("e2e #2133 (per-provider scope): only the route carrying compress.streamSum
     const proxy = await startProxy(
         {
             [`http://127.0.0.1:${portA}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: true } },
-            [`http://127.0.0.1:${portB}`]: { models: { "gpt-6-astra": { context: 10_000 } } },
+            [`http://127.0.0.1:${portB}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: false } },
         },
         {},
     );
@@ -257,11 +261,63 @@ test("e2e #2133 (per-provider scope): only the route carrying compress.streamSum
         assert.ok(sumsA.length >= 1 && sumsA.every((c) => c.stream), `route A summaries must all be stream, got ${JSON.stringify(callsA)}`);
 
         const rB = await driveResponsesPreflight(proxyPort, portB, "s2133-scope-b");
-        assert.equal(rB.status, 502, "route B has no knob and keeps the legacy non-stream-first behavior");
+        assert.equal(rB.status, 502, "route B carries the explicit OFF knob and keeps the legacy non-stream-first behavior");
         const sumsB = callsB.filter((c) => c.summary);
         assert.ok(sumsB.length >= 1 && sumsB.every((c) => !c.stream), `route B summaries must stay non-stream, got ${JSON.stringify(callsB)}`);
         assert.equal(bodiesB.length, 0, "route B forwarded nothing (its preflight failed)");
     } finally {
         await closeAll([proxy, upstreamA, upstreamB]);
+    }
+});
+
+test("e2e #2155/#2133 (stale learned flag): explicit OFF ignores a flag learned under the unset default", async () => {
+    // The disclosed opt-out contract has a third clause beyond the two learn
+    // paths: an ALREADY-learned metadata.preflightStreamSummary (acquired under
+    // the #2155 first-hit default while the cascade was unset) must be inert
+    // once the operator sets an explicit streamSummary:false on the route. The
+    // flag is seeded directly on the live session to simulate that prior
+    // learning; a failed preflight would arm the #726 dead-end cooldown for
+    // identical bodies, so the session is warmed with an in-window request
+    // instead of a failed long one.
+    const calls: Call[] = [];
+    const forwardBodies: string[] = [];
+    const upstream = makeCloudflareUpstream(calls, forwardBodies);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = await startProxy(
+        { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: false } } },
+        {},
+    );
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const warm = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "s2155-stale-flag" },
+            body: JSON.stringify({ model: "gpt-6-astra", stream: true, input: [{ type: "message", role: "user", content: "warmup" }] }),
+        });
+        assert.equal(warm.status, 200, `warmup must pass through, got ${warm.status}`);
+        const forwardedAfterWarmup = forwardBodies.length;
+
+        const sess = listSessions().find((s) => s.id.includes("s2155-stale-flag"));
+        assert.ok(sess, "session recorded by the warmup");
+        assert.equal(sess?.metadata?.preflightStreamSummary, undefined, "no flag before seeding");
+        sess!.metadata.preflightStreamSummary = true;
+
+        const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s2155-stale-flag");
+        assert.equal(r.status, 502, `explicit OFF must ignore the stale flag and fail fast, got ${r.status}; calls=${JSON.stringify(calls)}`);
+        const summaries = calls.filter((c) => c.summary);
+        assert.ok(summaries.length >= 1, "a summary call must have been made");
+        assert.ok(
+            summaries.every((c) => !c.stream),
+            `explicit OFF keeps every attempt non-stream even with a learned flag, got ${JSON.stringify(calls)}`,
+        );
+        assert.equal(forwardBodies.length, forwardedAfterWarmup, "the over-window payload was never forwarded (its preflight failed)");
+        assert.equal(sess?.metadata?.preflightStreamSummary, true, "the opt-out leaves the stale flag set but inert");
+    } finally {
+        await closeAll([proxy, upstream]);
     }
 });

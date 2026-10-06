@@ -510,6 +510,15 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     }
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // #2155: active self-heal state (zombie plugin degrade / nudge
+    // suppression) — surface it so the web list can badge the session.
+    const shRaw = metaRec["selfHeal"];
+    const selfHeal = shRaw !== null && typeof shRaw === "object"
+        && typeof (shRaw as Record<string, unknown>)["detected"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["action"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["since"] === "number"
+        ? { detected: (shRaw as Record<string, unknown>)["detected"] as string, action: (shRaw as Record<string, unknown>)["action"] as string, since: (shRaw as Record<string, unknown>)["since"] as number }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -534,6 +543,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         cacheHitPct: hitPct(inputTokens, cachedTokens),
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
+        ...(selfHeal ? { selfHeal } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
