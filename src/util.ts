@@ -104,6 +104,23 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
     return raw * k;
 }
 
+/** #2117: read-side gate for the learned estimator scale — the model dimension
+ *  of k̂ provenance. A factor published against model X must not decide on
+ *  model Y: tokenizers bill differently, and a stale cross-model factor can be
+ *  dangerously wrong in EITHER direction (k̂<1 deflates → trigger too LATE).
+ *  Both models known (non-empty strings) and different → factor absent (raw
+ *  estimate, legacy conservative behavior); either side unknown/empty/non-
+ *  string → factor kept as-is, so factors published before this field existed
+ *  (or requests without a model stamp) are never invalidated by missing
+ *  information — they retire through the normal ring rollover when new samples
+ *  land. Invalid factors degrade to absent. */
+export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string }, lastModel?: unknown): number | undefined {
+    const k = stats.calibratedEstimate;
+    if (k === undefined || !Number.isFinite(k) || k <= 0) return undefined;
+    if (stats.calibratedEstimateModel !== undefined && typeof lastModel === "string" && lastModel !== "" && stats.calibratedEstimateModel !== lastModel) return undefined;
+    return k;
+}
+
 export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 
 /**

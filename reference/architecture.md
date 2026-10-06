@@ -141,6 +141,8 @@ billion-context/
 │   │   ├── opencode-native.ts    #   opencode native bootstrap gate
 │   │   ├── opencode-legacy.ts    #   Legacy DCP hooks table
 │   │   ├── pi.ts                 #   pi plugin factory (session derivation, #1333/#1362)
+│   │   ├── pi-subagents.ts       #   Inlined acp_delegate sub-agent surface (markEmbedded wiring, #2186)
+│   │   ├── pi-host-stub.ts     #   esbuild alias stub for @earendil-works/pi-coding-agent (→ ".pi" fallback, #2186)
 │   │   ├── pi-native.ts          #   pi native bootstrap gate
 │   │   ├── omp.ts                #   omp plugin = createBiliPlugin("omp") re-export of pi factory
 │   │   ├── omp-native.ts         #   omp native bootstrap gate

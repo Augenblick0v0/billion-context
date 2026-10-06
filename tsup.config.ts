@@ -1,3 +1,5 @@
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "tsup";
 
 export default [
@@ -19,6 +21,14 @@ defineConfig({
     // the build if any relative import()/require() text ever reappears.
     esbuildOptions(options) {
         options.minifyWhitespace = true;
+        // #2186: billion-context-pi-subagents is inlined via noExternal, and
+        // its ONLY runtime host import is a namespace import of
+        // @earendil-works/pi-coding-agent (config-dir reads CONFIG_DIR_NAME,
+        // falling back to ".pi" when absent — the package's documented
+        // degradation for aliased hosts). Alias it to an empty stub so the
+        // bundle keeps bili's zero-runtime-dependency contract; no bili entry
+        // ever imports the real package.
+        options.alias = { "@earendil-works/pi-coding-agent": resolve(dirname(fileURLToPath(import.meta.url)), "src/agent/pi-host-stub.ts") };
     },
     outDir: "dist",
     clean: true,
@@ -30,7 +40,7 @@ defineConfig({
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
-    noExternal: ["acp-kernel", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
+    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     // sharp is an OPTIONAL runtime dependency (native module): it must stay
     // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves
     // at runtime from node_modules — missing ⇒ clean pass-through, and the

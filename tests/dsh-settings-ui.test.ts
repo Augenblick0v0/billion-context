@@ -427,7 +427,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(degBundleTexts.some((t) => t.includes("/acp")), "the bundle degraded hint points at /acp");
 });
 
-test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots)", async () => {
+test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots); #2187 keeps probing in a slow phase past the fast attempts", async () => {
     const { build } = await import("esbuild");
     const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
         entry: Record<string, string>;
@@ -594,6 +594,90 @@ test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on su
         (button.props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         m.runCleanups();
+    }
+
+    {
+        // #2187: past the fast phase, probing CONTINUES at the slow cadence
+        // instead of stopping — a late-arriving origin (background heal) must
+        // still upgrade the entry. Manual clock: capture each scheduled retry
+        // and fire it by hand so the test never waits in wall time.
+        const pending: Array<{ id: number; delay: number; fn: () => void }> = [];
+        let nextId = 1;
+        let polls = 0;
+        let landed = false;
+        const fakeSetTimeout = ((fn: () => void, delay?: number): unknown => {
+            const id = nextId++;
+            pending.push({ id, delay: delay ?? 0, fn });
+            return id;
+        }) as unknown as typeof setTimeout;
+        const fakeClearTimeout = ((id: unknown): void => {
+            const i = pending.findIndex((p) => p.id === id);
+            if (i >= 0) pending.splice(i, 1);
+        }) as unknown as typeof clearTimeout;
+        const m = mount({
+            fetch: async () => {
+                polls += 1;
+                if (polls >= 13) landed = true;
+                return { ok: true, json: async () => ({ origin: polls >= 13 ? "http://127.0.0.1:9997" : null }) };
+            },
+            setTimeout: fakeSetTimeout,
+            clearTimeout: fakeClearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        assert.equal(findButton(first), undefined, "first paint before the probe resolves is still degraded");
+        const delays: number[] = [];
+        for (;;) {
+            await tick();
+            if (landed) break;
+            if (pending.length === 0) throw new Error("polling stopped before the origin arrived");
+            const t = pending.shift()!;
+            delays.push(t.delay);
+            t.fn();
+        }
+        const second = m.component() as ElementNode;
+        const button = findButton(second);
+        assert.ok(button !== undefined, "a late-arriving origin upgrades the entry without a reload");
+        assert.deepEqual(delays.slice(0, 9), Array(9).fill(3000), "fast phase keeps the original cadence");
+        assert.ok(delays.length > 9, `probing must continue past the fast phase, got ${delays.length} retries`);
+        assert.deepEqual(delays.slice(9), Array(delays.length - 9).fill(10000), "slow phase uses the reduced cadence");
+        m.runCleanups();
+    }
+
+    {
+        // #2187: unmount still cancels the pending retry even in the slow phase
+        const pending: Array<{ id: number; delay: number; fn: () => void }> = [];
+        let nextId = 1;
+        let cleared = 0;
+        const fakeSetTimeout = ((fn: () => void, delay?: number): unknown => {
+            const id = nextId++;
+            pending.push({ id, delay: delay ?? 0, fn });
+            return id;
+        }) as unknown as typeof setTimeout;
+        const fakeClearTimeout = ((id: unknown): void => {
+            cleared += 1;
+            const i = pending.findIndex((p) => p.id === id);
+            if (i >= 0) pending.splice(i, 1);
+        }) as unknown as typeof clearTimeout;
+        const m = mount({
+            fetch: async () => ({ ok: true, json: async () => ({ origin: null }) }),
+            setTimeout: fakeSetTimeout,
+            clearTimeout: fakeClearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        const delays: number[] = [];
+        for (let i = 0; i < 12; i++) {
+            await tick();
+            if (pending.length === 0) break;
+            const t = pending.shift()!;
+            delays.push(t.delay);
+            t.fn();
+        }
+        assert.ok(delays.includes(10000), `reached the slow phase, got delays ${JSON.stringify(delays)}`);
+        m.runCleanups();
+        assert.ok(cleared >= 1, "the pending retry is cancelled on unmount");
+        assert.equal(pending.length, 0, "no timers survive unmount");
     }
 });
 

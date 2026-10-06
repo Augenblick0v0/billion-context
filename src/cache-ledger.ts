@@ -920,8 +920,23 @@ export function settleUsageReport(
         const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
         if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
             const rawSample = s.total / pendingEst;
+            // #2117 B: the ring is keyed by route AND model — tokenizers bill
+            // differently across models, so a mid-session model switch starts a
+            // FRESH ring instead of blending two models' billing scales into one
+            // factor. Missing model info NEVER invalidates (same discipline as
+            // currentCalibrationFactor): a ring without a model key — legacy
+            // pre-upgrade files included, and records restored after a restart
+            // whose load whitelist drops the model fields (#2141) — continues
+            // and ADOPTS the first known model. Discarding it would clear a
+            // provenance-matched published k̂ on the first post-restart settle
+            // (the #2129 regression class).
+            const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
             let ring = session.stats.calibrationRing;
-            if (!ring || ring.origin !== settleOrigin) ring = { origin: settleOrigin, values: [] };
+            if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
+                ring = { origin: settleOrigin, model: settleModel, values: [] };
+            } else if (ring.model === undefined && settleModel !== undefined) {
+                ring.model = settleModel;
+            }
             if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
                 ring.values.push(rawSample);
                 if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
@@ -930,9 +945,14 @@ export function settleUsageReport(
                     const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
                     session.stats.calibratedEstimate = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimateOrigin = settleOrigin;
+                    // Provenance is the ring's model key, not this sample's stamp —
+                    // an unknown-model settle continues a model-keyed ring without
+                    // blanking the established provenance.
+                    session.stats.calibratedEstimateModel = ring.model;
                 } else {
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
+                    delete session.stats.calibratedEstimateModel;
                 }
             }
             session.stats.calibrationRing = ring;

@@ -18,7 +18,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 
 // #247: proactive pre-forward compression. When the session's real context
@@ -78,6 +78,45 @@ const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
+// #2189: subscription-OAuth credentials (Claude Code login) accept only
+// requests whose system carries the client's billing-attribution block; every
+// other call on the same credential gets 429 rate_limit_error "Error" (a
+// shape rejection wearing a rate-limit costume). The main forward lane has
+// preserved the client's block shape since #1876 — this extractor lets the
+// summary side-path carry it too. cache_control is dropped (it pinned the
+// client's own placement, not one in bili's summary system); scanning instead
+// of index-0-only survives a host relocating the block.
+export const BILLING_ATTRIBUTION_PREFIX = "x-anthropic-billing-header:";
+
+export function extractBillingAttributionBlock(
+    system: string | Array<Record<string, unknown>> | undefined,
+): { type: "text"; text: string } | undefined {
+    if (!Array.isArray(system)) return undefined;
+    for (const block of system) {
+        if (!block || typeof block !== "object" || block.type !== "text") continue;
+        const text = block.text;
+        if (typeof text === "string" && text.trimStart().startsWith(BILLING_ATTRIBUTION_PREFIX)) {
+            return { type: "text", text };
+        }
+    }
+    return undefined;
+}
+
+// #2189: 429 + error.type "rate_limit_error" + the BARE message "Error" is
+// upstream's credential-shape rejection (see above), not a rate limit — real
+// limits carry descriptive messages. Retrying the identical shape cannot
+// succeed, so callers fail fast on this signature instead of burning the
+// replay budget. Both halves are required so real-limit wording can't trip it.
+export function isCredentialShapeRejection(status: number, body: string): boolean {
+    if (status !== 429) return false;
+    try {
+        const parsed = JSON.parse(body) as { error?: { type?: unknown; message?: unknown } };
+        return parsed.error?.type === "rate_limit_error" && parsed.error.message === "Error";
+    } catch {
+        return false;
+    }
+}
+
 export interface PreflightDeps {
     core: CompressionCore;
     session: Session;
@@ -111,6 +150,10 @@ export interface PreflightDeps {
     forceStreamSummary?: boolean;
     /** One external-summary deadline shared by every range/chunk in this invocation. */
     externalSummary?: ConfiguredSummaryPlan;
+    /** #2155: compress.streamSummary resolved FALSE for this request (explicit operator opt-out anywhere in the cascade). Neither learn path (400 "stream required" nor the 524/504 gateway-timeout first-hit learn) may arm, and an already-armed session flag is ignored — the operator said this upstream must never stream summaries. */
+    streamSummaryOff?: boolean;
+    /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
+    billingBlock?: { type: "text"; text: string };
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -325,10 +368,14 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
-        return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
+        // #2189: carry the client's billing-attribution block as system[0] with
+        // the bili prompt as system[1]; subscription-OAuth upstreams reject
+        // calls lacking it. Absent → legacy string system byte-identical.
+        const systemOut = billingBlock ? [billingBlock, { type: "text", text: system }] : system;
+        return { model, max_tokens: maxOutputTokens, system: systemOut, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
         return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
@@ -698,16 +745,29 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // at most one extra attempt per capability, in either rejection order.
     // #2133: compress.streamSummary forces SSE from the first attempt — the
     // learn path above only sees 400 "stream required" rejections, which a
-    // gateway timeout (524) never produces.
-    let stream = deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true;
+    // gateway timeout (524) never produces. #2155: an explicit cascade FALSE
+    // (streamSummaryOff) opts the request out of SSE summaries entirely — both
+    // learn paths stay disarmed and a stale learned flag is ignored.
+    let stream = !deps.streamSummaryOff && (deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true);
     let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
     for (;;) {
         try {
             return await requestSummary(deps, system, content, stream, includeMaxOutputTokens);
         } catch (err) {
+            if (err instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (err.status === 524 || err.status === 504)) {
+                // #2155 D3: first-hit learn — the non-streaming summary call
+                // timed out at the gateway. Flip this session to SSE summaries
+                // (persisted, same slot as the #626/#2133 learn) and retry once;
+                // the streaming attempt itself keeps normal transient retry
+                // semantics inside requestSummaryBody.
+                deps.session.metadata.preflightStreamSummary = true;
+                stream = true;
+                deps.log("info", `[preflight] non-streaming summary timed out at the gateway (HTTP ${err.status}); retrying with SSE (learned for this session, #2155)`);
+                continue;
+            }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
-                if (!stream && STREAM_REQUIRED_RE.test(err.body)) {
+                if (!stream && !deps.streamSummaryOff && STREAM_REQUIRED_RE.test(err.body)) {
                     deps.session.metadata.preflightStreamSummary = true;
                     stream = true;
                     adapted = true;
@@ -768,7 +828,7 @@ class SummaryTransportError extends Error {
     }
 }
 
-async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<string> {
+async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boolean): Promise<string> {
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         deps.signal?.throwIfAborted();
@@ -791,9 +851,27 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
         } catch (err) {
             deps.signal?.throwIfAborted();
             const failure = err instanceof UpstreamHttpError ? err : new SummaryTransportError(stage, err, attempt);
-            const retryable = failure instanceof UpstreamHttpError
-                ? isTransientUpstreamError(failure.status, failure.body)
-                : failure.retryable;
+            // #2155 D3: a gateway timeout (Cloudflare 524 / 504) on a
+            // NON-STREAMING summary must not burn the replay budget — each
+            // identical retry just waits out another ~100s edge timeout. Surface
+            // it immediately; summarizeRange learns SSE for the session and
+            // retries once with stream:true (the #2133 self-learn semantics,
+            // extended beyond the 400 "stream required" shape). Streaming
+            // attempts keep the normal transient replay below.
+            if (failure instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (failure.status === 524 || failure.status === 504)) {
+                throw failure;
+            }
+            // #2189: retrying the identical shape cannot succeed — name it and fail fast.
+            const shapeRejection = failure instanceof UpstreamHttpError
+                && isCredentialShapeRejection(failure.status, failure.body);
+            if (shapeRejection) {
+                deps.log("warn", `[preflight] summary rejected with HTTP 429 rate_limit_error "Error" — suspected credential-shape rejection rather than a rate limit (upstream requires a request attribute missing from this summary call, e.g. the client's billing-attribution system block; #2189); not retrying`);
+            }
+            const retryable = shapeRejection
+                ? false
+                : failure instanceof UpstreamHttpError
+                    ? isTransientUpstreamError(failure.status, failure.body)
+                    : failure.retryable;
             if (!retryable || attempt >= maxAttempts) {
                 if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
@@ -821,7 +899,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -886,7 +964,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // #1933 F1: capture k̂ once — it only mutates on usage settlement (outside
     // this invocation), while every fit judgment in this loop must stay on
     // one consistent scale with the gate that started it.
-    const kFactor = deps.session.stats.calibratedEstimate;
+    // #2117 B: model-provenance gate — a factor learned on another model acts
+    // as absent (raw estimate) rather than deciding with a cross-model scale.
+    const kFactor = currentCalibrationFactor(deps.session.stats, deps.session.metadata?.lastModel);
     const kOrigin = deps.session.stats.calibratedEstimateOrigin;
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
@@ -1224,13 +1304,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // upstream said no — log it the way the main paths already do
                         // and carry a bounded snippet into the client-visible detail.
                         const transient = isTransientUpstreamError(err.status, err.body);
+                        const shapeRejection = isCredentialShapeRejection(err.status, err.body);
                         const bodySnippet = safePrefix(err.body.trim(), 200);
                         failure = {
                             kind: "upstream",
                             status: err.status,
-                            retryable: transient,
+                            // #2189: a shape-based rejection is deterministic for this
+                            // payload — a client retry hits the same wall, so do not
+                            // advertise retryability (and let the dead-end cooldown arm).
+                            retryable: shapeRejection ? false : transient,
                             detail: err.status === 429
-                                ? `the summarization call was rate-limited by the upstream (HTTP 429)`
+                                ? shapeRejection
+                                    ? `the summarization call was rejected with HTTP 429 (rate_limit_error "Error") — suspected credential-shape rejection rather than a rate limit (the upstream requires a request attribute missing from the summary call, e.g. the client's billing-attribution system block; #2189)`
+                                    : `the summarization call was rate-limited by the upstream (HTTP 429)`
                                 : `the summarization call was rejected by the upstream (HTTP ${err.status})${bodySnippet ? `: ${bodySnippet}` : ""}`,
                         };
                         deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)${bodySnippet ? `: ${bodySnippet}` : ""}`);

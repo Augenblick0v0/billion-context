@@ -7,14 +7,20 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
+import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
+import { wirePiSubagents } from "./pi-subagents.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
+    // #2186: acp_delegate surface notifies stand-downs through the host toast
+    // when present (same channel CommandCtx already declares).
+    ui?: { notify?: (message: string, type?: string) => void } | undefined;
     // #1961: pi 0.99+ exposes the live model catalog on the extension ctx;
     // optional because older hosts lack it. The real ModelRegistry surface is
     // find(provider, modelId) — there is no getModel (verified against pi
@@ -44,10 +50,18 @@ type CommandCtx = {
     ui?: { notify?: (message: string, type?: string) => void } | undefined;
 };
 
+export type { ExtensionAPI, CommandCtx, ToolDefinition };
+
 type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
+    // completion notifications through the host's persistent transcript
+    // channel; optional because older hosts and non-pi hosts lack it.
+    sendUserMessage?: (message: string, options?: { deliverAs?: string }) => void;
+    // #2186: delegate fleet-inspector shortcut — TUI nicety, never load-bearing.
+    registerShortcut?: (key: string, options: { description?: string; handler: (ctx: CommandCtx) => void | Promise<void> }) => void;
     // #535: launcher passes provider URL rewrites via env; the extension
     // overrides each provider's baseUrl at load (file-free routing — no
     // models.json overlay). Optional because older hosts may lack it.
@@ -285,7 +299,11 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal, conversationId !== "unknown");
-                return { content: [{ type: "text", text: output }] };
+                // #2204: a business failure (e.g. a refused export) must reach
+                // the host as isError — rendering it as plain success text is
+                // what hid the #2204 write failures from OMP.
+                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true };
+                return { content: [{ type: "text", text: output.text }] };
             } catch (err) {
                 return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
             }
@@ -413,6 +431,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #2185 方案 A: this bundle's own file path, registered per session so
+        // pi-subagents children load it deterministically (see module header).
+        const subagentReg: SubagentSelfRegState = {};
+        const entryFile = fileURLToPath(import.meta.url);
         // #1217: -p single-shot fires round 1 before session_start's manifest
         // fetch can resolve, leaving the request unmarked → anonymous
         // proxy-mode session. Prime the fetch at load time: the launcher
@@ -652,7 +674,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const toolArgs = /(^|\s)(--)?full(\s|$)/.test(args ?? "") ? { detail: "full" as const } : {};
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown");
+                        const out = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown");
+                        if (out.failed) {
+                            notify(`bili: cache report failed: ${out.text}`, "error");
+                            return;
+                        }
+                        text = out.text;
                     } catch (err) {
                         notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
@@ -713,7 +740,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     }
                     let text: string;
                     try {
-                        text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs, undefined, conversationId !== "unknown");
+                        const out = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs, undefined, conversationId !== "unknown");
+                        if (out.failed) {
+                            notify(`bili: acp_rule failed: ${out.text}`, "error");
+                            return;
+                        }
+                        text = out.text;
                     } catch (err) {
                         notify(`bili: acp_rule failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
@@ -857,6 +889,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
+            if (agent === "pi") {
+                const regReason = selfRegisterForSession(subagentReg, {
+                    env: process.env,
+                    agent,
+                    sessionId: sessionIdOf(ctx),
+                    filePath: entryFile,
+                    log: (m) => console.warn(`bili-plugin(pi): ${m}`),
+                });
+                if (regReason !== "registered" && regReason !== "registered-already") {
+                    console.warn(`bili-plugin(pi): subagent self-registration skipped (${regReason})`);
+                }
+            }
             state.sid = undefined;
             // #1586 review: session_start captures its ctx for the whole
             // session — never suspend across it here. One-shot flows replace
@@ -867,6 +911,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
             void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+        });
+        // #2185: drop our required-child-extension entry when this session's
+        // extension runtime tears down (quit/reload/new/resume/fork).
+        pi.on("session_shutdown", () => {
+            disposeSubagentSelfReg(subagentReg);
         });
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
@@ -884,6 +933,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 signal: AbortSignal.timeout(5000),
             }).catch(() => {});
         });
+        // #2186: acp_delegate surface for the pi lane, inlined from
+        // billion-context-pi-subagents. omp never reaches the wiring (the
+        // gate repeats inside) and a previously claimed surface stands down.
+        wirePiSubagents(pi, agent);
     };
 }
 

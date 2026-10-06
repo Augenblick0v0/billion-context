@@ -243,7 +243,13 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<string> {
+/** #2204: business outcome of a forwarded tool call. ok:true means the tool
+ *  RAN; whether it achieved its effect rides the endpoint's machine-readable
+ *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
+ *  lane renders the same receipt the same way. */
+export type ForwardedToolResult = { text: string; failed: boolean };
+
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
     const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
@@ -256,11 +262,11 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
     }, TOOL_TIMEOUT_MS, signal);
-    const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
+    const data = json as { ok?: boolean; result?: string; error?: string; outcome?: string } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);
     }
-    return data.result ?? "";
+    return { text: data.result ?? "", failed: data.outcome === "failure" || data.outcome === "refused" };
 }
 
 /** Soft-fail by design: the status read is best-effort UI data; undefined

@@ -50,6 +50,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
+import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -78,10 +79,10 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -110,7 +111,8 @@ import { rewriteGoogleJsonResponseAsync } from "./stream-google.js";
 import { rewriteResponsesJsonResponseAsync } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
+import { dshPersonaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
@@ -119,7 +121,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, strippedResponseIdWarning, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
@@ -154,7 +156,7 @@ import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
-import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
@@ -889,6 +891,22 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
             );
         }
+        // #2090 plan A: signed requests refused earlier that the user has not
+        // configured away yet — surface them at EVERY startup, not only at
+        // the next failure, with the exact opt-in line.
+        {
+            const unresolved = unresolvedRefusals();
+            const entries = Object.entries(unresolved);
+            if (entries.length > 0) {
+                const list = entries.map(([scheme, e]) => `${scheme} (${e.origin}${e.count > 1 ? `, ${e.count}× since ${e.firstSeen.slice(0, 10)}` : ""})`).join("; ");
+                log(
+                    "warn",
+                    `[resign] ${entries.length} signed request scheme(s) were refused earlier and remain UNRESOLVED: ${list}. ` +
+                        `Per the compress-or-refuse contract they stay refused until bili ships a re-signer for each of them — no configuration can pass a signed body through unsigned. Also listed in the web UI: http://${displayHost}:${actualPort}/__bili/ (Configuration → Signed upstreams). ` +
+                        "Set resign[\"<scheme>\"].enabled=false / BILI_RESIGN=0 only if you accept the upstream rejecting rewritten bodies.",
+                );
+            }
+        }
         // #1723: residual zone drift is now an exception, not the norm — a
         // lane'd launch landing ABOVE its preferred port means that port was
         // held by something we must not wait on (foreign squatter, same-code
@@ -1092,6 +1110,11 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    /** #2189: the client's billing-attribution block captured from the INBOUND
+     *  anthropic system (pre-anchor). Preflight summary calls must carry it —
+     *  subscription-OAuth upstreams answer calls lacking it with 429
+     *  rate_limit_error "Error" (#2189). See extractBillingAttributionBlock. */
+    anthropicBillingBlock?: { type: "text"; text: string };
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
@@ -1370,6 +1393,7 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/resign") return sendResignStatus(res);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
@@ -2254,11 +2278,26 @@ async function handle(
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
                   : dshPersona && !sideRequestLike
-                    ? subagentNamespace(anthropicIdentity?.value ?? anthropicSignal, personaSystemText)
+                    // #2241: continuity-aware anchor — a system change whose
+                    // history continues the raw key's prefix-affinity chain
+                    // (model switch) MIGRATES the anchor instead of forking
+                    // the main lane off the raw key; only history-discontinuous
+                    // requests (review blobs) still fork onto `|sub:<fp>`.
+                    ? dshPersonaNamespace(
+                          anthropicIdentity?.value ?? anthropicSignal,
+                          personaSystemText,
+                          (parsed as AnthropicRequestBody).messages,
+                          log,
+                      )
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike
-                    ? subagentNamespace(openaiIdentity?.value ?? openaiSignal, personaSystemText)
+                    ? dshPersonaNamespace(
+                          openaiIdentity?.value ?? openaiSignal,
+                          personaSystemText,
+                          (parsed as OpenAIRequestBody).messages,
+                          log,
+                      )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain
@@ -2739,7 +2778,19 @@ async function handle(
         //    a USER message (leaving it at its anchor) so strict backends (SGLang:
         //    exactly one system at index 0, #377) accept it and the head system
         //    message stays byte-stable for the prefix cache.
-        const pluginMode = pluginAgent !== undefined;
+        //
+        //    #2155 self-heal degrade: a plugin-bound session whose live plugin
+        //    lane died (plugin removed, MCP subprocess gone) is flipped here
+        //    back to proxy mode — the proxy re-injects the ACP tools wire-side
+        //    and owns compression again, instead of nudging a session whose
+        //    tools are gone. The binding (metadata.pluginAgent) is kept so the
+        //    session can be restored when the lane returns.
+        // NOTE: the restore signal is the LIVE HEADER, not pluginAgent — the
+        // sticky binding keeps pluginAgent defined on headerless zombie
+        // requests, and restoring on that would clear the degrade one round
+        // after arming it (the session never actually degraded).
+        if (pluginAgent !== undefined) pluginLaneRestore(session, pluginAgentHeader(req.headers) !== undefined, log);
+        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session);
         // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
         // channel that can round-trip the full original, so CCR arms only where
         // that channel exists and is resolvable: proxy mode always (the proxy
@@ -2842,19 +2893,24 @@ async function handle(
         // reservation measure against the SAME capped window.
         const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
-        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message,
-        // ≤4 messages) is refused BEFORE any pipeline work: not forwarded, kernel
-        // state untouched. Active by default, explicitly opt-out-able (#2028) —
-        // auto pressure, overflow recovery, and manual /compact share one
-        // envelope, and a landed checkpoint durably shadows the raw history
-        // (irreversible), while every cost of refusing is dsh-side, caught, and
-        // recoverable; allowDshCompaction lifts the refusal for users who accept
-        // that trade. Runs before the #388 side-request lane: the compaction
-        // call is a full-budget request, so only this guard can catch it.
-        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed, inboundMsgs)) {
+        // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
+        // is refused BEFORE any pipeline work: not forwarded, kernel state
+        // untouched. MARKER-DECISIVE since #2193: message count no longer gates
+        // — rc.2 replays the full shadowed region (~1100+ msgs) and the old ≤4
+        // bar made the guard silently pass through, letting a checkpoint land
+        // and destroy the compression substrate. Active by default, explicitly
+        // opt-out-able (#2028) — auto pressure, overflow recovery, and manual
+        // /compact share one envelope, and a landed checkpoint durably shadows
+        // the raw history (irreversible), while every cost of refusing is
+        // dsh-side, caught, and recoverable; allowDshCompaction lifts the
+        // refusal for users who accept that trade. Runs before the #388
+        // side-request lane: the compaction call is a full-budget request, so
+        // only this guard can catch it.
+        if (protocol !== null && opts.allowDshCompaction !== true && isDshCompactionCall(protocol, parsed)) {
             if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
-                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
+                const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
+                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
             const refusal = dshCompactionRefusal(protocol);
             if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -3128,6 +3184,9 @@ async function handle(
             // retry path) suppresses the fail-fast response — forward() answers
             // with the original upstream 400 instead, preserving today's
             // client-visible contract when the payload cannot be rescued.
+            // #2155: self-heal evaluates once per HTTP request — the refold
+            // re-runs prepare below but must not double-count a round.
+            let selfHealRoundDone = false;
             const runPreparedPipeline = async (
                 respondFailFast: boolean,
                 overflowWindow?: number,
@@ -3216,6 +3275,21 @@ async function handle(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                // #2155 self-heal round: one evaluation per request, on the
+                // nudge-carrying prepared result (bypass lanes have nudge
+                // undefined and the hook no-ops inside). Side requests
+                // (title-gen etc.) never carry a nudge, so they cannot burn
+                // zombie credit either.
+                if (!selfHealRoundDone && prepared.nudge !== undefined) {
+                    selfHealRoundDone = true;
+                    evaluateSelfHealRound(session, {
+                        pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
+                        biliToolsDeclared: biliToolsDeclaredOnWire(parsed, protocol),
+                        nudgeActive: opts.compress.injectNudge && !nudgeSuppressed(session) && (prepared.nudge.shouldInject || emergencyNudge(prepared.nudge)),
+                        biliToolUses: countBiliToolUses(prepared.processedMessages),
+                        degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
+                    }, log);
+                }
                 if (!countTokens && !responsesCompact) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
@@ -3307,20 +3381,25 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
-            // #1884 (un-armed signed traffic): a request that already carries a
-            // body-covering signature (SDK-HMAC-SHA256 family — CodeArts APIG)
-            // and arrives WITHOUT the re-sign arm cannot survive any body
-            // rewrite: prepare* injects the compress tool + system notes, and
-            // the compress loop re-sends rebuilt rounds, so the upstream
-            // rejects every mutated request with 401 (APIG.0301 body-hash
-            // mismatch). Default: REFUSE (403, actionable message) — silently
-            // forwarding byte-untouched would silently disable compression;
-            // the user opted into bili, not into a pass-through tunnel.
-            // BILI_RESIGN_PASSTHROUGH=1 opts in to byte-untouched forwarding
-            // (no session, no compression, signature intact — the /bili/-
-            // prefix twin of the native lane's #1886 fallback);
-            // BILI_RESIGN=0 un-deploys the guard entirely (pre-resign
-            // handling: the request rides the normal rewrite path).
+            // #1884/#2090 (un-armed signed traffic): a request that already
+            // carries a body-covering signature (SDK-HMAC-SHA256 family —
+            // CodeArts APIG, or any gateway-invented scheme the shape-based
+            // detector catches, e.g. x-ofm-signature) and arrives WITHOUT a
+            // working re-sign arm cannot survive any body rewrite: prepare*
+            // injects the compress tool + system notes, and the compress loop
+            // re-sends rebuilt rounds, so the upstream rejects every mutated
+            // request with 401 (APIG.0301 body-hash mismatch /
+            // SignatureDoesNotMatch). Without a working re-sign arm the
+            // request is REFUSED locally for EVERY scheme (403, actionable
+            // message naming the exact opt-in) — #2090 owner ruling: bili's
+            // contract is "installed = compressed, or the user explicitly
+            // knows a link runs uncompressed"; the explicit passthrough
+            // opt-in IS that acknowledgment (byte-untouched, no compression).
+            // Refusals are remembered (recordSignedRefusal) so bili startups
+            // keep listing unresolved schemes until configured away.
+            // BILI_RESIGN=0 / resign["<scheme>"].enabled=false un-deploy the
+            // guard (pre-#1884 handling: the request rides the normal
+            // rewrite path — and clears the scheme's refusal memory).
             const guardScheme = inboundSignedScheme(req.headers);
             const resignMarker = String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "");
             // An armed request is only ARMABLE when its credential marker decodes:
@@ -3339,18 +3418,29 @@ async function handle(
                 !resignArmable &&
                 guardResign.enabled
             ) {
-                if (guardResign.passthrough) {
-                    log("warn", `[signed-passthrough] request carries a body-covering signature without the re-sign arm — forwarding byte-untouched, no compression (#1884; resign["${guardScheme}"].passthrough for this provider, BILI_RESIGN_PASSTHROUGH, or the global resign block)`);
+                // #2090 owner ruling ("compress or refuse"): the only
+                // pass-through outcome left is the pre-existing #1884 escape
+                // hatch on the BUILT-IN scheme itself; every other scheme is
+                // ALWAYS refused — its refusal has no user-side fix yet, only
+                // bili shipping the re-signer. Passthrough settings are inert
+                // for those schemes.
+                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough) {
+                    clearSignedRefusal(guardScheme);
+                    log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
                     return;
                 }
-                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing instead of silently dropping compression. Set resign["${guardScheme}"].passthrough for this provider (or BILI_RESIGN_PASSTHROUGH / the global resign block) for byte-untouched forwarding, or provide a signing credential (#1884)`);
+                recordSignedRefusal(guardScheme, upstreamOrigin);
+                log("warn", `[signed-refused] request carries a ${guardScheme} body-covering signature without a working re-sign arm${resignMarker === APIG_RESIGN_SCHEME ? " (arm marker present but credential does not decode)" : ""} — refusing per the compress-or-refuse contract (${guardScheme === APIG_RESIGN_SCHEME ? "provide a signing credential to make bili re-sign, #1884" : "no re-signer exists for this scheme yet — it stays refused until bili ships one; passthrough settings do not apply"}). Remembered — bili will keep reminding at startup.`);
                 const refusal = signedRefusal(guardScheme, (req.url ?? "").endsWith("/messages") ? "anthropic" : "openai");
                 forwarded = true;
                 res.writeHead(refusal.status, { "content-type": refusal.contentType, "x-bili-resign": "unavailable" });
                 res.end(refusal.body);
                 return;
+            }
+            if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
+                clearSignedRefusal(guardScheme);
             }
             const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
@@ -3911,6 +4001,10 @@ async function prepareAnthropic(
     // managed text and hides client-side drift (same rationale as the
     // responses site; keeps all four wires on one semantic).
     const clientSystem = parsed.system;
+    // #2189: from clientSystem (pre-anchor) — the anchor buildSystem below may
+    // collapse the block array, and subscription-OAuth upstreams 429 summary
+    // calls whose system lacks this block.
+    const anthropicBillingBlock = extractBillingAttributionBlock(clientSystem);
     // Plugin-mode agents own their context management and may already apply
     // their own cache-friendly head handling (#1085 scope: plain-proxy mode
     // only) — anchoring them would double-process.
@@ -4024,7 +4118,9 @@ async function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
+        // stops nagging — including the emergency path, per session.
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4141,7 +4237,7 @@ async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 
 async function prepareOpenai(
@@ -4269,7 +4365,7 @@ async function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4375,6 +4471,15 @@ async function prepareOpenai(
     // through: upstreams that ignore it lose nothing, upstreams that use it
     // get a per-conversation routing hint.
     delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
+    // #2218: body-only relay affinity for plugin hosts. dsh desktop's only
+    // identity signal is the bili-internal x-bili-plugin-conversation header
+    // (already forwarded as x-session-id by buildForwardTarget); body-keyed
+    // relays (workbuddy panel) can't read headers, so stamp the conversation
+    // id into prompt_cache_key too. Gated to admin-rewritten or loopback
+    // destinations — strict direct APIs can 400 unknown body params (#1403).
+    if (shouldStampRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin)) {
+        rebuilt.prompt_cache_key = session.id;
+    }
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without
     // it, streaming sessions never learn their real input_tokens →
@@ -4535,7 +4640,7 @@ async function prepareGoogle(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
@@ -4842,7 +4947,7 @@ async function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
@@ -5479,7 +5584,14 @@ function buildForwardTarget(
     }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
-    if (affinity && !clientConversationHeader(req.headers)) {
+    // #2218/#1931: the plugin-protocol header x-bili-plugin-conversation is
+    // bili-internal — no third-party upstream can read it — so a plugin host
+    // (dsh desktop) whose ONLY identity signal it is would otherwise arrive
+    // at a relay with zero usable session signal and lose sticky routing /
+    // cache pools (workbuddy hub and sub2api both key off x-session-id).
+    // Treat it like "no header": forward the affinity as x-session-id.
+    const convSource = conversationHeaderSource(req.headers);
+    if (affinity && (!convSource || convSource.name === "x-bili-plugin-conversation")) {
         headers["x-session-id"] = affinity;
     }
     const decision = resolveProxyDecision(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
@@ -5704,13 +5816,33 @@ function outboundPayloadBreakdown(
  *  project from it (numbers identical to re-parsing the same string), null =
  *  caller already tried and failed → keep the prepared projection and skip the
  *  doomed re-parses inside the helpers (they return 0 on unparseable input). */
-export function outboundContextEstimate(
+/** #2117: both calibers of one outbound send, computed in ONE projection pass.
+ *  upperBound is the char-count upper bound (every character counts as one
+ *  token — never undershoots; the fail-closed decision/display caliber, and
+ *  the legacy outboundContextEstimate value). textOverhead is the billing
+ *  caliber preflight calibrates with k̂ (#1933 F1): CJK-aware
+ *  estimateCoreMessages + system/tools wire overhead. imageTokens is the
+ *  separate image term (learned per-route #1843/#1857), kept out of both so
+ *  callers can recombine per channel. */
+export interface OutboundContextEstimates {
+    upperBound: number;
+    textOverhead: number;
+    imageTokens: number;
+}
+
+/** #2078: `parsed` carries the caller's pre-parsed send body so forward() does
+ *  not pay a second full JSON.parse of the largest payload in flight per
+ *  request. Three states: undefined = parse here (legacy callers), object =
+ *  project from it (numbers identical to re-parsing the same string), null =
+ *  caller already tried and failed → keep the prepared projection and skip the
+ *  doomed re-parses inside the helpers (they return 0 on unparseable input). */
+export function outboundContextEstimates(
     prepared: Prepared,
     wireBody: string,
     opts: ProxyOptions,
     upstream: string,
     parsed?: Record<string, unknown> | null,
-): number {
+): OutboundContextEstimates {
     let msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const project = (value: unknown): void => {
         switch (prepared.protocol) {
@@ -5730,8 +5862,23 @@ export function outboundContextEstimate(
     } else {
         raw = "";
     }
-    return estimateCoreMessagesUpper(msgs) + estimateWireOverhead(prepared.protocol, raw)
-        + imageReserveFor(prepared.session, prepared.protocol, raw, opts, upstream);
+    const overhead = estimateWireOverhead(prepared.protocol, raw);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, raw, opts, upstream);
+    return {
+        upperBound: estimateCoreMessagesUpper(msgs) + overhead + imageTokens,
+        textOverhead: estimateCoreMessages(msgs) + overhead,
+        imageTokens,
+    };
+}
+
+export function outboundContextEstimate(
+    prepared: Prepared,
+    wireBody: string,
+    opts: ProxyOptions,
+    upstream: string,
+    parsed?: Record<string, unknown> | null,
+): number {
+    return outboundContextEstimates(prepared, wireBody, opts, upstream, parsed).upperBound;
 }
 
 async function preflightCompressIfNeeded(
@@ -5811,8 +5958,10 @@ async function preflightCompressIfNeeded(
     // factor k̂ learned from this session's own usage reports (local estimate ÷
     // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
     // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
-    // i.e. today's behavior.
-    const kFactor = session.stats.calibratedEstimate;
+    // i.e. today's behavior. #2117 B: the model dimension gates too — a factor
+    // learned on another model acts as absent here rather than deciding with a
+    // cross-model billing scale (currentCalibrationFactor).
+    const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
     const calibratedPayload = calibratedText + imageTokens;
@@ -5986,6 +6135,10 @@ async function preflightCompressIfNeeded(
     // learn path can't see gateway timeouts (524/503), so operators behind such
     // gateways need a deterministic escape hatch.
     const forceStreamSummary = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === true;
+    // #2155: the same cascade resolved FALSE is an explicit operator opt-out —
+    // neither learn path (400 "stream required" nor the 524/504 first-hit
+    // learn) may arm streaming summaries for this request's session lane.
+    const streamSummaryOff = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === false;
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -5997,6 +6150,7 @@ async function preflightCompressIfNeeded(
                 prompts: prepared.prompts ?? defaultPrompts,
                 surface: prepared.surface,
                 protocol: prepared.protocol,
+                billingBlock: prepared.anthropicBillingBlock,
                 url: upstreamUrl,
                 headers,
                 model,
@@ -6008,6 +6162,7 @@ async function preflightCompressIfNeeded(
                 unknownBaseline,
                 upstreamOrigin: currentOrigin,
                 forceStreamSummary,
+                streamSummaryOff,
             },
             prepared.originalMessages,
         );
@@ -6097,7 +6252,10 @@ async function preflightCompressIfNeeded(
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    // #2189: an explicit retryable=false from preflight (credential-shape
+    // rejection — deterministic for the identical payload) overrides the
+    // status-based heuristic below; every other path keeps today's mapping.
+    const retryable = f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
@@ -6466,9 +6624,21 @@ async function forward(
             sentParsed = null;
         }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
-        const estimate = outboundContextEstimate(prepared, sentBody, opts, upstreamUrl, sentParsed);
-        prepared.session.stats.localInputEstimate = estimate;
-        prepared.session.stats.contextTokens = estimate;
+        const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
+        prepared.session.stats.localInputEstimate = est.upperBound;
+        // The char-count upper bound stays the published context value: it is
+        // the fail-closed caliber decision paths and legacy displays trust for
+        // never-reporting upstreams (#553/#728/#1493). #2117 additionally
+        // publishes the billing-caliber estimate of THIS send — preflight's own
+        // formula (CJK-aware text + wire overhead), k̂-scaled only where the
+        // factor's route+model provenance matches (#1933 F1 / #2117 B), plus
+        // the image reserve — so display surfaces can show a calibrated reading
+        // instead of the ~2–3.5× over-counting bound. Display-only field.
+        const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
+        const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
+        prepared.session.stats.contextEstimateTokens = Math.round(scaledText + est.imageTokens);
+        prepared.session.stats.contextEstimateCalibrated = scaledText !== est.textOverhead;
+        prepared.session.stats.contextTokens = est.upperBound;
         prepared.session.stats.contextTokensSource = "estimate";
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
@@ -7682,6 +7852,27 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         }
     }
     res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+}
+
+// #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
+// every known/observed signature scheme with its current effective policy,
+// plus the remembered refusals and which of them are still unresolved.
+function sendResignStatus(res: http.ServerResponse): void {
+    const names = new Set<string>([...Object.keys(KNOWN_SIGNATURE_SCHEMES), ...Object.keys(readPendingRefusals())]);
+    const schemes: Record<string, { known?: { label: string; source: string; builtIn?: boolean }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }> = {};
+    for (const name of [...names].sort()) {
+        const st = resolveResignSettings(process.env, undefined, name);
+        schemes[name] = { known: KNOWN_SIGNATURE_SCHEMES[name], builtIn: name === APIG_RESIGN_SCHEME, enabled: st.enabled, passthrough: st.passthrough, passthroughApplies: name === APIG_RESIGN_SCHEME };
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        builtinScheme: APIG_RESIGN_SCHEME,
+        builtinCredentialSource: "dsh credentials service (jet-hub state.json) — the only scheme bili re-signs itself",
+        envOverrides: { BILI_RESIGN: process.env.BILI_RESIGN ?? null, BILI_RESIGN_PASSTHROUGH: process.env.BILI_RESIGN_PASSTHROUGH ?? null },
+        schemes,
+        pending: readPendingRefusals(),
+        unresolved: Object.keys(unresolvedRefusals()),
+    }, null, 2));
 }
 
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {

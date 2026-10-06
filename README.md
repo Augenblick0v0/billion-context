@@ -338,6 +338,16 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Why does the first compaction wait until ~200k?** Compaction does not
+trigger on absolute window position but on growth intervals: by default the
+first soft compaction fires 50k tokens past the boot content
+(`compress.nudgeGrowthTokens`, flat and window-independent). With a boot around
+100k — or with the growth step set to ~100k — the first compaction may wait
+until ~200k. To make it fire earlier: 1) trim the system prompt, disable
+unneeded tools, prune skills; 2) lower `compress.nudgeGrowthTokens` to ~50k;
+3) enable lean mode. Worked example in
+[CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
+
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher
@@ -430,10 +440,11 @@ Minimal example:
 }
 ```
 
-Two knobs people look for first:
+Knobs people look for first:
 
 - **Upstream proxy (firewall/GFW)** — routing the proxy's own outbound traffic through v2rayA/clash: full resolution order, empty-string = explicit direct, SOCKS5 rejection, both egress paths, and the `mitm://` vs `https://` key schemes live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `proxy`; Providers → key schemes).
 - **Wire-compat role rewrite (`compat.roles`)** — an upstream that rejects the `developer` role? Covered by [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `compat`) — including the learn-on-failure auto-fix that needs no configuration at all.
+- **Signed upstreams (body-covering signatures)** — a gateway whose requests carry a body-covering signature (CodeArts APIG's `SDK-HMAC-SHA256`, or gateway-invented headers like `x-ofm-signature`): the built-in scheme re-signs transparently on dsh; every other detected scheme is ALWAYS refused locally — signed requests are either re-signed+compressed or refused, never passed through unsigned — and bili keeps reminding at startup and in the web UI until it ships the scheme's re-signer (#1884/#2090). Detection rules, per-scheme overrides, and `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `resign`).
 
 ## How sessions work
 

@@ -1,5 +1,5 @@
 import { orderedRefPair } from "acp-kernel";
-import { listSessions, type Session } from "../session.js";
+import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
 import { conflictEventsOf } from "../conflict-watch.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
@@ -8,7 +8,7 @@ import { buildSessionCacheReport } from "../cache-ledger.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
-import { statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 
@@ -35,6 +35,12 @@ export interface WebSessionSummary {
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
     contextTokensSource?: "usage" | "estimate";
+    /** #2117: the honest best reading of "how full is this context right now",
+     *  picked by provenance (usage > calibrated estimate > char-count upper
+     *  bound). Display surfaces drive their main bar from this so one value
+     *  never mixes calibers; raw contextTokens stays for API compat + legacy
+     *  clients. Absent when nothing has been observed yet. */
+    contextBest?: ContextBest;
     tokensSaved: number;
     inputTokens: number;
     cachedTokens: number;
@@ -140,6 +146,17 @@ export interface WebSessionDetail extends WebSessionSummary {
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
+    /** #2117: char-count upper bound of the LAST outbound send (the fail-closed
+     *  caliber) — rendered beside the main bar as an explicit BOUND, never as a
+     *  reading; over-window here does not mean actually over-window. */
+    contextUpperTokens?: number;
+    /** #2117: route that measured the last usage-grade input (#1933 F2 provenance). */
+    lastInputTokensOrigin?: string;
+    /** #2117: wall-clock when the last usage-grade context value settled. */
+    contextMeasuredAt?: number;
+    /** #2117: the learned estimator calibration behind the displayed estimate —
+     *  k̂ plus its evidence (samples admitted on this route+model, spread). */
+    estimateCalibration?: { factor: number; origin?: string; model?: string; samples: number; spread: number };
     ledger: ReturnType<typeof buildSessionCacheReport> | null;
     /** Raw markdown of the handoff doc (handoffHtml rendered) — for the
      *  copy-markdown / download buttons. */
@@ -254,21 +271,30 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
-/** #2180: a top-level ENOENT means "pristine" — a fresh install where the data
- *  root was never created, so no session file can exist anywhere — only when
- *  the DEFAULT layout is in effect: BILI_SESSIONS_DIR unset AND the XDG data
- *  root itself absent. An explicit override pointing nowhere, or a data root
- *  that exists without its sessions subdir, stays loud (#1937): silence there
- *  would hide a moved/misconfigured path while real sessions sit elsewhere. */
+// #2260(F)/#2180 follow-up: bili's own infra dirs created under the data root
+// BEFORE any session exists (ensureRootCA() makes <data>/ca at proxy start) —
+// their presence alone must not read as "misconfigured". The set is closed by
+// construction: paths.ts writes only `sessions` and `ca` directly under it.
+const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
+
+/** #2180: a top-level ENOENT means "pristine" — no session file can exist
+ *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
+ *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  dirs (a fresh install where ensureRootCA() already ran). An explicit
+ *  override pointing nowhere, or a data root containing anything else, stays
+ *  loud (#1937): silence there would hide a moved/misconfigured path while
+ *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
     if (process.env.BILI_SESSIONS_DIR) return false;
+    let entries: string[];
     try {
         statSync(dataDir());
-        return false;
+        entries = readdirSync(dataDir());
     } catch (e) {
         return (e as NodeJS.ErrnoException).code === "ENOENT";
     }
+    return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
 /** Single-flight index refresh. Steady-state cost is one stat per file; only
@@ -394,7 +420,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
 interface SummarySource {
     id: string;
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string };
-    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate" };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string }> };
     lastSeen: number;
@@ -436,6 +462,12 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             // #1839: mirror buildSession's narrowing (persist.ts) — grouped stats
             // only, so list rows always agree with detail rows; legacy files lack it.
             contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
+            // #2117 x #1937: display-caliber fields — without these the bounded
+            // index rows fall back to the char-count bound for evicted sessions.
+            lastUsageGradeTokens: num(stats.lastUsageGradeTokens) > 0 ? num(stats.lastUsageGradeTokens) : undefined,
+            lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
+            contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
         },
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
@@ -487,11 +519,22 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     }
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // #2155: active self-heal state (zombie plugin degrade / nudge
+    // suppression) — surface it so the web list can badge the session.
+    const shRaw = metaRec["selfHeal"];
+    const selfHeal = shRaw !== null && typeof shRaw === "object"
+        && typeof (shRaw as Record<string, unknown>)["detected"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["action"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["since"] === "number"
+        ? { detected: (shRaw as Record<string, unknown>)["detected"] as string, action: (shRaw as Record<string, unknown>)["action"] as string, since: (shRaw as Record<string, unknown>)["since"] as number }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
+    const best = displayContextBest(s);
     return {
         id: s.id,
+        ...(best ? { contextBest: best } : {}),
         ...(s.meta.title ? { title: s.meta.title } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
@@ -509,6 +552,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         cacheHitPct: hitPct(inputTokens, cachedTokens),
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
+        ...(selfHeal ? { selfHeal } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
@@ -752,6 +796,22 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
+        ...(typeof session.stats.localInputEstimate === "number" && session.stats.localInputEstimate > 0
+            ? { contextUpperTokens: session.stats.localInputEstimate } : {}),
+        ...(session.stats.lastInputTokensOrigin ? { lastInputTokensOrigin: session.stats.lastInputTokensOrigin } : {}),
+        ...(typeof session.metadata["contextTokensAt"] === "number" ? { contextMeasuredAt: session.metadata["contextTokensAt"] as number } : {}),
+        ...(typeof session.stats.calibratedEstimate === "number" && session.stats.calibratedEstimate > 0 && (session.stats.calibrationRing?.values.length ?? 0) > 0
+            ? (() => {
+                  const vals = session.stats.calibrationRing!.values;
+                  return { estimateCalibration: {
+                      factor: session.stats.calibratedEstimate,
+                      ...(session.stats.calibratedEstimateOrigin !== undefined ? { origin: session.stats.calibratedEstimateOrigin } : {}),
+                      ...(session.stats.calibratedEstimateModel !== undefined ? { model: session.stats.calibratedEstimateModel } : {}),
+                      samples: vals.length,
+                      spread: Math.max(...vals) / Math.min(...vals),
+                  } };
+              })()
+            : {}),
         ledger: buildSessionCacheReport(session),
         handoffMd,
         handoffHtml: markdownToHtml(handoffMd),

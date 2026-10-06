@@ -1271,6 +1271,58 @@ export function resolveNonHttpProviders(env: NodeJS.ProcessEnv = process.env): s
     return [...out];
 }
 
+/** `pi.subagents` section of the config file (#2230 config-home): the home
+ *  for the built-in pi-lane acp_delegate surface. Fields map 1:1 onto the
+ *  standalone package's DelegateConfig (billion-context-pi-subagents); the
+ *  two renames vs the deprecated acp.json keys: `prompt` replaces
+ *  `delegatePrompt`, and `debug` is scoped to the sub-agent subsystem (the
+ *  top-level `debug` key stays the proxy's own). See CONFIGURATION.md. */
+export interface PiSubagentsFileConfig {
+    /** Master switch, default true. `false` (or the boolean shorthand
+     *  `"pi": {"subagents": false}`) removes the three tools, the
+     *  system-prompt section and the fleet shortcut (new session required). */
+    enabled?: boolean;
+    /** Keep acp_delegate active even when a project-scope pi-subagents
+     *  install is detected (#415 stand-down). Default false. Env
+     *  PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over the file. */
+    forceEnable?: boolean;
+    /** "separate" (default) — delegate tokens tracked in their own
+     *  accumulator; "merged" — folded into the main session totals. */
+    displayUsage?: "merged" | "separate";
+    /** Max nesting depth (default 2: main → child → grandchild). Propagated
+     *  to children via PI_ACP_DELEGATE_MAX_DEPTH; env wins over the file. */
+    maxDepth?: number;
+    /** Hard timeout for synchronous delegates, minutes (default 5);
+     *  0/null disables. Env PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES wins. */
+    syncTimeoutMinutes?: number | null;
+    /** Idle watchdog for async delegates, minutes (default 5); 0/null
+     *  disables (warns). Env PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES wins. */
+    idleTimeoutMinutes?: number | null;
+    /** Hard time limit for async delegates, minutes (default 30); 0/null
+     *  disables. Env PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES wins. */
+    asyncTimeoutMinutes?: number | null;
+    /** Cap on concurrent background delegates (default unlimited); extras
+     *  queue. Env PI_ACP_DELEGATE_MAX_CONCURRENT wins. */
+    maxConcurrent?: number;
+    /** Global default thinking level (off|minimal|low|medium|high|xhigh|max). */
+    thinkingLevel?: string;
+    /** Per-role defaults keyed by role (reviewer/researcher/worker/planner/
+     *  oracle or custom): { model: "provider/id", thinkingLevel: "…" }. */
+    agents?: Record<string, { model?: string; thinkingLevel?: string }>;
+    /** "skip" (default) — suppress the completion notification when the
+     *  model already read the result file; "always" — always inject. */
+    notifyIfRead?: "skip" | "always";
+    /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
+     *  disables keyboard registration (/acp-fleet still works). */
+    fleetShortcut?: string;
+    /** Replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS
+     *  system-prompt appendix. acp.json name: `delegatePrompt`. */
+    prompt?: string | null;
+    /** Debug-level events in the shared ACP log (~/.pi/acp.log), scoped to
+     *  the sub-agent subsystem. */
+    debug?: boolean;
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -1395,6 +1447,18 @@ type FileConfig = {
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
      *  Env BILI_CLAUDE_NATIVE_PORT wins over the file. */
     claude?: { nativePort?: number };
+    /** Built-in pi-lane sub-agents (#2230 config-home): the `pi.subagents`
+     *  section owns the acp_delegate surface for the pi lane (embedded wiring
+     *  src/agent/pi-subagents.ts; the standalone package
+     *  billion-context-pi-subagents reads the same section through its own
+     *  loader — the file format is the contract, not shared code). Fields map
+     *  1:1 onto the package's DelegateConfig; `prompt` replaces acp.json's
+     *  `delegatePrompt` and `debug` is scoped to the sub-agent subsystem (no
+     *  collision with the top-level proxy `debug`). Boolean shorthand:
+     *  `"pi": {"subagents": false}` disables the whole surface. The four
+     *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
+     *  deprecated fallback, read only while this section is absent. */
+    pi?: { subagents?: PiSubagentsFileConfig | boolean };
     /** Native-hook attach policy (#1335): set `true` to let native hooks
      *  attach to lifecycle-less listeners (a manually started `bili start`
      *  daemon — no session-lifecycle watchdog, outlives every session, often
@@ -1521,6 +1585,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
+    "pi",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
@@ -1587,6 +1652,7 @@ export function loadConfigFile(): FileConfig {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);
             warnUnknownTopLevelKeys(obj);
+            warnInertResignPassthrough(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1681,6 +1747,53 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
             : file.passthrough === true;
     const credentialRef = env.BILI_CODEARTS_REF?.trim() || providerBlock.credentialRef || file.credentialRef || undefined;
     return { enabled, passthrough, credentialRef };
+}
+
+// #2260(B)/#2090: pre-v0.1.186 configs may carry `passthrough: true` under a
+// NON-built-in scheme key. Since the compress-or-refuse contract the unsigned
+// pass-through exists ONLY for sdk-hmac-sha256 (both guard sites gate on it),
+// so such a key is inert while its requests stay refused — "my opt-in does
+// nothing". Name the dead key(s) at config load instead of letting the 403
+// body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
+// when the set changes, stay quiet while it stays fixed or empty.
+let inertResignPassthroughSignature: string | null = null;
+export function warnInertResignPassthrough(obj: Record<string, unknown>): void {
+    const inert: string[] = [];
+    const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
+        if (!map || typeof map !== "object" || Array.isArray(map)) return;
+        for (const [key, val] of Object.entries(map as Record<string, unknown>)) {
+            if (key === RESIGN_BUILTIN_SCHEME) continue;
+            const block = val !== null && typeof val === "object" && !Array.isArray(val) ? (val as Record<string, unknown>) : {};
+            if (block["passthrough"] !== true) continue;
+            // Same enabled cascade as resolveResignSettings (env > provider >
+            // file > default-true), read straight off the parsed object so the
+            // hook never re-enters loadConfigFile (it runs mid-parse).
+            const fileBlock = ((obj.resign as Record<string, ResignFileSettings> | undefined) ?? {})[key];
+            const providerBlock = providerBlockFor(key);
+            const enabled = process.env.BILI_RESIGN !== undefined
+                ? process.env.BILI_RESIGN !== "0"
+                : providerBlock?.enabled !== undefined
+                    ? providerBlock.enabled
+                    : fileBlock?.enabled !== false;
+            if (enabled) inert.push(key);
+        }
+    };
+    consider(obj.resign, () => undefined);
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const entry of Object.values(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const pmap = (entry as Record<string, unknown>).resign;
+            if (pmap === undefined) continue;
+            consider(pmap, (key) => ((pmap as Record<string, ResignFileSettings> | undefined) ?? {})[key]);
+        }
+    }
+    inert.sort();
+    const sig = inert.join(",");
+    if (sig === "" || sig === inertResignPassthroughSignature) return;
+    inertResignPassthroughSignature = sig;
+    const list = inert.map((k) => `resign["${k}"].passthrough`).join(", ");
+    loggerLog("warn", `[acp-config] ${list}=true is INERT — since the #2090 compress-or-refuse contract, unsigned pass-through exists ONLY for the built-in scheme "${RESIGN_BUILTIN_SCHEME}"; those signed requests stay REFUSED until bili ships a re-signer for them. Restore pre-resign handling with resign["<scheme>"].enabled=false or BILI_RESIGN=0 (the upstream will then reject the rewritten bodies).`);
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane

@@ -506,12 +506,14 @@ test(`Responses WS faults: ${terminalMode} after a delivered tool never commits 
         assert.ok(!f.rows[2].full.some(item => item.call_id === call.call_id));
         assert.ok(!JSON.stringify(f.rows[2].full).includes("private-request-payload"));
         assert.equal(f.httpRequests, 0);
-        const log = await readLogUntil(
-            f.logPath,
-            [/\[responses-ws\] \[conn=\d+\] \[session="ses_ws_/, terminalMode === "disconnect" ? /upstream failed phase=stream event=close close_code=1011/ : new RegExp(`checkpoint reset reason=response\.${terminalMode}`)],
-            /private-tool-payload|private-request-payload|private-upstream-close-reason|fake-credential/,
-        );
-        if (terminalMode === "disconnect") assert.match(log, /checkpoint reset reason=upstream-disconnect/);
+        // #2212: the 1011 warn line and the upstream-disconnect reset line are emitted back-to-back in the
+        // same close handler but reach the log file through two separate async writes — waiting only on the
+        // first leaves a window where the second is still buffered (observed on Windows CI). Both patterns
+        // always land as a pair, so waiting on both cannot time out where waiting on one did not.
+        const faultPatterns = [/\[responses-ws\] \[conn=\d+\] \[session="ses_ws_/];
+        if (terminalMode === "disconnect") faultPatterns.push(/upstream failed phase=stream event=close close_code=1011/, /checkpoint reset reason=upstream-disconnect/);
+        else faultPatterns.push(new RegExp(`checkpoint reset reason=response\.${terminalMode}`));
+        await readLogUntil(f.logPath, faultPatterns, /private-tool-payload|private-request-payload|private-upstream-close-reason|fake-credential/);
     } finally { await f.close(); }
 });
 }
@@ -601,7 +603,9 @@ test(`Responses WS faults: repeated ${code} stops after one transport recovery`,
         assert.equal(f.rows.length, 4);
         assert.equal(f.rows[3].request.previous_response_id, undefined);
         assert.ok(!JSON.stringify(f.rows[3].full).includes("bounded retry"));
-        const log = (await readLogUntil(f.logPath, [/upstream rejected phase=await-first-event status=400/]))
+        // The retry-count assert below reads `upstream retry reason=` lines that are not in the wait list —
+        // settle them first (same buffered-log race class as #2212).
+        const log = (await readLogUntil(f.logPath, [/upstream rejected phase=await-first-event status=400/, /upstream retry reason=/]))
             .split("\n").filter(line => line.includes("[responses-ws]")).join("\n");
         assert.equal((log.match(/upstream retry reason=/g) ?? []).length, 1);
         assert.doesNotMatch(log, /private-error-message|fake-credential/);

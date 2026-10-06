@@ -143,19 +143,25 @@ async function boot(): Promise<Harness> {
 
 type TextBlock = { type: "text"; text: string };
 type FakeTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ content: TextBlock[]; isError?: boolean }> };
+type PiHandler = (event: unknown, ctx: unknown) => unknown;
 type FakePi = {
-    events: Map<string, (event: unknown, ctx: unknown) => unknown>;
+    // Real pi stores an ARRAY of handlers per event name and awaits each
+    // (pi-coding-agent@0.83.0 runner.js emit(): `ext.handlers.get(type)` →
+    // `for (const handler of handlers)`), so a second registration for the
+    // same event (e.g. the embedded subagents wiring) must APPEND, not
+    // replace. A Map-of-one would silently drop the factory's own handler.
+    events: Map<string, PiHandler[]>;
     tools: FakeTool[];
     commands: Map<string, unknown>;
     providers: Map<string, string>;
-    on: (event: string, handler: unknown) => void;
+    on: (event: string, handler: PiHandler) => void;
     registerTool: (tool: FakeTool) => void;
     registerCommand: (name: string, options: unknown) => void;
     registerProvider: (name: string, config: { baseUrl: string }) => void;
 };
 
 function makeFakePi(): FakePi {
-    const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const events = new Map<string, PiHandler[]>();
     const tools: FakeTool[] = [];
     const commands = new Map<string, unknown>();
     const providers = new Map<string, string>();
@@ -164,7 +170,11 @@ function makeFakePi(): FakePi {
         tools,
         commands,
         providers,
-        on: (event, handler) => events.set(event, handler as (event: unknown, ctx: unknown) => unknown),
+        on: (event, handler) => {
+            const list = events.get(event);
+            if (list) list.push(handler);
+            else events.set(event, [handler]);
+        },
         registerTool: (tool) => {
             const i = tools.findIndex((t) => t.name === tool.name);
             if (i >= 0) tools[i] = tool;
@@ -186,7 +196,7 @@ async function makeHost(h: Harness, sid: string): Promise<{ host: FakePi; ctx: R
         cwd: "/tmp",
     };
     biliPlugin(host as never);
-    await host.events.get("session_start")!({}, ctx);
+    for (const handler of host.events.get("session_start") ?? []) await handler({}, ctx);
     const deadline = Date.now() + 15000;
     while (!host.tools.some((t) => t.name === "acp_cache")) {
         if (Date.now() > deadline) throw new Error(`timed out waiting for the acp_cache tool on ${sid}`);
@@ -197,7 +207,7 @@ async function makeHost(h: Harness, sid: string): Promise<{ host: FakePi; ctx: R
 
 async function stampedChatHeaders(host: FakePi, ctx: Record<string, unknown>): Promise<Record<string, string>> {
     const headers: Record<string, string> = {};
-    await host.events.get("before_provider_headers")!({ headers }, ctx);
+    for (const handler of host.events.get("before_provider_headers") ?? []) await handler({ headers }, ctx);
     headers["x-bili-plugin-model"] = "gpt-test";
     return headers;
 }

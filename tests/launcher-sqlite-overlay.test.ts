@@ -64,6 +64,41 @@ function buildDb(root: string, dir: string, name: string, seed: string, tail: st
     execFileSync(process.execPath, ["--no-warnings", script, dir, name, seed, tail, clean ? "clean" : "dirty"], { cwd: root });
 }
 
+// Child-process fixture: opens an EXISTING db, reads one row, hard-exits
+// without closing. Leaves exactly what a merely-opened WAL-mode db leaves —
+// a zero-byte -wal plus a -shm (connection artifacts, no commit).
+const BARE_OPEN_SRC = `
+import { DatabaseSync } from "node:sqlite";
+import path from "node:path";
+const [dir, name] = process.argv.slice(2);
+const db = new DatabaseSync(path.join(dir, name));
+db.prepare("SELECT count(*) FROM t").get();
+process.exit(0);
+`;
+
+function bareOpen(root: string, dir: string, name: string): void {
+    const script = path.join(root, "bare-open.mjs");
+    if (!fs.existsSync(script)) fs.writeFileSync(script, BARE_OPEN_SRC);
+    execFileSync(process.execPath, ["--no-warnings", script, dir, name], { cwd: root });
+}
+
+// Deterministic main-mtime tie: emulates Windows timestamp-preserving file
+// copies (the reported failure condition) without depending on platform copy
+// semantics or wall-clock ordering.
+const TIE_EPOCH_S = 1_700_000_000;
+function pinMainsEqual(a: string, b: string): void {
+    touch(a, TIE_EPOCH_S);
+    touch(b, TIE_EPOCH_S);
+}
+
+function noConflicts(...dirs: string[]): void {
+    for (const dir of dirs) {
+        for (const n of fs.readdirSync(dir)) {
+            assert.ok(!n.includes("bili-conflict"), `unexpected quarantined generation ${path.join(dir, n)}`);
+        }
+    }
+}
+
 function rowsOf(p: string): number[] {
     assert.ok(sqliteCtor, "node:sqlite unavailable");
     const db = new sqliteCtor(p);
@@ -79,6 +114,16 @@ function quickCheckOk(p: string): boolean {
     const db = new sqliteCtor(p);
     try {
         return String(db.prepare("PRAGMA quick_check").get()!.quick_check) === "ok";
+    } finally {
+        db.close();
+    }
+}
+
+function integrityOk(p: string): boolean {
+    assert.ok(sqliteCtor, "node:sqlite unavailable");
+    const db = new sqliteCtor(p);
+    try {
+        return String(db.prepare("PRAGMA integrity_check").get()!.integrity_check) === "ok";
     } finally {
         db.close();
     }
@@ -192,8 +237,9 @@ test("leftover .sqlite set merges back as one unit (no per-file splice)", (t) =>
         const rWal = fs.readFileSync(rw);
         const oWal = fs.readFileSync(ow);
         // Adversarial mtimes: the loser side owns the NEWER wal, so any
-        // per-file adjudication splices generations. The winner is forced by
-        // the MAIN db's mtime only.
+        // per-file adjudication splices generations. No origin snapshot exists
+        // here (both sets built independently) → the conservative MAIN-db-mtime
+        // fallback decides (#2195).
         const T = Date.now() / 1000;
         if (winnerSide === "real") {
             touch(rm, T);
@@ -919,4 +965,164 @@ test("finalizeCodexHome: a leftover lease directory never merges into the real h
     const realNames = fs.readdirSync(codexHome);
     assert.ok(!realNames.includes(".bili-launch.lock"), `lease dir leaked into the real home: ${JSON.stringify(realNames)}`);
     for (const n of realNames) assert.ok(!n.startsWith(".bili-"), `no bili metadata in the real home: ${n}`);
+});
+
+test("WAL-only overlay commit wins even with EQUAL main mtimes (#2195)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    // The reported bug shape: sequential bili launches, no concurrent codex.
+    // The run's only commit sits in an uncheckpointed WAL, so the main db keeps
+    // the copied bytes AND mtime; with equal main mtimes the old mtime rule
+    // picked the STALE real side and quarantined the new generation.
+    const run = (viaExit: boolean): void => {
+        const root = mkRoot();
+        const real = path.join(root, "real");
+        const overlay = path.join(root, "overlay");
+        fs.mkdirSync(real, { recursive: true });
+        buildDb(root, real, "state_5.sqlite", "1:A", "", true);
+        assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+        // The session commits ONLY to the WAL and dies without closing.
+        buildDb(root, overlay, "state_5.sqlite", "", "2:B", false);
+        const rep = path.join(real, "state_5.sqlite");
+        const ovp = path.join(overlay, "state_5.sqlite");
+        const oMainBytes = fs.readFileSync(ovp);
+        const oWalBytes = fs.readFileSync(`${ovp}-wal`);
+        pinMainsEqual(rep, ovp);
+        const errs = capturedErrors(() => {
+            if (viaExit) assert.ok(finalizeCodexHome(real, overlay, [".env", "config.toml"]));
+            else assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+        });
+        assert.ok(!errs.some((e) => e.includes("diverge") || e.includes("distinct")), `a single-side advance is not a divergence: ${JSON.stringify(errs)}`);
+        assert.deepEqual(fs.readFileSync(rep), oMainBytes, "active main must come from the committed (overlay) side");
+        assert.deepEqual(fs.readFileSync(`${rep}-wal`), oWalBytes, "the uncheckpointed WAL travels with its main");
+        assert.deepEqual(rowsOf(rep), [1, 2], "the new thread is readable in the real home without manual recovery");
+        assert.ok(integrityOk(rep), "active db passes integrity_check");
+        noConflicts(real, overlay);
+        fs.rmSync(root, { recursive: true, force: true });
+    };
+    run(true); // exit-time merge-back (the reported failure site)
+    run(false); // next-launch startup fold (retry path)
+});
+
+test("WAL-only real-side advance wins over the idle overlay copy, equal mtimes (#2195)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:A", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    // A plain codex commits ONLY to the REAL home's WAL; the bili session merely
+    // opened its copy (read) and died, leaving connection artifacts.
+    buildDb(root, real, "state_5.sqlite", "", "2:P", false);
+    bareOpen(root, overlay, "state_5.sqlite");
+    const rep = path.join(real, "state_5.sqlite");
+    const ovp = path.join(overlay, "state_5.sqlite");
+    pinMainsEqual(rep, ovp);
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(real, overlay, [".env", "config.toml"])));
+    assert.deepEqual(errs, [], `an idle overlay copy is provably stale — no warning at all: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1, 2], "plain-run rows kept");
+    assert.ok(integrityOk(rep));
+    assert.ok(!fs.existsSync(ovp), "stale overlay copy silently dropped");
+    assert.ok(!fs.existsSync(`${ovp}-wal`) && !fs.existsSync(`${ovp}-shm`), "connection artifacts dropped with their set");
+    noConflicts(real, overlay);
+});
+
+test("SHM-only drift is neither a commit nor a divergence (#2195)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:A", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    // The -shm is a rebuildable coordination file: reading can rewrite it, so
+    // its byte drift alone must not count as a business commit.
+    fs.writeFileSync(path.join(overlay, "state_5.sqlite-shm"), Buffer.alloc(32768, 0xab));
+    const rep = path.join(real, "state_5.sqlite");
+    pinMainsEqual(rep, path.join(overlay, "state_5.sqlite"));
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(real, overlay, [".env", "config.toml"])));
+    assert.deepEqual(errs, [], `shm-only drift must stay silent: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1]);
+    assert.ok(integrityOk(rep));
+    noConflicts(real, overlay);
+});
+
+test("true WAL-only divergence on BOTH sides warns and preserves both generations (#2195)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:A", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    // Both sides commit WAL-only after the copy: genuine concurrent divergence.
+    buildDb(root, overlay, "state_5.sqlite", "", "2:B", false);
+    buildDb(root, real, "state_5.sqlite", "", "3:P", false);
+    const rep = path.join(real, "state_5.sqlite");
+    const ovp = path.join(overlay, "state_5.sqlite");
+    pinMainsEqual(rep, ovp);
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(real, overlay, [".env", "config.toml"])));
+    assert.ok(errs.some((e) => e.includes("diverge") && e.includes("distinct")), `true divergence must be reported loudly: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1, 3], "mtime tiebreak keeps one generation active deterministically");
+    assert.ok(integrityOk(rep));
+    const cMain = path.join(real, "state_5.sqlite.bili-conflict");
+    const cWal = path.join(real, "state_5.sqlite-wal.bili-conflict");
+    assert.ok(fs.existsSync(cMain) && fs.existsSync(cWal), "loser preserved as a whole recoverable group");
+    // Recover exactly like the issue's manual step 6: restore standard names in
+    // an isolated dir, then read.
+    const iso = path.join(root, "iso");
+    fs.mkdirSync(iso);
+    fs.copyFileSync(cMain, path.join(iso, "state_5.sqlite"));
+    fs.copyFileSync(cWal, path.join(iso, "state_5.sqlite-wal"));
+    assert.deepEqual(rowsOf(path.join(iso, "state_5.sqlite")), [1, 2], "conflict group recovers the overlay generation");
+    assert.ok(integrityOk(path.join(iso, "state_5.sqlite")));
+    for (const n of fs.readdirSync(real)) {
+        assert.ok(!n.endsWith(".bili-conflict.1"), `no double-preservation round: ${n}`);
+    }
+});
+
+test("missing origin snapshot stays conservative with WAL-only commits (#2195)", (t) => {
+    if (!sqliteCtor) {
+        t.skip("node:sqlite unavailable on this Node");
+        return;
+    }
+    const root = mkRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const real = path.join(root, "real");
+    const overlay = path.join(root, "overlay");
+    fs.mkdirSync(real, { recursive: true });
+    buildDb(root, real, "state_5.sqlite", "1:A", "", true);
+    assert.ok(refreshOverlayHome(real, overlay, ["config.toml"]));
+    fs.rmSync(path.join(overlay, SQLITE_ORIGIN_FILE));
+    buildDb(root, overlay, "state_5.sqlite", "", "2:B", false);
+    const rep = path.join(real, "state_5.sqlite");
+    const ovp = path.join(overlay, "state_5.sqlite");
+    pinMainsEqual(rep, ovp);
+    const errs = capturedErrors(() => assert.ok(finalizeCodexHome(real, overlay, [".env", "config.toml"])));
+    assert.ok(errs.some((e) => e.includes("diverge") || e.includes("distinct")), `without provenance the conservative warning must fire: ${JSON.stringify(errs)}`);
+    assert.deepEqual(rowsOf(rep), [1], "no provenance claim: nothing is dropped silently");
+    assert.ok(integrityOk(rep));
+    const cMain = path.join(real, "state_5.sqlite.bili-conflict");
+    const cWal = path.join(real, "state_5.sqlite-wal.bili-conflict");
+    assert.ok(fs.existsSync(cMain) && fs.existsSync(cWal), "both generations preserved when provenance is unknown");
+    const iso = path.join(root, "iso");
+    fs.mkdirSync(iso);
+    fs.copyFileSync(cMain, path.join(iso, "state_5.sqlite"));
+    fs.copyFileSync(cWal, path.join(iso, "state_5.sqlite-wal"));
+    assert.deepEqual(rowsOf(path.join(iso, "state_5.sqlite")), [1, 2], "preserved group stays recoverable");
 });

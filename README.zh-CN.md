@@ -260,6 +260,8 @@ curl -s http://localhost:8787/__bili/stats
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
+**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上增长 50k token 才触发第一次软压缩(`compress.nudgeGrowthTokens` 恒定步长、与窗口无关)。开机 100k 左右、或把 `compress.nudgeGrowthTokens` 设到 100k 左右时,可能都要到 ~200k 才发生第一次压缩。想更早压缩省 token:1.删减系统提示词、关闭不需要的工具、精简 skill;2.把 nudge 调小到 50k 左右;3.开启 lean 功能。完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
+
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
@@ -348,10 +350,11 @@ bili --no-auto-update        # 本次启动禁用自动更新
 }
 ```
 
-两个最常找的开关:
+最常找的开关:
 
 - **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。
 - **线上兼容角色改写(`compat.roles`)**—— 上游拒绝 `developer` 角色?[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `compat`)已覆盖 —— 包括零配置即用的失败自学习修复。
+- **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
 
 ## 会话机制
 
