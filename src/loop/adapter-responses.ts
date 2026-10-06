@@ -5,7 +5,7 @@ import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWi
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId, strippedResponseIdWarning } from "../util.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES } from "../compress-tool.js";
@@ -369,7 +369,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }),
             );
             const tagFilter = makeFilter();
-            const reasoningFilters = new Map<string, { filter: ReturnType<typeof makeFilter>; ref: { itemId: string; outputIndex: number; summaryIndex: number } }>();
+            // Unified ACP invariant: reasoning summaries are the thinking channel —
+            // identity filters, byte-verbatim (never rewritten; matches the
+            // openai adapter's reasoning_filter and #1960/KDD#10).
+            const reasoningFilters = new Map<string, { filter: TagEchoFilter; ref: { itemId: string; outputIndex: number; summaryIndex: number } }>();
             let lastTextRef: { itemId: string; outputIndex: number } | null = null;
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
@@ -637,7 +640,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         let entry = reasoningFilters.get(key);
                         if (!entry) {
                             entry = {
-                                filter: makeFilter(),
+                                filter: createIdentityStreamFilter(),
                                 ref: {
                                     itemId: typeof obj.item_id === "string" ? obj.item_id : "",
                                     outputIndex: typeof obj.output_index === "number" ? obj.output_index : 0,
@@ -651,9 +654,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             const chunk = clean === rsDelta ? rawBuf : rebuildResponsesEvent(type, { ...obj, delta: clean });
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
-                    } else if (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) {
-                        yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)), firstRoundOnly: true } as ParsedStreamEvent;
                     } else {
+                        // Unified ACP invariant: non-delta reasoning-summary
+                        // events (.done with whole text) are thinking channel —
+                        // byte-verbatim, no strip pass.
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else {

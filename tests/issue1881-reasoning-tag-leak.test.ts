@@ -21,6 +21,8 @@ import { stripAcpTags, createTagEchoFilter } from "../src/loop/tag-echo-filter.t
 const TAG = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
 const BARE = "\x3cacp\x3em00001\x3c/acp\x3e";
 
+const TAG_JSON = JSON.stringify(TAG).slice(1, -1); // TAG as it appears in JSON frame bytes
+
 async function collect(adapter: CompressLoopAdapter, body: string): Promise<ParsedStreamEvent[]> {
     const events: ParsedStreamEvent[] = [];
     for await (const ev of adapter.parseStream(new Response(body, { status: 200 }).body!, 1)) events.push(ev);
@@ -59,7 +61,7 @@ test("#1881 streaming filter: a bare pair splits cleanly at EVERY split point", 
     }
 });
 
-test("#1881 openai: reasoning_content echo is stripped; same-frame content arrives once, cleaned", async () => {
+test("unified invariant: openai reasoning_content rides VERBATIM; same-frame content arrives once, cleaned", async () => {
     const adapter = createOpenaiAdapter({ model: "gpt" });
     const events = await collect(
         adapter,
@@ -68,11 +70,14 @@ test("#1881 openai: reasoning_content echo is stripped; same-frame content arriv
             "data: [DONE]\n\n",
     );
     const out = clientBytes(events);
-    assert.ok(!out.includes("\x3cacp"), `no render tag may reach the client, got: ${out}`);
+    // Thinking channel: byte-verbatim (unified ACP invariant, #2229 direction).
+    assert.ok(out.includes(TAG_JSON), `reasoning_content is the thinking channel and rides verbatim, got: ${out}`);
+    // Visible text channel: still cleaned, exactly once.
     assert.equal((out.match(/kept/g) ?? []).length, 1, `content arrives once, got: ${out}`);
+    assert.ok(out.includes(`\"content\":\"kept\"`), `content arrives cleaned of the tag, got: ${out}`);
 });
 
-test("#1881 openai: a tool-frame replay carries cleaned reasoning bytes, arguments verbatim", async () => {
+test("unified invariant: a tool-frame replay carries reasoning VERBATIM, arguments verbatim", async () => {
     const adapter = createOpenaiAdapter({ model: "gpt" });
     const args = JSON.stringify({ path: "src/plugin.ts" });
     const events = await collect(
@@ -82,7 +87,7 @@ test("#1881 openai: a tool-frame replay carries cleaned reasoning bytes, argumen
             "data: [DONE]\n\n",
     );
     const out = clientBytes(events);
-    assert.ok(!out.includes("\x3cacp"), `replayed frame must not carry the echo, got: ${out}`);
+    assert.ok(out.includes(TAG_JSON), `reasoning bytes ride verbatim (thinking channel), got: ${out}`);
     assert.ok(out.includes('"name":"read"'), `the real call still reaches the client: ${out}`);
     // args is a STRING field of the frame: byte-exact means its JSON-escaped
     // form inside the frame equals JSON.stringify(args) (#1039).
@@ -106,7 +111,7 @@ test("#1960 anthropic: signed thinking_delta echo rides VERBATIM (filtering bric
     assert.ok(out.includes("plan first"), `thinking prose survives: ${out}`);
 });
 
-test("#1881 responses: reasoning_summary_text.delta echo is stripped, prose survives", async () => {
+test("unified invariant: responses reasoning_summary_text.delta rides VERBATIM", async () => {
     const adapter = createResponsesAdapter(false);
     const events = await collect(
         adapter,
@@ -114,7 +119,8 @@ test("#1881 responses: reasoning_summary_text.delta echo is stripped, prose surv
             sse({ type: "response.completed", response: { id: "r1", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } } }),
     );
     const out = clientBytes(events);
-    assert.ok(!out.includes("\x3cacp"), `no render tag may reach the client, got: ${out}`);
+    // Thinking channel: byte-verbatim (unified ACP invariant).
+    assert.ok(out.includes(TAG_JSON), `reasoning summary deltas ride verbatim, got: ${out}`);
     assert.ok(out.includes("think more"), `reasoning prose survives: ${out}`);
 });
 

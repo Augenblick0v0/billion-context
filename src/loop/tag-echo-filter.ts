@@ -1195,16 +1195,10 @@ function stripItemContent(it: unknown, drop: boolean, requestText?: string): unk
         out[k] = v;
     };
     if (Array.isArray(io.content)) set("content", stripParts(io.content, drop, requestText));
-    if (Array.isArray(io.summary)) {
-        set(
-            "summary",
-            io.summary.map((s) =>
-                s && typeof s === "object" && typeof (s as Record<string, unknown>).text === "string"
-                    ? { ...(s as Record<string, unknown>), text: stripAcpTags((s as Record<string, unknown>).text as string, drop, requestText) }
-                    : s,
-            ),
-        );
-    }
+    // Unified ACP invariant: reasoning summaries are the thinking channel —
+    // byte-verbatim, never rewritten (matches stripOpenaiChatText leaving
+    // reasoning_content alone and the adapters' identity filters).
+    // `content` on a message item is visible prose and stays strippable.
     return out ?? it;
 }
 
@@ -1233,8 +1227,11 @@ export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestTex
             if (h && typeof h === "object") {
                 const hh = { ...(h as Record<string, unknown>) };
                 hh["content"] = stripIfString(hh["content"], drop, requestText);
-                hh["reasoning_content"] = stripIfString(hh["reasoning_content"], drop, requestText);
-                hh["reasoning"] = stripIfString(hh["reasoning"], drop, requestText);
+                // Unified ACP invariant (owner directive, #2229): the
+                // thinking/reasoning channel is byte-verbatim — it is the
+                // model's private channel, not prose, and reasoning replay
+                // (DeepSeek-style) or signature checks can validate it. Only
+                // the visible text channel is ever rewritten.
                 ch[holder] = hh;
             }
         }

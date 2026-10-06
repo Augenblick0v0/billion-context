@@ -316,7 +316,9 @@ test("stripOpenaiChatText: armed drop / echo / not-armed (delta and message)", (
     }));
     const armed = stripOpenaiChatText(make(), true);
     assert.equal(armed.choices[0].delta?.content, "");
-    assert.equal(armed.choices[0].delta?.reasoning_content, "");
+    // Unified ACP invariant: reasoning fields ride verbatim in the strip
+    // functions too (defense in depth with the adapters' identity filters).
+    assert.equal(armed.choices[0].delta?.reasoning_content, EMISSION);
     assert.equal(armed.choices[1].message?.content, "");
     const echo = JSON.stringify({ messages: [{ role: "user", content: EMISSION.trim() }] });
     const kept = stripOpenaiChatText(make(), true, echo);

@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
@@ -249,6 +249,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // shared instance would hold a tag-shaped tail against the wrong
             // field's bytes (residue leak or content loss). Tool-call
             // arguments never enter any filter (#1039 invariant).
+            // Unified ACP invariant: the reasoning channel rides an IDENTITY
+            // filter — thinking is never rewritten (matches signed-thinking
+            // treatment in the anthropic/google adapters, #1960/KDD#10).
             // m00885: whole-field absorb-emission drop is armed only when this
             // request instructed the model about absorb (server-side provenance
             // — the absorb section exists on this request's wire iff absorbName
@@ -278,7 +281,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // only turn must still report an empty text channel, not a missing
             // one. Thinking/reasoning presence reaches the gate via sawReasoning.
             const contentFilter = makeFieldFilter();
-            const reasoningFilter = makeFieldFilter();
+            const reasoningFilter = createIdentityStreamFilter();
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const ct = contentFilter.flush();
                 if (ct.length > 0) yield { kind: "text", delta: ct, raw: buildContent(ct) } as ParsedStreamEvent;

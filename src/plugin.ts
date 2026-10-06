@@ -1776,7 +1776,10 @@ export async function pipePluginChatWithStrip(
             // `thought` parts) must ride byte-for-byte — any rewrite desyncs its
             // signature and bricks replay. Route it through an identity filter
             // instead of the prose filters (matches the loop adapters).
-            const signedThinking = (protocol === "anthropic" || protocol === "google") && field === "thinking";
+            // Unified ACP invariant (#2229): the same treatment extends to the
+            // openai reasoning fields — the thinking channel is NEVER
+            // rewritten, only the visible text channel is.
+            const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
             s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
@@ -3108,16 +3111,12 @@ export async function pipePluginResponsesWithStrip(
                     // The done is not visible text to the degenerate-turn retry below, so it
                     // is stripped and released directly.
                     if (type === "response.reasoning_summary_part.done") {
-                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
-                        // Whole-field tool-call emission (m00885) — an absorb-instructed
-                        // turn may answer as prose; drop the span, not just the tags.
-                        const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
-                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
-                        if (hadEcho) sawStrippedEcho = true;
-                        const evOut = hadEcho ? stripResponsesText(ev, dropEmission, requestText) : ev;
-                        proseAcc += responsesEventText(evOut);
-                        const out = hadEcho ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
-                        await write(flushArgTails() + flushTail(out));
+                        // Unified ACP invariant: reasoning summaries are the
+                        // thinking channel — byte-verbatim, no strip pass. The
+                        // text still feeds proseAcc so degenerate-turn
+                        // accounting sees it.
+                        proseAcc += responsesEventText(ev);
+                        await write(flushArgTails() + flushTail(rawEvent + "\n\n"));
                         continue;
                     }
                     if (type === "response.output_text.done" || type === "response.content_part.done" || type === "response.output_item.done") {
@@ -3237,32 +3236,15 @@ export async function pipePluginResponsesWithStrip(
                         await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
-                    // Reasoning summary deltas carry visible prose; function_call
-                    // argument deltas are user intent and pass through verbatim
-                    // (#1039), falling into the generic rawEvent write below.
-                    const argField = type === "response.reasoning_summary_text.delta" ? "delta" : null;
-                    if (argField !== null && typeof type === "string") {
-                        const v = ev[argField];
-                        if (typeof v !== "string" || v.length === 0) {
-                            await write(rawEvent + "\n\n");
-                            continue;
-                        }
-                        if (!mayStartRenderTag(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !(absorbInstructed === true && mayStartToolCallEmission(v)) && !argAnyPending() && !tagFilter.pending()) {
-                            proseAcc += v;
-                            // #2190: residue audit — see the twin above.
-                            if (v.length > 0 && containsEchoResidue(v)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${v.slice(0, 80).replace(/\n/g, " ")}`);
-                            await write(rawEvent + "\n\n");
-                            continue;
-                        }
-                        const s = argStreamFor(type, argField, ev);
-                        const clean = s.filter.push(v);
-                        if (clean.length === 0) continue;
-                        proseAcc += clean;
-                        if (clean === v) {
-                            await write(flushArgTails() + rawEvent + "\n\n");
-                            continue;
-                        }
-                        await write(flushArgTails() + rebuildEvent(rawEvent, { ...ev, [argField]: clean }));
+                    // Reasoning summary deltas are the thinking channel —
+                    // byte-verbatim under the unified ACP invariant (never
+                    // filtered). Function_call argument deltas are user intent
+                    // and pass through verbatim (#1039), falling into the
+                    // generic rawEvent write below.
+                    if (type === "response.reasoning_summary_text.delta" && typeof ev["delta"] === "string") {
+                        const v = ev["delta"] as string;
+                        if (v.length > 0) proseAcc += v;
+                        await write(rawEvent + "\n\n");
                         continue;
                     }
                     // #2248: raw exit — unrecognized event types never enter the
