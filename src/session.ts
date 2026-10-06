@@ -156,6 +156,17 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #2117: billing-caliber estimate of the CURRENT outbound request —
+         *  estimateCoreMessages + wire overhead, k̂-scaled only where the
+         *  factor's route+model provenance matches (#1933 F1 / #2117 B), plus
+         *  the image reserve. Written by forward() alongside the char-count
+         *  upper bound above (which stays the fail-closed caliber for
+         *  never-reporting upstreams, #553/#728). Display-only: no decision
+         *  path reads it — preflight keeps its own per-invocation formula. */
+        contextEstimateTokens?: number;
+        /** #2117: whether k̂ actually scaled contextEstimateTokens (false when
+         *  the factor is absent or its provenance doesn't match). */
+        contextEstimateCalibrated?: boolean;
         /** #1569: last netted input value written by a REAL upstream usage
          *  report (the arming paths never touch it — they only pose as
          *  usage-grade for lastInputTokens). While > 0, effectiveTokenCount
@@ -201,11 +212,19 @@ export type Session = {
           *  from a different origin starts a fresh ring instead of blending
           *  two providers' scales. */
          calibratedEstimateOrigin?: string;
-         /** #1933 F1: evidence ring behind calibratedEstimate — the recent
-          *  admitted raw samples for ONE origin (max 3). Persisted so a
-          *  restart doesn't re-arm the warmup delay; reset at native-
-          *  compaction boundaries with the rest of the baseline stats. */
-         calibrationRing?: { origin: string; values: number[] };
+         /** #2117 B: model the calibratedEstimate was learned against — the
+          *  second provenance dimension. The ring and every read gate on
+          *  route AND model: a mid-session model switch invalidates the old
+          *  factor instead of reusing a cross-model billing scale (dangerous
+          *  in either direction — a stale k̂<1 deflates → trigger too late).
+          *  Absent on factors published before this field existed → reads
+          *  treat it as compatible and retire it through normal rollover. */
+         calibratedEstimateModel?: string;
+         /** #1933 F1 / #2117 B: evidence ring behind calibratedEstimate —
+          *  the recent admitted raw samples for ONE origin+model (max 3).
+          *  Persisted so a restart doesn't re-arm the warmup delay; reset at
+          *  native-compaction boundaries with the rest of the baseline stats. */
+         calibrationRing?: { origin: string; model?: string; values: number[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate),
@@ -428,6 +447,49 @@ export function statusInputBaseline(session: Session): number {
     return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;
+}
+
+/** #2117: the honest best reading of "how full is this context right now" for
+ *  DISPLAY surfaces, picked by provenance — never mixes calibers on one bar:
+ *   usage     — last upstream-measured input (billing grade); wins whenever present.
+ *   estimate  — the billing-caliber estimate of the CURRENT outbound request
+ *               (contextEstimateTokens, k̂-scaled where its route+model
+ *               provenance matches), shown only while a usage-grade anchor
+ *               exists: a never-reporting upstream has no evidence that the
+ *               optimistic rate holds, so it keeps the fail-closed upper bound
+ *               (#553/#728 discipline).
+ *   upper     — char-count upper bound of the last send: never undershoots,
+ *               but over-counts ASCII-heavy payloads up to ~3.5× — a BOUND,
+ *               not a reading; over-window here does NOT mean actually
+ *               over-window.
+ * Legacy sessions without contextEstimateTokens fall through to upper —
+ * exactly today's display. Read-only; decision paths are untouched. */
+export interface ContextBest {
+    tokens: number;
+    kind: "usage" | "estimate" | "upper";
+    /** true when kind=="estimate" and k̂ actually scaled the value. */
+    calibrated?: boolean;
+    /** wall-clock of the underlying measurement (usage reports stamp it). */
+    at?: number;
+}
+
+// #2117 x #1937: minimal structural param — web list rows build from bounded
+// summary sources (sessions-data.ts) that carry no full Session object.
+export function displayContextBest(session: {
+    stats: Pick<Session["stats"], "contextTokens" | "contextTokensSource" | "lastUsageGradeTokens" | "lastInputTokensSource" | "contextEstimateTokens" | "contextEstimateCalibrated">;
+    metadata?: Record<string, unknown>;
+}): ContextBest | null {
+    const st = session.stats;
+    if (st.contextTokensSource === "usage" && st.contextTokens > 0) {
+        const at = typeof session.metadata?.contextTokensAt === "number" ? session.metadata.contextTokensAt : undefined;
+        return { tokens: st.contextTokens, kind: "usage", ...(at !== undefined ? { at } : {}) };
+    }
+    const anchored = (st.lastUsageGradeTokens ?? 0) > 0 || st.lastInputTokensSource === "usage";
+    if (anchored && typeof st.contextEstimateTokens === "number" && st.contextEstimateTokens > 0) {
+        return { tokens: st.contextEstimateTokens, kind: "estimate", ...(st.contextEstimateCalibrated ? { calibrated: true } : {}) };
+    }
+    if (st.contextTokens > 0) return { tokens: st.contextTokens, kind: "upper" };
+    return null;
 }
 
 /** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
@@ -833,9 +895,15 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.lastInputTokensOrigin;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
+    // #2117 B: same boundary — the factor's model provenance dies with it.
+    delete session.stats.calibratedEstimateModel;
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;
+    // #2117: the per-send estimate describes the pre-compaction payload too —
+    // let the next forward re-measure instead of displaying a stale reading.
+    delete session.stats.contextEstimateTokens;
+    delete session.stats.contextEstimateCalibrated;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
     session.metadata.nativeCompactionAt = Date.now();
