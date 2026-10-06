@@ -158,6 +158,7 @@ h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 .5em; }
 .copy-btn { font: inherit; background: #1c2530; color: #aab6c2; border: 1px solid #2d3644; border-radius: 7px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
 .copy-btn:hover { color: #fff; }
 .codebox pre { margin: 0; padding: 20px; font-size: 14px; line-height: 1.9; color: #dce5ee; overflow-x: auto; }
+.codebox pre a { color: #58a6ff; }
 .install-alt { margin-top: 26px; color: var(--faint); font-size: 14px; }
 
 /* ---------- paper ---------- */
