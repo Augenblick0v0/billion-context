@@ -963,14 +963,23 @@ export function buildCodexArgs(
     // bypasses the proxy. The TARGET itself is already chosen from the merged
     // effective view (profile + CLI overrides), so appending never hides a
     // user-selected endpoint behind a stale one.
-    const args = [...extra];
+    // #2260(D): "after the user's argv" means after the user's FLAGS, not
+    // after their positionals — everything past a `--` is positional to
+    // codex's parser, so appending there turns the rewrites into prompt text
+    // and the traffic bypasses the proxy. Insert before the first `--` when
+    // one exists; all user flag tokens still precede the rewrites, keeping
+    // last-wins intact.
+    const rewrites: string[] = [];
     for (const r of httpRewrites) {
-        args.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
+        rewrites.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
     }
     for (const r of httpsRewrites) {
-        args.push("-c", `${r.key}=${r.realUpstream}`);
+        rewrites.push("-c", `${r.key}=${r.realUpstream}`);
     }
-    return args;
+    if (rewrites.length === 0) return [...extra];
+    const sep = extra.indexOf("--");
+    if (sep === -1) return [...extra, ...rewrites];
+    return [...extra.slice(0, sep), ...rewrites, ...extra.slice(sep)];
 }
 
 /**

@@ -2746,6 +2746,40 @@ test("buildCodexArgs: no rewrites → just extra args", () => {
     assert.deepEqual(buildCodexArgs("http://h:p", [], [], ["--foo"]), ["--foo"]);
 });
 
+// #2260(D): cli.ts only eats a LEADING `--` right after the client name, so a
+// non-leading one reaches buildCodexArgs inside extra — and everything past it
+// is positional to codex's parser. Appending there turned the rewrites into
+// prompt text and silently bypassed the proxy (`bili codex exec -- "-p"`).
+test("buildCodexArgs: #2260(D) rewrites land BEFORE a user `--` separator, not after its positionals", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, [], ["exec", "--", "-p"]), [
+        "exec",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
+test("buildCodexArgs: #2260(D) last-wins holds across `--` — a user -c before the separator still loses to bili's rewrite", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["-c", "model_providers.x.base_url=https://user-picked.local/v1", "--", "-p"],
+    );
+    assert.deepEqual(out, [
+        "-c", "model_providers.x.base_url=https://user-picked.local/v1",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
 test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
