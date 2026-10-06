@@ -260,7 +260,7 @@ curl -s http://localhost:8787/__bili/stats
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
-**为什么 262k 窗口不到 200k 就开始压缩?** 两个默认值在悄悄相互作用:输出预留(`min(max_tokens, outputHeadroomMaxPct × window)`,上限默认 25%)先被扣掉——262,144 窗口 + `max_tokens = 131072` 只剩有效窗口 196,608,默认 75% 强制阈值就在 ≈147k(仅约整个窗口的 56%)处触发;而增长 nudge 步长按设计固定 50k(与窗口无关),重型启动(100k+ 工具/技能预填充)在一个长任务里就会撞上多次增量压缩——本地模型上每次都是完整重预填充。两者都不是 bug。算例 + 对策(先用 `/acp` 或 Web UI 实测用量;把 `compress.nudgeGrowthTokens` 提到 100k+;用 `promptPack: "lean"` 精简启动):[CONFIGURATION.zh-CN.md — 大窗口下压缩为何比预期更早更频繁地触发](CONFIGURATION.zh-CN.md#大窗口下压缩为何比预期更早更频繁地触发)。
+**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上增长 5 万 token 才触发第一次软压缩(`compress.nudgeGrowthTokens` 恒定步长、与窗口无关),第一次压缩的绝对位置 ≈ 开机占用 + 50k —— 开机 100k–150k(重型启动)时很可能要到 ~200k 才发生;强制线(默认 75%)只是兑底,且作用在扣除输出预留后的有效窗口上。想更早省 token → 调小 nudge 或调低 `maxContextLimit`;想减少次数 → 调大 nudge、`lean` pack 精简开机。完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
 
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 

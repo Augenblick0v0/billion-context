@@ -338,18 +338,17 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
-**Why does my 262k window start compacting before 200k?** Two defaults
-interact invisibly: the output reserve (`min(max_tokens, outputHeadroomMaxPct
-× window)`, cap default 25%) is subtracted first — a 262,144 window +
-`max_tokens = 131072` leaves an effective 196,608, so the default 75% forced
-threshold fires at ≈147k, only ≈56% of the full window; and the growth-nudge
-step is flat 50k by design (window-independent), so a heavy boot (100k+ of
-tools/skills prefill) meets several incremental compactions over one long task
-— each a full re-prefill on local models. Neither is a bug. Worked example +
-remedies (measure first with `/acp` or the web UI; raise
-`compress.nudgeGrowthTokens` to 100k+; slim the boot with `promptPack:
-"lean"`): [CONFIGURATION.md — Why compaction starts earlier than expected on
-large windows](CONFIGURATION.md#why-compaction-starts-earlier-than-expected-on-large-windows).
+**Why does the first compaction wait until ~200k?** Compaction does not
+trigger on absolute window position but on growth intervals: by default the
+first soft compaction fires 50k tokens past the boot content
+(`compress.nudgeGrowthTokens`, flat and window-independent), so its absolute
+position is ≈ boot + 50k — with a heavy boot (100k–150k of tools and skills)
+that lands around 200k. The 75% forced threshold is only a backstop and applies
+to the effective window (native window minus the output reserve). Want to save
+tokens earlier → lower the nudge step or `maxContextLimit`; want fewer
+compactions → raise the step or slim the boot with the `lean` pack. Worked
+example in
+[CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
 
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
