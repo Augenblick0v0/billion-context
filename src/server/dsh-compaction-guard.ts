@@ -34,10 +34,10 @@
  *      fallback so a future template reword that breaks the full-text match
  *      degrades to today's behavior instead of going blind.
  *
- * Deliberately unconditional (auto pressure, context-overflow recovery, and
- * manual /compact all send the same envelope — the traffic layer cannot tell
- * which trigger fired, and a landed checkpoint is equally destructive from
- * any of them). Not gated on the dsh plugin marker: a dsh host routed through
+ * Active by default, explicitly opt-out-able via allowDshCompaction (#2028):
+ * auto pressure, context-overflow recovery, and manual /compact all send the
+ * same envelope — the traffic layer cannot tell which trigger fired, and a
+ * landed checkpoint is equally destructive from any of them. Not gated on the dsh plugin marker: a dsh host routed through
  * a global bili proxy without the plugin bundle must be covered too. Refusal
  * message text intentionally rides into dsh's own warn line
  * (\x22step compaction failed: <message>; continuing the turn\x22).
