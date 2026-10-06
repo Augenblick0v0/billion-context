@@ -860,9 +860,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
             // #2265: simhash chain-alignment adoption (identity ladder rung 2)
-            //  — on by default; BILI_AFFINITY_SIMHASH=0 restores the pre-#2265
-            //  exact-hash-only resolution for a hot kill-switch.
-            setSimhashAdoptionEnabled(process.env.BILI_AFFINITY_SIMHASH !== "0");
+            //  — on by default; affinitySimhash: false / BILI_AFFINITY_SIMHASH=0
+            //  restores the pre-#2265 exact-hash-only resolution (hot kill-switch).
+            setSimhashAdoptionEnabled(opts.affinitySimhash ?? true);
             hydratePrefixAffinity();
             atomicWriteInstanceFile(instanceRecord);
         } catch {

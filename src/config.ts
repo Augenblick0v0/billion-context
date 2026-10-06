@@ -753,6 +753,15 @@ export type ProxyOptions = {
      *  blocks with resumeInheritance (#1834, default on).
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
+    /** Simhash chain-alignment adoption (#2265, default ON). A client-side
+     *  pervasive decorative rewrite (Trae re-stamps model tags on every
+     *  assistant message after a model switch) breaks the exact hash chain;
+     *  without this rung every request mints a fresh pfa-* session and
+     *  re-folds the full history from zero. Chain-level similarity
+     *  re-attaches the existing session and its compression state; the next
+     *  request resolves by the exact fast path again.
+     *  Disable with `affinitySimhash: false` or env BILI_AFFINITY_SIMHASH=0. */
+    affinitySimhash?: boolean;
     /** Resume-fork inheritance (#1486, default ON). Identified clients that
      *  resume a conversation under a NEW client-provided session id (Claude
      *  Code --resume forks a fresh UUID while replaying the full transcript)
@@ -1222,6 +1231,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
+        affinitySimhash: (env.BILI_AFFINITY_SIMHASH ?? (fileConfig.affinitySimhash === false ? "0" : "1")) !== "0",
         resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
@@ -1394,6 +1404,9 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
+    /** Set `false` to disable simhash chain-alignment adoption (#2265,
+     *  default ON; env BILI_AFFINITY_SIMHASH=0 wins over the file). */
+    affinitySimhash?: boolean;
     /** Set `false` to disable resume-fork inheritance (#1486, default ON;
      *  env BILI_RESUME_INHERITANCE=0 wins over the file). */
     resumeInheritance?: boolean;
@@ -1578,7 +1591,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
-    "subagentSplit", "forkAdoption", "resumeInheritance",
+    "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
