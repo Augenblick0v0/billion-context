@@ -54,15 +54,14 @@
         <h2 id="quickstart" data-i18n="d.toc_qs">Quickstart</h2>
         <p data-i18n="d.qs.p">One npm package, Node 22+. Install it, then launch your agent through bili — a dedicated compression proxy starts up alongside:</p>
         <div class="codebox">
-          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context&#10;bili pi" data-i18n="common.copy">Copy</button></div>
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context&#10;bili &lt;your-agent&gt;" data-i18n="common.copy">Copy</button></div>
           <pre class="mono"><code>npm install -g billion-context     # Node 22+
-bili pi                            # launch pi through bili — a dedicated compression proxy starts with it
-# any supported agent works: bili claude / codex / omp / opencode / dsh / …</code></pre>
+bili &lt;your-agent&gt;                  # e.g. bili pi · bili claude · bili codex · bili omp · bili opencode · bili dsh …
         </div>
         <p data-i18n="d.qs.p2">Everything binds loopback only — nothing is exposed externally. Every instance serves the same built-in dashboard under its own address:</p>
         <div class="codebox">
           <div class="codebox-head"><span class="mono">browser</span><button class="copy-btn" type="button" data-copy="http://127.0.0.1:18787/__bili/&#10;http://127.0.0.1:8787/__bili/" data-i18n="common.copy">Copy</button></div>
-          <pre class="mono"><a href="http://127.0.0.1:18787/__bili/">http://127.0.0.1:18787/__bili/</a>       # bili pi &amp; co. — lane ports start at 18787, sticky per agent
+          <pre class="mono"><a href="http://127.0.0.1:18787/__bili/">http://127.0.0.1:18787/__bili/</a>       # any launcher agent above — lane ports start at 18787, sticky per agent
 <a href="http://127.0.0.1:8787/__bili/">http://127.0.0.1:8787/__bili/</a>        # standalone `bili` daemon</pre>
         </div>
         <p class="hint" data-i18n-html="d.qs.next">Next stop: the panel below — configuration, session stats, and live logs all live there.</p>
