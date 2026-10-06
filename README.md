@@ -338,6 +338,19 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Why does my 262k window start compacting before 200k?** Two defaults
+interact invisibly: the output reserve (`min(max_tokens, outputHeadroomMaxPct
+× window)`, cap default 25%) is subtracted first — a 262,144 window +
+`max_tokens = 131072` leaves an effective 196,608, so the default 75% forced
+threshold fires at ≈147k, only ≈56% of the full window; and the growth-nudge
+step is flat 50k by design (window-independent), so a heavy boot (100k+ of
+tools/skills prefill) meets several incremental compactions over one long task
+— each a full re-prefill on local models. Neither is a bug. Worked example +
+remedies (measure first with `/acp` or the web UI; raise
+`compress.nudgeGrowthTokens` to 100k+; slim the boot with `promptPack:
+"lean"`): [CONFIGURATION.md — Why compaction starts earlier than expected on
+large windows](CONFIGURATION.md#why-compaction-starts-earlier-than-expected-on-large-windows).
+
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 `bili plugin remove <client>` for native installs, stop using the launcher

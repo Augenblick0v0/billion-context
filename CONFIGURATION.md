@@ -1300,6 +1300,30 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
 
+### Why compaction starts earlier than expected on large windows
+
+Community feedback (e.g. [awesome-dsh-plugin discussion #5795](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/discussions/5795)) keeps reporting the same two symptoms on **large-window + local-model** setups: "my 262k window starts compacting before 200k", and "it keeps compacting, the task took 2–3× longer". Both trace to the interaction of two defaults — neither is a bug, but the interaction is invisible without doing the arithmetic.
+
+**1. The forced threshold applies to the *effective* window.** Before the nudge/truncate bands are placed, the proxy subtracts the model's output reserve from the window: `reserved = min(max_tokens, outputHeadroomMaxPct × window)` (cap default `outputHeadroomMaxPct = 0.25`, three-level merge). Worked example:
+
+| Step | Value |
+|---|---|
+| Native window | 262,144 |
+| Requested `max_tokens` | 131,072 |
+| Output reserve `min(131072, 0.25 × 262144)` | 65,536 |
+| **Effective window** handed to the kernel | **196,608** |
+| Default 75% `maxContextLimit` fires at | **≈147k ≈ 56% of the full window** |
+
+So "compacting before 200k" on a 262k window is the default math working as designed: the percentage bands sit on 196,608, not 262,144.
+
+**2. The growth-nudge step is flat by design (window-independent).** The default growth step is a fixed 50k tokens at every window size (`nudgeGrowthTokens`; kernel `nudge.growthFloor == nudge.growthCap == 50000`, golden-pinned — see [Soft target with elastic headroom](#soft-target-with-elastic-headroom-1122)). A heavy boot (many tools + skills, 100k–150k of prefill before the first user turn) on a 262k window therefore sees 2–4 incremental compactions over a 200k-token task — and on a local model each compaction is a full re-prefill, which is exactly the reported "keeps compacting, 2–3× slower" experience.
+
+**Remedies (in order):**
+
+1. **Measure first** — check actual boot/context usage with `/acp` or the web UI before tuning anything; the boot prefill size sets how often the flat step fires.
+2. **Raise `compress.nudgeGrowthTokens`** (e.g. `100000`+ on large windows) — flattens the growth step to a wider fixed interval so heavy sessions fold less often.
+3. **Slim the boot** — set `compress.promptPack: "lean"` for one-line tool descriptions and condensed rules (roughly halves the prompt surface bili injects per request).
+
 ### Soft target with elastic headroom (#1122)
 
 Autonomous agents often want two things at once: keep the *active* context small (cost/latency), while allowing a single task to burst well past that target when it genuinely needs to (e.g., reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — one field plays two roles at once (the usage-ratio denominator **and** the hard preflight wall), so any payload above it gets folded mid-task or fails fast (#1122).
