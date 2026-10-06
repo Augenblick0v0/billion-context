@@ -1933,7 +1933,7 @@ test("ensureProxyRunning: stale starting marker (dead owner) → removed, then s
 
 test("ensureProxyRunning: expired starting marker (hung owner) → spawns (#707)", async () => {
     try {
-        claimStartingMarker({ token: "starter-c", pid: process.pid, host: "127.0.0.1", port: 8789, startedAt: Date.now() - 55_000 });
+        claimStartingMarker({ token: "starter-c", pid: process.pid, host: "127.0.0.1", port: 8789, startedAt: Date.now() - 95_000 }); // #2187: past the extended 90s marker TTL
         let spawnCalls = 0;
         const handle = await ensureProxyRunning(
             { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },

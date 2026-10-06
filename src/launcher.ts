@@ -153,11 +153,20 @@ export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "h
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
 const SPAWN_WAIT_MS = 20000;
+// #2187: grace beyond the initial wait for a LIVE child still starting.
+// Spawn-window startups have been observed taking 26-45s on slow Windows
+// machines (AV / first-run disk activity); the one-shot 20s budget misread
+// that as failure and left the lane degraded for the whole session.
+const SLOW_START_GRACE_MS = 40_000;
+// Total wait for a live child: initial window + grace. A child that EXITS or
+// fails to spawn still fails fast (the poll loop breaks on exit/error).
+export const SPAWN_BUDGET_MS = SPAWN_WAIT_MS + SLOW_START_GRACE_MS;
 const PROBE_TIMEOUT_MS = 1500;
-// #707: max age of a starting marker still treated as an in-progress bring-up.
-// A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
-// disks and client teardown before it clears the marker.
-const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
+// #707/#2187: max age of a starting marker still treated as an in-progress
+// bring-up. A well-behaved starter resolves within SPAWN_BUDGET_MS (a live
+// child may take the whole budget); the slack covers slow disks and client
+// teardown before it clears the marker.
+const STARTING_MARKER_TTL_MS = SPAWN_BUDGET_MS + 30_000;
 // #1903: budget for the post-exit re-discovery below. A spawned child dying
 // before becoming healthy is evidence the port it wanted is HELD — but our
 // one-shot discovery snapshot may predate the holder publishing its identity
@@ -3439,8 +3448,10 @@ function pickAttachable(
 }
 
 /** #707: wait for another launcher's in-flight bring-up to produce a live
- *  instance. Bounded by SPAWN_WAIT_MS; breaks early when the starting marker
- *  disappears (starter gave up / crashed). The final probe closes the
+ *  instance. Bounded by SPAWN_BUDGET_MS — the starter's own live-child wait
+ *  has the same envelope (#2187); bailing earlier would double-spawn against
+ *  a still-starting child; breaks early when the starting marker disappears
+ *  (starter gave up / crashed). The final probe closes the
  *  deadline-boundary sliver: the starter's own poll window ends ~now, and its
  *  success path clears the marker — indistinguishable from a failure bail
  *  without one last look. */
@@ -3455,7 +3466,7 @@ async function waitForStarterInstance(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
 ): Promise<ProxyInstanceFile | undefined> {
-    const deadline = now() + SPAWN_WAIT_MS;
+    const deadline = now() + SPAWN_BUDGET_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
         pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo, diag), opts, codeFingerprint, attachExternal, refusedLog, diag);
     let inst: ProxyInstanceFile | undefined;
@@ -3764,7 +3775,7 @@ export async function ensureProxyRunning(
     };
     // #1225: an in-flight starter of a DIFFERENT declared lane can never
     // produce an instance we may attach to — waiting would only stall this
-    // launch behind its SPAWN_WAIT_MS window. Undeclared lanes wildcard.
+    // launch behind its SPAWN_BUDGET_MS window. Undeclared lanes wildcard.
     const starterLaneMatches = (m: ProxyStartingMarker): boolean =>
         opts.lane === undefined || m.lane === undefined || m.lane === opts.lane;
     const marker = readStartingMarker();
@@ -3876,7 +3887,7 @@ export async function ensureProxyRunning(
 
         // #401/#480: fail fast when OUR spawned child dies before becoming
         // healthy — otherwise a startup crash (bad config, missing upstream, …)
-        // burns the whole SPAWN_WAIT_MS poll window before erroring.
+        // burns the whole spawn wait budget before erroring.
         let childExit: { code: number | null; signal: string | null } | undefined;
         // #809/D: an async spawn failure (EACCES/ENOENT on the resolved runtime)
         // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
@@ -3895,9 +3906,19 @@ export async function ensureProxyRunning(
             childError = rest[0];
         });
 
-        const deadline = now() + SPAWN_WAIT_MS;
+        const deadline = now() + SPAWN_BUDGET_MS;
+        // #2187: announce the phase boundary once — a live child past the
+        // initial window is still being waited for, and the log is the only
+        // place to see that the budget was extended instead of failing.
+        let slowStartNoticed = false;
         while (now() < deadline) {
             if (childExit || childError !== undefined) break;
+            if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
+                slowStartNoticed = true;
+                console.error(
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (log: ${logPath})`,
+                );
+            }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -3979,7 +4000,7 @@ export async function ensureProxyRunning(
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
