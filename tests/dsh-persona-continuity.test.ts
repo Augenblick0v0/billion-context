@@ -15,6 +15,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -27,6 +30,15 @@ import { getSession, peekSession, _resetSessionsForTest } from "../src/session.t
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
+
+// Hermetic state dirs (#7.2: no environmental luck). Without these, each rig
+// hydrates the shared prefix-affinity snapshot left by the PREVIOUS run of
+// this file — whose deeper dshc-* chains make chainContinues reject the
+// shorter replay and fork instead of migrate, failing the second run while
+// the first (and CI, fresh container) passes.
+const testRoot = mkdtempSync(join(tmpdir(), "bili-dsh-cont-"));
+test.after(() => rmSync(testRoot, { recursive: true, force: true }));
+for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 
 const MODEL = "claude-sonnet-4-5";
 const SYSTEM_A = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-A.\nWorkspace: /tmp.";
@@ -117,6 +129,8 @@ async function startRig(): Promise<Rig> {
     _resetSessionsForTest();
     _resetPluginStateForTest();
     resetPersonaAnchorsForTest();
+    const dir = mkdtempSync(join(testRoot, "run-"));
+    for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
