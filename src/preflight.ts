@@ -147,6 +147,8 @@ export interface PreflightDeps {
     upstreamOrigin?: string;
     /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
     forceStreamSummary?: boolean;
+    /** #2155: compress.streamSummary resolved FALSE for this request (explicit operator opt-out anywhere in the cascade). Neither learn path (400 "stream required" nor the 524/504 gateway-timeout first-hit learn) may arm, and an already-armed session flag is ignored — the operator said this upstream must never stream summaries. */
+    streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
 }
@@ -733,14 +735,16 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // at most one extra attempt per capability, in either rejection order.
     // #2133: compress.streamSummary forces SSE from the first attempt — the
     // learn path above only sees 400 "stream required" rejections, which a
-    // gateway timeout (524) never produces.
-    let stream = deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true;
+    // gateway timeout (524) never produces. #2155: an explicit cascade FALSE
+    // (streamSummaryOff) opts the request out of SSE summaries entirely — both
+    // learn paths stay disarmed and a stale learned flag is ignored.
+    let stream = !deps.streamSummaryOff && (deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true);
     let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
     for (;;) {
         try {
             return await requestSummary(deps, system, content, stream, includeMaxOutputTokens);
         } catch (err) {
-            if (err instanceof UpstreamHttpError && !stream && (err.status === 524 || err.status === 504)) {
+            if (err instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (err.status === 524 || err.status === 504)) {
                 // #2155 D3: first-hit learn — the non-streaming summary call
                 // timed out at the gateway. Flip this session to SSE summaries
                 // (persisted, same slot as the #626/#2133 learn) and retry once;
@@ -753,7 +757,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
             }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
-                if (!stream && STREAM_REQUIRED_RE.test(err.body)) {
+                if (!stream && !deps.streamSummaryOff && STREAM_REQUIRED_RE.test(err.body)) {
                     deps.session.metadata.preflightStreamSummary = true;
                     stream = true;
                     adapted = true;
@@ -844,7 +848,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             // retries once with stream:true (the #2133 self-learn semantics,
             // extended beyond the 400 "stream required" shape). Streaming
             // attempts keep the normal transient replay below.
-            if (failure instanceof UpstreamHttpError && !stream && (failure.status === 524 || failure.status === 504)) {
+            if (failure instanceof UpstreamHttpError && !stream && !deps.streamSummaryOff && (failure.status === 524 || failure.status === 504)) {
                 throw failure;
             }
             // #2189: retrying the identical shape cannot succeed — name it and fail fast.

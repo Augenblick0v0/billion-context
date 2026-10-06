@@ -185,7 +185,7 @@ test("e2e #2133 (global config ON): 524 gateway → SSE forced first-shot, fold 
     }
 });
 
-test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no self-heal, fail-fast 502", async () => {
+test("e2e #2133/#2155 (explicit OFF): 524 gateway → legacy non-stream retries, no learn, fail-fast 502", async () => {
     const calls: Call[] = [];
     const forwardBodies: string[] = [];
     const upstream = makeCloudflareUpstream(calls, forwardBodies);
@@ -193,19 +193,23 @@ test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
+    // #2155 flipped the UNSET default to first-hit SSE learn on 524/504; an
+    // explicit cascade FALSE is now the operator's "never stream summaries"
+    // opt-out and must keep the legacy behavior: no learn path arms, every
+    // attempt stays non-stream, preflight fails fast.
     const proxy = await startProxy(
         { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-6-astra": { context: 10_000 } } } },
-        {},
+        { streamSummary: false },
     );
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const r = await driveResponsesPreflight(proxyPort, upstreamPort, "s2133-off-1");
-        // Pins the UNCHANGED default behavior: without the knob the gateway
-        // timeout never arms the learn path, so preflight fails fast instead
-        // of folding (the exact symptom reported in #2133).
-        assert.equal(r.status, 502, `default behavior must still fail fast behind the 524 gateway, got ${r.status}`);
+        // Pins the explicit-OFF behavior (#2155): the operator opted this
+        // route out of streaming summaries, so the gateway timeout must not
+        // arm the 524 learn path — preflight fails fast instead of folding.
+        assert.equal(r.status, 502, `explicit OFF must still fail fast behind the 524 gateway, got ${r.status}`);
         const body = await r.json() as { error?: { code?: string; retryable?: boolean } };
         assert.equal(body.error?.code, "preflight_compress_failed");
         assert.equal(body.error?.retryable, true);
@@ -214,7 +218,7 @@ test("e2e #2133 (config OFF, default): 524 gateway → non-stream first-shot, no
         assert.ok(summaries.length >= 1, "a summary call must have been made");
         assert.ok(
             summaries.every((c) => !c.stream),
-            `without the knob every summary attempt stays non-stream (the 524 never matches the learn regex), got ${JSON.stringify(calls)}`,
+            `explicit OFF keeps every summary attempt non-stream (no learn path arms), got ${JSON.stringify(calls)}`,
         );
         assert.equal(forwardBodies.length, 0, "nothing was forwarded — the payload could not be brought under the window");
     } finally {
@@ -243,7 +247,7 @@ test("e2e #2133 (per-provider scope): only the route carrying compress.streamSum
     const proxy = await startProxy(
         {
             [`http://127.0.0.1:${portA}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: true } },
-            [`http://127.0.0.1:${portB}`]: { models: { "gpt-6-astra": { context: 10_000 } } },
+            [`http://127.0.0.1:${portB}`]: { models: { "gpt-6-astra": { context: 10_000 } }, compress: { streamSummary: false } },
         },
         {},
     );
@@ -257,7 +261,7 @@ test("e2e #2133 (per-provider scope): only the route carrying compress.streamSum
         assert.ok(sumsA.length >= 1 && sumsA.every((c) => c.stream), `route A summaries must all be stream, got ${JSON.stringify(callsA)}`);
 
         const rB = await driveResponsesPreflight(proxyPort, portB, "s2133-scope-b");
-        assert.equal(rB.status, 502, "route B has no knob and keeps the legacy non-stream-first behavior");
+        assert.equal(rB.status, 502, "route B carries the explicit OFF knob and keeps the legacy non-stream-first behavior");
         const sumsB = callsB.filter((c) => c.summary);
         assert.ok(sumsB.length >= 1 && sumsB.every((c) => !c.stream), `route B summaries must stay non-stream, got ${JSON.stringify(callsB)}`);
         assert.equal(bodiesB.length, 0, "route B forwarded nothing (its preflight failed)");

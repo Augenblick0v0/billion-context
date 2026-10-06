@@ -6095,6 +6095,10 @@ async function preflightCompressIfNeeded(
     // learn path can't see gateway timeouts (524/503), so operators behind such
     // gateways need a deterministic escape hatch.
     const forceStreamSummary = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === true;
+    // #2155: the same cascade resolved FALSE is an explicit operator opt-out —
+    // neither learn path (400 "stream required" nor the 524/504 first-hit
+    // learn) may arm streaming summaries for this request's session lane.
+    const streamSummaryOff = resolveCompress(opts.routes, route?.rewrittenUrl, model, opts.compress).streamSummary === false;
     let result: PreflightResult;
     try {
         result = await preflightCompress(
@@ -6118,6 +6122,7 @@ async function preflightCompressIfNeeded(
                 unknownBaseline,
                 upstreamOrigin: currentOrigin,
                 forceStreamSummary,
+                streamSummaryOff,
             },
             prepared.originalMessages,
         );

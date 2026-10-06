@@ -331,6 +331,10 @@ bypass and side lanes never earn credit):
   instead the session learns `metadata.preflightStreamSummary = true` on the
   **first** hit and the summary is re-requested as SSE — the same learned
   store as the manual `compress.streamSummary` knob (#2133), auto-armed.
+  The cascade is honored in both directions: an explicit `streamSummary:
+  false` anywhere (global → provider → model) is the operator's opt-out —
+  neither learn path arms and a stale learned flag is ignored
+  (`streamSummaryOff` in `PreflightDeps`).
 
 Observability: `session.metadata.selfHeal = { detected, action, since }` is
 exposed in `/__bili/sessions`, badged in the web UI ("heal"), and every
