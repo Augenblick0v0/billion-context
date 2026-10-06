@@ -110,7 +110,7 @@
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
-| `pi.subagents` | { subagents?: object \| boolean } | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
+| `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 
 **MITM 通道**
 
@@ -683,7 +683,7 @@
 - **类型：** `{ subagents?: PiSubagentsFileConfig | boolean }`
 - **默认值：** `{}`（acp_delegate 面按包默认值启用）
 - **状态：** ACTIVE（#2230 配置搬家）
-- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（在 bili 日志与 `~/.pi/acp.log` 各警告一次），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
+- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
 
 ```jsonc
 "pi": {

@@ -476,7 +476,7 @@ transports the native intercept actually covers**. Pi is the only host that
 brings WebSocket model traffic into the loop.
 
 **Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
-dele gate tools, roles, fleet inspector — wired by `bili pi` through the
+delegate tools, roles, fleet inspector — wired by `bili pi` through the
 embedded extension) is configured in bili's own config file, the `pi.subagents`
 section of `~/.config/billion-context/billion-context.json` (boolean shorthand
 `"pi": {"subagents": false}` disables it). The four `~/.pi/acp.json` keys
