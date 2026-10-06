@@ -50,7 +50,7 @@ import {
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -3203,6 +3203,9 @@ async function handle(
                 overflowWindow?: number,
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = async (): Promise<Prepared> => {
+                    // #1820: this prepare consumes one unit of post-rebuild anchor
+                    // validity (the last one deletes it — see session.ts).
+                    tickPostRebuildAnchor(session);
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     // #1279: stamp this request's effective cache-economics price
                     // profile on the session so request-context-free report faces
@@ -3878,6 +3881,17 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // but it is bounded by the declared/stated window so it cannot produce
     // the >100% ghost class, and the next real usage report overwrites it.
     if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #1820: right after a preflight rebuild the usage-grade baseline above is
+    // momentarily absent (the rebuild request's own report hasn't landed yet,
+    // or the upstream never reports), and every branch below sizes on the
+    // INCOMING RAW history — the very mass the rebuild just folded away —
+    // inflating the meter ~3.4× (char-count upper bound) and firing a phantom
+    // EMERGENCY nudge into an already-at-window context. Decide against the
+    // rebuilt payload's measured size instead (same quantity the preflight fit
+    // gate checked); setPostRebuildAnchor bounds the lifetime so never-
+    // reporting upstreams fall back to legacy sizing rather than a frozen meter.
+    const anchored = postRebuildAnchorTokens(session);
+    if (anchored > 0) return { tokens: anchored, source: "estimate" };
     const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
@@ -6208,6 +6222,9 @@ async function preflightCompressIfNeeded(
         // near the window edge — so the post-compression reading could EXCEED
         // the trigger-time reading ("~42619 tokens saved (2309870 → 2818817)")
         // and inflate every later meter until a real usage report landed.
+        // Same measurement the fit gate below uses — the view that actually
+        // goes out (processedMessages empty ⇒ kernel transform failure ⇒ the
+        // raw body rides; mirror outboundPayloadBreakdown's fallback).
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
@@ -6223,6 +6240,14 @@ async function preflightCompressIfNeeded(
         const fits = unknownBaseline
             ? result.fitsWindow
             : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
+        // #1820: anchor the meter to the rebuilt payload's measured size — the
+        // rebuild request's own usage report (the only sample that can supersede
+        // this) hasn't landed yet, and the meter's fallback branches would size
+        // on the incoming raw history, firing a phantom EMERGENCY nudge into an
+        // already-at-window context. Raw caliber (images included, no k̂
+        // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
+        // session.ts) so never-reporting upstreams fall back to legacy sizing.
+        setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
@@ -6254,7 +6279,10 @@ async function preflightCompressIfNeeded(
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
     if (imageArbitration) {
-        const outText = estimateCoreMessages(outbound.processedMessages);
+        // Same fallback as the fit-gate measurement above: processedMessages
+        // empty ⇒ kernel transform failure ⇒ the raw body rides.
+        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const outText = estimateCoreMessages(outMsgs);
         if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
             log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
             return outbound;
