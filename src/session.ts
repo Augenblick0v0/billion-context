@@ -336,15 +336,19 @@ export type Session = {
      *  non-CCR riders (#1207 range restore, ccr:false). Legacy sessions from
      *  before the rework may still carry ccr:true entries; the reconcile/
      *  commit/drop machinery below handles them (they are never re-created). */
-     pendingRetrievals: PendingRetrieval[];
-      /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
-       *  index built per request from the INBOUND body while stripImages is armed,
-       *  so decompress({ imageRef }) can pull a stripped/folded image's original
-       *  pixels back. Latest-wins (the client re-sends full history every turn, so
-       *  each request's index is complete); cleared when stripImages is off. Values
-       *  hold only metadata + the on-disk path (bytes are spilled at index-time and
-       *  never retained), so residency stays O(refs) regardless of image volume. */
-      incomingImageIndex?: Map<string, Array<{ mediaType: string; bytes: number; width?: number; height?: number; path: string }>>;
+    pendingRetrievals: PendingRetrieval[];
+    /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
+     *  index built per request from the INBOUND body while stripImages is armed,
+     *  so decompress({ imageRef }) can pull a stripped/folded image's original
+     *  pixels back. Latest-wins (the client re-sends full history every turn, so
+     *  each request's index is complete); cleared when stripImages is off. Values
+     *  hold only metadata + the on-disk path (bytes are spilled at index-time and
+     *  never retained), so residency stays O(refs) regardless of image volume. */
+    incomingImageIndex?: Map<string, Array<{ mediaType: string; bytes: number; width?: number; height?: number; path: string }>>;
+    /** #1995 in-memory only: timestamp of the last best-effort
+     *  pruneRetrieveImgExports sweep for this session (throttled to once a
+     *  minute in the request path). */
+    lastImgPrune?: number;
      /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache

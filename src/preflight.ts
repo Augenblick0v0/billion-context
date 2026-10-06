@@ -8,7 +8,7 @@ import {
     type PackSurface,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
-import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
+import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
@@ -1353,6 +1353,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // sidecars the kernel never sees. Consumed child blocks render through the
                 // kernel from the original state so they stay summaries.
                 const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                // #1995: summary notes carry the ref so the fold's own text
+                // points at the restore channel (decompress imageRef).
+                const byRaw = deps.session.state?.messageRefs?.byRaw;
                 const parts: string[] = [];
                 const droppedParts: string[] = [];
                 for (const id of planned.directMessageIds) {
@@ -1360,7 +1363,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
                     const m = messages[i];
                     let text = m.text ?? "";
-                    const notes = imagePlaceholders(m);
+                    const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
                     if (notes.length > 0) {
                         const note = notes.join(" ");
                         text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;

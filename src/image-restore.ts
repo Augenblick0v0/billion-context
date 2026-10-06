@@ -13,7 +13,7 @@
 // sends no such bytes to the proxy, so those belong to the agent's in-process
 // recovery (cf. billion-context-pi#594), not here.
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     anthropicToCore,
@@ -247,6 +247,116 @@ export function buildIncomingImageIndex(
         });
     }
     return index;
+}
+
+/** Protocol-dispatching convenience: run the inbound body through the wire
+ *  → core converter and return the flattened core messages (or undefined when
+ *  the body does not parse for that protocol). */
+export function coreMessagesFor(
+    parsed: unknown,
+    protocol: WireProtocol,
+): BiliMessage[] | undefined {
+    let result: unknown;
+    try {
+        switch (protocol) {
+            case "anthropic": result = anthropicToCore(parsed as AnthropicRequestBody); break;
+            case "openai": result = openaiToCore(parsed as OpenAIRequestBody); break;
+            case "google": result = googleToCore(parsed as GoogleRequestBody); break;
+            case "responses": result = responsesToCore(parsed as ResponsesRequestBody); break;
+        }
+    } catch {
+        return undefined;
+    }
+    return coreMsgsOf(result);
+}
+
+/** #1995 gap 2 — fold-anchored strip cutoff for stripImages.
+ *
+ *  Today the strip window SLIDES (`len - keepRecent`), so every new message
+ *  moves the byte boundary of the outgoing body one message earlier: the
+ *  prompt cache breaks at that point every turn, and the most expensive bytes
+ *  in the window (images) are re-billed as cache writes forever. Instead, when
+ *  an active fold exists we anchor the cutoff to fold coverage: strip exactly
+ *  the wire messages covered by (or older than) the latest active fold. The
+ *  cutoff then only moves on compression events, so the stripped prefix is
+ *  byte-stable between folds and the cache break stays put.
+ *
+ *  ANTHROPIC ONLY, deliberately. Anchoring is only safe where stripping does
+ *  not perturb kernel message ids: anthropic's strip placeholder "[image]" is
+ *  byte-identical to the id seed the converter derives for image blocks, so a
+ *  stripped image keeps the id the fold recorded at compression time. The
+ *  other three wires flip ids on strip (openai/google drop to "" vs "[image]";
+ *  responses concatenates text+"[image]"), so anchoring there would orphan
+ *  fold coverage at T+1 — they keep the sliding window until their
+ *  placeholders are made id-neutral (follow-up to #1995).
+ *
+ *  Returns `undefined` when there is no anchor (no active fold covers any
+ *  message with a known wire index), so the caller falls back to the sliding
+ *  window. */
+export function foldAnchoredCutoff(
+    parsed: unknown,
+    protocol: WireProtocol,
+    state: CompressionState,
+): number | undefined {
+    if (protocol !== "anthropic") return undefined;
+    const blocks = (state as { blocks?: { active?: boolean; effectiveMessageIds?: string[] }[] })?.blocks;
+    if (!Array.isArray(blocks)) return undefined;
+    const covered = new Set<string>();
+    for (const b of blocks) {
+        if (!b?.active) continue;
+        for (const id of b.effectiveMessageIds ?? []) covered.add(id);
+    }
+    if (covered.size === 0) return undefined;
+    const msgs = coreMessagesFor(parsed, protocol);
+    if (!msgs) return undefined;
+    let last = -1;
+    let boundaryFull = false;
+    for (const m of msgs) {
+        if (m.wireIndex === undefined) continue;
+        if (covered.has(m.id)) {
+            if (m.wireIndex > last) { last = m.wireIndex; boundaryFull = true; }
+            else if (m.wireIndex === last) boundaryFull = boundaryFull && true;
+        } else if (m.wireIndex === last) {
+            // A core message sharing the boundary wire message but NOT covered
+            // (e.g. an image block in the same anthropic message the fold
+            // stopped before): stripping that wire message would strip a LIVE
+            // image, so the boundary message itself stays intact.
+            boundaryFull = false;
+        }
+    }
+    if (last < 0) return undefined;
+    return last + (boundaryFull ? 1 : 0);
+}
+
+/** Best-effort expiry for spilled restore files (#1995): `decompress imageRef`
+ *  needs the bytes long after the wire dropped them, but sessions end and disk
+ *  is not infinite — default TTL one week. Prunes only THIS session's export
+ *  dir. Errors are swallowed (eviction must never take down a request). */
+export function pruneRetrieveImgExports(sessionId: string, ttlMs = 7 * 24 * 3600 * 1000): number {
+    const dir = restoreExportDir(sessionId);
+    let entries: string[];
+    try {
+        entries = readdirSync(dir);
+    } catch {
+        return 0;
+    }
+    const now = Date.now();
+    let removed = 0;
+    for (const name of entries) {
+        const p = join(dir, name);
+        try {
+            const st = statSync(p);
+            if (st.isFile() && now - st.mtimeMs > ttlMs) { unlinkSync(p); removed++; }
+        } catch {}
+    }
+    if (removed > 0) {
+        try {
+            // Drop the dir too when we emptied it, so finished sessions leave
+            // no residue.
+            if (readdirSync(dir).length === 0) rmdirSync(dir);
+        } catch {}
+    }
+    return removed;
 }
 
 function refNum(ref: string): number {

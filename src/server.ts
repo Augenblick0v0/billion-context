@@ -69,7 +69,7 @@ import {
 import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, commitRetrievalNotes, contentStoreOf, dropRetrievals, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
-import { buildIncomingImageIndex } from "./image-restore.js";
+import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "./image-restore.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, imageUsageSuffix, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
@@ -3227,15 +3227,32 @@ async function handle(
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
+                    // #1995 gap 2: when an active fold exists (anthropic only —
+                    // see foldAnchoredCutoff for the id-stability proof), anchor
+                    // the strip boundary to fold coverage instead of the sliding
+                    // window so the stripped prefix is byte-stable between folds
+                    // and the prompt cache survives turn-over-turn. Falls back to
+                    // the sliding window when there is nothing to anchor to.
+                    const anchoredCutoff = cs.stripImages && protocol
+                        ? foldAnchoredCutoff(parsed, protocol, session.state)
+                        : undefined;
                     const stripped = cs.stripImages
-                        ? stripHistoricalImages(parsed, protocol, keepRecent)
+                        ? stripHistoricalImages(parsed, protocol, keepRecent, anchoredCutoff !== undefined ? { cutoffIndex: anchoredCutoff } : undefined)
                         : { body: parsed, removed: 0 };
                     // #1995: index recoverable historical images by ref from the UNSTRIPPED
                     // body before stripping drops them, so decompress({ imageRef }) can pull
                     // specific pixels back later. Gated on stripImages (recovery is only
                     // meaningful when stripping removes something); latest-wins per request.
-                    if (cs.stripImages && protocol) {
+                    // count_tokens requests skip the (pure bookkeeping) index rebuild but
+                    // still strip with the same cutoff, so token counts stay representative
+                    // of what the model turn would send. Eviction rides along (best-effort,
+                    // throttled to once a minute).
+                    if (cs.stripImages && protocol && !countTokens) {
                         session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
+                        if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
+                            session.lastImgPrune = Date.now();
+                            pruneRetrieveImgExports(session.id);
+                        }
                     } else if (session.incomingImageIndex) {
                         session.incomingImageIndex = undefined;
                     }

@@ -90,7 +90,11 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
   // (excludeTools / protectedTools / isNeverPreserveRecent) are name-based.
   // Not part of the result identity seed — ids must stay stable across versions.
   const toolNames = new Map<string, string>();
-  for (const m of body.messages) {
+  for (const [wireIndex, m] of body.messages.entries()) {
+    // #1995: record the source wire ordinal so host-side strip anchoring can
+    // map fold coverage (core-message space) back to wire positions without
+    // re-deriving the converter's block-split behavior.
+    const before = msgs.length;
     const blocks =
       typeof m.content === "string"
         ? [{ type: "text" as const, text: m.content }]
@@ -197,6 +201,9 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           break;
         }
       }
+    }
+    for (let k = before; k < msgs.length; k++) {
+      (msgs[k] as BiliMessage).wireIndex = wireIndex;
     }
   }
   return { msgs, cacheControls };

@@ -201,7 +201,9 @@ test("host preflight includes notes for mixed and image-only tool outputs withou
         await response.text();
         assert.ok(summaries.length > 0, "genuine text pressure triggers preflight");
         const summaryInput = summaries.map((body) => JSON.stringify(body)).join("\n");
-        assert.equal(summaryInput.split("[image: png 2048x1152]").length - 1, 2);
+        // #1995: summary notes now carry the ref ("... · mNNNNN") so the fold's
+        // own text points at the decompress imageRef restore channel.
+        assert.equal((summaryInput.match(/\[image: png 2048x1152 · m\d+\]/g) ?? []).length, 2);
         assert.ok(summaryInput.includes("The screenshot shows a failure."));
         assert.ok(!summaryInput.includes("data:image"));
         assert.ok(!summaryInput.includes(imageUrl.slice(22, 80)));
