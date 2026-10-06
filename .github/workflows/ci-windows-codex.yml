@@ -33,6 +33,14 @@ jobs:
       - name: Install codex CLI
         shell: pwsh
         run: npm install -g @openai/codex
+      # #2196 hard gate (deterministic, no model calls — unlike the soft-gated
+      # verify below): the Windows argv pass-through contract must hold on a real
+      # machine — full corpus round-trip with the child's RECEIVED argv asserted
+      # item-by-item, official-npm-layout detection against the real global
+      # install, and the wrapper's --help booting through plain node.
+      - name: Windows argv pass-through tests (#2196)
+        shell: pwsh
+        run: node --import tsx --test tests/win-cmd-argv.test.ts
       # Non-obvious on purpose: do NOT remove continue-on-error until one clean
       # run proves codex boots unauthenticated on windows-latest. The transcript
       # artifact shows what happened so this can then become a hard gate.
