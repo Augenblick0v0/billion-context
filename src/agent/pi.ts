@@ -10,11 +10,15 @@ import path from "node:path";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
+import { wirePiSubagents } from "./pi-subagents.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
+    // #2186: acp_delegate surface notifies stand-downs through the host toast
+    // when present (same channel CommandCtx already declares).
+    ui?: { notify?: (message: string, type?: string) => void } | undefined;
     // #1961: pi 0.99+ exposes the live model catalog on the extension ctx;
     // optional because older hosts lack it. The real ModelRegistry surface is
     // find(provider, modelId) — there is no getModel (verified against pi
@@ -44,10 +48,18 @@ type CommandCtx = {
     ui?: { notify?: (message: string, type?: string) => void } | undefined;
 };
 
+export type { ExtensionAPI, CommandCtx, ToolDefinition };
+
 type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
+    // completion notifications through the host's persistent transcript
+    // channel; optional because older hosts and non-pi hosts lack it.
+    sendUserMessage?: (message: string, options?: { deliverAs?: string }) => void;
+    // #2186: delegate fleet-inspector shortcut — TUI nicety, never load-bearing.
+    registerShortcut?: (key: string, options: { description?: string; handler: (ctx: CommandCtx) => void | Promise<void> }) => void;
     // #535: launcher passes provider URL rewrites via env; the extension
     // overrides each provider's baseUrl at load (file-free routing — no
     // models.json overlay). Optional because older hosts may lack it.
@@ -898,6 +910,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 signal: AbortSignal.timeout(5000),
             }).catch(() => {});
         });
+        // #2186: acp_delegate surface for the pi lane, inlined from
+        // billion-context-pi-subagents. omp never reaches the wiring (the
+        // gate repeats inside) and a previously claimed surface stands down.
+        wirePiSubagents(pi, agent);
     };
 }
 
