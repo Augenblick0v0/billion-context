@@ -50,6 +50,24 @@ import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-com
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
     const ci = (ch: string) => `[${ch}${ch.toUpperCase()}]`;
+    // #2190 round 2: field-attested drift names OUTSIDE the core+insertion
+    // set. Inclusion rule (round 3 decontamination): a name enters ONLY on
+    // CLEAN spontaneous evidence — block-initial emission, tokens= attribute,
+    // deduped n>=4 — because open-side grep counts are inflated by the model
+    // quoting tag names inside its own reasoning. Qualifying: accessp, acacp,
+    // acb. Considered and EXCLUDED: acpx (raw census ~217 fails the clean
+    // filter — self-referential/constructed hits; one case-variant sighting
+    // only) and acpaa (n=1). Excluded forms are not silent: the fast-path and
+    // filter-release residue audits (#2190) warn on m\d{4,}</word> shapes, so
+    // any production appearance is observable and can earn inclusion later.
+    // Exact enumeration only — every character-class generalization that
+    // covers these also matches real prose words (acgroup/acmap/acstep are
+    // structurally identical to acacp).
+    const attestedDrift = [
+        "[aA][cC][cC][eE][sS][sS][pP]",
+        "[aA][cC][aA][cC][pP]",
+        "[aA][cC][bB]",
+    ];
     const fourLetter = new Set<string>();
     const threeLetter = new Set<string>();
     for (const c of cores) {
@@ -60,7 +78,7 @@ function buildAcplikeName(): string {
             );
         }
     }
-    return [...fourLetter, ...threeLetter].join("|");
+    return [...attestedDrift, ...fourLetter, ...threeLetter].join("|");
 }
 
 /** Longest-first alternation of every tolerated render-tag name (#673), case-folded via letter classes (#1731). */
@@ -76,9 +94,10 @@ const NAME = ACP_NAME_ALT;
 // and the #644 release rules. Close-side tails keep their {0,32} bound — that
 // one is load-bearing (#644: an unbounded close-side tail ate real content
 // after a malformed close).
-// A render tag wraps exactly one bare ref: the kernel emits <acp tokens="…"
+// A render tag wraps ONLY KERNEL REFS between its tags: the kernel emits <acp tokens="…"
 // type="…">mNNNNN</acp> and nothing else between the tags (#1720). Content that
-// is not a ref is prose wearing tags — the tags go, the content stays. No g
+// is not refs-only is prose wearing tags — the tags go, the content stays
+// (#1720/#2023). No g
 // flag: createTagEchoFilter drives it with exec() on a sliding buffer. It is
 // flag-free by construction — case folding lives inside ACP_NAME_ALT's letter
 // classes (#1731) — so every .source reconstruction below preserves behavior
@@ -86,17 +105,60 @@ const NAME = ACP_NAME_ALT;
 // Attrs are OPTIONAL: the kernel always emits them, but models imitate the
 // bare form <name>mNNNNN</name> (#1881) — whole-span strip must cover it or
 // the interior ref leaks as residue after the lone tags go.
-const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
-const REF_LIKE = /^\s*m\d{4,}\s*$/;
+const REF_TOKEN = "m\\d{4,}";
+// One kernel ref, or a run of them joined by whitespace / dash / comma — the
+// shapes the compress machinery prints (single ref, mNNNNN–mMMMMM ranges,
+// comma-separated range lists) that models imitate inside or beside render
+// tags (#2023). A bare run is never prose: prose cites ONE ref among words,
+// never a sequence of them.
+const REFS_RUN = REF_TOKEN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*" + REF_TOKEN + ")*";
+// Whole string is a refs run (optionally padded): tag content, not prose.
+const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
+// Body of a paired render tag: refs-only or empty (#1720/#2023). Anything
+// else is prose wearing tags — PAIRED must not match it.
+const PAIRED_BODY = "\\s*(?:" + REFS_RUN + ")?\\s*";
+const PAIRED = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>(" + PAIRED_BODY + ")" + "\x3c\\/" + NAME + ">");
+// An orphan refs run sitting directly against a close tag: the open half was
+// consumed by another branch (or never came), and stripping the close alone
+// leaves the refs behind as residue (#2023). The unit — run plus close — is
+// dead markup; the lookbehind keeps word-like tokens (xm01233) and refs
+// adjacent to a tag terminator out of it — a run right after \x3e belongs to
+// tag structure (an over-cap-dropped opening, #644) and stays lossless.
+// Streaming: consulted only when no opening is live (the swallowing state
+// owns paired closes, #1720). Whole-text: applied to UNMATCHED closes only
+// (see orphanCloseSpans) so a ref cited inside a prose-wearing pair survives.
+const ORPHAN_REF_CLOSE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
+// Same unit anchored to the END of a string: the refs run immediately
+// preceding an unmatched close (whole-text orphan pass).
+const ORPHAN_RUN_BEFORE = new RegExp("(?<![\\w>])\\s*" + REFS_RUN + "\\s*$");
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
+// #2190: a ref body closed by a DEGENERATE close name (any short word — the
+// drift set is open; the attested census alone has p/a/ap/apc/cap/ck/div/
+// warn/aph/ambient/apm). Whole-span strip only: the open must be a valid
+// acplike name and the body exactly one bare ref, so genuine HTML prose such
+// as "see </p>" or "<a>m1234 text</a>" is untouched. Runs BEFORE the lone
+// passes in stripAcpTags so the pair dies atomically instead of leaving the
+// ref behind.
+const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[a-zA-Z][a-zA-Z0-9]{0,15}>", "g");
 // A suffix of the buffer that could still grow into a render tag: either an
-// unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
-// ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
+// unterminated \x3c<name> … opening (attrs so far, no \x3e yet — the
+// mangled \x3c<name>=… form counts too, #2066), a short
+// ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …, a trailing refs
+// run whose close may arrive in the next chunk (#2023 orphan unit) — alone or
+// already followed by the tag fragment that opens the split close — or a
+// partial ref prefix (a bare m or m + 1-3 digits) that may complete across
+// the boundary.
+// Refs right after a tag terminator (\x3e) are NOT held: they belong to tag
+// structure (over-cap-dropped openings, #644) and stay lossless. Held on the
+// small cap so a split unit can be stripped whole; a lone trailing ref with
+// no tag context is released at EOF, prose-safe.
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "|(?<![\\w>])m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
-const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
+// The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
+// tag content, not an element.
+const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$|\x3c" + NAME + "\\s*=\\s*[^<>]*$");
 // A truncated render-tag CLOSE at the end of a string: \x3c/<name> optionally
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
@@ -111,7 +173,15 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // next `<`. A properly terminated opening never matches: its attribute list
 // ends at a `>`, and no `<` can be reached from there within the class.
 const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
-const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
+// A mangled render-tag OPENING: the name, then `=` where the attribute list's
+// first whitespace belongs, e.g. `<acp=1>`. The kernel never emits it — the
+// model mangles the framing it learned from the wire (production session
+// ses_efe4cfcbdffe, 2026-10-03: 5 assistant turns opening with `<acp=1>`).
+// The `=` anchor is what keeps plain HTML safe: `<caption>`, `<font>` and any
+// real element name carry no `=`, and a properly formed render tag matches
+// LONE_OPEN/PAIRED, not this.
+const MANGLED_OPEN = new RegExp("\x3c" + NAME + "\\s*=\\s*[^<>]*>");
+const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c" + NAME + "=|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
@@ -144,6 +214,56 @@ function looseCloseSpan(s: string): { start: number; end: number } | null {
 function looseCloseEnd(s: string): number {
     const span = looseCloseSpan(s);
     return span === null ? -1 : span.end;
+}
+// #2190: models imitate the CLOSE with arbitrary short words instead of an
+// acplike name — field census (session-A, 2026-10-05): ap/p/a/apc/cap/ck/div/
+// warn/aph/ambient/apm, an open set a whitelist cannot keep up with. Accepted
+// as a swallow terminator ONLY when the whole body since the opening is one
+// bare ref (the kernel's emit shape, #1720): ref-body + any short close is an
+// echo, never prose — a prose body stays indistinguishable from legitimate
+// markup and keeps the existing hold/budget/flush behavior. Strict >
+// termination, same discipline as looseCloseSpan (a partial close at the
+// buffer end is still undecidable and stays held).
+const DEGEN_CLOSE_NAME = /^[a-zA-Z][a-zA-Z0-9]{0,15}>/;
+// Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
+// this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
+const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
+function degenCloseAfterRef(s: string): { start: number; end: number } | null {
+    let idx = s.indexOf(CLOSE_HEAD);
+    while (idx >= 0) {
+        const m = DEGEN_CLOSE_NAME.exec(s.slice(idx + 2));
+        if (m && SINGLE_REF_BODY.test(s.slice(0, idx))) return { start: idx, end: idx + 2 + m[0].length };
+        idx = s.indexOf(CLOSE_HEAD, idx + 1);
+    }
+    return null;
+}
+
+/** Spans of every close tag in s with NO unmatched open before it (#2023).
+ *  Opens and closes are paired greedily in document order (echoed tags are
+ *  flat; kernel tags are well-nested), and only depth-zero closes count as
+ *  orphans — a close inside any pair protects the refs run it terminates
+ *  (#1720 prose-wearing pairs keep their content). */
+function orphanCloseSpans(s: string): { start: number; end: number }[] {
+    const events: { idx: number; open: boolean }[] = [];
+    const reO = new RegExp(LONE_OPEN.source, "g");
+    const reC = new RegExp(LONE_CLOSE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = reO.exec(s)) !== null) events.push({ idx: m.index, open: true });
+    while ((m = reC.exec(s)) !== null) events.push({ idx: m.index, open: false });
+    events.sort((a, b) => a.idx - b.idx);
+    const spans: { start: number; end: number }[] = [];
+    let depth = 0;
+    for (const ev of events) {
+        if (ev.open) {
+            depth++;
+        } else if (depth === 0) {
+            const cm = new RegExp(LONE_CLOSE.source).exec(s.slice(ev.idx));
+            if (cm) spans.push({ start: ev.idx, end: ev.idx + cm[0].length });
+        } else {
+            depth--;
+        }
+    }
+    return spans;
 }
 
 /** The span of one wrapped-turn imitation in `s`: where it starts, and the span
@@ -232,7 +352,16 @@ export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");
 }
 
-export function stripAcpTags(text: string): string {
+export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+    // A whole-field tool-call emission first: the field IS the call, so the
+    // span goes whole (see toolCallEmissionSpan). Gated by the caller; the
+    // m00885 echo check keeps a span the user asked to be emitted verbatim.
+    if (dropToolCallEmission) {
+        const span = toolCallEmissionSpan(text);
+        if (span !== null && !emissionEchoesRequest(text.slice(span.start, span.end), requestText)) {
+            text = text.slice(span.end);
+        }
+    }
     // A wrapped-turn imitation first, whole: it swallows the model's turn, and
     // leaving its payload behind hands the client the orphan markup that makes
     // the turn unusable. Each pass removes at least the head, so this ends.
@@ -242,9 +371,27 @@ export function stripAcpTags(text: string): string {
         if (wrapped === null) break;
         out = out.slice(0, wrapped.start) + out.slice(wrapped.end);
     }
+    out = out.replace(new RegExp(PAIRED.source, "g"), "");
+    // #2023: a refs run sitting directly against an UNMATCHED close is residue
+    // (its open was consumed elsewhere or never came) and goes with the close.
+    // A close inside any pair — even a prose-wearing one — belongs to that
+    // pair's content and stays (#1720), so only depth-zero closes qualify.
+    // Delete right-to-left so earlier offsets stay valid.
+    {
+        const spans = orphanCloseSpans(out);
+        for (let i = spans.length - 1; i >= 0; i--) {
+            const sp = spans[i];
+            const pre = out.slice(0, sp.start);
+            const rm = ORPHAN_RUN_BEFORE.exec(pre);
+            if (!rm) continue;
+            out = out.slice(0, pre.length - rm[0].length) + out.slice(sp.end);
+        }
+    }
     out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
+        .replace(DEGEN_PAIR, "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
+        .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
@@ -270,6 +417,16 @@ export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
 
+// #2190: post-audit shape check — a bare ref immediately followed by ANY close
+// tag is echo residue by construction (genuine prose never puts mNNNNN right
+// before </word>; the kernel wraps refs in tags, so a naked ref IS the leak).
+// Used where bytes bypassed or escaped the filter and must be logged, not
+// dropped: fast-path gate sites and filter release points.
+const ECHO_RESIDUE = /m\d{4,}\s*\x3c\/[a-zA-Z]/;
+export function containsEchoResidue(s: string): boolean {
+    return ECHO_RESIDUE.test(s);
+}
+
 // #468: some upstreams stream a model-imitated render tag in tokenizer-sized
 // fragments ("\x3cac", "p tokens", ...) so no single chunk ever trips
 // RENDER_TAG_DETECT. Per-chunk gates must also engage when the chunk contains
@@ -278,7 +435,23 @@ export function containsRenderTagText(s: string): boolean {
 // (byte-identical passthrough); only chunks with a tag-head tail ("\x3c", "\x3c/",
 // "\x3ca", "\x3cac", "\x3cacp ...attrs", "\x3c/acp ...") engage it.
 export function mayStartRenderTag(s: string): boolean {
-    return RENDER_TAG_DETECT.test(s) || PARTIAL_TAIL.test(s);
+    // MANGLED_OPEN carries its own ">" (PARTIAL_TAIL only sees unterminated
+    // tails), so it is tested directly: a chunk with a complete mangled open
+    // must engage the machine to drop it.
+    return RENDER_TAG_DETECT.test(s) || MANGLED_OPEN.test(s) || PARTIAL_TAIL.test(s);
+}
+
+// #2190: a BROADER ambiguous head, used by the streaming gate and the filter's
+// hold decision only. Degenerate imitations drift the name beyond the acplike
+// mutation set (the observed close census already proves free-form name drift),
+// so a head like \x3cck must engage the state machine or the rest of the tag
+// rides the fast path verbatim. Deliberately NOT folded into PARTIAL_TAIL /
+// mayStartRenderTag: isOrphanMarkupText (#1760) consumes those for
+// degenerate-turn accounting, where a prose tail such as "a<b" must stay
+// prose, not residue.
+const BROAD_TAG_HEAD_TAIL = new RegExp("\x3c\\/?[A-Za-z0-9]{0,16}$");
+export function mayStartDegenerateRenderTag(s: string): boolean {
+    return BROAD_TAG_HEAD_TAIL.test(s);
 }
 
 // #361: tool-call XML template fragments a model may echo from the context
@@ -289,6 +462,145 @@ export function mayStartRenderTag(s: string): boolean {
 const TOOL_CALL_XML = /\x3c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b[^<>]*\x3e|\\u003c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b|\x3c\/?antml:[a-z_]+/i;
 export function containsToolCallXmlFragment(s: string): boolean {
     return TOOL_CALL_XML.test(s);
+}
+
+// ─── Whole-field tool-call EMISSION (production 2026-10-03) ────────────────
+// The #361 fragments above are tool-call markup QUOTED inside prose —
+// legitimate content, detect + warn only. A different shape exists: the
+// model writes the whole call as the prose field's body (the "hybrid"
+// emission in opencode session ses_efe4cfcbdffe, 2026-10-03:
+// \n<parameter=ref>\nm00608\n</parameter>\n<parameter=summary>…prose…\n
+// </parameter>\n</function>\n</function_calls> standing alone in the prose
+// channel). That field IS the call, not prose quoting a call. Its shape is
+// the absorb tool's signature — the only bili tool with a ref+summary
+// parameter pair — so a whole-field shape is a tight discriminator: a
+// tool-call open at the field start, a ref parameter whose body is a kernel
+// ref, a summary parameter, and a call close. Embedded quotes never start
+// the field, so they are untouched. Dropping the span is additionally
+// gated on provenance (the request carried the [ACP absorb] instruction);
+// shape alone never decides.
+export const ABSORB_INSTRUCTION_MARKER = "[ACP absorb]";
+const TC_OPEN_AT_START = /^\x3c(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b/;
+const TC_PARAM_REF = /\x3c(?:antml:)?parameter(?:\s*=\s*["']?ref["']?|\s+name\s*=\s*["']ref["'])?[^<>]*\x3e\s*m\d{4,}\s*\x3c\/(?:antml:)?parameter/i;
+const TC_PARAM_SUMMARY = /\x3c(?:antml:)?parameter(?:\s*=\s*["']?summary["']?|\s+name\s*=\s*["']summary["'])?[^<>]*\x3e/i;
+const TC_CLOSE = /\x3c\/(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b[^<>]*\x3e/i;
+const TC_ORPHAN_HEAD = /^\s*\x3c\/(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b/;
+const TC_TAG_STRIP = /\x3c\/?(?:antml:)?(?:function_calls|function|parameter|parameters|invoke|tool_calls|tool_call)\b[^<>]*\x3e/gi;
+// Raw-wire whitespace: inside a JSON body, the gap between the markup and
+// the ref body arrives as two-char escape pairs (\n \r \t) that \s cannot
+// see. Brackets are never JSON-escaped, so a raw presence test is sound.
+const RAW_WS = "(?:\\\\[a-z]|\\s|\\\\)*";
+const TC_PARAM_REF_RAW = new RegExp(
+    "\\x3c(?:antml:)?parameter(?:\\s*=\\s*[\"']?ref[\"']?|\\s+name\\s*=\\s*[\"']ref[\"'])?[^<>]*\\x3e" + RAW_WS + "m\\d{4,}" + RAW_WS + "\\x3c\\/(?:antml:)?parameter",
+    "i"
+);
+
+/** Span of a whole-field tool-call emission: from the field start (after
+ *  leading whitespace) through the last call close. Null when the field is
+ *  not shaped as one. Pure shape — the caller gates the drop on
+ *  provenance. */
+export function toolCallEmissionSpan(text: string): { start: number; end: number } | null {
+    const lead = text.length - text.trimStart().length;
+    const t = text.slice(lead);
+    if (t.length === 0 || !TC_OPEN_AT_START.test(t)) return null;
+    if (!TC_PARAM_REF.test(t) || !TC_PARAM_SUMMARY.test(t)) return null;
+    let end = -1;
+    for (const m of t.matchAll(new RegExp(TC_CLOSE.source, "gi"))) end = m.index + m[0].length;
+    if (end === -1) return null;
+    return { start: lead, end: lead + end };
+}
+
+/** Whole field is a tool-call emission (see above). */
+export function isToolCallEmission(text: string): boolean {
+    return toolCallEmissionSpan(text) !== null;
+}
+
+/** A field that opens on a tool-call CLOSE whose remainder is nothing but
+ *  refs and whitespace — the tail half of an emission split across a field
+ *  boundary (defensive; no production record yet). */
+export function isOrphanToolCallTail(text: string): boolean {
+    if (!TC_ORPHAN_HEAD.test(text)) return false;
+    return /^\s*(?:m\d{4,}\s*)*$/.test(text.replace(TC_TAG_STRIP, ""));
+}
+
+/** Raw-wire pre-check for the emission shape inside an SSE/JSON body (the
+ *  gate runs before parsing; the exact field-level decision is
+ *  toolCallEmissionSpan on parsed field text). */
+export function containsToolCallEmissionText(s: string): boolean {
+    return TC_PARAM_REF_RAW.test(s) && TC_PARAM_SUMMARY.test(s) && TC_CLOSE.test(s);
+}
+
+// Canonical comparison form for the m00885 echo check. The request side is
+// JSON text, where a newline in the user's quote is the two-char escape
+// pair `\n` — dropping the backslash alone would leave a stray `n` between
+// the markup and the ref body and break containment, so escape pairs are
+// resolved first (\uXXXX to the char, \n \t \r and the other pairs to a
+// space) and only then do backslashes and whitespace vanish. Both sides
+// end up in the same form, so a fragment quoted in the request and
+// re-emitted by the model — literal, JSON-escaped, or re-spaced — compares
+// equal.
+function canonicalEmissionForm(t: string): string {
+    return t
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\\n/g, " ")
+        .replace(/\\t/g, " ")
+        .replace(/\\r/g, " ")
+        .replace(/\\[\"\\/btf]/g, " ")
+        .replace(/[\\\s]/g, "");
+}
+
+/** m00885: an emission-shaped span is KEPT when it echoes the shipped
+ *  request — the user asked the model to output a tool-call-shaped fragment
+ *  verbatim as the response, so the fragment is user intent, not a leaked
+ *  internal call. The span (markup + ref body + summary + close) must be
+ *  contained in the request bytes, whitespace/escape-insensitively; a
+ *  model-invented emission (the production shape, where the ref points at a
+ *  tool result the user never wrote) cannot match. */
+export function emissionEchoesRequest(spanText: string, requestText: string | undefined): boolean {
+    if (typeof requestText !== "string" || requestText.length === 0 || spanText.length === 0) return false;
+    if (requestText.includes(spanText)) return true;
+    const needle = canonicalEmissionForm(spanText);
+    if (needle.length === 0) return false;
+    return canonicalEmissionForm(requestText).includes(needle);
+}
+
+const TC_OPEN_NAMES = ["function_calls", "function", "tool_calls", "tool_call", "parameters", "parameter", "invoke"];
+
+/** Whether an accumulated field head could still be, or already is, the
+ *  start of a tool call: "open" when a name head has reached its boundary
+ *  (space/=/>), "prefix" while it may still grow into one, "none" when no
+ *  name head remains possible. */
+export function toolCallOpenStatus(s: string): "none" | "prefix" | "open" {
+    let prefix = false;
+    for (const name of TC_OPEN_NAMES) {
+        for (const head of ["\x3c" + name, "\x3cantml:" + name]) {
+            if (s === head) {
+                prefix = true;
+                continue;
+            }
+            if (s.startsWith(head)) {
+                const nxt = s[head.length];
+                if (nxt === undefined) {
+                    prefix = true;
+                    continue;
+                }
+                if (nxt === " " || nxt === "\t" || nxt === "\n" || nxt === "\r" || nxt === "=" || nxt === ">") return "open";
+            } else if (head.startsWith(s)) {
+                prefix = true;
+            }
+        }
+    }
+    return prefix ? "prefix" : "none";
+}
+
+/** Per-chunk gate: does the chunk contain or end with a tool-call open, so
+ *  the streaming machine must engage to decide whether the field is a
+ *  whole-field emission? */
+export function mayStartToolCallEmission(s: string): boolean {
+    for (let i = s.indexOf("\x3c"); i !== -1; i = s.indexOf("\x3c", i + 1)) {
+        if (toolCallOpenStatus(s.slice(i)) !== "none") return true;
+    }
+    return false;
 }
 
 // ─── #1634: bili-owned internal artifacts echoed by the model ───────────────
@@ -425,8 +737,14 @@ export function mayStartBiliInternal(s: string): boolean {
 // literal marker line, truncated internal-artifact open/header) is dead to the
 // host like an empty turn, so degenerate-turn detection counts it as residue;
 // plain prose (CJK leads included) is visible output, not residue.
+// #2023 review: the probe is PARTIAL_TAIL's \x3c -prefixed alternatives ONLY.
+// Its refs-run alternatives match genuine citations released at EOF; counting
+// those as residue made every bare-citation answer read as degenerate and fire
+// the one-shot retry (#732/#821) on a healthy turn. Tagged echoes need no help
+// here: their drop already sets sawStrippedEcho upstream.
+const TAG_PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 export function isOrphanMarkupText(s: string): boolean {
-    return mayStartRenderTag(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
+    return RENDER_TAG_DETECT.test(s) || TAG_PARTIAL_TAIL.test(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
 }
 
 function tailHoldLen(s: string): number {
@@ -523,8 +841,21 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
+    /** Last character actually emitted ("" at stream start). Extends the
+     *  [\w>] orphan-unit lookbehind ACROSS chunk boundaries: a refs run
+     *  arriving at the buffer head was preceded by whatever was emitted
+     *  before, and a \x3e there marks tag-structure residue (#644). */
+    let lastEmitted = "";
+    // Whole-field tool-call emission hold: when the request carried the
+    // [ACP absorb] instruction, the first non-whitespace head of each field
+    // that could be a tool-call open is held until the field is complete, so
+    // the emission decision runs on the WHOLE field (a mid-stream shape
+    // check could never see the closing tags). "pending" = not yet seen a
+    // non-whitespace byte; "committed" = a tool-call open is in the head;
+    // "off" = decided not one (or no instruction in the request).
+    let tcHold: "off" | "pending" | "committed" = absorbInstructed === true ? "pending" : "off";
     let swallowUntilClose = false;
     let swallowed = "";
     /** Which budget the current swallow answers to (SWALLOW_CAP or
@@ -550,6 +881,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             onDrop(snippet);
         }
     };
+    /** Character immediately before the refs run of an orphan-unit match —
+     *  within the buffer, or the last emitted char when the run sits at the
+     *  buffer head (chunk boundary). */
+    const charBeforeRun = (mm: RegExpExecArray, s: string): string => {
+        const lead = mm[0].match(/^\s*/)?.[0].length ?? 0;
+        const pos = mm.index + lead;
+        return pos === 0 ? lastEmitted : s[pos - 1];
+    };
     const process = (input: string): string => {
         let buf = input;
         let out = "";
@@ -558,12 +897,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 const combined = swallowed + buf;
                 const span = looseCloseSpan(combined);
                 if (span !== null) {
-                    // Only a ref-shaped body is tag content (#1720): a prose
-                    // body between paired tags is released and just the close
-                    // goes. An attested imitation (swallowReleases=false)
-                    // discards whatever the body is.
+                    // Only a refs-only body is tag content (#1720/#2023): a
+                    // prose body between paired tags is released and just the
+                    // close goes — a ref cited inside such a body survives.
+                    // An attested imitation (swallowReleases=false) discards
+                    // whatever the body is.
                     const inner = combined.slice(0, span.start);
-                    if (REF_LIKE.test(inner) || !swallowReleases) {
+                    if (REFS_ONLY.test(inner) || !swallowReleases) {
                         drop(combined.slice(0, span.end));
                     } else {
                         out += inner;
@@ -574,11 +914,34 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     buf = combined.slice(span.end);
                     continue;
                 }
+                if (swallowReleases) {
+                    // #2190: a degenerate close ends the span too. The body is
+                    // ref-shaped by construction (degenCloseAfterRef), so the
+                    // drop-whole rule applies unconditionally — wrapped mode
+                    // never reaches here (its payload may contain arbitrary
+                    // markup and must be discarded whole).
+                    const dspan = degenCloseAfterRef(combined);
+                    if (dspan !== null) {
+                        drop(combined.slice(0, dspan.end));
+                        swallowed = "";
+                        swallowUntilClose = false;
+                        buf = combined.slice(dspan.end);
+                        continue;
+                    }
+                }
                 if (combined.length > swallowLimit) {
                     swallowed = "";
                     if (swallowReleases) {
+                        // A refs-only tail past the #644 budget is an imitated
+                        // marker list, not prose — discard it. Mixed tails are
+                        // content and still release losslessly.
+                        if (REFS_ONLY.test(combined)) {
+                            drop(combined);
+                            return out;
+                        }
                         swallowUntilClose = false;
                         buf = combined;
+                        if (onResidueWarn && containsEchoResidue(combined)) onResidueWarn(combined);
                         continue;
                     }
                     // The span is an attested imitation's payload: discard it and
@@ -592,8 +955,20 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             const p = PAIRED.exec(buf);
             const o = LONE_OPEN.exec(buf);
             const c = LONE_CLOSE.exec(buf);
+            // Orphan unit (#2023): only reached when no opening is live — a
+            // close inside a swallow belongs to that pair's content (#1720).
+            // The lookbehind class extends across the chunk boundary: a run at
+            // the buffer head preceded by an emitted word char is word-like
+            // (xm01233), and one preceded by \x3e is tag-structure residue
+            // (#644) — neither is an orphan.
+            let r = ORPHAN_REF_CLOSE.exec(buf);
+            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) r = null;
+            // A mangled open (<name=...>) is a complete self-contained tag:
+            // drop it in place, no swallow (a following close dies via
+            // LONE_CLOSE on its own).
+            const g = MANGLED_OPEN.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, o, c]) {
+            for (const cand of [p, o, c, r, g]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -623,7 +998,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 continue;
             }
             if (!m) {
-                const t = PARTIAL_TAIL.exec(buf);
+                const t = PARTIAL_TAIL.exec(buf) ?? BROAD_TAG_HEAD_TAIL.exec(buf);
                 if (t) {
                     // A definite \x3c<name> opening is never prose — hold it far
                     // past HOLD_LIMIT (drop it past TAG_OPEN_CAP); a short
@@ -641,6 +1016,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                         out += buf;
                     }
                 } else {
+                    if (onResidueWarn && containsEchoResidue(buf)) onResidueWarn(buf);
                     out += buf;
                 }
                 break;
@@ -680,13 +1056,65 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
     return {
         push(delta: string): string {
             inputChars += delta.length;
+            if (tcHold !== "off") {
+                held += delta;
+                const t = held.trimStart();
+                if (t.length === 0) return "";
+                if (t[0] !== "\x3c") tcHold = "off";
+                else {
+                    const st = toolCallOpenStatus(t);
+                    if (st === "open") tcHold = "committed";
+                    else if (st === "none") tcHold = "off";
+                }
+                if (tcHold !== "off") return "";
+                // Clear BEFORE processing: process() can stash a partial tag-head
+                // tail into the shared held buffer (PARTIAL_TAIL hold); clearing
+                // after would wipe it and re-emit the tag head as fresh prose on
+                // the next delta (#2267 review fix, mirrors normal-push/flush paths).
+                const chunk = held;
+                held = "";
+                const r = process(chunk);
+                outputChars += r.length;
+                return r;
+            }
             const chunk = held + delta;
             held = "";
             const r = process(chunk);
+            if (r.length > 0) lastEmitted = r[r.length - 1];
             outputChars += r.length;
             return r;
         },
         flush(): string {
+            if (tcHold !== "off") {
+                // The field ended while its head was held: decide the whole
+                // field, then hand any non-emission rest to the normal path.
+                tcHold = "off";
+                const field = held;
+                held = "";
+                const t = field.trimStart();
+                if (t.length > 0 && t[0] === "\x3c") {
+                    const span = toolCallEmissionSpan(field);
+                    if (span !== null) {
+                        if (!emissionEchoesRequest(field.slice(span.start, span.end), requestText)) {
+                            drop(field.slice(0, span.end));
+                            const rest = field.slice(span.end);
+                            if (rest.length === 0) return "";
+                            const r = process(rest);
+                            outputChars += r.length;
+                            return r;
+                        }
+                        // The span mirrors the request verbatim (m00885): the
+                        // user asked for this fragment as the whole response —
+                        // it is user intent, so it flows through untouched.
+                    } else if (isOrphanToolCallTail(field)) {
+                        drop(field);
+                        return "";
+                    }
+                }
+                const r = process(field);
+                outputChars += r.length;
+                return r;
+            }
             const rest = swallowed + held;
             const wasSwallowing = swallowUntilClose;
             swallowed = "";
@@ -702,8 +1130,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
-                // over-budget-or-EOF tail is content unless it is exactly a
-                // ref; only a truncated open/close tail is dead markup.
+                // over-budget-or-EOF tail is content unless it is refs-only —
+                // an imitated marker list (#2023), not a citation; only a
+                // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
                     drop(t[0]);
@@ -713,6 +1142,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     if (tc) {
                         drop(tc[0]);
                         result = rest.slice(0, tc.index);
+                    } else if (REFS_ONLY.test(rest)) {
+                        drop(rest);
+                        result = "";
                     } else {
                         result = rest;
                     }
@@ -732,6 +1164,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     }
                 }
             }
+            if (result.length > 0) lastEmitted = result[result.length - 1];
+            if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
             return result;
         },
@@ -747,17 +1181,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
     };
 }
 
-function stripParts(content: unknown): unknown {
+function stripParts(content: unknown, drop: boolean, requestText?: string): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((part) => {
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string) };
+            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string, drop, requestText) };
         }
         return part;
     });
 }
 
-function stripItemContent(it: unknown): unknown {
+function stripItemContent(it: unknown, drop: boolean, requestText?: string): unknown {
     if (!it || typeof it !== "object") return it;
     const io = it as Record<string, unknown>;
     let out: Record<string, unknown> | undefined;
@@ -765,22 +1199,16 @@ function stripItemContent(it: unknown): unknown {
         out ??= { ...io };
         out[k] = v;
     };
-    if (Array.isArray(io.content)) set("content", stripParts(io.content));
-    if (Array.isArray(io.summary)) {
-        set(
-            "summary",
-            io.summary.map((s) =>
-                s && typeof s === "object" && typeof (s as Record<string, unknown>).text === "string"
-                    ? { ...(s as Record<string, unknown>), text: stripAcpTags((s as Record<string, unknown>).text as string) }
-                    : s,
-            ),
-        );
-    }
+    if (Array.isArray(io.content)) set("content", stripParts(io.content, drop, requestText));
+    // Unified ACP invariant: reasoning summaries are the thinking channel —
+    // byte-verbatim, never rewritten (matches stripOpenaiChatText leaving
+    // reasoning_content alone and the adapters' identity filters).
+    // `content` on a message item is visible prose and stays strippable.
     return out ?? it;
 }
 
-function stripIfString(v: unknown): unknown {
-    return typeof v === "string" ? stripAcpTags(v) : v;
+function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown {
+    return typeof v === "string" ? stripAcpTags(v, drop, requestText) : v;
 }
 
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
@@ -792,7 +1220,7 @@ function stripIfString(v: unknown): unknown {
 // execute/persist, so a shape-based false positive would silently corrupt
 // data — only model prose is stripped. Mutates in place, mirroring
 // stripResponsesText.
-export function stripOpenaiChatText<T>(obj: T): T {
+export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     if (!Array.isArray(o["choices"])) return obj;
@@ -803,9 +1231,12 @@ export function stripOpenaiChatText<T>(obj: T): T {
             const h = ch[holder];
             if (h && typeof h === "object") {
                 const hh = { ...(h as Record<string, unknown>) };
-                hh["content"] = stripIfString(hh["content"]);
-                hh["reasoning_content"] = stripIfString(hh["reasoning_content"]);
-                hh["reasoning"] = stripIfString(hh["reasoning"]);
+                hh["content"] = stripIfString(hh["content"], drop, requestText);
+                // Unified ACP invariant (owner directive, #2229): the
+                // thinking/reasoning channel is byte-verbatim — it is the
+                // model's private channel, not prose, and reasoning replay
+                // (DeepSeek-style) or signature checks can validate it. Only
+                // the visible text channel is ever rewritten.
                 ch[holder] = hh;
             }
         }
@@ -814,25 +1245,27 @@ export function stripOpenaiChatText<T>(obj: T): T {
     return obj;
 }
 
-// Plugin-passthrough parity for the Anthropic wire: strip `delta.{text,
-// thinking}` on content_block_delta streams and `content[].{text,thinking}`
-// on non-streaming message bodies. Mutates in place.
-export function stripAnthropicText<T>(obj: T): T {
+// Plugin-passthrough parity for the Anthropic wire: strip `delta.text` on
+// content_block_delta streams and `content[].text` on non-streaming message
+// bodies. Signed `thinking` / `redacted_thinking` blocks are LEFT byte-for-byte
+// (#1960/KDD#10): they are verified against their signature on replay, so any
+// rewrite desyncs them and bricks the session — matching the loop adapters'
+// "prose filters never touch thinking" treatment. Mutates in place.
+export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     const d = o["delta"];
     if (d && typeof d === "object") {
         const dd = { ...(d as Record<string, unknown>) };
-        dd["text"] = stripIfString(dd["text"]);
-        dd["thinking"] = stripIfString(dd["thinking"]);
+        dd["text"] = stripIfString(dd["text"], drop, requestText);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
         o["content"] = (o["content"] as unknown[]).map((c) => {
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
-            if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
-            return { ...cc, text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) };
+            if (typeof cc["text"] !== "string") return c;
+            return { ...cc, text: stripIfString(cc["text"], drop, requestText) };
         });
     }
     return obj;
@@ -846,25 +1279,25 @@ export function stripAnthropicText<T>(obj: T): T {
 // fragment carriers) are deliberately untouched (#1039): they carry user
 // intent that hosts execute/persist, so a shape-based false positive would
 // silently corrupt data — only model prose is stripped.
-export function stripResponsesText<T>(obj: T): T {
+export function stripResponsesText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
-    if (typeof o.text === "string") o.text = stripAcpTags(o.text);
+    if (typeof o.text === "string") o.text = stripAcpTags(o.text, drop, requestText);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
-        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string) };
+        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string, drop, requestText) };
     }
     if (o.item && typeof o.item === "object") {
-        o.item = stripItemContent(o.item);
+        o.item = stripItemContent(o.item, drop, requestText);
     }
     if (o.response && typeof o.response === "object") {
         const resp = { ...(o.response as Record<string, unknown>) };
         if (Array.isArray(resp.output)) {
-            resp.output = resp.output.map(stripItemContent);
+            resp.output = (resp.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
         }
         o.response = resp;
     }
     if (Array.isArray(o.output)) {
-        o.output = o.output.map(stripItemContent);
+        o.output = (o.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
     }
     return obj;
 }
@@ -975,5 +1408,26 @@ export function composeStreamFilters(a: TagEchoFilter, b: TagEchoFilter): TagEch
             outputChars: b.stats().outputChars,
             dropped: a.dropped() || b.dropped(),
         }),
+    };
+}
+
+// #1960/KDD#10 — signature-verified channels (signed Anthropic `thinking`
+// deltas, Gemini `thought` parts) must ride byte-for-byte: any rewrite
+// desyncs them from their signature and bricks replay. This identity filter
+// passes every delta through unchanged while keeping honest char accounting,
+// so degenerate-turn detection (#673) still sees real input/output sizes.
+export function createIdentityStreamFilter(): TagEchoFilter {
+    let inputChars = 0;
+    let outputChars = 0;
+    return {
+        push: (delta: string) => {
+            inputChars += delta.length;
+            outputChars += delta.length;
+            return delta;
+        },
+        flush: () => "",
+        dropped: () => false,
+        pending: () => false,
+        stats: () => ({ inputChars, outputChars, dropped: false }),
     };
 }

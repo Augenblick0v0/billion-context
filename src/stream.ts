@@ -8,7 +8,7 @@ import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.j
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
@@ -172,6 +172,86 @@ function clearCompressFailures(session: Session): void {
     }
 }
 
+// #2146: the exact-spec repeat guard above is defeated by a model that walks
+// spec space — one fresh (also failing) range per call. In the incident,
+// glm-5.3-flash burned 2h42m on 161 DISTINCT failing specs after a client
+// restart left stale-generation refs in its persisted history, never calling
+// acp_status despite every receipt asking it to; the #1026/#1029 hints were
+// in the receipts and were ignored. A session-level streak of consecutive
+// TOTAL failures (any spec) catches that shape: at N failures the receipt
+// switches from diagnostic hints to a hard-stop instruction. Hardcoded by
+// design (config-surface discipline, cf. DEGENERATE_FOLD_COVERAGE). Disarm is
+// success or 10 min of quiet — refs keep advancing DURING the loop (each
+// failed round appends messages), so a frontier-based decay would disarm
+// mid-loop and be defeated the same way.
+const COMPRESS_LOOP_KEY = "compressFailStreak";
+const COMPRESS_LOOP_THRESHOLD = 3;
+const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
+
+type CompressLoopStreak = { n: number; lastAt: number };
+
+function readCompressLoopStreak(session: Session): CompressLoopStreak | undefined {
+    const v = session.metadata[COMPRESS_LOOP_KEY];
+    if (!v || typeof v !== "object") return undefined;
+    const o = v as Record<string, unknown>;
+    if (typeof o["n"] !== "number" || !Number.isFinite(o["n"]) || typeof o["lastAt"] !== "number") return undefined;
+    return { n: Math.max(0, Math.floor(o["n"] as number)), lastAt: o["lastAt"] as number };
+}
+
+function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undefined): void {
+    if (s === undefined) delete session.metadata[COMPRESS_LOOP_KEY];
+    else session.metadata[COMPRESS_LOOP_KEY] = s;
+    markDirty(session);
+}
+
+/** #2146: record one total compress failure (any spec) and return "" while
+ *  healthy, or the circuit-breaker paragraph to embed in the receipt once the
+ *  streak arms. The breaker NEVER refuses execution — it only changes what a
+ *  FAILED call tells the model, so a legitimate call can always still succeed
+ *  and reset the streak via clearCompressLoopStreak. */
+export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
+    const now = Date.now();
+    let streak = readCompressLoopStreak(ctx.session);
+    if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
+    const n = (streak?.n ?? 0) + 1;
+    writeCompressLoopStreak(ctx.session, { n, lastAt: now });
+    if (n < COMPRESS_LOOP_THRESHOLD) return "";
+    const label = specLabel || "unparseable call";
+    if (n === COMPRESS_LOOP_THRESHOLD) {
+        ctx.log(`[warn: compress-loop] circuit breaker armed after ${n} consecutive compress failures (last spec: ${label}) — receipts now demand a full stop; disarms on success or ${COMPRESS_LOOP_DECAY_MS / 60000} min quiet`);
+    } else {
+        ctx.log(`[warn: compress-loop] failure ${n} in armed streak (last spec: ${label})`);
+    }
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed and further attempts will keep failing. STOP calling compress now: do not try other ranges, do not re-issue any previous range, and do not poll acp_status. Continue your actual task without compressing — compression happens again only when there is genuinely new content to fold.]`;
+}
+
+export function clearCompressLoopStreak(session: Session): void {
+    if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
+}
+
+/** #2146: every requested endpoint sits strictly ABOVE the session's highest
+ *  mapped m-ref. Such refs cannot exist in this session (refs are never
+ *  pre-allocated), so the kernel's generic "typo or wrong session" wording
+ *  misleads models into hunting for the typo and re-anchoring on other stale
+ *  artifacts. The deterministic cause is stale-generation refs baked into the
+ *  client's persisted history — name it instead. */
+export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
+    let highest = 0;
+    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    if (highest <= 0 || ranges.length === 0) return "";
+    const allAbove = ranges.every((r) => {
+        const s = M_REF_NUM_RE.exec(r.startRef.trim());
+        const e = M_REF_NUM_RE.exec(r.endRef.trim());
+        return !!s && !!e && Number(s[1]) > highest && Number(e[1]) > highest;
+    });
+    if (!allAbove) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
 // #1029: after a session-generation change (client restart/fork starts a fresh
 // session instance whose refs restart at m00001), stale refs from the previous
 // generation fail resolution. The kernel gate points at acp_status; inline the
@@ -311,7 +391,11 @@ function applyErrorNote(r: { errors: string[] }): string {
 // hosts that want to penalize this shape grep the warn marker below.
 const DEGENERATE_FOLD_COVERAGE = 0.8;
 
-export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): ProxyToolResult {
+export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
+    // #2146: preflight overflow-compress is bili's OWN internal lane — its
+    // failures have separate reporting (noteSkip) and must not arm the
+    // model-facing circuit breaker on attempts the model never made.
+    const trackLoop = opts?.loopTracking !== false;
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
@@ -345,23 +429,25 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             !isEmptyCall &&
             argLen !== undefined &&
             (diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated");
+        const parseKey = `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`;
         const guard = recordCompressFailure(
             ctx.session,
-            `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`,
+            parseKey,
             isEmptyCall
                 ? "An empty call fails identically on every retry — drop it instead of re-issuing."
                 : argCorruption
                     ? "Do not retry the same corrupt byte string — re-issue the call as one well-formed JSON object."
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0);
         }
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`, "refused", 0);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -450,9 +536,38 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
             const dropped = droppedEntriesNote(diagnostics);
-            return compressResult(`[Compression FAILED: ${errs}${revNote}${currentRefsSnapshot(ctx)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}${spanHint}${noViableAnywhere}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`, "refused", 0);
+            const specKey = normalizedSpecKey(ranges);
+            const repeatGuard = recordCompressFailure(ctx.session, specKey);
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+            const beyond = beyondFrontierNote(ctx.session.state, ranges);
+            // #2146: once the breaker arms, the diagnostic hint cluster it used
+            // to lead with has proven unread by the looping model — swap it for
+            // the hard-stop paragraph instead of stacking more ignored advice.
+            const hints = loopGuard === ""
+                ? `${beyond}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                : `${beyond}${loopGuard}`;
+            let receipt = `[Compression FAILED: ${errs}${revNote}${hints}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
+            // #2146: when every requested ref is provably stale-generation, the
+            // kernel's per-range error text hands those exact phantom numbers
+            // straight back into the client-persisted history — where the
+            // looping model reads them as unfinished work and slides further up
+            // the same ladder (incident log: m29971–m30020 → m30021–m30070 → …
+            // across hours). Scrub the requested endpoints from the model-
+            // visible receipt so that echo channel dies; the ctx.log line above
+            // keeps the real refs for the operator. Live refs are untouched:
+            // when the note fires, every requested ref exceeds the session's
+            // highest mapped ref, so no live snapshot number can collide.
+            if (beyond !== "") {
+                for (const rg of ranges) {
+                    for (const id of [rg.startRef, rg.endRef]) {
+                        receipt = receipt.split(id).join("[stale-ref]");
+                    }
+                }
+            }
+            return compressResult(receipt, "refused", 0);
         }
         clearCompressFailures(ctx.session);
+        clearCompressLoopStreak(ctx.session);
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
@@ -508,6 +623,32 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
+        // #1819: honest output — r.tokensCompressed is the REMOVED mass; the new
+        // summaries re-enter the payload, so the line above can claim "saved"
+        // while the fold actually grew context (weak-model regurgitation on the
+        // model-driven path). Net per touched block: new blocks remove their
+        // compressedTokens and add their summary mass; refolds swap old summary
+        // mass for new. The base line stays intact — core.ts parses
+        // `~N tokens saved` out of it — so the correction appends after it.
+        let netDelta = 0;
+        let touchedBlocks = 0;
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev === undefined) {
+                touchedBlocks += 1;
+                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
+            } else if (prev !== b.summary) {
+                touchedBlocks += 1;
+                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
+            }
+        }
+        if (touchedBlocks > 0 && netDelta <= 0) {
+            const netNote = netDelta < 0
+                ? `[Net context change: +${-netDelta} tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it.]`
+                : `[No net shrink: the new summary costs about as much as what it replaced; this fold left the context size unchanged.]`;
+            msg += netNote;
+            logMsg += netNote;
+        }
         // #1494: a partial fold must not read as a clean success — surface the
         // parse-dropped entries (and log them server-side) so the model
         // re-issues the rejected range instead of believing it folded.
@@ -578,7 +719,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         return compressResult(msg, dropped !== "" || r.errors.length > 0 ? "partial" : "applied", r.blocksCreated);
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
-        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`, "refused", 0);
+        const specKey = normalizedSpecKey(ranges);
+        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0);
     }
 }
 
@@ -627,11 +769,16 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
     }
     b.content = newContent;
     if (converted && !sawRealToolUse) b.stop_reason = "end_turn";
+    // Absorb signature in whole text (m00885): drop only when the request
+    // actually instructed the model about absorb — the shape check alone
+    // cannot tell an emission from a user-quoted fragment.
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
+    const requestText = JSON.stringify(ctx.messages);
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;
-        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t))) {
+        if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t) || (absorbArmed && containsToolCallEmissionText(t)))) {
             ctx.log(`[warn: tag echo] non-stream model output contains ACP echo (render tags/markers/internal artifacts), stripped: ${t.slice(0, 120).replace(/\n/g, " ")}`);
-            (blk as { text?: string }).text = stripAcpTags(t);
+            (blk as { text?: string }).text = stripAcpTags(t, absorbArmed, requestText);
         }
     }
     return body;

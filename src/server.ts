@@ -46,12 +46,11 @@ import {
     injectResponsesDeveloperMessage,
     conversationIdentityResponses,
     conversationSignalResponses,
-    subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -97,7 +96,7 @@ import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
-import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
@@ -112,7 +111,7 @@ import { rewriteResponsesJsonResponseAsync } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
-import { dshPersonaNamespace } from "./persona-anchor.js";
+import { personaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
@@ -2288,7 +2287,7 @@ async function handle(
                     // (model switch) MIGRATES the anchor instead of forking
                     // the main lane off the raw key; only history-discontinuous
                     // requests (review blobs) still fork onto `|sub:<fp>`.
-                    ? dshPersonaNamespace(
+                    ? personaNamespace(
                           anthropicIdentity?.value ?? anthropicSignal,
                           personaSystemText,
                           (parsed as AnthropicRequestBody).messages,
@@ -2297,7 +2296,7 @@ async function handle(
                     : anthropicIdentity?.value ?? anthropicSignal)
             : protocol === "openai"
               ? (dshPersona && !sideRequestLike
-                    ? dshPersonaNamespace(
+                    ? personaNamespace(
                           openaiIdentity?.value ?? openaiSignal,
                           personaSystemText,
                           (parsed as OpenAIRequestBody).messages,
@@ -2333,9 +2332,18 @@ async function handle(
                      // not a new persona. See instructionsFingerprintApplies
                      // in src/session-id.ts.
                       ? (!sideRequestLike
-                          ? subagentNamespace(
+                          ? // #2250: same continuity resolver as the dsh lanes
+                            // — an instructions drift whose history continues
+                            // the raw key's chain (model switch / AGENTS.md
+                            // edit / -c override / upgrade reassembly) MIGRATES
+                            // the anchor instead of forking the main lane off
+                            // its compression state; a genuinely fresh task
+                            // reusing the id (#150) still forks `|sub:<fp>`.
+                            personaNamespace(
                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).instructions,
+                                (parsed as ResponsesRequestBody).instructions ?? "",
+                                (parsed as ResponsesRequestBody).input,
+                                log,
                             )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
@@ -3204,6 +3212,9 @@ async function handle(
                 overflowWindow?: number,
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = async (): Promise<Prepared> => {
+                    // #1820: this prepare consumes one unit of post-rebuild anchor
+                    // validity (the last one deletes it — see session.ts).
+                    tickPostRebuildAnchor(session);
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     // #1279: stamp this request's effective cache-economics price
                     // profile on the session so request-context-free report faces
@@ -3879,6 +3890,17 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // but it is bounded by the declared/stated window so it cannot produce
     // the >100% ghost class, and the next real usage report overwrites it.
     if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #1820: right after a preflight rebuild the usage-grade baseline above is
+    // momentarily absent (the rebuild request's own report hasn't landed yet,
+    // or the upstream never reports), and every branch below sizes on the
+    // INCOMING RAW history — the very mass the rebuild just folded away —
+    // inflating the meter ~3.4× (char-count upper bound) and firing a phantom
+    // EMERGENCY nudge into an already-at-window context. Decide against the
+    // rebuilt payload's measured size instead (same quantity the preflight fit
+    // gate checked); setPostRebuildAnchor bounds the lifetime so never-
+    // reporting upstreams fall back to legacy sizing rather than a frozen meter.
+    const anchored = postRebuildAnchorTokens(session);
+    if (anchored > 0) return { tokens: anchored, source: "estimate" };
     const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
@@ -6209,6 +6231,9 @@ async function preflightCompressIfNeeded(
         // near the window edge — so the post-compression reading could EXCEED
         // the trigger-time reading ("~42619 tokens saved (2309870 → 2818817)")
         // and inflate every later meter until a real usage report landed.
+        // Same measurement the fit gate below uses — the view that actually
+        // goes out (processedMessages empty ⇒ kernel transform failure ⇒ the
+        // raw body rides; mirror outboundPayloadBreakdown's fallback).
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
@@ -6224,6 +6249,14 @@ async function preflightCompressIfNeeded(
         const fits = unknownBaseline
             ? result.fitsWindow
             : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
+        // #1820: anchor the meter to the rebuilt payload's measured size — the
+        // rebuild request's own usage report (the only sample that can supersede
+        // this) hasn't landed yet, and the meter's fallback branches would size
+        // on the incoming raw history, firing a phantom EMERGENCY nudge into an
+        // already-at-window context. Raw caliber (images included, no k̂
+        // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
+        // session.ts) so never-reporting upstreams fall back to legacy sizing.
+        setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
@@ -6255,7 +6288,10 @@ async function preflightCompressIfNeeded(
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
     if (imageArbitration) {
-        const outText = estimateCoreMessages(outbound.processedMessages);
+        // Same fallback as the fit-gate measurement above: processedMessages
+        // empty ⇒ kernel transform failure ⇒ the raw body rides.
+        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const outText = estimateCoreMessages(outMsgs);
         if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
             log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
             return outbound;
@@ -7112,6 +7148,17 @@ async function forward(
     // opt-in #371 fake-completion backstop buffers + retries first, same as
     // proxy mode (#473).
     if (prepared?.pluginMode) {
+        // m00885 provenance gate: the request body is where the kernel
+        // injects its "[ACP absorb]" instruction, so only an absorb-instructed
+        // request may have its whole-field tool-call prose dropped. wireBody
+        // is the exact shipped bytes (string or Buffer — .includes(string)
+        // works on both).
+        const absorbInstructed = wireBody.includes(ABSORB_INSTRUCTION_MARKER);
+        // m00885: the shipped request text doubles as the echo provenance — a
+        // tool-call-shaped span the user asked to output verbatim sits in the
+        // request, so an identical span in the response is an echo, not a
+        // model-invented emission.
+        const wireBodyText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #411: clear the idle timer on every path — resolveFakeCompletion and
         // other failures still escape these pipes; without a finally each one
         // leaked a live idle timer. (#721: the SSE pipes themselves no longer
@@ -7160,6 +7207,8 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        absorbInstructed,
+                        wireBodyText,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -7184,10 +7233,12 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        absorbInstructed,
+                        wireBodyText,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
             }
         } finally {
             clearUpstreamTimer();
@@ -7404,7 +7455,7 @@ async function forward(
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const systemPrompt = withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so

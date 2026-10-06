@@ -342,3 +342,35 @@ transition logs one `[self-heal]` line (detect + recovery). `bili plugin
 remove <client>` best-effort queries the live proxy (instance file →
 `GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
 when sessions of that client were active within the last **10 minutes**.
+
+## Unified ACP tag-echo remediation — the four invariants (#2023/#2066/#2190/#2248)
+
+One PR folds the three remediation legs together (refs-run residue #2023,
+degenerate-close stripping + egress audit net #2190, emission drop +
+signed-thinking verbatim #2066) under a single set of hard rules that govern
+EVERY text-rewriting surface (loop adapters, plugin passthrough, JSON strip
+functions, exit audits):
+
+1. **The thinking channel is byte-verbatim.** Anthropic `thinking`, Google
+   `thought`, OpenAI `reasoning_content`/`reasoning`, and Responses reasoning
+   summaries ride as-is — echo-shaped reasoning included. Rationale: reasoning
+   replay (DeepSeek-style) and signature verification validate these bytes;
+   any rewrite desyncs them and bricks the session (#1960/KDD#10). The
+   adapters route these fields through `createIdentityStreamFilter`, and the
+   strip functions (`stripOpenaiChatText`, `stripResponsesText`) leave them
+   untouched (defense in depth). NOTE: this REVERSES the pre-#1881-era
+   reasoning-echo strip — the thinking channel is no longer cleaned.
+2. **Model prose is manageable.** Render-tag echoes, marker lines,
+   bili-internal text, degenerate open/close residue, and (when
+   absorb-instructed) whole tool-call emissions are stripped from the visible
+   text channel only.
+3. **Model output bound for files is byte-identical (#1039).** Tool-call
+   arguments never enter any filter, whatever bytes they carry.
+4. **User-sent bytes are never rewritten.** A verbatim echo of the user's own
+   fragment survives even when stripping is armed (#463 exemption, keyed on
+   the request text, not shape).
+
+The egress audit net (#2248) stays log-only: raw exits (unrecognized frames,
+parse failures) forward as-is and log `[tag-echo] raw exit` so new leak shapes
+become visible without changing the wire. Pinned by
+`tests/unified-acp-invariants.test.ts` (eight tests, both lanes).

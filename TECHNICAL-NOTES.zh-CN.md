@@ -105,3 +105,14 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 - **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
 
 可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。
+
+## ACP 标签回声统一整治 —— 四条不变量(#2023/#2066/#2190/#2248)
+
+一个 PR 把三条整治腿合并(refs-run 残留 #2023、退化闭名剥离+出口审计网 #2190、emission 整段丢弃+签名思考 verbatim #2066),并统一受四条硬规则约束 —— 覆盖**所有**文本改写面(loop 适配器、插件直通、JSON strip 函数、出口审计):
+
+1. **思考通道逐字节不动。** Anthropic `thinking`、Google `thought`、OpenAI `reasoning_content`/`reasoning`、Responses reasoning summaries 原样透传 —— 哪怕长得像标签回声。理由:reasoning 回放(DeepSeek 式)与签名校验验证的就是这些字节,任何改写都会让它们失步并卡死会话(#1960/KDD#10)。适配器侧走 `createIdentityStreamFilter`,strip 函数(`stripOpenaiChatText`、`stripResponsesText`)同样不动它们(纵深防御)。**注意:这翻转了 #1881 时代的 reasoning 回声剥离 —— 思考通道不再清洗。**
+2. **模型的正文输出可以治理。** 渲染标签回声、marker 行、bili 内部文本、退化开/闭名残骸,以及(absorb 受指令时)整段工具调用 emission,只在可见文本通道剥离。
+3. **模型写入文件的内容逐字节不变(#1039)。** 工具调用 arguments 无论携带什么字节都不进任何过滤器。
+4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
+
+出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。
