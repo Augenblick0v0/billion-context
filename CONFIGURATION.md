@@ -110,6 +110,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
+| `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md. |
 
 **MITM lane**
 
@@ -676,6 +677,49 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** `{}` (attach gate closed for lane'd instances)
 - **Status:** ACTIVE
 - **Description:** Native-hook attach policy (#1335). Lane'd native hooks attach to a running proxy only when it reports an armed session-lifecycle watchdog; an unarmed lane'd listener (a crashed session's orphan) is refused loudly instead of being silently ridden — a manually started `bili start` daemon (no lane) is user-zone and attachable by default (#1660). Set `attachExternal: true` to attach to *lane'd* unarmed listeners anyway (any code/lane-compatible listener becomes attachable regardless of watchdog state, including pre-#1330 builds). Overridden by `BILI_NATIVE_ATTACH_EXTERNAL` (`1` opens the gate even over a closed file; `0` closes it even over a permissive file). Full mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660).
+
+### `pi`
+
+- **Type:** `{ subagents?: PiSubagentsFileConfig | boolean }`
+- **Default:** `{}` (acp_delegate surface enabled with package defaults)
+- **Status:** ACTIVE (#2230 config-home)
+- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the standalone `billion-context-pi-subagents` package reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
+
+```jsonc
+"pi": {
+  "subagents": {
+    "enabled": true,              // master switch; false (or "subagents": false) removes tools+prompt+shortcut (new session)
+    "forceEnable": false,        // keep acp_delegate even when a project-scope pi-subagents install is detected (#415)
+    "displayUsage": "separate",  // "separate" (own footer block) | "merged" (folded into tool-result usage)
+    "maxDepth": 2,               // nesting depth cap, propagated to children
+    "syncTimeoutMinutes": 5,     // hard timeout for sync delegates; 0/null disables
+    "idleTimeoutMinutes": 5,     // idle watchdog for async delegates; 0/null disables (warns)
+    "asyncTimeoutMinutes": 30,   // hard limit for async delegates; 0/null disables
+    "maxConcurrent": 4,          // cap on concurrent background delegates (default unlimited; extras queue)
+    "thinkingLevel": "medium",   // off|minimal|low|medium|high|xhigh|max; priority per-call > role > this > pi default
+    "agents": {                  // per-role defaults: { model: "provider/id", thinkingLevel: "…" }
+      "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
+    },
+    "notifyIfRead": "skip",      // "skip" — no completion nudge if the model already read the result file
+    "fleetShortcut": "ctrl+alt+d", // "" disables the keyboard shortcut (/acp-fleet still works)
+    "prompt": null,              // replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS appendix
+    "debug": false               // debug events in ~/.pi/acp.log, scoped to sub-agents
+  }
+}
+```
+
+**Env overrides** (per-process spawn channels, propagate to delegate children; `PI_ACP_DELEGATE_*` > `pi.subagents` > deprecated acp.json > default):
+
+| Env var | Overrides | Notes |
+|---|---|---|
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents.forceEnable` | `true`/`false`; unparseable values warn and fall back to the file value. |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents.maxDepth` | Integer ≥ 1; invalid warns and falls back. |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents.syncTimeoutMinutes` | `0` disables; negative/non-numeric warns and falls back. |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents.idleTimeoutMinutes` | `0` disables (warns — hung children then need `acp_delegate_cancel`). |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` disables. |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | Integer ≥ 1; invalid falls through to the file value, then unlimited. |
+
+Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme).
 
 ### Process-level blocks (#2030)
 
@@ -1481,6 +1525,12 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
 <!-- /bili:gen -->
 

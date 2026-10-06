@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { wirePiSubagents } from "../src/agent/pi-subagents.ts";
+import { piSubagentsAdapter, wirePiSubagents } from "../src/agent/pi-subagents.ts";
 import type { ExtensionAPI, CommandCtx } from "../src/agent/pi.ts";
 
 // #2186: hermetic wiring tests for the inlined acp_delegate surface. The
@@ -11,9 +11,13 @@ import type { ExtensionAPI, CommandCtx } from "../src/agent/pi.ts";
 // the registration lifecycle is driven: agent gate, embedded-marker
 // check-before-claim, session_start registration, prompt append, read-tracking
 // dispatch. HOME is redirected before any import so loadSubagentsUserConfig /
-// findPiSubagentsInstalls see an empty world, not the developer's real ~/.pi.
+// findPiSubagentsInstalls see an empty world, not the developer's real ~/.pi;
+// BILI_CONFIG_FILE likewise isolates the #2230 pi.subagents config-home read
+// from the developer's real billion-context.json.
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pi-subagents-home-"));
 process.env.HOME = HOME;
+const BILI_CONFIG_FILE = path.join(HOME, "billion-context.json");
+process.env.BILI_CONFIG_FILE = BILI_CONFIG_FILE;
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -144,7 +148,18 @@ test("acp-fleet command handler notifies instead of opening the inspector when d
     const ctx = sessionCtx();
     fs.mkdirSync(path.join(ctx.cwd, ".pi"), { recursive: true });
     fs.writeFileSync(path.join(ctx.cwd, ".pi", "acp.json"), JSON.stringify({ delegate: { enabled: false } }));
-    await handlers.get("session_start")!(undefined, ctx);
+    // This is the deprecated fallback path now (#2230): acp.json keys still
+    // work but must say so loudly. Spy (and silence) the warning — the
+    // one-shot flag is module-global, and this is the first fallback test.
+    const errors: string[] = [];
+    const savedError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.join(" ")) };
+    try {
+        await handlers.get("session_start")!(undefined, ctx);
+    } finally {
+        console.error = savedError;
+    }
+    assert.ok(errors.some((e) => /deprecated/.test(e) && /pi/.test(e)), `deprecation warning logged, got: ${errors.join(" | ")}`);
     assert.deepEqual(tools, []);
     assert.deepEqual(commands, ["acp-fleet"]);
     const opts = commandOpts.get("acp-fleet");
@@ -172,4 +187,88 @@ test("project-scope pi-subagents install stands acp_delegate down (#415)", async
     assert.equal(ctx.ui.notifications.length, 1);
     assert.match(ctx.ui.notifications[0][0], /pi-subagents detected/);
     assert.equal(ctx.ui.notifications[0][1], "warning");
+});
+
+// --- #2230 config-home: pi.subagents in billion-context.json ---
+
+function writeBiliConfig(value: unknown): void {
+    fs.writeFileSync(BILI_CONFIG_FILE, JSON.stringify(value));
+}
+
+function clearBiliConfig(): void {
+    fs.rmSync(BILI_CONFIG_FILE, { force: true });
+}
+
+test("pi.subagents enabled:false drops the tools, prompt section and shortcut", async () => {
+    clearBiliConfig();
+    writeBiliConfig({ pi: { subagents: { enabled: false } } });
+    const { pi, handlers, tools, shortcuts } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    await handlers.get("session_start")!(undefined, ctx);
+    assert.deepEqual(tools, []);
+    assert.equal(shortcuts.length, 0);
+    const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "BASE" }, ctx) as { systemPrompt: string } | undefined;
+    assert.equal(prompt, undefined, "no prompt event result while disabled");
+});
+
+test("pi.subagents boolean shorthand false is equivalent", async () => {
+    writeBiliConfig({ pi: { subagents: false } });
+    const { pi, handlers, tools } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    await handlers.get("session_start")!(undefined, sessionCtx());
+    assert.deepEqual(tools, []);
+});
+
+test("pi.subagents section owns the config: acp.json keys are ignored when both exist", async () => {
+    writeBiliConfig({ pi: { subagents: { enabled: true } } });
+    const { pi, handlers, tools } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    fs.mkdirSync(path.join(ctx.cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(ctx.cwd, ".pi", "acp.json"), JSON.stringify({ delegate: { enabled: false } }));
+    await handlers.get("session_start")!(undefined, ctx);
+    assert.equal(tools.length, 3, "bili section wins over the disabled acp.json keys");
+});
+
+test("pi.subagents prompt rename replaces the delegate appendix", async () => {
+    writeBiliConfig({ pi: { subagents: { prompt: "CUSTOM-PROMPT-MARKER" } } });
+    const { pi, handlers } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    await handlers.get("session_start")!(undefined, sessionCtx());
+    const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "BASE" }, sessionCtx()) as { systemPrompt: string };
+    assert.ok(prompt.systemPrompt.includes("CUSTOM-PROMPT-MARKER"), "custom prompt present");
+    assert.ok(!prompt.systemPrompt.includes("ACP_DELEGATE"), "built-in appendix replaced");
+});
+
+test("pi.subagents section values flow through session_start without breaking registration", async () => {
+    writeBiliConfig({ pi: { subagents: { debug: true, maxConcurrent: 2 } } });
+    const { pi, handlers, tools } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    await handlers.get("session_start")!(undefined, sessionCtx());
+    assert.equal(tools.length, 3);
+});
+
+// The mapper is the single translation point onto the package adapter shape
+// (cross-repo file-format contract); debug/maxConcurrent have no hermetically
+// observable wiring-level effect, so the mapping is pinned here directly.
+test("piSubagentsAdapter maps the pi.subagents section onto the package adapter shape", () => {
+    assert.deepEqual(piSubagentsAdapter(false), { delegate: { enabled: false } });
+    assert.deepEqual(piSubagentsAdapter(true), {});
+    assert.deepEqual(piSubagentsAdapter({}), {});
+    assert.deepEqual(piSubagentsAdapter({ enabled: false }), { delegate: { enabled: false } });
+    assert.deepEqual(
+        piSubagentsAdapter({ debug: true, maxConcurrent: 2, displayUsage: "merged", prompt: "P", thinkingLevel: "low" }),
+        { delegate: { maxConcurrent: 2, displayUsage: "merged", thinkingLevel: "low" }, delegatePrompt: "P", debug: true },
+    );
 });

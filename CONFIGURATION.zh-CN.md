@@ -110,6 +110,7 @@
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | 面向缓存感知路由选择的提示词缓存路由姿态。 |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | 允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
+| `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 
 **MITM 通道**
 
@@ -676,6 +677,49 @@
 - **默认值：** `{}`（lane'd 实例的 attach 门关闭）
 - **状态：** ACTIVE
 - **说明：** native hook attach 策略（#1335）。lane'd native hook 仅在运行中的代理报告了已武装的会话生命周期看门狗时才 attach；未武装的 lane'd listener（崩溃会话的孤儿）被大声拒收而不是被静默搭车 —— 手动启动的 `bili start` 守护（无 lane）属用户区，默认可 attach（#1660）。设 `attachExternal: true` 仍可 attach 到 *lane'd* 未武装 listener（任何代码/lane 兼容的 listener 均可 attach，不论看门狗状态，包括 pre-#1330 构建）。可由 `BILI_NATIVE_ATTACH_EXTERNAL` 覆盖（`1` 即使文件关闭也开门；`0` 即使文件宽松也关门）。完整机制见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#proxy-reuse-and-the-attach-gate-1225-1335-1232-1660)。
+
+### `pi`
+
+- **类型：** `{ subagents?: PiSubagentsFileConfig | boolean }`
+- **默认值：** `{}`（acp_delegate 面按包默认值启用）
+- **状态：** ACTIVE（#2230 配置搬家）
+- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
+
+```jsonc
+"pi": {
+  "subagents": {
+    "enabled": true,              // 总开关；false（或 "subagents": false）移除工具+提示词+快捷键（新会话生效）
+    "forceEnable": false,        // 检测到项目级 pi-subagents 安装时仍保留 acp_delegate（#415）
+    "displayUsage": "separate",  // "separate"（独立 footer 块）| "merged"（并入工具结果用量）
+    "maxDepth": 2,               // 嵌套深度上限，向子进程传播
+    "syncTimeoutMinutes": 5,     // 同步 delegate 硬超时；0/null 关闭
+    "idleTimeoutMinutes": 5,     // 异步 delegate 空闲看门狗；0/null 关闭（告警）
+    "asyncTimeoutMinutes": 30,   // 异步 delegate 硬时限；0/null 关闭
+    "maxConcurrent": 4,          // 后台并发上限（默认无限；超出排队）
+    "thinkingLevel": "medium",   // off|minimal|low|medium|high|xhigh|max；优先级 每次调用 > 角色 > 此处 > pi 默认
+    "agents": {                  // 角色默认：{ model: "provider/id", thinkingLevel: "…" }
+      "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
+    },
+    "notifyIfRead": "skip",      // "skip" —— 模型已读结果文件则不再补发完成通知
+    "fleetShortcut": "ctrl+alt+d", // "" 关闭快捷键（/acp-fleet 仍可用）
+    "prompt": null,              // 替换（字符串）或移除（null）ACP_DELEGATE NOTIFICATIONS 附录
+    "debug": false               // ~/.pi/acp.log 调试事件，仅限子代理子系统
+  }
+}
+```
+
+**环境变量覆盖**（进程级 spawn 通道，随子代理子进程传播；`PI_ACP_DELEGATE_*` > `pi.subagents` > 已废弃 acp.json > 默认）：
+
+| 环境变量 | 覆盖 | 说明 |
+|---|---|---|
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents.forceEnable` | `true`/`false`；非法值告警并回退到文件值。 |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents.maxDepth` | ≥1 整数；非法值告警并回退。 |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents.syncTimeoutMinutes` | `0` 关闭；负数/非数字告警并回退。 |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents.idleTimeoutMinutes` | `0` 关闭（告警 —— 挂死子进程需 `acp_delegate_cancel`）。 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` 关闭。 |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | ≥1 整数；非法值回落到文件值，再回落到无限。 |
+
+修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme)。
 
 ### 进程级配置块（#2030）
 
@@ -1486,6 +1530,12 @@
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
+| `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
 <!-- /bili:gen -->
 
