@@ -38,6 +38,7 @@ const {
     _resetInstallBackoffForTest,
     _resetUpdateThrottleForTest,
     _installBackoffStateForTest,
+    _backoffCooldownForTest,
     _reloadBackoffsForTest,
     clearOwnerLaneBackoff,
     ownerLaneKey,
@@ -536,6 +537,10 @@ test("a corrupt or clock-skewed backoff state file biases toward retrying, never
         stubRegistryFetch(fx2.tgz, "https://registry.test/bc2-2.0.0.tgz", "2.0.0", integrityField(fx2.tgz), hits);
         const hitsBefore = hits.count;
         _reloadBackoffsForTest();
+        // non-vacuous: prove the skew entry is dropped AT LOAD/GATE TIME, not
+        // merely overwritten by a later persist racing the file
+        assert.equal(await _backoffCooldownForTest(key), false, "a clock-skewed entry must be dropped at the gate, never obeyed");
+        assert.equal(_installBackoffStateForTest()[key], undefined, "the skew entry must not live in the map after load");
         await refreshDshDesktopCopy("2.0.0", log, process.env);
         assert.ok(hits.count > hitsBefore, `a clock-skewed state entry must be dropped, not obeyed: ${lines.join(" | ")}`);
         assert.ok(_installBackoffStateForTest()[key] === undefined, "the healthy run cleared the lane key");

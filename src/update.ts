@@ -20,7 +20,7 @@
  * version and stops trying. No notified Set — failed installs retry next
  * cycle automatically.
  */
-import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, rename, mkdtemp, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink, lstat, stat, rename, mkdtemp, readdir } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import crypto from "node:crypto";
@@ -173,53 +173,140 @@ const installBackoffRemediatedKeys = new Set<string>();
 // via a small JSON state file in the cache dir. The map alone is per-process,
 // so k running instances (global + one proxy per dsh profile) each carried an
 // independent 3-strike budget and multiplied the retry rate k×. The file is
-// the cross-process carrier; the in-memory map is a write-through cache, and
-// sharing is approximate (concurrent writers are last-write-wins — good
-// enough for bounding a retry loop). Every failure mode of the FILE biases
-// toward RETRYING, never toward silence: unreadable/corrupt → treated empty,
+// the cross-process carrier; the in-memory map is a write-through cache.
+// Sharing is cooperative, not locked, and every failure mode biases toward
+// RETRYING, never toward silence: unreadable/corrupt file → treated empty,
 // entries whose nextRetryAt is beyond now+cap (jumped clock, bit rot) →
 // dropped so the lane re-arms, stale entries → pruned. Bad state on disk can
-// never permanently stop an update lane.
+// never permanently stop an update lane. Writers merge with what is on disk
+// (they never stomp entries another process armed) and write atomically
+// (tmp+rename) so a concurrent reader never sees a torn file; long-lived
+// processes re-read the file when its mtime moves so a manual disarm by one
+// copy is visible to the others on their next gate check.
 const BACKOFF_STATE_FILE = path.join(cacheDir(), ".install-backoff.json");
 // Entries untouched for a week are gone for good: every cooldown is capped at
 // 6 h, so a week-old entry can only be residue of a dead version key.
 const BACKOFF_PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 let backoffsLoaded = false;
+// -1 = never looked, 0 = confirmed absent (or unreadable at last look), >0 =
+// the mtime we last incorporated into the in-memory map.
+let backoffFileMtime = -1;
 
-async function ensureBackoffsLoaded(): Promise<void> {
-    if (backoffsLoaded) return;
-    backoffsLoaded = true;
+interface PersistedBackoff {
+    count: number;
+    nextRetryAt: number;
+    updatedAt: number;
+}
+
+function validatePersisted(val: unknown, now: number): PersistedBackoff | undefined {
+    const b = val as { count?: unknown; nextRetryAt?: unknown; updatedAt?: unknown } | null;
+    if (!b || typeof b !== "object") return undefined;
+    if (typeof b.count !== "number" || typeof b.nextRetryAt !== "number" || typeof b.updatedAt !== "number") return undefined;
+    if (!Number.isFinite(b.count) || !Number.isFinite(b.nextRetryAt) || !Number.isFinite(b.updatedAt)) return undefined;
+    if (b.count <= 0) return undefined;
+    // clock-skew / corruption guard: a cooldown beyond now+cap can only come
+    // from a jumped clock or a damaged file. Drop it so the lane re-arms
+    // instead of going silent for weeks.
+    if (b.nextRetryAt > now + BACKOFF_CAP_MS) return undefined;
+    // stale: untouched for a week → residue of a dead key.
+    if (b.updatedAt < now - BACKOFF_PRUNE_MS) return undefined;
+    return { count: b.count, nextRetryAt: b.nextRetryAt, updatedAt: b.updatedAt };
+}
+
+async function statBackoffFile(): Promise<number> {
+    try {
+        return (await stat(BACKOFF_STATE_FILE)).mtimeMs;
+    } catch {
+        return 0; // absent
+    }
+}
+
+/** Best-effort read. `undefined` = absent or unreadable/corrupt (bias:
+ *  retry). A parsed file always returns, even with zero valid entries. */
+async function readBackoffFile(): Promise<{ mtime: number; entries: Map<string, PersistedBackoff> } | undefined> {
+    const mtime = await statBackoffFile();
+    if (mtime === 0) return undefined;
     let raw: string;
     try {
         raw = await readFile(BACKOFF_STATE_FILE, "utf-8");
     } catch {
-        return; // absent or unreadable → start empty (bias: retry)
+        return undefined;
     }
     try {
         const doc = JSON.parse(raw) as { v?: unknown; entries?: unknown };
-        if (!doc || typeof doc !== "object" || doc.v !== 1 || !doc.entries || typeof doc.entries !== "object" || Array.isArray(doc.entries)) return;
+        if (!doc || typeof doc !== "object" || doc.v !== 1 || !doc.entries || typeof doc.entries !== "object" || Array.isArray(doc.entries)) return undefined;
         const now = Date.now();
+        const entries = new Map<string, PersistedBackoff>();
         for (const [key, val] of Object.entries(doc.entries as Record<string, unknown>)) {
-            const b = val as { count?: unknown; nextRetryAt?: unknown; updatedAt?: unknown };
-            if (typeof b?.count !== "number" || typeof b?.nextRetryAt !== "number" || typeof b?.updatedAt !== "number") continue;
-            if (!Number.isFinite(b.count) || b.count <= 0 || !Number.isFinite(b.nextRetryAt) || !Number.isFinite(b.updatedAt)) continue;
-            // clock-skew / corruption guard: a cooldown beyond now+cap can only
-            // come from a jumped clock or a damaged file. Drop it so the lane
-            // re-arms instead of going silent for weeks.
-            if (b.nextRetryAt > now + BACKOFF_CAP_MS) continue;
-            // stale: untouched for a week → residue of a dead key.
-            if (b.updatedAt < now - BACKOFF_PRUNE_MS) continue;
-            if (!installBackoffs.has(key)) installBackoffs.set(key, { count: b.count, nextRetryAt: b.nextRetryAt, updatedAt: b.updatedAt });
+            const v = validatePersisted(val, now);
+            if (v) entries.set(key, v);
         }
+        return { mtime, entries };
     } catch {
-        return; // corrupt JSON → empty (bias: retry)
+        return undefined; // corrupt JSON → treated empty (bias: retry)
     }
 }
 
-async function persistBackoffs(): Promise<void> {
+/** Fold a successfully-read file into the in-memory map. File entries newer
+ *  than ours (or unknown to us) win — another process armed them after our
+ *  last look. A memory key ABSENT from the file was cleared or pruned by
+ *  someone else (the file was rewritten after we last touched the key) —
+ *  drop it so a manual disarm survives contact with other processes.
+ *  `skipAdopt` keeps keys we are actively clearing from being adopted back
+ *  from the stale file content. */
+function mergeFromFile(f: { mtime: number; entries: Map<string, PersistedBackoff> }, skipAdopt?: Set<string>): void {
+    for (const [key, v] of f.entries) {
+        const m = installBackoffs.get(key);
+        if (m ? v.updatedAt > m.updatedAt : !skipAdopt?.has(key)) installBackoffs.set(key, v);
+    }
+    for (const [key, m] of [...installBackoffs]) {
+        if (!f.entries.has(key) && f.mtime > m.updatedAt) installBackoffs.delete(key);
+    }
+    backoffFileMtime = f.mtime;
+}
+
+async function ensureBackoffsLoaded(): Promise<void> {
+    if (backoffsLoaded) return;
+    backoffsLoaded = true;
+    const f = await readBackoffFile();
+    if (!f) {
+        backoffFileMtime = 0;
+        return;
+    }
+    mergeFromFile(f);
+}
+
+/** #2206 follow-up: long-lived proxies load the file once; without this a
+ *  manual `bili plugin update` disarm by ANOTHER process would stay invisible
+ *  to them until restart (≤6 h self-heal). Gate checks are infrequent
+ *  (minutes apart), so a stat-per-gate is cheap. Only a successfully parsed
+ *  NEWER file can drop keys; unreadable/corrupt keeps memory (bias: retry).
+ *  An absent file after we had seen one means someone cleared it (the empty
+ *  map is rm'd by the writer) → drop everything. */
+async function syncBackoffsIfFileChanged(): Promise<void> {
+    const mtime = await statBackoffFile();
+    if (mtime === backoffFileMtime) return;
+    const f = await readBackoffFile();
+    if (f) {
+        mergeFromFile(f);
+        return;
+    }
+    if (backoffFileMtime > 0 && mtime === 0) installBackoffs.clear();
+    backoffFileMtime = mtime;
+}
+
+/** Write the merged state atomically (tmp+rename) so a concurrent reader
+ *  never sees a torn file. Never rejects — an unwritable cache dir degrades
+ *  to per-process memory (bias: retry). */
+async function persistBackoffs(skipAdopt?: Set<string>): Promise<void> {
     try {
+        // merge first: never stomp entries another process armed, and drop
+        // keys another process cleared (bounded races here only delay a
+        // manual disarm by one cycle — never silence a lane).
+        const f = await readBackoffFile();
+        if (f) mergeFromFile(f, skipAdopt);
         const now = Date.now();
-        const entries: Record<string, { count: number; nextRetryAt: number; updatedAt: number }> = {};
+        const entries: Record<string, PersistedBackoff> = {};
         let live = 0;
         for (const [key, b] of installBackoffs) {
             if (b.updatedAt < now - BACKOFF_PRUNE_MS) continue; // prune stale on write
@@ -229,8 +316,12 @@ async function persistBackoffs(): Promise<void> {
         await mkdir(path.dirname(BACKOFF_STATE_FILE), { recursive: true });
         if (live === 0) {
             await rm(BACKOFF_STATE_FILE, { force: true });
+            backoffFileMtime = 0;
         } else {
-            await writeFile(BACKOFF_STATE_FILE, JSON.stringify({ v: 1, entries }), "utf-8");
+            const tmp = `${BACKOFF_STATE_FILE}.${process.pid}.tmp`;
+            await writeFile(tmp, JSON.stringify({ v: 1, entries }), "utf-8");
+            await rename(tmp, BACKOFF_STATE_FILE); // atomic swap
+            backoffFileMtime = await statBackoffFile();
         }
     } catch {
         // best-effort: an unwritable cache dir degrades to per-process memory
@@ -241,6 +332,7 @@ export async function _resetInstallBackoffForTest(): Promise<void> {
     installBackoffs.clear();
     installBackoffRemediatedKeys.clear();
     backoffsLoaded = false;
+    backoffFileMtime = -1;
     await rm(BACKOFF_STATE_FILE, { force: true });
 }
 
@@ -251,6 +343,7 @@ export function _reloadBackoffsForTest(): void {
     installBackoffs.clear();
     installBackoffRemediatedKeys.clear();
     backoffsLoaded = false;
+    backoffFileMtime = -1;
 }
 
 /** Test-only snapshot of the live backoff entries (key → streak state). */
@@ -272,14 +365,22 @@ export function ownerLaneKey(lane: "dsh-desktop" | "dsh-profile" | "pi-npm", ver
 
 async function backoffInCooldown(key: string): Promise<boolean> {
     await ensureBackoffsLoaded();
+    await syncBackoffsIfFileChanged();
     const b = installBackoffs.get(key);
     return !!b && Date.now() < b.nextRetryAt;
+}
+
+/** Test-only: run a gate check for one key (load + mtime sync + check). */
+export async function _backoffCooldownForTest(key: string): Promise<boolean> {
+    return backoffInCooldown(key);
 }
 
 async function clearInstallBackoff(key: string): Promise<void> {
     await ensureBackoffsLoaded();
     const had = (installBackoffs.delete(key) ? 1 : 0) | (installBackoffRemediatedKeys.delete(key) ? 1 : 0);
-    if (had) void persistBackoffs();
+    // skipAdopt: do not read the key we are clearing back from the file —
+    // the on-disk copy is stale by exactly this clear.
+    if (had) await persistBackoffs(new Set([key]));
 }
 
 /** #2192: manual repair hook — `bili plugin update`'s dsh lane calls this on
@@ -330,15 +431,15 @@ async function recordInstallFailure(key: string, error: string, installDir: stri
     b.count += 1;
     b.updatedAt = now;
     if (b.count >= BACKOFF_THRESHOLD) {
-        // arm BEFORE persisting: persistBackoffs runs its snapshot
-        // synchronously, so a write scheduled earlier would freeze the
-        // pre-assignment nextRetryAt (=0, unarmed) into the state file.
+        // arm BEFORE persisting: the persist merge must see the armed
+        // nextRetryAt, not the pre-assignment value (=0, unarmed).
         b.nextRetryAt = now + backoffMs(b.count);
     }
     installBackoffs.set(key, b);
-    void persistBackoffs(); // write-through even below threshold: crash-looping
+    await persistBackoffs(); // write-through even below threshold: crash-looping
     // processes never reach 3 strikes in one life, so early strikes must
-    // survive restarts for the machine-wide budget to arm.
+    // survive restarts for the machine-wide budget to arm. Awaited so the
+    // state file is on disk before the caller (and a test) looks at it.
     const note = installDirNote(installDir);
     if (b.count < BACKOFF_THRESHOLD) {
         loggerLog("warn", `[update] install failed: ${error}${note}. Will retry next cycle.`);
