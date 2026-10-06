@@ -1860,6 +1860,41 @@ function rootFromDistFile(file: string): string {
     return path.dirname(path.dirname(path.dirname(file)));
 }
 
+/** #1234/#2199: on-disk root of the OpenCode v2 cache copy of billion-context —
+ *  $XDG_CACHE_HOME/opencode/npm/billion-context@<spec>/<ts>/node_modules/billion-
+ *  context (newest spec slot, newest timestamp wins). Read-only; undefined when
+ *  no cache copy exists. Lets doctor / `plugin update` report the ACTUAL load
+ *  path + disk version instead of guessing or claiming "not resolvable". Bili
+ *  reads/updates this INNER copy only — it never edits opencode's outer
+ *  package.json/package-lock.json nor deletes its cache, so drift between the
+ *  outer lockfile and the inner package version is expected and left alone. */
+export function opencodeCacheCopyRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const xdgCache = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.trim().length > 0 ? env.XDG_CACHE_HOME : path.join(os.homedir(), ".cache");
+    const npm = path.join(xdgCache, "opencode", "npm");
+    let slots: string[];
+    try {
+        slots = fs.readdirSync(npm);
+    } catch {
+        return undefined;
+    }
+    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort().reverse()) {
+        let stamps: string[];
+        try {
+            stamps = fs.readdirSync(path.join(npm, slot));
+        } catch {
+            continue;
+        }
+        for (const stamp of stamps.sort().reverse()) {
+            const root = path.join(npm, slot, stamp, "node_modules", DSH_PACKAGE);
+            try {
+                fs.accessSync(root);
+                return root;
+            } catch {}
+        }
+    }
+    return undefined;
+}
+
 export function inspectLanePresence(agent: PluginAgent): LanePresence {
     if (agent === "pi") {
         const root = selfPackageRoot();
@@ -1986,6 +2021,14 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         if (hasMcp) out.pointers.push("mcp.bili");
         if (listed.includes(OPENCODE_NPM_ENTRY)) {
             out.form = "npm";
+            // #1234/#2199: the bare npm entry is materialized into opencode's
+            // cache — surface the actual copy root + disk version so doctor can
+            // report staleness honestly instead of "version not resolvable".
+            const cacheRoot = opencodeCacheCopyRoot();
+            if (cacheRoot !== undefined) {
+                out.targets.push(cacheRoot);
+                out.copyVersion = pkgVersionAt(cacheRoot);
+            }
         } else if (listed.includes(dir)) {
             out.form = "local-path";
             out.targets.push(path.join(dir, "index.js"));
@@ -2124,16 +2167,19 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
 }
 
 // #991 single-writer: every lane's update path, user-facing. Host-managed
-// copies (pi's npm entry, opencode's plugin dir) are only ever updated by
-// their host; dsh profile bundles track the global version; reference lanes
-// (omp/claude/codex/kimi/hermes/zcode) follow the global bili install itself —
-// hermes additionally re-copies its Python files via `bili plugin update hermes`.
+// copies (pi's npm entry, opencode's DATA-HOME plugin tree) are only ever updated
+// by their host; EXCEPT the opencode v2 CACHE copy (~/.cache/opencode/npm/...),
+// which is bili-owned IN PLACE and self-updates through its own proxy (#1234) — a
+// different tree from the data-home one. dsh profile bundles track the global
+// version; reference lanes (omp/claude/codex/kimi/hermes/zcode) follow the global
+// bili install itself — hermes additionally re-copies its Python files via
+// `bili plugin update hermes`.
 export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     pi: "pi update --extension npm:billion-context (pi owns the npm copy; its proxy self-drives the refresh every check cycle, #1196)",
     omp: "the global bili install (entry points at it)",
     claude: "the global bili install (hook/MCP point at it)",
     codex: "the global bili install (the mcp launcher shells out to it)",
-    opencode: "opencode's own plugin manager (opencode owns the copy)",
+    opencode: "the cache copy self-updates in place via its own proxy (#1234); OpenCode v2 'plugin update' is an extra manual channel — reload/restart OpenCode after a disk update to activate",
     dsh: "the global bili self-update (profile bundles track it)",
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
@@ -2154,10 +2200,13 @@ export interface PluginUpdateOpts {
  *  date, each through its OWN owner (#991 single-writer):
  *  - reference lanes (omp/claude/codex/kimi) need nothing per-lane: they
  *    point at the global install, so only the global copy updates;
- *  - host-managed copies (pi npm entry, opencode plugin entry) are never
- *    overwritten by bili — the report says which host command upgrades
+ *  - host-managed copies (pi npm entry, opencode DATA-HOME plugin entry) are
+ *    never overwritten by bili — the report says which host command upgrades
  *    them (the pi copy's own proxy also self-refreshes through pi's
- *    update channel on its periodic check, #1196);
+ *    update channel on its periodic check, #1196). The opencode v2 CACHE copy
+ *    is the exception (#1234): bili-owned in place, self-updated by its own
+ *    proxy — `plugin update opencode` does NOT run opencode's upgrade, it only
+ *    reports that the cache copy manages itself and needs a host reload to activate;
  *  - dsh profile bundles are re-resolved to the latest registry version
  *    through dsh's own plugin channel.
  *  Returns user-facing lines. Network is only touched when a dsh profile
@@ -2197,7 +2246,11 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
-            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"];
+            const root = opencodeCacheCopyRoot();
+            const ver = root !== undefined ? pkgVersionAt(root) : undefined;
+            const where = root !== undefined ? ` (${root})` : "";
+            const v = ver !== undefined ? ` v${ver}` : "";
+            return [`opencode: the cache copy is bili-owned and self-updates in place through its own proxy${where}${v} (#1234) — this command does NOT run opencode's upgrade; OpenCode v2 'plugin update' is an extra manual channel, and reload/restart OpenCode after a disk update to activate it`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
