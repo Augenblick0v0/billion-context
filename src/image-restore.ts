@@ -69,10 +69,13 @@ function b64Bytes(b64: string): number {
 }
 
 /** The base64 images this core message carries, in wire order, across all four
- *  protocols (anthropic / openai / responses / google). URL-sourced images whose
- *  bytes we cannot obtain (non-data URLs) yield no entry — only carryable
- *  base64 payloads are indexed. Returns [] for plain-text messages (the common
- *  case). */
+ *  protocols (anthropic / openai / responses / google) — INCLUDING images nested
+ *  in tool results (anthropic tool_result.content, Responses function_call_output
+ *  .output, Gemini functionResponse.parts), which the strip side also removes:
+ *  every stripped shape must have a recovery path or it is lost forever (#1995).
+ *  URL/fileData-sourced images whose bytes we cannot obtain yield no entry —
+ *  only carryable base64 payloads are indexed. Returns [] for plain-text
+ *  messages (the common case). */
 export function messageImageBytes(m: CoreMessage): RestorableImage[] {
     const mm = m as BiliMessage;
     const out: RestorableImage[] = [];
@@ -92,22 +95,51 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
         }
         return out;
     }
+    // Anthropic tool_results carry images NESTED in their content array — the
+    // strip side removes them (stripNestedImages), so they must be indexed here
+    // too or that whole class would be stripped-but-unrecoverable (#1995).
+    if (isObj(ab) && ab.type === "tool_result" && Array.isArray(ab.content)) {
+        for (const c of ab.content) {
+            if (!isObj(c) || c.type !== "image") continue;
+            const s = c.source;
+            const mediaType = isObj(s) && typeof s.media_type === "string" ? s.media_type : "image/png";
+            if (!isObj(s)) continue;
+            if (s.type === "base64" && typeof s.data === "string") {
+                out.push({ mediaType, b64: s.data, bytes: b64Bytes(s.data) });
+            } else if (s.type === "url") {
+                const r = dataUrlRef(s.url);
+                if (r?.b64) out.push({ mediaType: r.mediaType ?? mediaType, b64: r.b64, bytes: b64Bytes(r.b64) });
+            }
+        }
+        return out;
+    }
     // Responses: the original item keeps every input_image part (the singular
     // imageBase64 sidecar covers only the first), so walk the item's content.
+    // Tool outputs (function_call_output / custom_tool_call_output) keep their
+    // parts in `.output` instead of `.content` — the strip side reads them from
+    // there, so the index must too (#1995 nested-tool-image parity).
     const ri = mm.rawResponsesItem;
-    if (isObj(ri) && Array.isArray(ri.content)) {
-        for (const part of ri.content) {
-            if (!isObj(part) || part.type !== "input_image") continue;
-            const u = isObj(part.image_url) ? part.image_url.url : part.image_url;
-            const r = dataUrlRef(u);
-            if (r?.b64) out.push({ mediaType: r.mediaType ?? "image/png", b64: r.b64, bytes: b64Bytes(r.b64) });
+    if (isObj(ri)) {
+        const arr = ri.type === "function_call_output" || ri.type === "custom_tool_call_output"
+            ? (Array.isArray(ri.output) ? ri.output : undefined)
+            : (Array.isArray(ri.content) ? ri.content : undefined);
+        if (arr) {
+            for (const part of arr) {
+                if (!isObj(part) || part.type !== "input_image") continue;
+                const u = isObj(part.image_url) ? part.image_url.url : part.image_url;
+                const r = dataUrlRef(u);
+                if (r?.b64) out.push({ mediaType: r.mediaType ?? "image/png", b64: r.b64, bytes: b64Bytes(r.b64) });
+            }
+            if (out.length > 0) return out;
         }
-        if (out.length > 0) return out;
     }
     // Multi-part sources come FIRST: the shared singular imageBase64 sidecar is
     // set by every protocol for a single data-URL image, so checking it earlier
     // would shadow the multi-part fields and drop every image after the first.
-    // Google: inlineData parts (raw base64 in .data, mime in .mimeType).
+    // Google: inlineData parts (raw base64 in .data, mime in .mimeType), plus
+    // images NESTED in functionResponse.parts — the strip side removes those
+    // too (image-mime inlineData/fileData there). fileData entries are remote
+    // references with no carried bytes, so only inlineData is indexable.
     if (Array.isArray(mm.rawGoogleParts)) {
         for (const part of mm.rawGoogleParts as unknown[]) {
             if (!isObj(part)) continue;
@@ -115,6 +147,16 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             if (isObj(inline) && typeof inline.data === "string") {
                 const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
                 out.push({ mediaType, b64: inline.data, bytes: b64Bytes(inline.data) });
+            }
+            const fr = part.functionResponse;
+            if (isObj(fr) && Array.isArray(fr.parts)) {
+                for (const np of fr.parts) {
+                    if (!isObj(np)) continue;
+                    const ni = np.inlineData;
+                    if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
+                        out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
+                    }
+                }
             }
         }
         if (out.length > 0) return out;

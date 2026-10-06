@@ -224,3 +224,55 @@ test("cross-session isolation: same ref number in two sessions never collides", 
     assert.deepEqual(readFileSync(a[1][0].path), Buffer.from(PNG, "base64"));
     assert.deepEqual(readFileSync(b[1][0].path), Buffer.from(GIF, "base64"), "beta restores its own pixels, not alpha's");
 });
+
+test("messageImageBytes: tool-result-nested images are indexed on every wire that strips them", () => {
+    // anthropic tool_result.content — strip side removes these (stripNestedImages),
+    // so the index must see them or they are unrecoverable.
+    const tr = messageImageBytes({ rawAnthropicBlock: { type: "tool_result", tool_use_id: "t1", content: [
+        { type: "text", text: "screenshot attached" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: PNG } },
+        { type: "image", source: { type: "url", url: dataUrl } },
+    ] } } as never);
+    assert.equal(tr.length, 2, "both nested images extracted, text part ignored");
+    assert.equal(tr[0].b64, PNG);
+    assert.equal(tr[1].mediaType, "image/png");
+
+    // responses function_call_output keeps parts in `.output`, not `.content`.
+    const fco = messageImageBytes({ rawResponsesItem: { type: "function_call_output", call_id: "c1", output: [
+        { type: "output_text", text: "see" },
+        { type: "input_image", image_url: dataUrl },
+    ] } } as never);
+    assert.equal(fco.length, 1, "image found in .output array");
+    assert.equal(fco[0].b64, PNG);
+
+    // google functionResponse.parts nested inlineData (image mime only).
+    const fr = messageImageBytes({ rawGoogleParts: [{ functionResponse: { name: "shot", parts: [
+        { inlineData: { mimeType: "image/png", data: PNG } },
+        { inlineData: { mimeType: "application/pdf", data: "AAAA" } }, // document: stripped? no — not an image mime, strip keeps it
+    ] } } ] } as never);
+    assert.equal(fr.length, 1, "nested image-mime inlineData indexed, pdf part left alone");
+
+    // google nested fileData is a remote reference with no bytes -> nothing indexable.
+    const fd = messageImageBytes({ rawGoogleParts: [{ functionResponse: { name: "shot", parts: [
+        { fileData: { mimeType: "image/png", fileUri: "https://files.example/x.png" } },
+    ] } } ] } as never);
+    assert.equal(fd.length, 0, "remote fileData carries no bytes to recover");
+});
+
+test("buildIncomingImageIndex: end-to-end nested tool_result recovery (anthropic)", () => {
+    // A user turn with a tool_use, then a tool_result carrying a screenshot.
+    // The strip side drops the nested image on the next turn; the index must
+    // have spilled it under the tool message's ref before that happens.
+    const idx = buildIndex("anthropic", { model: "claude", messages: [
+        { role: "user", content: [{ type: "text", text: "run it" }, { type: "tool_use", id: "t1", name: "screenshot", input: {} }] },
+        { role: "assistant", content: [{ type: "text", text: "running" }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [
+            { type: "image", source: { type: "base64", media_type: "image/png", data: PNG } },
+        ] }] },
+    ] });
+    assert.equal(idx.size, 1, "the tool_result message is indexed");
+    const [ref, imgs] = [...idx.entries()][0];
+    assert.match(ref, /^m\d+$/);
+    assert.ok(existsSync(imgs[0].path), "nested image spilled at index time");
+    assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "nested pixels round-trip");
+});
