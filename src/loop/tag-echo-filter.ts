@@ -50,16 +50,22 @@ import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-com
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
     const ci = (ch: string) => `[${ch}${ch.toUpperCase()}]`;
-    // #2190 round 2: field-attested drift names OUTSIDE the core+insertion set
-    // (229-session census: accessp×339, acacp×455, acpx×217, acb×229). Exact
-    // enumeration only — every character-class generalization that covers
-    // these also matches real prose words (acgroup/acmap/acstep are
-    // structurally identical to acacp), so each newly observed name is added
-    // here individually, with its census evidence, as it is attested.
+    // #2190 round 2: field-attested drift names OUTSIDE the core+insertion
+    // set. Inclusion rule (round 3 decontamination): a name enters ONLY on
+    // CLEAN spontaneous evidence — block-initial emission, tokens= attribute,
+    // deduped n>=4 — because open-side grep counts are inflated by the model
+    // quoting tag names inside its own reasoning. Qualifying: accessp, acacp,
+    // acb. Considered and EXCLUDED: acpx (raw census ~217 fails the clean
+    // filter — self-referential/constructed hits; one case-variant sighting
+    // only) and acpaa (n=1). Excluded forms are not silent: the fast-path and
+    // filter-release residue audits (#2190) warn on m\d{4,}</word> shapes, so
+    // any production appearance is observable and can earn inclusion later.
+    // Exact enumeration only — every character-class generalization that
+    // covers these also matches real prose words (acgroup/acmap/acstep are
+    // structurally identical to acacp).
     const attestedDrift = [
         "[aA][cC][cC][eE][sS][sS][pP]",
         "[aA][cC][aA][cC][pP]",
-        "[aA][cC][pP][xX]",
         "[aA][cC][bB]",
     ];
     const fourLetter = new Set<string>();

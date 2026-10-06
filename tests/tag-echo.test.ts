@@ -97,7 +97,7 @@ test("stripAcpTags leaves underscore trigger tags intact", () => {
 });
 
 test("stripAcpTags leaves ordinary angle brackets alone", () => {
-    assert.equal(stripAcpTags("a < b and </abcd> and <abc>"), "a < b and </abcd> and <abc>");
+    assert.equal(stripAcpTags("a < b and </abcd> and <acpx>"), "a < b and </abcd> and <acpx>");
 });
 
 test("stripAcpTags: long paired content keeps content, strips tags", () => {

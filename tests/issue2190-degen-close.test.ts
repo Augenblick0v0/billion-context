@@ -196,15 +196,19 @@ test("#2190 responses pipe: done-family full-text payload with degenerate pair i
     assert.ok(text.includes("clean "), "prose survives");
 });
 
-// #2190 round 2: field-attested drift names outside the core+insertion set
-// (229-session census: acacp×455, accessp×339, acb×229, acpx×217). These must
-// be stripped too — every name-derived matcher consumes ACP_NAME_ALT, so the
-// single-point extension in buildAcplikeName() covers gate and filter alike.
+// #2190 round 2: field-attested drift names outside the core+insertion set.
+// Round 3 decontamination (#2190 thread): inclusion requires CLEAN spontaneous
+// evidence (block-initial, tokens= attribute, deduped n>=4) because open-side
+// grep counts are inflated by models quoting tag names in their own reasoning.
+// Qualifying: acacp/accessp/acb. acpx was added in round 2 and REMOVED in
+// round 3 (its raw census ~217 proved self-referential/constructed; one
+// case-variant sighting only) — excluded forms stay observable via the
+// residue audits, so a clean attestation earns re-inclusion later. Every
+// name-derived matcher consumes ACP_NAME_ALT: one point covers gate+filter.
 const DRIFT_FORMS: Array<[string, string, string]> = [
     ["acacp", "\x3cacacp tokens=\"34\" type=\"text\"\x3em00375\x3c/acacp\x3e", "m00375"],
     ["accessp", "\x3caccessp tokens=\"37\" type=\"text\"\x3em07960\x3c/accessp\x3e", "m07960"],
     ["acb", "\x3c" + "acb" + "\x3e" + "m00123" + "\x3c/" + "acb" + "\x3e", "m00123"],
-    ["acpx", "\x3cacpx\x3em00456\x3c/acpx\x3e", "m00456"],
 ];
 
 test("#2190 round 2 streaming: attested drift-name forms are stripped character-by-character", () => {
@@ -233,7 +237,7 @@ test("#2190 round 2 streaming: case-folded drift names strip; cross-name pairing
 
 test("#2190 round 2 stripAcpTags: drift forms die whole-text, genuine words survive byte-identical", () => {
     const leaky = DRIFT_FORMS.map(([, w]) => w).join(" ");
-    assert.equal(stripAcpTags(leaky), "   ", "all four drift spans strip atomically");
+    assert.equal(stripAcpTags(leaky), "  ", "all three drift spans strip atomically");
     const legit = [
         "\x3caccount\x3em00375\x3c/account\x3e",
         "\x3caction\x3em00375\x3c/action\x3e",
@@ -253,9 +257,13 @@ test("#2190 round 2 gate: drift-name heads engage the render-tag predicates once
     assert.equal(mayStartRenderTag("\x3cacacp "), true);
     assert.equal(mayStartRenderTag("\x3caccessp x"), true);
     assert.equal(mayStartRenderTag("\x3c" + "acb" + " "), true);
-    assert.equal(mayStartRenderTag("\x3cacpx"), false, "bare head without terminator: BROAD tail covers it");
-    assert.equal(mayStartDegenerateRenderTag("\x3cacpx"), true, "BROAD tail engages on the bare head");
-    assert.equal(mayStartRenderTag("\x3cacpx\x3e"), true);
+    // acpx boundary pin (round 3 exclusion): NOT in the name set anymore —
+    // the render-tag predicates must stay false for it, while the BROAD tail
+    // keeps engaging the gate so such bytes at least enter the state machine
+    // (and the residue audits observe any release).
+    assert.equal(mayStartRenderTag("\x3cacpx"), false, "excluded form: render-tag predicate stays false");
+    assert.equal(mayStartDegenerateRenderTag("\x3cacpx"), true, "BROAD tail still engages on the bare head");
+    assert.equal(mayStartRenderTag("\x3cacpx\x3e"), false, "excluded form: terminated head stays prose");
     assert.equal(mayStartRenderTag("\x3caccount"), false, "genuine word stays prose");
     assert.equal(mayStartRenderTag("\x3cacgroup"), false, "custom tag stays prose");
 });
