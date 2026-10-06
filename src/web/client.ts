@@ -73,10 +73,18 @@ export const WEB_CLIENT = `(function () {
     // actionable i18n line per resolved client (capped so the banner stays a
     // summary), unknown clients fall back to the generic hint, and every block
     // ends at the docs pointer instead of duplicating the full matrix.
-    function conflictHintKey(cl) {
-        const k = "conflict.hint." + cl;
-        if (MESSAGES[locale][k] !== undefined || MESSAGES["zh-CN"][k] !== undefined) return k;
-        return "conflict.hint.generic";
+    // Explicit branches keep every key a literal t("…") reference so the #1024
+    // liveness gate sees them (dynamic "conflict.hint." + cl reads as dead);
+    // the whitelist mirrors the server map (conflictRemediation), unknown → generic.
+    function conflictHintLine(cl) {
+        switch (cl) {
+            case "opencode": return t("conflict.hint.opencode");
+            case "claude": return t("conflict.hint.claude");
+            case "codex": return t("conflict.hint.codex");
+            case "pi": return t("conflict.hint.pi");
+            case "omp": return t("conflict.hint.omp");
+            default: return t("conflict.hint.generic");
+        }
     }
     function conflictHintBlock(clients) {
         const uniq = [];
@@ -90,7 +98,7 @@ export const WEB_CLIENT = `(function () {
             html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(t("conflict.hint.generic")) + "</div>";
         } else {
             for (const cl of uniq.slice(0, MAX_HINTS)) {
-                html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(t(conflictHintKey(cl))) + "</div>";
+                html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(conflictHintLine(cl)) + "</div>";
             }
             if (uniq.length > MAX_HINTS) html += '<div class="dim small">' + t("conflict.hint_more", { n: uniq.length - MAX_HINTS }) + "</div>";
         }
@@ -1122,7 +1130,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.conflicts_title") + '</span><span class="hint">' + t("det.conflicts_hint") + '</span></div><div class="card-b">');
             // #2219: per-client remediation for THIS session — conflictClient is
             // resolved server-side (sessions-data), unknown/absent → generic hint.
-            parts.push('<div class="mono small dim" style="margin-bottom:8px">' + escapeHtml(t(conflictHintKey(d.conflictClient))) + "</div>");
+            parts.push('<div class="mono small dim" style="margin-bottom:8px">' + escapeHtml(conflictHintLine(d.conflictClient)) + "</div>");
             for (const ev of d.conflicts.slice(-10).reverse()) {
                 parts.push('<div class="alert-row"><span class="mono">' + escapeHtml(fmtDT(ev.at)) + ' · ' + escapeHtml(ev.kind) + "</span><span>" + escapeHtml(ev.detail) + "</span></div>");
             }

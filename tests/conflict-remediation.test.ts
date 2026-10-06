@@ -186,6 +186,6 @@ test("web hint block: zh locale renders the zh hint lines (#2219)", () => {
 
 test("web wiring: banner consumes conflicts.clients, session-detail card consumes conflictClient (#2219)", () => {
     assert.ok(WEB_CLIENT.includes("conflictHintBlock(c.clients)"), "banner wired to summarizeConflicts clients[]");
-    assert.ok(WEB_CLIENT.includes("conflictHintKey(d.conflictClient)"), "session-detail card wired to conflictClient");
+    assert.ok(WEB_CLIENT.includes("conflictHintLine(d.conflictClient)"), "session-detail card wired to conflictClient");
     assert.ok(WEB_CLIENT.includes("window.bili_conflictHintBlock = conflictHintBlock;"), "test seam export present");
 });
