@@ -1,4 +1,5 @@
 import { isCodexClient } from "./codex-compact.js";
+import { isLoopbackAddress } from "./util.js";
 
 export type ConversationIdentity = {
     value: string;
@@ -193,6 +194,46 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
  */
 export function affinityToken(identity: ConversationIdentity): string | undefined {
     return identity.clientProvided ? identity.value : undefined;
+}
+
+/**
+ * #2218: decide whether the proxy stamps `prompt_cache_key` into an outbound
+ * OpenAI chat body on behalf of a plugin host (dsh desktop) whose ONLY
+ * identity signal is the bili-internal x-bili-plugin-conversation header.
+ * Body-keyed relays (the workbuddy panel reads the body only: metadata →
+ * conversation_id → prompt_cache_key → content digest) cannot see any
+ * header, so without the stamp every plugin-lane request falls to a content
+ * digest and any account migration freezes the provider prefix cache.
+ * sub2api's OpenAI wire reads headers first (x-session-id wins), which the
+ * buildForwardTarget x-session-id fix already covers — the body stamp is
+ * specifically for the body-only relay family.
+ *
+ * Returns true only when ALL of:
+ *  - the plugin lane owns the identity (the winning conversation header is
+ *    the bili-internal one, not a header the upstream could read itself);
+ *  - the client sent no prompt_cache_key of its own (client value wins);
+ *  - the destination is admin-configured (provider-rewritten route) or
+ *    loopback — deliberate relay/local deployments. Strict direct APIs can
+ *    400 unknown body params (#1403), so unrouted non-loopback forwards
+ *    stay unstamped.
+ */
+export function shouldStampRelayAffinityPck(
+    identityHeaderName: string | undefined,
+    clientPck: unknown,
+    routeRewrittenUrl: string | undefined,
+    upstreamOrigin: string,
+): boolean {
+    if (identityHeaderName !== "x-bili-plugin-conversation") return false;
+    if (clientPck !== undefined) return false;
+    if (routeRewrittenUrl !== undefined) return true;
+    try {
+        const hostname = new URL(upstreamOrigin).hostname;
+        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
+        // only); a silent miss here would reproduce the zero-signal bug (#2218).
+        return hostname === "localhost" || isLoopbackAddress(hostname);
+    } catch {
+        return false;
+    }
 }
 
 /**
