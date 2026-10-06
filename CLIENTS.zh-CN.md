@@ -182,7 +182,9 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 
 值得知道的注意事项:
 
-- **限制性 `tools:` 白名单会滤掉 ACP 工具。** frontmatter `tools:` 列表未包含 ACP 工具名的 agent 定义(如内建 `scout` 只列了 `read`/`bash`/…),child 里不会出现这些工具——尽管会话是具名的、压缩也成立。修复前的前台 child 恰好靠代理 wire 注入绕过了白名单拿到工具——所以这类 agent 升级后可用的工具变少了。恢复方式:省略 `tools:` 字段,或补上 `compress,decompress,search_context,acp_status,acp_cache`。该过滤是 pi-subagents 的既有行为,不是本修复引入的回归。
+- **限制性 `tools:` 白名单的角色会自动拿回 ACP 通道(#2268)。** frontmatter `tools:` 列表未包含任何 ACP 工具名的角色——全部 7 个内置角色都是如此(如 `delegate` 只列 `read,grep,find,ls,bash,edit,write,contact_supervisor`)——在 #2185 具名 plugin 化之后**不再**丢失交互式压缩。bili 按请求检测这类 child(pi-subagents 会在每个子会话的 system prompt 打上 `<active_agent name="…">` 标记;门控还要求请求的 tools 数组未暴露任何 bili 可注入的工具名),并为其走 **proxy-style 压缩通道**:wire 注入 ACP 工具 + nudge、服务端执行、`acp_summary` carrier——同时保留 #2185 的具名 plugin 会话身份。无需任何配置改动;角色的原白名单在 wire 上原样保留,白名单中途变更会在下一个请求自愈。范围仅限 nicobailon/pi-subagents 的 child(标记是它的),其他 plugin host 不受影响。若上游日后移除该标记,这些角色会退回 #2268 之前的行为(具名会话、无本地 ACP 工具)。
+  - 暴露**任一** ACP/bili 可注入名的角色保持纯 plugin 模式(重复的工具声明会被上游拒绝),因此**部分授予不受支持**——要么一个都不给,要么全给(`compress,decompress,search_context,acp_status[,acp_cache]`)。
+  - 想让某个特定角色用本地注册(plugin-carrier)的工具?保留手动授权:省略 `tools:` 字段或在其中补上 ACP 工具名即可。
 - **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
 - **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
 

@@ -159,6 +159,7 @@ import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } 
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
+import { piSubagentChannelFallback } from "./server/pi-subagent-channel.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -2801,7 +2802,22 @@ async function handle(
         // requests, and restoring on that would clear the degrade one round
         // after arming it (the session never actually degraded).
         if (pluginAgent !== undefined) pluginLaneRestore(session, pluginAgentHeader(req.headers) !== undefined, log);
-        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session);
+        // #2268: pi-subagents children whose role allowlist grants none of the ACP
+        // context tools are served through the proxy-style channel instead of pure
+        // plugin mode (mechanism + scope: src/server/pi-subagent-channel.ts).
+        // Session identity stays plugin-bound either way — only the compression
+        // channel flips, per request (stateless: whitelist changes self-heal).
+        // Like the #2155 degrade above it only ever demotes plugin→proxy, so the
+        // two signals compose conjunctively below.
+        const subagentFallback = pluginAgent === "pi" ? piSubagentChannelFallback(bodyBuffer, parsed) : { present: false as const };
+        if (subagentFallback.present) {
+            if (session.metadata.subagentFallbackNotified !== true) {
+                session.metadata.subagentFallbackNotified = true;
+                markDirty(session);
+                log("info", `[${sessionId}] [pi-subagents] child "${subagentFallback.agent ?? "unknown"}" role allowlist lacks ACP context tools — serving proxy-style compression channel (#2268)`);
+            }
+        }
+        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session) && !subagentFallback.present;
         // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
         // channel that can round-trip the full original, so CCR arms only where
         // that channel exists and is resolvable: proxy mode always (the proxy
