@@ -41,7 +41,7 @@ function coreMsgs(r: unknown): Array<{ id?: string }> {
 // Run the protocol parser, assign each produced core message a deterministic ref
 // (m00001..), then build the index. excludeImaged leaves imaged messages unref'd to
 // exercise the "unref'd tail messages are skipped" path.
-function buildIndex(proto: WireProtocol, body: unknown, excludeImaged = false) {
+function buildIndex(proto: WireProtocol, body: unknown, excludeImaged = false, sessionId = "s1") {
     const conv = TO_CORE[proto] as unknown as (b: unknown) => unknown;
     const msgs = coreMsgs(conv(body));
     const state = createInitialState();
@@ -50,7 +50,7 @@ function buildIndex(proto: WireProtocol, body: unknown, excludeImaged = false) {
         if (excludeImaged && messageImageBytes(m as never).length > 0) return;
         state.messageRefs.byRaw[m.id] = `m${String(i + 1).padStart(5, "0")}`;
     });
-    return buildIncomingImageIndex(body, proto, state);
+    return buildIncomingImageIndex(body, proto, state, sessionId);
 }
 function ctxWith(index: Map<string, IndexedImage[]> | undefined): ProxyToolCtx {
     // Only the imageRef branch of resolveDecompress is exercised here; it touches
@@ -158,33 +158,69 @@ test("describeRestorable: one line per image, sorted, capped", () => {
 });
 
 test("writeRestoredImage: writes decoded bytes 0600 under retrieve/img, idempotent", () => {
-    const p = writeRestoredImage("m00042", 0, pngImg);
-    assert.ok(p && p.endsWith(join("retrieve", "img", "m00042.png")), `path ${p}`);
+    const p = writeRestoredImage("m00042", 0, pngImg, "sess-A");
+    assert.ok(p && p.endsWith(join("retrieve", "img", "sess-A", "m00042.png")), `path ${p}`);
     assert.ok(existsSync(p!));
     assert.deepEqual(readFileSync(p!), Buffer.from(PNG, "base64"), "decoded bytes round-trip");
     if (process.platform !== "win32") assert.equal(statSync(p!).mode & 0o777, 0o600, "not world-readable");
     // Multi-image suffix + extension mapping.
-    const p2 = writeRestoredImage("m00042", 1, pngImg);
+    const p2 = writeRestoredImage("m00042", 1, pngImg, "sess-A");
     assert.ok(p2!.endsWith("m00042-1.png"));
-    const jpg = writeRestoredImage("m00042", 0, { ...pngImg, mediaType: "image/jpeg" });
+    const jpg = writeRestoredImage("m00042", 0, { ...pngImg, mediaType: "image/jpeg" }, "sess-B");
     assert.ok(jpg!.endsWith("m00042.jpg"));
     // Idempotent rewrite of identical bytes.
-    assert.equal(writeRestoredImage("m00042", 0, pngImg), p);
+    assert.equal(writeRestoredImage("m00042", 0, pngImg, "sess-A"), p);
 });
 
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {
-    const p = writeRestoredImage("m00042", 0, pngImg)!;
+    const p = writeRestoredImage("m00042", 0, pngImg, "sess-A")!;
     const idx = new Map<string, IndexedImage[]>([["m00042", [{ mediaType: "image/png", bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: p }]]]);
-    const list = resolveDecompress({ imageRef: "list" }, ctxWith(idx));
+    const list = resolveDecompress({ imageRef: "list" }, ctxWith(idx)).text;
     assert.match(list, /\[Restorable images \(1\):\]/);
     assert.match(list, /m00042/);
 
-    const restored = resolveDecompress({ imageRef: "m00042" }, ctxWith(idx));
+    const restored = resolveDecompress({ imageRef: "m00042" }, ctxWith(idx)).text;
     assert.match(restored, /Restored 1 image\(s\) for m00042/);
     assert.ok(existsSync(p), "restored file exists");
     assert.deepEqual(readFileSync(p), Buffer.from(PNG, "base64"));
 
-    assert.match(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)), /no restorable image for ref "m99999"/);
-    assert.match(resolveDecompress({ imageRef: "" }, ctxWith(idx)), /\[Restorable images \(1\):\]/, "empty string == list");
-    assert.match(resolveDecompress({ imageRef: "list" }, ctxWith(undefined)), /No restorable images right now/, "absent index degrades gracefully");
+    assert.match(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)).text, /no restorable image for ref "m99999"/);
+    assert.equal(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)).outcome, "failure");
+    assert.match(resolveDecompress({ imageRef: "" }, ctxWith(idx)).text, /\[Restorable images \(1\):\]/, "empty string == list");
+    assert.match(resolveDecompress({ imageRef: "list" }, ctxWith(undefined)).text, /No restorable images right now/, "absent index degrades gracefully");
+});
+
+test("cross-session isolation: same ref number in two sessions never collides", () => {
+    // Regression for the review blocker: refs are per-session sequence numbers,
+    // so a flat retrieve/img/ let session B's m00001 hit session A's file via
+    // skip-if-exists — B's restore would return A's pixels. The session id is
+    // now part of the directory, so each session spills under its own tree.
+    const GIF = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    const gifImg: RestorableImage = { mediaType: "image/gif", b64: GIF, bytes: Buffer.byteLength(GIF, "base64") };
+    const pa = writeRestoredImage("m00001", 0, pngImg, "conv-alpha")!;
+    const pb = writeRestoredImage("m00001", 0, gifImg, "conv-beta")!;
+    assert.notEqual(pa, pb, "two sessions' m00001 must be distinct files");
+    assert.ok(pa.includes(join("retrieve", "img", "conv-alpha")));
+    assert.ok(pb.includes(join("retrieve", "img", "conv-beta")));
+    assert.deepEqual(readFileSync(pa), Buffer.from(PNG, "base64"), "alpha's file holds alpha's pixels");
+    assert.deepEqual(readFileSync(pb), Buffer.from(GIF, "base64"), "beta's file holds beta's pixels — not skipped as a duplicate");
+
+    // End-to-end through the index builder: identical ref numbering, different
+    // sessions -> each index's path resolves to that session's own bytes.
+    const body = { model: "gpt", messages: [
+        { role: "user", content: [{ type: "text", text: "see" }, { type: "image_url", image_url: { url: dataUrl } }] },
+        { role: "assistant", content: "ok" },
+    ] };
+    const bodyGif = { model: "gpt", messages: [
+        { role: "user", content: [{ type: "text", text: "see" }, { type: "image_url", image_url: { url: `data:image/gif;base64,${GIF}` } }] },
+        { role: "assistant", content: "ok" },
+    ] };
+    const idxA = buildIndex("openai", body, false, "conv-alpha");
+    const idxB = buildIndex("openai", bodyGif, false, "conv-beta");
+    const a = [...idxA.entries()][0];
+    const b = [...idxB.entries()][0];
+    assert.equal(a[0], b[0], "both sessions legitimately number the image m00001-style");
+    assert.notEqual(a[1][0].path, b[1][0].path, "but the spilled paths differ by session");
+    assert.deepEqual(readFileSync(a[1][0].path), Buffer.from(PNG, "base64"));
+    assert.deepEqual(readFileSync(b[1][0].path), Buffer.from(GIF, "base64"), "beta restores its own pixels, not alpha's");
 });

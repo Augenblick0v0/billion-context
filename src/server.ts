@@ -3235,7 +3235,7 @@ async function handle(
                     // specific pixels back later. Gated on stripImages (recovery is only
                     // meaningful when stripping removes something); latest-wins per request.
                     if (cs.stripImages && protocol) {
-                        session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state);
+                        session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
                     } else if (session.incomingImageIndex) {
                         session.incomingImageIndex = undefined;
                     }

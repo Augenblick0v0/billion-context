@@ -164,6 +164,7 @@ export function buildIncomingImageIndex(
     parsed: unknown,
     protocol: WireProtocol,
     state: CompressionState,
+    sessionId: string,
 ): Map<string, IndexedImage[]> {
     const index = new Map<string, IndexedImage[]>();
     const byRaw = state?.messageRefs?.byRaw;
@@ -192,7 +193,7 @@ export function buildIncomingImageIndex(
             // #1995 review: spill at index-time so the session retains only
             // metadata + path (never base64). Skip-if-exists keeps the steady
             // state to one stat per image per turn, not a full decode + write.
-            const path = writeRestoredImage(ref, i, im);
+            const path = writeRestoredImage(ref, i, im, sessionId);
             if (!path) return;
             let width: number | undefined;
             let height: number | undefined;
@@ -231,10 +232,14 @@ export function describeRestorable(index: Map<string, IndexedImage[]>, cap = 50)
     return lines;
 }
 
-/** Directory restored images are written to: <stateDir>/retrieve/img/, sharing
- *  the CCR retrieve tree so operators find both under one place. */
-export function restoreExportDir(): string {
-    return join(stateDir(), "retrieve", "img");
+/** Directory restored images are written to: <stateDir>/retrieve/img/<sessionId>/.
+ *  mNNNNN refs are PER-SESSION sequence numbers, so the session id MUST be part
+ *  of the path — a flat retrieve/img/ would let two sessions' same-numbered refs
+ *  collide, and with skip-if-exists the first session's pixels would be served
+ *  for the second session's ref forever (cross-session finding from review). */
+export function restoreExportDir(sessionId: string): string {
+    const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100) || "session";
+    return join(stateDir(), "retrieve", "img", safe);
 }
 
 function extFor(mediaType: string): string {
@@ -245,11 +250,14 @@ function extFor(mediaType: string): string {
 
 /** Write one restorable image to disk (decoded bytes, 0600 — conversation
  *  content is not world-readable on multi-user hosts) and return its absolute
- *  path. Content-addressed by ref (+index); a repeated call skips the rewrite
- *  when the file is already present (idempotent). Returns null on write failure. */
-export function writeRestoredImage(ref: string, idx: number, img: RestorableImage): string | null {
+ *  path. Addressed by session + ref (+index) — refs alone are per-session, so
+ *  the session id is what keeps concurrent sessions from overwriting each
+ *  other; a repeated call skips the rewrite when the file is already present
+ *  (idempotent within one session, where refs are deterministic). Returns null
+ *  on write failure. */
+export function writeRestoredImage(ref: string, idx: number, img: RestorableImage, sessionId: string): string | null {
     const safeRef = ref.replace(/[^a-zA-Z0-9_-]/g, "-");
-    const dir = restoreExportDir();
+    const dir = restoreExportDir(sessionId);
     const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}.${extFor(img.mediaType)}`);
     try {
         if (existsSync(path)) return path;
