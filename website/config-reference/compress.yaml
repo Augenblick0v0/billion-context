@@ -139,20 +139,20 @@ entries:
     group: compress
     id: ct.pt
     render: compress-row
-    desc_en: "Hard exclusion across all history: results of listed tools never fold."
-    desc_zh: "全历史硬排除：列出工具的结果永不折叠。"
-    site_en: "Hard exclusion across all history: results of listed tools never fold (use with care)."
-    site_zh: "全历史硬排除：列出工具的结果永不折叠（慎用）。"
+    desc_en: "Hard exclusion across all history: results of listed tools never fold. Supports skill path patterns (#1947)."
+    desc_zh: "全历史硬排除：列出工具的结果永不折叠。支持 skill 路径模式（#1947）。"
+    site_en: "Hard exclusion across all history: results of listed tools never fold (use with care). Supports <code>skill/&lt;name&gt;</code> path patterns (#1947)."
+    site_zh: "全历史硬排除：列出工具的结果永不折叠（慎用）。支持 <code>skill/&lt;name&gt;</code> 路径模式（#1947）。"
   - key: compress.protectedLatestTools
     type: "string[]"
     default: "none"
     group: compress
     id: ct.plt
     render: compress-row
-    desc_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
-    desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
-    site_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
-    site_zh: "只保护累积快照类工具的「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
+    desc_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns protect one latest per distinct path (#1947)."
+    desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按路径各保最新一条（#1947）。"
+    site_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns protect one latest per distinct path (#1947)."
+    site_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按路径各保最新一条（#1947）。"
   - key: compress.neverPreserveRecentTools
     type: "string[] ([] valid)"
     default: "[\"decompress\", \"search_context\", \"read\", \"bash\"] (kernel)"
