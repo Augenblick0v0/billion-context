@@ -430,10 +430,11 @@ Minimal example:
 }
 ```
 
-Two knobs people look for first:
+Knobs people look for first:
 
 - **Upstream proxy (firewall/GFW)** — routing the proxy's own outbound traffic through v2rayA/clash: full resolution order, empty-string = explicit direct, SOCKS5 rejection, both egress paths, and the `mitm://` vs `https://` key schemes live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `proxy`; Providers → key schemes).
 - **Wire-compat role rewrite (`compat.roles`)** — an upstream that rejects the `developer` role? Covered by [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `compat`) — including the learn-on-failure auto-fix that needs no configuration at all.
+- **Signed upstreams (body-covering signatures)** — a gateway whose requests carry a body-covering signature (CodeArts APIG's `SDK-HMAC-SHA256`, or gateway-invented headers like `x-ofm-signature`): the built-in scheme re-signs transparently on dsh; every other detected scheme is ALWAYS refused locally — signed requests are either re-signed+compressed or refused, never passed through unsigned — and bili keeps reminding at startup and in the web UI until it ships the scheme's re-signer (#1884/#2090). Detection rules, per-scheme overrides, and `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `resign`).
 
 ## How sessions work
 

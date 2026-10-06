@@ -1354,8 +1354,80 @@ export const WEB_CLIENT = `(function () {
                 clearPt.hidden = true;
             }
             loadUpstream(cfg);
+            void loadResign();
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    // #2090 plan A: read-only "Signed upstreams" card — every known/observed
+    // signature scheme with its effective policy, remembered refusals, and —
+    // for the BUILT-IN scheme only — a copy-ready passthrough snippet (other
+    // schemes show an awaiting-re-signer hint: no config can pass them
+    // through, #2090 owner ruling).
+    async function loadResign() {
+        const box = $("resign-body");
+        if (!box) return;
+        let data;
+        try {
+            data = await json("/__bili/resign");
+        } catch (e) {
+            const el = document.createElement("div");
+            el.className = "dim small";
+            el.textContent = t("cfg.resign_none") + " (" + e.message + ")";
+            box.replaceChildren(el);
+            return;
+        }
+        box.innerHTML = "";
+        const schemes = data.schemes && typeof data.schemes === "object" ? data.schemes : {};
+        const pending = data.pending && typeof data.pending === "object" ? data.pending : {};
+        let anyPending = false;
+        for (const name of Object.keys(schemes).sort()) {
+            const s = schemes[name];
+            if (!s || typeof s !== "object") continue;
+            anyPending = anyPending || Boolean(pending[name]);
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+            const label = document.createElement("span");
+            label.className = "mono small";
+            label.textContent = s.builtIn && s.known ? t("cfg.resign_builtin", { scheme: name, label: s.known.label }) : name;
+            row.appendChild(label);
+            const badge = document.createElement("span");
+            badge.className = "badge ";
+            const effectivePassthrough = Boolean(s.builtIn && s.passthrough);
+            badge.textContent = !s.enabled ? t("cfg.resign_disabled") : effectivePassthrough ? t("cfg.resign_passthrough") : t("cfg.resign_refusing");
+            badge.classList.add(effectivePassthrough ? "ok" : s.enabled ? "warn" : "disk");
+            row.appendChild(badge);
+            const entry = pending[name];
+            if (entry && typeof entry === "object") {
+                const meta = document.createElement("span");
+                meta.className = "dim small";
+                meta.textContent = t("cfg.resign_row", { origin: entry.origin || "—", count: entry.count ?? 1, firstSeen: String(entry.firstSeen ?? "").slice(0, 10) });
+                row.appendChild(meta);
+                if (s.enabled && !effectivePassthrough) {
+                    if (s.builtIn) {
+                        const btn = document.createElement("button");
+                        btn.className = "btn sm copy-btn";
+                        btn.setAttribute("data-copy", JSON.stringify({ resign: { [name]: { passthrough: true } } }, null, 0));
+                        btn.setAttribute("title", t("cfg.resign_copy_hint"));
+                        const sp = document.createElement("span");
+                        sp.textContent = t("common.copy");
+                        btn.appendChild(sp);
+                        row.appendChild(btn);
+                    } else {
+                        const hint = document.createElement("span");
+                        hint.className = "dim small";
+                        hint.textContent = t("cfg.resign_awaiting");
+                        row.appendChild(hint);
+                    }
+                }
+            }
+            box.appendChild(row);
+        }
+        if (!anyPending && Object.keys(pending).length === 0) {
+            const el = document.createElement("div");
+            el.className = "dim small";
+            el.textContent = t("cfg.resign_none");
+            box.appendChild(el);
         }
     }
     function hydrateQuickConfig(cfg) {
