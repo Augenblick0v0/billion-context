@@ -341,13 +341,11 @@ alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
 first soft compaction fires 50k tokens past the boot content
-(`compress.nudgeGrowthTokens`, flat and window-independent), so its absolute
-position is ≈ boot + 50k — with a heavy boot (100k–150k of tools and skills)
-that lands around 200k. The 75% forced threshold is only a backstop and applies
-to the effective window (native window minus the output reserve). Want to save
-tokens earlier → lower the nudge step or `maxContextLimit`; want fewer
-compactions → raise the step or slim the boot with the `lean` pack. Worked
-example in
+(`compress.nudgeGrowthTokens`, flat and window-independent). With a boot around
+100k — or with the growth step set to ~100k — the first compaction may wait
+until ~200k. To make it fire earlier: 1) trim the system prompt, disable
+unneeded tools, prune skills; 2) lower `compress.nudgeGrowthTokens` to ~50k;
+3) enable lean mode. Worked example in
 [CONFIGURATION.md](CONFIGURATION.md#why-the-first-compaction-waits-until-200k).
 
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
