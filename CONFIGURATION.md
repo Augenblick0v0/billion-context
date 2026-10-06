@@ -1508,6 +1508,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
 | `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
@@ -1524,7 +1525,6 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
-| `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
