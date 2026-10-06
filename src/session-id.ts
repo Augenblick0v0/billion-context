@@ -126,7 +126,9 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  *  hash, "hash 不一样自动分裂") should participate in the compression-session
  *  key for THIS request. Allowlist by plugin agent, evidence-per-client — the
  *  same discipline as instructionsFingerprintApplies (#1104/#1107 inverted
- *  allowlist), applied to the openai/anthropic lanes where the agent rides.
+ *  allowlist), applied to the openai/anthropic/responses lanes where the
+ *  agent rides (#2203: dsh-over-Responses shares the same id-reuse shape;
+ *  `instructions` is that wire's system carrier).
  *
  *  dsh is the first entry: it stamps ONE x-bili-plugin-conversation id on
  *  every model request of a session — including the auto-review
