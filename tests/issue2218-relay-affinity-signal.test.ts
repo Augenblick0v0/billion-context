@@ -155,8 +155,10 @@ test("#2218 fix: dsh plugin lane reaches relays with BOTH header and body sessio
 });
 
 test("#2218 fix: dsh plugin lane stamps pck on a loopback destination even without a configured route", async () => {
-    // routes-less harness pins the loopback leg of the gate (the GF-machine
-    // deployment shape: provider rewrite to a local relay port).
+    // The /bili/-embedded-URL form always resolves a route (rewrittenUrl set),
+    // so this case pins the gate's route-rewrite leg with an EMPTY admin
+    // provider table; the bare loopback leg (route undefined + loopback
+    // origin) is pinned by the unit matrix above.
     const h = await startHarness(undefined);
     try {
         const base = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`;
