@@ -315,7 +315,6 @@ export function foldAnchoredCutoff(
         if (m.wireIndex === undefined) continue;
         if (covered.has(m.id)) {
             if (m.wireIndex > last) { last = m.wireIndex; boundaryFull = true; }
-            else if (m.wireIndex === last) boundaryFull = boundaryFull && true;
         } else if (m.wireIndex === last) {
             // A core message sharing the boundary wire message but NOT covered
             // (e.g. an image block in the same anthropic message the fold
