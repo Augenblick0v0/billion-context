@@ -50,6 +50,18 @@ import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-com
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
     const ci = (ch: string) => `[${ch}${ch.toUpperCase()}]`;
+    // #2190 round 2: field-attested drift names OUTSIDE the core+insertion set
+    // (229-session census: accessp×339, acacp×455, acpx×217, acb×229). Exact
+    // enumeration only — every character-class generalization that covers
+    // these also matches real prose words (acgroup/acmap/acstep are
+    // structurally identical to acacp), so each newly observed name is added
+    // here individually, with its census evidence, as it is attested.
+    const attestedDrift = [
+        "[aA][cC][cC][eE][sS][sS][pP]",
+        "[aA][cC][aA][cC][pP]",
+        "[aA][cC][pP][xX]",
+        "[aA][cC][bB]",
+    ];
     const fourLetter = new Set<string>();
     const threeLetter = new Set<string>();
     for (const c of cores) {
@@ -60,7 +72,7 @@ function buildAcplikeName(): string {
             );
         }
     }
-    return [...fourLetter, ...threeLetter].join("|");
+    return [...attestedDrift, ...fourLetter, ...threeLetter].join("|");
 }
 
 /** Longest-first alternation of every tolerated render-tag name (#673), case-folded via letter classes (#1731). */

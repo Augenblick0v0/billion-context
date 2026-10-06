@@ -195,3 +195,67 @@ test("#2190 responses pipe: done-family full-text payload with degenerate pair i
     assert.ok(!text.includes("m00001"), "done-family payload must be cleaned");
     assert.ok(text.includes("clean "), "prose survives");
 });
+
+// #2190 round 2: field-attested drift names outside the core+insertion set
+// (229-session census: acacp×455, accessp×339, acb×229, acpx×217). These must
+// be stripped too — every name-derived matcher consumes ACP_NAME_ALT, so the
+// single-point extension in buildAcplikeName() covers gate and filter alike.
+const DRIFT_FORMS: Array<[string, string, string]> = [
+    ["acacp", "\x3cacacp tokens=\"34\" type=\"text\"\x3em00375\x3c/acacp\x3e", "m00375"],
+    ["accessp", "\x3caccessp tokens=\"37\" type=\"text\"\x3em07960\x3c/accessp\x3e", "m07960"],
+    ["acb", "\x3c" + "acb" + "\x3e" + "m00123" + "\x3c/" + "acb" + "\x3e", "m00123"],
+    ["acpx", "\x3cacpx\x3em00456\x3c/acpx\x3e", "m00456"],
+];
+
+test("#2190 round 2 streaming: attested drift-name forms are stripped character-by-character", () => {
+    for (const [name, whole, ref] of DRIFT_FORMS) {
+        const out = streamThrough([...whole]);
+        assert.ok(!out.includes(ref), `${name}: ref leaked`);
+        assert.ok(!out.toLowerCase().includes(`\x3c${name}`), `${name}: open leaked`);
+        assert.equal(out, "", `${name}: whole span must die, got ${JSON.stringify(out)}`);
+        const withProse = [`before ${whole} after`];
+        const out2 = streamThrough(withProse[0].split(""));
+        assert.equal(out2, "before  after", `${name}: surrounding prose must survive verbatim`);
+    }
+});
+
+test("#2190 round 2 streaming: case-folded drift names strip; cross-name pairing strips", () => {
+    const cases = [
+        "\x3cACACP tokens=\"34\"\x3em00375\x3c/aCaCp\x3e",
+        "\x3cacP tokens=\"1\" type=\"text\"\x3em00001\x3c/acacp\x3e",
+        "\x3cAcAcP tokens=\"2\"\x3em00002\x3c/ACCESSP\x3e",
+    ];
+    for (const c of cases) {
+        const out = streamThrough([...c]);
+        assert.equal(out, "", `case/cross form must die, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("#2190 round 2 stripAcpTags: drift forms die whole-text, genuine words survive byte-identical", () => {
+    const leaky = DRIFT_FORMS.map(([, w]) => w).join(" ");
+    assert.equal(stripAcpTags(leaky), "   ", "all four drift spans strip atomically");
+    const legit = [
+        "\x3caccount\x3em00375\x3c/account\x3e",
+        "\x3caction\x3em00375\x3c/action\x3e",
+        "\x3cACTIVE\x3em00375\x3c/active\x3e",
+        "\x3cacgroup\x3em00375\x3c/acgroup\x3e",
+        "\x3cacmap\x3em00375\x3c/acmap\x3e",
+        "\x3cacstep\x3em00375\x3c/acstep\x3e",
+        "\x3cacpipe\x3em00375\x3c/acpipe\x3e",
+    ];
+    for (const l of legit) {
+        assert.equal(stripAcpTags(l), l, `legit word must stay verbatim: ${l}`);
+        assert.equal(streamThrough([...l]), l, `legit word must stream verbatim: ${l}`);
+    }
+});
+
+test("#2190 round 2 gate: drift-name heads engage the render-tag predicates once spaced", () => {
+    assert.equal(mayStartRenderTag("\x3cacacp "), true);
+    assert.equal(mayStartRenderTag("\x3caccessp x"), true);
+    assert.equal(mayStartRenderTag("\x3c" + "acb" + " "), true);
+    assert.equal(mayStartRenderTag("\x3cacpx"), false, "bare head without terminator: BROAD tail covers it");
+    assert.equal(mayStartDegenerateRenderTag("\x3cacpx"), true, "BROAD tail engages on the bare head");
+    assert.equal(mayStartRenderTag("\x3cacpx\x3e"), true);
+    assert.equal(mayStartRenderTag("\x3caccount"), false, "genuine word stays prose");
+    assert.equal(mayStartRenderTag("\x3cacgroup"), false, "custom tag stays prose");
+});

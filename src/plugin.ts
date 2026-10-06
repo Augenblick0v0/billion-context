@@ -2028,6 +2028,9 @@ export async function pipePluginChatWithStrip(
         }
         const choices = ev["choices"];
         if (!Array.isArray(choices)) {
+            // #2190: no-choices frames bypass the state machine — audit them.
+            // No tool_calls exclusion needed: arguments live under choices.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         let rebuilt: Record<string, unknown> | null = null;
@@ -2151,6 +2154,9 @@ export async function pipePluginChatWithStrip(
             }
             return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        // #2190: these exits forward frames whose text lived outside the
+        // managed fields — audit them (argument frames excluded: #1039).
+        if (!openaiFrameHasToolCalls(choices)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
@@ -2382,6 +2388,8 @@ export async function pipePluginChatWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        // #2190: unparseable frames bypass every filter — audit them.
+                        auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
@@ -2495,6 +2503,29 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
         for (const k of Object.keys(d)) {
             if (k !== "content" && k !== "reasoning_content" && k !== "reasoning") return true;
         }
+    }
+    return false;
+}
+
+// #2190: residue audit for frames forwarded verbatim by a raw exit — i.e. a
+// frame whose text lives OUTSIDE the managed fields (or is not parseable) and
+// therefore never touches the tag-echo state machine. Log-only: the bytes are
+// forwarded exactly as received (#1039 wire fidelity); the point is that such
+// a leak is observable in the log instead of silent.
+function auditRawForward(rawEvent: string): void {
+    if (containsEchoResidue(rawEvent)) {
+        loggerLog("warn", `[tag-echo] raw forward carried echo-residue-shaped bytes (#2190): ${rawEvent.slice(0, 80).replace(/\n/g, " ")}`);
+    }
+}
+
+// #2190 companion to auditRawForward: tool-call argument fragments are user
+// intent (#1039) and may legitimately match the residue shape, so frames
+// carrying them are excluded from the audit.
+function openaiFrameHasToolCalls(choices: unknown): boolean {
+    if (!Array.isArray(choices)) return false;
+    for (const c of choices) {
+        const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
+        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
     }
     return false;
 }
@@ -2851,6 +2882,8 @@ export async function pipePluginResponsesWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        // #2190: unparseable frames bypass every filter — audit them.
+                        auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
