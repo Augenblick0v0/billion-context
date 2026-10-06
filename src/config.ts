@@ -1649,6 +1649,7 @@ export function loadConfigFile(): FileConfig {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);
             warnUnknownTopLevelKeys(obj);
+            warnInertResignPassthrough(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1743,6 +1744,53 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
             : file.passthrough === true;
     const credentialRef = env.BILI_CODEARTS_REF?.trim() || providerBlock.credentialRef || file.credentialRef || undefined;
     return { enabled, passthrough, credentialRef };
+}
+
+// #2260(B)/#2090: pre-v0.1.186 configs may carry `passthrough: true` under a
+// NON-built-in scheme key. Since the compress-or-refuse contract the unsigned
+// pass-through exists ONLY for sdk-hmac-sha256 (both guard sites gate on it),
+// so such a key is inert while its requests stay refused — "my opt-in does
+// nothing". Name the dead key(s) at config load instead of letting the 403
+// body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
+// when the set changes, stay quiet while it stays fixed or empty.
+let inertResignPassthroughSignature: string | null = null;
+export function warnInertResignPassthrough(obj: Record<string, unknown>): void {
+    const inert: string[] = [];
+    const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
+        if (!map || typeof map !== "object" || Array.isArray(map)) return;
+        for (const [key, val] of Object.entries(map as Record<string, unknown>)) {
+            if (key === RESIGN_BUILTIN_SCHEME) continue;
+            const block = val !== null && typeof val === "object" && !Array.isArray(val) ? (val as Record<string, unknown>) : {};
+            if (block["passthrough"] !== true) continue;
+            // Same enabled cascade as resolveResignSettings (env > provider >
+            // file > default-true), read straight off the parsed object so the
+            // hook never re-enters loadConfigFile (it runs mid-parse).
+            const fileBlock = ((obj.resign as Record<string, ResignFileSettings> | undefined) ?? {})[key];
+            const providerBlock = providerBlockFor(key);
+            const enabled = process.env.BILI_RESIGN !== undefined
+                ? process.env.BILI_RESIGN !== "0"
+                : providerBlock?.enabled !== undefined
+                    ? providerBlock.enabled
+                    : fileBlock?.enabled !== false;
+            if (enabled) inert.push(key);
+        }
+    };
+    consider(obj.resign, () => undefined);
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const entry of Object.values(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const pmap = (entry as Record<string, unknown>).resign;
+            if (pmap === undefined) continue;
+            consider(pmap, (key) => ((pmap as Record<string, ResignFileSettings> | undefined) ?? {})[key]);
+        }
+    }
+    inert.sort();
+    const sig = inert.join(",");
+    if (sig === "" || sig === inertResignPassthroughSignature) return;
+    inertResignPassthroughSignature = sig;
+    const list = inert.map((k) => `resign["${k}"].passthrough`).join(", ");
+    loggerLog("warn", `[acp-config] ${list}=true is INERT — since the #2090 compress-or-refuse contract, unsigned pass-through exists ONLY for the built-in scheme "${RESIGN_BUILTIN_SCHEME}"; those signed requests stay REFUSED until bili ships a re-signer for them. Restore pre-resign handling with resign["<scheme>"].enabled=false or BILI_RESIGN=0 (the upstream will then reject the rewritten bodies).`);
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane
