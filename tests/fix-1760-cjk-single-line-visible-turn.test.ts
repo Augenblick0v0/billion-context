@@ -92,6 +92,12 @@ test("isOrphanMarkupText classifies a released tail by its bytes, not its origin
     assert.equal(isOrphanMarkupText("OK"), false);
     // A lone astral icon held to terminal is preserved content the client sees.
     assert.equal(isOrphanMarkupText("📦"), false);
+    // A refs run released at EOF is a genuine citation — visible prose
+    // (#2023 review: counting it as residue fired the one-shot retry on
+    // bare-citation answers).
+    assert.equal(isOrphanMarkupText("m01233"), false, "a lone ref citation is prose");
+    assert.equal(isOrphanMarkupText(" m01217\u2013m01233"), false, "a ref range is prose");
+    assert.equal(isOrphanMarkupText("m01095\u2013m01215, m01217\u2013m01233"), false, "a comma range list is prose");
     // Markup-shaped tails stay residue (the #870 contract).
     assert.equal(isOrphanMarkupText("\x3ca"), true, "partial render-tag head");
     assert.equal(isOrphanMarkupText('\x3cacp tokens="1" type="text"'), true, "unclosed render-tag opening");
@@ -175,6 +181,28 @@ test("#870 kept: a tail shaped like an unclosed render tag still retries once", 
     assert.equal(calls, 1, "markup-shaped residue still triggers the one invisible retry");
     assert.ok(textDeltas(text).includes("real answer after the nudge"), "the retry's prose reaches the client");
     assert.ok(!text.includes("[ACP] stream error"), "one retry suffices — no in-band error");
+});
+
+test("#2023 review: a turn whose only answer is a bare ref citation does not retry", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("unwanted")));
+    };
+    await pipePluginChatWithStrip(
+        streamOf([chatChunk({ role: "assistant" }), ...[..."m01233"].map((c) => chatChunk({ content: c })), chatStop(), DONE]),
+        makeRes(out),
+        "openai",
+        makeSession(),
+        undefined,
+        refetch,
+    );
+    const text = out.join("");
+    assert.equal(calls, 0, "a released refs-run tail is visible output — no nudge re-issue");
+    assert.ok(!text.includes("[ACP] stream error"), "no in-band degenerate error");
+    assert.equal(textDeltas(text), "m01233", "the citation reaches the client");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "exactly one terminator");
 });
 
 test("multi-line CJK answer in one chunk stays clean (never affected)", async () => {

@@ -238,7 +238,7 @@ test("#1039 responses: function_call_arguments deltas and done payloads pass thr
     const completed = parsed.find((e) => e["type"] === "response.completed") ?? {};
     const outItem = asObj(asArr(asObj(completed["response"])["output"])[0]);
     assert.equal(asString(outItem["arguments"]), dirtyArgs, "response.completed arguments untouched");
-    assert.ok(!text.includes("m00009"), "reasoning summary tag ref still stripped");
+    assert.ok(text.includes("m00009"), "unified invariant: reasoning summary rides verbatim (#2267)");
 });
 
 test("#1039 non-streaming: pipePluginJson leaves tool-call argument payloads verbatim, strips prose tags", async () => {

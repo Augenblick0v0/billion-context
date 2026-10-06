@@ -40,7 +40,7 @@ import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } fro
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
-import { fetchRegistryVersion } from "./update.js";
+import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
@@ -2329,8 +2329,14 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const latest = await fetchRegistryVersion(opts, opts.packageName);
         if (!latest) return ["dsh: could not resolve the latest version from npm — leaving profile bundles alone"];
         const before = targets.length;
-        const refreshed = await refreshDshProfileBundles(latest, log);
-        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+        const { refreshed, failed } = await refreshDshProfileBundles(latest, log);
+        if (failed === 0) {
+            // #2192: a clean manual run is evidence the lane works — disarm
+            // its cooldown immediately instead of letting the automatic channel
+            // wait out the window (up to 6 h).
+            await clearOwnerLaneBackoff("dsh-profile", latest);
+        }
+        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel${failed > 0 ? ` (${failed} failed)` : ""} (see log for per-profile results)`];
     }
     if (agent === "hermes") {
         if (hermesStatus() !== "installed") return ["hermes: not installed — nothing to update"];

@@ -12,7 +12,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { clearPostRebuildAnchor, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -957,6 +957,9 @@ export function settleUsageReport(
             }
             session.stats.calibrationRing = ring;
         }
+        // #1820: a real usage-grade sample supersedes the post-rebuild meter
+        // anchor immediately — no need to wait out its prepare budget.
+        clearPostRebuildAnchor(session);
         // #1110: a real usage report retires the one-shot overflow arm.
         delete session.stats.overflowArmTokens;
         // #1595: a real report landing far below a stale-high nudge reference

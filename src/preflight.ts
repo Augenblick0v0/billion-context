@@ -35,6 +35,10 @@ export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
+// #1775: gap between joined chunk summaries ("\n\n") — subtracted when
+// spreading maxSummaryLength across chunks so the assembled candidate fits the
+// cap when every chunk lands exactly on its per-chunk budget.
+const SUMMARY_JOIN_GAP = 2;
 // #853: thinking-on-by-default models spend the shared output budget on
 // reasoning_content before any answer text (observed ~9.5k reasoning tokens on
 // deepseek-flash, whose real output ceiling is 384k) — the old 8192 cap
@@ -47,6 +51,21 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+// #1819: net-shrink monotonicity tolerance for fold acceptance. A weak
+// summarizer can regurgitate a verbose re-narration that EXCEEDS its own
+// range: the flat maxSummaryLength cap bounds absolute size only, so such a
+// summary was accepted as a successful fold and the rebuild landed LARGER
+// than the preflight input (越压越大 — minutes of latency, re-firing rounds,
+// misleading "tokens saved" telemetry). The acceptance gate compares the
+// candidate's mass against the span's mass in the SAME units this loop's
+// post-fold accounting uses (token regime: the kernel's credit for the span;
+// char regime: raw-char mass), so a passing fold always nets a shrink under
+// that accounting. The slack covers O(1) tag/wrapper overhead and estimator
+// noise between the two sides; regurgitation (typically ≥2x) is rejected
+// decisively either way. Folds whose summary merely fails to shrink by more
+// than the slack are rejected too — they buy nothing but block-management
+// cost, and the halving path routes the budget to smaller material.
+export const NET_SHRINK_TOLERANCE = 1.05;
 // #1767: bounded same-span retries for TRANSIENT empty summaries — HTTP 200
 // with no text (finish_reason=content_filter, truncated streams, empty bodies).
 // Distinct from the #726 halving cascade, which assumes the empty answer is
@@ -61,6 +80,12 @@ const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
 // few extra calls instead of burning the full budget on doomed draws.
 // Reset alongside summaryCalls when soft protection is relaxed (#575-merge).
 const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
+// #1841: slack on the futility verdicts below. Range token estimates carry
+// ±~20% error on mixed CJK/Latin/code, and a fold's summary re-enters the
+// payload, so realizable saving is strictly below span mass. Fail CLOSED:
+// skip a doomed round only when the shortfall survives this slack — when
+// unsure, walk exactly as before.
+const FUTILITY_SLACK = 1.2;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -303,6 +328,24 @@ export function splitSummaryContent(content: string, budget: number, countTokens
         offset = low;
     }
     return chunks;
+}
+
+// #1775: rescue for an assembled summary that exceeds maxSummaryLength but is
+// still shorter than the folded content — truncating to the cap nets savings,
+// so keep the summary instead of discarding the whole range (the halving retry
+// cannot help: on tool-dense spans summary length does not scale with input
+// size, so every half fails identically). Cuts at a line boundary with a
+// marker, only if the result still passes the kernel's minSummaryLength gate;
+// null when the cap cannot carry a usable result (caller keeps the discard).
+function truncateSummaryToLimit(text: string, maxChars: number, minChars: number): string | null {
+    if (text.length <= maxChars) return text;
+    const marker = "\n[truncated]";
+    const room = maxChars - marker.length;
+    if (room < minChars) return null;
+    let cut = text.lastIndexOf("\n", room);
+    if (cut < minChars) cut = room;
+    const out = `${text.slice(0, cut)}${marker}`;
+    return out.length <= maxChars && out.trim().length >= minChars ? out : null;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -726,10 +769,18 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
+async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number): Promise<SummaryOutcome> {
+    // #1775: the cap used to be enforced only after the fact — an over-cap
+    // assembly was discarded wholesale (the #1775 incident). Tell the model the
+    // character budget up front so the first attempt already fits. Below
+    // MIN_SUMMARY_CHARS the instruction would be counterproductive (the kernel
+    // minimum-summary gate rejects such output anyway), so omit it.
     const system =
         buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
-        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
+        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+        (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
+            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
+            : "");
     if (deps.externalSummary) {
         const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
             maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
@@ -1111,6 +1162,71 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        if (baselineKnown && ranges.length > 0) {
+            // #1841: round-level futility gate. A fold removes its span's mass
+            // at best (its summary re-enters the payload), so the sum of all
+            // foldable range masses bounds this round's possible saving. When
+            // even that cannot close the gap to the window, no combination of
+            // folds can fit the payload — walking would only burn summarization
+            // calls minutes at a time (incident 08cc0df7: ~9 calls over 5 min,
+            // net −5.5%). Skip with zero calls and an honest detail instead.
+            // The deficit is measured on payloadEstimate (the floorless wire
+            // estimate the caller's forward decision itself uses, #470/#1492),
+            // NOT on currentTokens: the usage-based floor also covers system
+            // prompt + tool definitions that folding cannot remove, so a
+            // floor-pinned deficit would declare futility while folding would
+            // still bring the forwarded payload under the window.
+            // Only RESOLVABLE ranges can ever fold: a range whose refs are
+            // absent from the current state dies in the walk before any summary
+            // call, contributing zero saving. And a pool that is entirely dead
+            // (potential === 0) must still be walked — it spends no calls and
+            // its per-range skip notes are the only record of WHY each
+            // candidate died (#1372 brain-split shape); gating it would mask
+            // that diagnosis behind a window-mis-size verdict.
+            const { refToIdx: gateRefs } = refMaps(messages, deps.session.state);
+            const resolvableMass = (rs: Array<{ startRef: string; endRef: string; tokens: number }>): number => rs.reduce((sum, r) => {
+                const si = gateRefs.get(r.startRef);
+                const ei = gateRefs.get(r.endRef);
+                return si !== undefined && ei !== undefined && si <= ei ? sum + r.tokens : sum;
+            }, 0);
+            let potential = resolvableMass(ranges);
+            const deficit = result.payloadEstimate - limit;
+            if (potential > 0 && deficit > 0 && potential * FUTILITY_SLACK < deficit) {
+                if (!relaxed) {
+                    // The soft-protected recent zone is not in `ranges` yet; #330
+                    // makes it foldable on relax. Probe the relaxed view (CPU-only,
+                    // mirrors the preview convention — kernel entry points return
+                    // new state without mutating the input) before declaring
+                    // futility, or a false positive here regresses the #330 path.
+                    const probe = deps.core.processTurn({
+                        messages,
+                        state: deps.session.state,
+                        config: noEmergencyTruncate(ccrLoopConfig(deps.session, relaxedConfig(deps.config))),
+                        tokenCount: currentTokens,
+                        renderTags: "text-only",
+                        contentStore: contentStoreOf(deps.session),
+                    });
+                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+                    const relaxedPotential = resolvableMass(relaxedRanges);
+                    if (relaxedPotential * FUTILITY_SLACK >= deficit) {
+                        activeConfig = relaxedConfig(deps.config);
+                        relaxed = true;
+                        textTarget = Math.max(0, limit - imageReserve);
+                        summaryCalls = 0;
+                        budgetHit = false;
+                        transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
+                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${potential} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
+                        continue;
+                    }
+                    // The relaxed pool is the superset: quote it as the true bound.
+                    potential = relaxedPotential;
+                }
+                const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
+                failure = { kind: "exhausted", detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
+                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
+                break;
+            }
+        }
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
             // Relax the soft zone (oldest-first within it) and retry — the hard
@@ -1139,7 +1255,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         }
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
-        for (const range of ordered) {
+        // #1841: set when the mid-walk futility check stops the walk before
+        // every range was tried; the round-end site turns it into a failure
+        // unless the #330 relax path is still available.
+        let futileBail = false;
+        let bailRemaining = 0;
+        let bailDeficit = 0;
+        for (let oi = 0; oi < ordered.length; oi++) {
+            const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
@@ -1149,6 +1272,34 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const skipKey = `${range.startRef}:${range.endRef}`;
             if (skipSet.has(skipKey)) continue;
             const { refToIdx } = refMaps(messages, deps.session.state);
+            if (baselineKnown) {
+                // #1841: mid-walk futility bail. Ranges already consumed,
+                // skipped, or unresolvable cannot yield saving; when the live
+                // untried rest of the walk cannot close the gap either, stop
+                // before spending more summarization calls on ranges that
+                // cannot change the outcome. Same payloadEstimate-based deficit
+                // as the pre-walk gate (floor-pinned currentTokens would
+                // overstate what folding can still influence). remaining === 0
+                // means every rest-of-walk candidate is structurally dead —
+                // walking it is call-free and its notes are the diagnosis
+                // (#1372), so bail only when some live mass remains.
+                let remaining = 0;
+                for (let j = oi; j < ordered.length; j++) {
+                    const rj = ordered[j];
+                    if (skipSet.has(`${rj.startRef}:${rj.endRef}`)) continue;
+                    const si = refToIdx.get(rj.startRef);
+                    const ei = refToIdx.get(rj.endRef);
+                    if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
+                }
+                const deficit = result.payloadEstimate - limit;
+                if (remaining > 0 && deficit > 0 && remaining * FUTILITY_SLACK < deficit) {
+                    futileBail = true;
+                    bailRemaining = remaining;
+                    bailDeficit = deficit;
+                    deps.log("warn", `[preflight] remaining foldable mass (~${remaining} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
+                    break;
+                }
+            }
             const startIdx = refToIdx.get(range.startRef);
             const endIdx = refToIdx.get(range.endRef);
             if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
@@ -1265,13 +1416,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 try {
                     const parts: string[] = [];
                     const chunks = splitSummaryContent(content, budget, countText);
+                    // #1775: spread maxSummaryLength across the chunks (minus the exact
+                    // "\n\n" join gaps) so each summarization call carries a per-chunk
+                    // character ceiling — previously nothing bounded the model's output,
+                    // and one verbose chunk made the whole assembly unusable.
+                    const maxSummary = activeConfig.compress.maxSummaryLength;
+                    const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
                     for (const chunk of chunks) {
                         if (summaryCalls >= summaryBudget) {
                             budgetHit = true;
                             break;
                         }
                         summaryCalls += 1;
-                        let part = await summarizeRange(deps, chunk, startRef, endRef);
+                        let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                         let transientTries = 0;
                         while (
                             "unusable" in part && part.transient &&
@@ -1286,7 +1443,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             deps.log("warn", `[preflight] transient empty summary on ${startRef}:${endRef} (${part.unusable.slice(0, 160)}); retrying same span in ${delayMs}ms (${transientTries}/${TRANSIENT_EMPTY_SUMMARY_RETRIES})`);
                             await sleep(delayMs, deps.signal);
                             summaryCalls += 1;
-                            part = await summarizeRange(deps, chunk, startRef, endRef);
+                            part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                         }
                         if ("unusable" in part) {
                             outcome = part;
@@ -1298,11 +1455,39 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const candidate = parts.join("\n\n");
                         // #861: a summary the kernel would reject on length wastes the apply
                         // attempt and its failure log — route it through the same
-                        // halving/skip path as any unusable output.
-                        if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) {
-                            summary = candidate;
+                        // halving/skip path as any unusable output. #1775: except when
+                        // truncating to the cap still nets savings (the candidate is
+                        // shorter than the folded content) — then rescue the summary
+                        // instead of discarding the whole range. #1819: every accepted
+                        // candidate — rescued or not — must additionally satisfy net-shrink
+                        // monotonicity (NET_SHRINK_TOLERANCE) — same units as the post-fold
+                        // accounting below: token regime takes the kernel's credit for this
+                        // span, char regime the raw-char mass of the folded messages. A
+                        // regurgitated summary that exceeds its range routes through the
+                        // halving/skip path like any other unusable output instead of
+                        // inflating the payload.
+                        const spanUnits = baselineKnown
+                            ? planned.compressedTokens
+                            : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                        const shrinkOk = (text: string): boolean => countText(text) <= spanUnits * NET_SHRINK_TOLERANCE;
+                        if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                            if (shrinkOk(candidate)) {
+                                summary = candidate;
+                            } else {
+                                outcome = { unusable: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            }
+                        } else if (candidate.length < content.length) {
+                            const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                            if (rescued !== null && shrinkOk(rescued)) {
+                                deps.log("warn", `[preflight] range ${skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                summary = rescued;
+                            } else if (rescued !== null) {
+                                outcome = { unusable: `assembled summary (~${countText(rescued)} units after truncation) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            } else {
+                                outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be truncated to a usable length` };
+                            }
                         } else {
-                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${activeConfig.compress.maxSummaryLength})` };
+                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and is not shorter than the folded content (${content.length} chars)` };
                         }
                     }
                 } catch (err) {
@@ -1390,7 +1575,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     log: (msg) => deps.log("info", msg),
                 };
                 const creditBefore = deps.session.stats.compressCreditTokens;
-                const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
+                // #2146: internal lane — must not arm the model-facing loop breaker.
+                const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx, { loopTracking: false });
                 if (applied.outcome === "refused") {
                     deps.log("warn", `[preflight] ${applied.text}`);
                     noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
@@ -1418,6 +1604,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (failure || budgetHit) break;
         }
         if (appliedThisRound === 0) {
+            // #1841: the mid-walk futility bail becomes a failure here unless the
+            // #330 relax path below is still available (!relaxed AND the payload
+            // overflows the window) — in that case fall through to it; the next
+            // round re-judges on the relaxed view.
+            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate < limit)) {
+                const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
+                // #1372 contract: per-range skip notes are the diagnosis of WHY
+                // candidates died — carry them into the bail verdict too.
+                const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
+                failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
+                break;
+            }
             if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;

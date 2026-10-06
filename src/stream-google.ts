@@ -1,11 +1,11 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { GooglePart } from "acp-kernel/wire";
 import type { Session } from "./session.js";
-import { isProxyToolFor } from "./absorb.js";
+import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool, executeProxyToolAsync } from "./loop/core.js";
 import { drainPendingRetrievals } from "./store.js";
 import { runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     return runJsonRewrite(rewriteGoogleJsonSteps(body, ctx), (call) => executeProxyTool(call.name, call.args as Record<string, unknown>, ctx, call.id).text);
@@ -28,6 +28,10 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     let sawReal = false;
     const noteParts: string[] = [];
     const keptParts: GooglePart[] = [];
+    // Absorb signature in whole text (m00885): drop only when the request
+    // actually instructed the model about absorb.
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
+    const requestText = JSON.stringify(ctx.messages);
     for (const part of parts) {
         if (!part || typeof part !== "object") continue;
         const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
@@ -38,9 +42,12 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
             continue;
         }
         if (fc) sawReal = true;
-        if (typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text))) {
+        // #1960/KDD#10: a thought part carries a thoughtSignature the client
+        // echoes back verbatim — rewriting its text desyncs the signature and
+        // bricks replay. Strip prose only from non-thought parts.
+        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
             ctx.log(`[warn: tag echo] non-stream google output contains ACP echo (render tags/markers/internal artifacts), stripped: ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
-            part.text = stripAcpTags(part.text);
+            part.text = stripAcpTags(part.text, absorbArmed, requestText);
         }
         keptParts.push(part);
     }

@@ -14,7 +14,15 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, lstat
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
-import { installViaTarball, readDiskVersion, refreshDshDesktopCopy } from "../src/update.ts";
+// #2206: src/update.ts freezes its cache-dir paths (THROTTLE_FILE,
+// BACKOFF_STATE_FILE, ...) at import time. The backoff state file is shared
+// across processes, so a static import here would freeze the REAL
+// ~/.cache paths and have these tests read (and write) the machine's live
+// backoff state. Set the override BEFORE loading it — same discipline as
+// update-backoff.test.ts / update-owner-lane-backoff.test.ts.
+const __cacheRoot = mkdtempSync(path.join(tmpdir(), "bc-2082-smoke-cache-"));
+process.env.XDG_CACHE_HOME = path.join(__cacheRoot, "cache");
+const { installViaTarball, readDiskVersion, refreshDshDesktopCopy } = await import("../src/update.ts");
 import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {

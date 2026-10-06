@@ -13,7 +13,14 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, lstat
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
-import { installViaTarball, readDiskVersion, refreshDshDesktopCopy } from "../src/update.ts";
+// #2206: src/update.ts freezes its cache-dir paths (THROTTLE_FILE,
+// BACKOFF_STATE_FILE, ...) at import time — a static import would freeze the
+// REAL ~/.cache paths and have these tests read (and write) the machine's
+// live cross-process backoff state. Override BEFORE loading it (same
+// discipline as update-backoff.test.ts).
+const __cacheRoot = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-cache-"));
+process.env.XDG_CACHE_HOME = path.join(__cacheRoot, "cache");
+const { installViaTarball, readDiskVersion, refreshDshDesktopCopy } = await import("../src/update.ts");
 import { refreshDshProfileBundles } from "../src/dsh-channel.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -235,8 +242,8 @@ test("refreshDshProfileBundles skips the desktop profile without spawning the CL
     process.env.DSH_HOME = dshHome;
     const env = { ...process.env, BILI_DSH_BIN: path.join(root, "no-such-dsh-binary") };
     const { lines, log } = captureLog();
-    const refreshed = await refreshDshProfileBundles("2.0.0", log, env);
-    assert.equal(refreshed, 0);
+    const result = await refreshDshProfileBundles("2.0.0", log, env);
+    assert.deepEqual(result, { refreshed: 0, failed: 1 }); // web's CLI attempt fails (missing binary); desktop was never attempted
     assert.ok(!lines.some((l) => l.includes("profile desktop")), `must not attempt the CLI for desktop: ${lines.join(" | ")}`);
     // control: a non-desktop registry-pinned stale profile DID attempt the CLI,
     // proving this harness detects attempts — the desktop silence above is a skip,
