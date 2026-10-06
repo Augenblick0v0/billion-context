@@ -50,6 +50,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
+import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -2753,7 +2754,19 @@ async function handle(
         //    a USER message (leaving it at its anchor) so strict backends (SGLang:
         //    exactly one system at index 0, #377) accept it and the head system
         //    message stays byte-stable for the prefix cache.
-        const pluginMode = pluginAgent !== undefined;
+        //
+        //    #2155 self-heal degrade: a plugin-bound session whose live plugin
+        //    lane died (plugin removed, MCP subprocess gone) is flipped here
+        //    back to proxy mode — the proxy re-injects the ACP tools wire-side
+        //    and owns compression again, instead of nudging a session whose
+        //    tools are gone. The binding (metadata.pluginAgent) is kept so the
+        //    session can be restored when the lane returns.
+        // NOTE: the restore signal is the LIVE HEADER, not pluginAgent — the
+        // sticky binding keeps pluginAgent defined on headerless zombie
+        // requests, and restoring on that would clear the degrade one round
+        // after arming it (the session never actually degraded).
+        if (pluginAgent !== undefined) pluginLaneRestore(session, pluginAgentHeader(req.headers) !== undefined, log);
+        const pluginMode = pluginAgent !== undefined && !pluginLaneDegraded(session);
         // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
         // channel that can round-trip the full original, so CCR arms only where
         // that channel exists and is resolvable: proxy mode always (the proxy
@@ -3147,6 +3160,9 @@ async function handle(
             // retry path) suppresses the fail-fast response — forward() answers
             // with the original upstream 400 instead, preserving today's
             // client-visible contract when the payload cannot be rescued.
+            // #2155: self-heal evaluates once per HTTP request — the refold
+            // re-runs prepare below but must not double-count a round.
+            let selfHealRoundDone = false;
             const runPreparedPipeline = async (
                 respondFailFast: boolean,
                 overflowWindow?: number,
@@ -3235,6 +3251,21 @@ async function handle(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                // #2155 self-heal round: one evaluation per request, on the
+                // nudge-carrying prepared result (bypass lanes have nudge
+                // undefined and the hook no-ops inside). Side requests
+                // (title-gen etc.) never carry a nudge, so they cannot burn
+                // zombie credit either.
+                if (!selfHealRoundDone && prepared.nudge !== undefined) {
+                    selfHealRoundDone = true;
+                    evaluateSelfHealRound(session, {
+                        pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
+                        biliToolsDeclared: biliToolsDeclaredOnWire(parsed, protocol),
+                        nudgeActive: opts.compress.injectNudge && !nudgeSuppressed(session) && (prepared.nudge.shouldInject || emergencyNudge(prepared.nudge)),
+                        biliToolUses: countBiliToolUses(prepared.processedMessages),
+                        degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
+                    }, log);
+                }
                 if (!countTokens && !responsesCompact) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
@@ -4063,7 +4094,9 @@ async function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
+        // stops nagging — including the emergency path, per session.
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4308,7 +4341,7 @@ async function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4574,7 +4607,7 @@ async function prepareGoogle(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
@@ -4881,7 +4914,7 @@ async function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);

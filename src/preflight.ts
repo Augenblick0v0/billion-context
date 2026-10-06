@@ -740,6 +740,17 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
         try {
             return await requestSummary(deps, system, content, stream, includeMaxOutputTokens);
         } catch (err) {
+            if (err instanceof UpstreamHttpError && !stream && (err.status === 524 || err.status === 504)) {
+                // #2155 D3: first-hit learn — the non-streaming summary call
+                // timed out at the gateway. Flip this session to SSE summaries
+                // (persisted, same slot as the #626/#2133 learn) and retry once;
+                // the streaming attempt itself keeps normal transient retry
+                // semantics inside requestSummaryBody.
+                deps.session.metadata.preflightStreamSummary = true;
+                stream = true;
+                deps.log("info", `[preflight] non-streaming summary timed out at the gateway (HTTP ${err.status}); retrying with SSE (learned for this session, #2155)`);
+                continue;
+            }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
                 if (!stream && STREAM_REQUIRED_RE.test(err.body)) {
@@ -803,7 +814,7 @@ class SummaryTransportError extends Error {
     }
 }
 
-async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<string> {
+async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boolean): Promise<string> {
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         deps.signal?.throwIfAborted();
@@ -826,6 +837,16 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
         } catch (err) {
             deps.signal?.throwIfAborted();
             const failure = err instanceof UpstreamHttpError ? err : new SummaryTransportError(stage, err, attempt);
+            // #2155 D3: a gateway timeout (Cloudflare 524 / 504) on a
+            // NON-STREAMING summary must not burn the replay budget — each
+            // identical retry just waits out another ~100s edge timeout. Surface
+            // it immediately; summarizeRange learns SSE for the session and
+            // retries once with stream:true (the #2133 self-learn semantics,
+            // extended beyond the 400 "stream required" shape). Streaming
+            // attempts keep the normal transient replay below.
+            if (failure instanceof UpstreamHttpError && !stream && (failure.status === 524 || failure.status === 504)) {
+                throw failure;
+            }
             // #2189: retrying the identical shape cannot succeed — name it and fail fast.
             const shapeRejection = failure instanceof UpstreamHttpError
                 && isCredentialShapeRejection(failure.status, failure.body);
@@ -864,7 +885,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);

@@ -95,3 +95,13 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 | **hermes** | `~/.hermes/plugins/billion-context/`(拷贝文件 + 指向全局 dist 的 `bili.json` sidecar) | **`bili plugin update hermes`** 重新拷文件;sidecar 跟随全局安装 |
 
 这在代码里强制,不只是约定:自更新器(`src/update.ts` → `hostManagedInstall`)识别 pnpm 虚拟 store(`.pnpm`)或宿主 agent 树(pi / opencode / dsh / kimi / omp home)下的安装目录并**跳过**它们;`installViaTarball` 从结构上拒绝它们,直接调用方也无法损坏 store。混用*命令*没问题(`dsh plugin add` ≡ `bili plugin install dsh` —— 同一通道、同一记录);混用*写者*才是守卫禁止的事。`bili plugin update [client]` 是唯一能驱动每条 lane 走各自 owner 的命令,并打印逐 lane 更新路径(`bili plugin list` 显示同样的逐 lane 通道)。
+
+## 会话卡死自愈 —— 检测常量与补救(#2155)
+
+三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
+
+- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
+- **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除。
+- **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。
+
+可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。

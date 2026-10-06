@@ -31,7 +31,7 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
@@ -486,7 +486,10 @@ export async function main(): Promise<void> {
         }
         if (pluginAction === "remove") {
             try {
-                console.log(pluginRemove(pluginAgent!));
+                // #2155: best-effort note about still-open client windows.
+                const removed = pluginRemove(pluginAgent!);
+                const warn = await warnActivePluginSessions(pluginAgent!);
+                console.log(warn === "" ? removed : removed + "\n" + warn);
             } catch (error) {
                 console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
                 process.exit(1);

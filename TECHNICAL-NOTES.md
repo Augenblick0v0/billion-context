@@ -298,3 +298,43 @@ so direct callers cannot corrupt a store either. Mixing *commands* is fine
 mixing *writers* is what the guard forbids. `bili plugin update [client]`
 is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
+
+## Stuck-session self-heal — detection constants and remedies (#2155)
+
+Three failure shapes share one detector family in `src/session-self-heal.ts`,
+evaluated once per request (after `prepare`, on the nudge-carrying lanes only;
+bypass and side lanes never earn credit):
+
+- **D2 zombie plugin lane** — the plugin was uninstalled (or its MCP child
+  died) but already-open client windows keep the session plugin-bound
+  (sticky `metadata.pluginAgent`, `src/server.ts`). Signal: 5 consecutive
+  rounds (`SELF_HEAL_WINDOW`) that were nudged, carried **no** `x-bili-plugin`
+  header, declared **no** bili tools on the wire, and produced **no**
+  compression reduction. Remedy: **degrade to proxy mode** — the single
+  `pluginMode` flip (`pluginAgent !== undefined && !pluginLaneDegraded(session)`)
+  re-injects the ACP tools wire-side, re-arms the compress rewriter, CCR
+  stamping and absorb, and **keeps the nudge** (the tools are back). When wire
+  injection is unavailable (`compress.injectTool=false` → `degradeAvailable`
+  false) the remedy falls back to **suppress-nudge**. Recovery: the live
+  plugin header (`pluginLaneRestore`, hoisted BEFORE the `pluginMode` flip so
+  the first header-bearing request is already plugin mode — the sticky
+  `pluginAgent` must NOT be used as the restore signal or the degrade clears
+  one round after arming). The binding is kept, never erased.
+- **D1 nudge idle** (non-plugin generalization) — 5 consecutive nudged rounds
+  with zero reduction and zero bili tool uses. Remedy: suppress the nudge at
+  all four `willInjectNudge` gates (`&& !nudgeSuppressed(session)`, covering
+  the emergency path too). Recovery: any compression reduction or bili tool
+  use lifts the suppression.
+- **D3 gateway-killed summaries** — a **non-streaming** preflight summary that
+  dies with HTTP 524/504 (Cloudflare class) is not retried in place (the old
+  transient-retry path burned ~100 s per attempt against a dead gateway);
+  instead the session learns `metadata.preflightStreamSummary = true` on the
+  **first** hit and the summary is re-requested as SSE — the same learned
+  store as the manual `compress.streamSummary` knob (#2133), auto-armed.
+
+Observability: `session.metadata.selfHeal = { detected, action, since }` is
+exposed in `/__bili/sessions`, badged in the web UI ("heal"), and every
+transition logs one `[self-heal]` line (detect + recovery). `bili plugin
+remove <client>` best-effort queries the live proxy (instance file →
+`GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
+when sessions of that client were active within the last **10 minutes**.
