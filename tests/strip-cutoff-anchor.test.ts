@@ -6,11 +6,13 @@ import { join } from "node:path";
 import {
     coreMessagesFor,
     foldAnchoredCutoff,
+    messageImageBytes,
     pruneRetrieveImgExports,
     restoreExportDir,
+    restoreExportDirName,
 } from "../src/image-restore.ts";
 import { imagePlaceholdersForSummary } from "../src/image-note.ts";
-import type { CompressionState } from "acp-kernel";
+import type { CompressionState, Config, CoreMessage } from "acp-kernel";
 
 const antTxt = (t: string) => ({ type: "text", text: t });
 const antImg = () => ({
@@ -134,4 +136,113 @@ test("imagePlaceholdersForSummary: appends the ref, degrades without one", () =>
     };
     assert.deepEqual(imagePlaceholdersForSummary(m, "m00042"), ["[image: png · m00042]"]);
     assert.deepEqual(imagePlaceholdersForSummary(m, undefined), ["[image: png]"]);
+});
+
+test("restoreExportDirName: sanitizer collisions are salted apart; pure ids keep their historical name (#1995 review ①)", () => {
+    assert.equal(restoreExportDirName("plain-session"), "plain-session", "no sanitizer change → no salt");
+    const slash = restoreExportDirName("a/b");
+    const dash = restoreExportDirName("a-b");
+    assert.notEqual(slash, dash, "'a/b' and 'a-b' must not share a spill dir");
+    assert.match(slash, /^a-b-[0-9a-f]{8}$/);
+    assert.equal(dash, "a-b", "already-safe ids keep their historical unsalted name");
+    assert.equal(slash, restoreExportDirName("a/b"), "salt is deterministic across restarts");
+    const long = "L".repeat(120);
+    assert.match(restoreExportDirName(long), /^L{100}-[0-9a-f]{8}$/, "truncation also salts");
+});
+
+test("messageImageBytes: mirrors the Gemini-3 $ref guard — ref-pointed parts are not indexed (#1995 review ⑤)", () => {
+    const imgPart = { inlineData: { mimeType: "image/png", data: "QUJD" } };
+    const bodyOf = (response: unknown) => ({
+        model: "gemini",
+        contents: [{ role: "user", parts: [{ functionResponse: { name: "shot", response, parts: [imgPart] } }] }],
+    });
+    const guarded = coreMessagesFor(bodyOf({ $ref: "part_0" }), "google")!;
+    const guardedCarrier = guarded.find((m) => Array.isArray((m as { rawGoogleParts?: unknown }).rawGoogleParts));
+    assert.ok(guardedCarrier, "google wire produced a sidecar-carrying core message");
+    assert.equal(messageImageBytes(guardedCarrier).length, 0, "$ref-pointed response parts are skipped (strip side keeps them)");
+    const plain = coreMessagesFor(bodyOf({ ok: true }), "google")!;
+    const plainCarrier = plain.find((m) => Array.isArray((m as { rawGoogleParts?: unknown }).rawGoogleParts));
+    assert.ok(plainCarrier);
+    assert.equal(messageImageBytes(plainCarrier).length, 1, "ordinary nested inlineData is indexed");
+});
+
+test("model-driven fold: summary gains a folded-images footer carrying refs (#1995 review ④)", async () => {
+    // The preflight path renders host-side image notes into its summaries; a
+    // MODEL-driven fold writes whatever the model wrote. The footer keeps the
+    // decompress({ imageRef }) discoverability pointer alive in that path too.
+    const { createCore, defaultConfig } = await import("acp-kernel");
+    const { applyRanges } = await import("../src/stream.ts");
+    const { parseCompressInput } = await import("../src/compress-tool.ts");
+    const { getSession } = await import("../src/session.ts");
+    const { applyCompressSettings } = await import("../src/compress-settings.ts");
+
+    const tinyPng =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const config = applyCompressSettings(
+        defaultConfig(200_000),
+        200_000,
+        { ccr: { enabled: false, minToolTokens: 50 } },
+    ) as Config;
+    const core = createCore();
+    const session = getSession(`imgfoot-${Math.random().toString(36).slice(2)}`);
+    const msgs: CoreMessage[] = [
+        {
+            id: "h_0",
+            role: "assistant",
+            contentType: "tool-call",
+            toolCallId: "c1",
+            toolName: "shot",
+            text: "capture the failure",
+        },
+        {
+            id: "h_1",
+            role: "tool",
+            contentType: "tool-result",
+            toolCallId: "c1",
+            toolName: "shot",
+            text: "screenshot below",
+            rawResponsesItem: {
+                type: "function_call_output",
+                call_id: "c1",
+                output: [
+                    { type: "input_text", text: "screenshot below" },
+                    { type: "input_image", image_url: `data:image/png;base64,${tinyPng}` },
+                ],
+            },
+        } as CoreMessage & Record<string, unknown>,
+    ];
+    for (let i = 2; i < 24; i++) {
+        msgs.push({
+            id: `h_${i}`,
+            role: i % 2 === 0 ? "user" : "assistant",
+            contentType: "text",
+            text: `detail ${i} ${"x".repeat(2000)}`,
+        });
+    }
+    const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
+    session.state = turn.state;
+    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
+    applyRanges(
+        parseCompressInput({ content: [{ startId: "m00001", endId: "m00008", summary: "Model's own summary of the early history, setup and diagnostics." }] }),
+        ctx,
+    );
+    const block = [...session.state.blocks].find((b) => b.active);
+    assert.ok(block, "a block was created");
+    assert.match(block.summary, /Model.s own summary of the early history/);
+    // The image-bearing tool result is message 2 → m00002; the footer names it
+    // with its ref so a later turn can find the restore channel.
+    assert.match(
+        block.summary,
+        /\[folded images: \[image: png 1x1 · m00002\] — decompress\(\{ imageRef \}\) restores pixels\]/,
+    );
+    // And nothing was appended when the range has no sidecar images: fold the
+    // pure-text tail in a second block and check its summary stays untouched.
+    applyRanges(
+        parseCompressInput({ content: [{ startId: "m00009", endId: "m00014", summary: "Second stretch of text-only history and diagnostics notes." }] }),
+        ctx,
+    );
+    const blocks = [...session.state.blocks].filter((b) => b.active);
+    const textOnly = blocks.find((b) => b.summary.startsWith("Second stretch"));
+    assert.ok(textOnly, "second fold landed");
+    assert.ok(!textOnly.summary.includes("[folded images:"), "no footer without covered images");
 });

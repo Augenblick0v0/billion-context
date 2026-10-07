@@ -14,6 +14,7 @@
 // recovery (cf. billion-context-pi#594), not here.
 
 import { existsSync, mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
     anthropicToCore,
@@ -150,11 +151,20 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             }
             const fr = part.functionResponse;
             if (isObj(fr) && Array.isArray(fr.parts)) {
-                for (const np of fr.parts) {
-                    if (!isObj(np)) continue;
-                    const ni = np.inlineData;
-                    if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
-                        out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
+                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (kernel
+                // strip-images.ts) — when `response` points at a part via
+                // {"$ref": displayName} the strip side leaves the part untouched,
+                // so there is nothing to restore: skip indexing (harmless waste,
+                // not corruption, but the index and the strip disagree for no
+                // reason without this).
+                const refGuarded = JSON.stringify(fr.response ?? null).includes('"$ref"');
+                if (!refGuarded) {
+                    for (const np of fr.parts) {
+                        if (!isObj(np)) continue;
+                        const ni = np.inlineData;
+                        if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
+                            out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
+                        }
                     }
                 }
             }
@@ -388,9 +398,23 @@ export function describeRestorable(index: Map<string, IndexedImage[]>, cap = 50)
  *  of the path — a flat retrieve/img/ would let two sessions' same-numbered refs
  *  collide, and with skip-if-exists the first session's pixels would be served
  *  for the second session's ref forever (cross-session finding from review). */
+/** Directory name (not path) for a session's spill tree — exported so the
+ *  session GC can address the same dir under a test-provided root. */
+export function restoreExportDirName(sessionId: string): string {
+    const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100);
+    // Review ①: distinct raw ids that sanitize to the same safe form ("a/b" vs
+    // "a-b", or a >100-char truncation) must not share a directory — salt with
+    // a short hash of the RAW id whenever the sanitizer changed anything. The
+    // salt is deterministic, so the path survives restarts, and post-salt the
+    // map id -> dir is injective (two ids can only collide when both sanitize
+    // AND hash identically). Unsalted ids keep their historical path.
+    return safe === sessionId
+        ? (safe || "session")
+        : `${safe || "session"}-${createHash("sha256").update(sessionId).digest("hex").slice(0, 8)}`;
+}
+
 export function restoreExportDir(sessionId: string): string {
-    const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100) || "session";
-    return join(stateDir(), "retrieve", "img", safe);
+    return join(stateDir(), "retrieve", "img", restoreExportDirName(sessionId));
 }
 
 function extFor(mediaType: string): string {
