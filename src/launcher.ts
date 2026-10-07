@@ -14,6 +14,7 @@
  *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili aider  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE (cert-MITM)
+ *   bili crush  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE (cert-MITM)
  *   bili test pi                      non-polluting pi smoke test
  *
  * The real upstream hosts are DISCOVERED by reading (never editing) the
@@ -63,7 +64,7 @@ import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
@@ -139,6 +140,8 @@ export {
     type AiderConfig,
     COPILOT_DEFAULT_MODEL_HOSTS,
     AMP_DEFAULT_MODEL_HOSTS,
+    CRUSH_DEFAULT_MODEL_HOSTS,
+    readCrushConfig,
     resolveGooseDirs,
     readGooseConfig,
     type GooseConfig,
@@ -147,9 +150,9 @@ export {
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -821,6 +824,29 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "crush") {
+        // #2340: open-source Go binary — cert-MITM like amp/copilot (net/http
+        // honors HTTPS_PROXY; CA rides SSL_CERT_FILE). Whitelist the built-in
+        // provider hosts plus custom provider base_urls discovered from
+        // crush.json (readCrushConfig, https only); exotic relays ride
+        // --mitm-domain.
+        for (const h of CRUSH_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+        for (const raw of config.crush?.baseUrls ?? []) {
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+                const host = new URL(raw).hostname.toLowerCase();
+                if (host && !httpsSeen.has(host)) {
+                    httpsSeen.add(host);
+                    httpsDomains.push(host);
+                }
+            } catch {}
+        }
     } else if (client === "goose") {
         // #1049: release builds wire reqwest with rustls (webpki roots), so the
         // proxy's CA is untrusted and cert-MITM cannot reach goose at all — every
@@ -1028,6 +1054,13 @@ export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return buildClientEnv(ENV_CLIENTS.amp, origin, caPath, baseEnv);
+}
+
+export function buildCrushEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #2340: crush is a Go binary like amp/copilot — same cert-MITM contract
+    // (net/http honors HTTPS_PROXY; the combined CA bundle replaces Go's
+    // system trust store via SSL_CERT_FILE).
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
 export function buildCodexArgs(
@@ -1395,12 +1428,12 @@ function isPrivateIPv4(host: string): boolean {
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
- *  copilot/amp/goose are excluded likewise: closed or unverified MCP
- *  surfaces, v1 runs pure wire mode (#1049). antigravity is excluded too
+ *  copilot/amp/crush/goose are excluded likewise: closed or unverified MCP
+ *  surfaces, v1 runs pure wire mode (#1049 / #2340). antigravity is excluded too
  *  (#2115): its model channel is a closed Go binary with no MCP-injection
  *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -5022,6 +5055,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #1049: cert-MITM like copilot; ampcode.com carries both the model
         // leg and the control plane, so the single whitelist entry covers both.
         env = buildAmpEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "crush") {
+        // #2340: cert-MITM like amp/copilot — Go net/http honors HTTPS_PROXY
+        // and the combined CA bundle via SSL_CERT_FILE. Whitelist = built-in
+        // provider hosts + crush.json custom base_urls (discoverRoutes).
+        env = buildCrushEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "goose") {
         // #1049: rustls release builds won't trust bili's CA, so no proxy envs
         // at all — every model leg is redirected straight at the proxy as
