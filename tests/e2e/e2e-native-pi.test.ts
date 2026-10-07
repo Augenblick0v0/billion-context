@@ -787,6 +787,180 @@ if (checkOnly) {
   );
 
   test(
+    "pi-subagents unmodified delegate child (fork): real compress fold through the fallback channel (#2268)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const pisPkg = await ensurePiSubagents();
+      if (!pisPkg) {
+        t.skip(
+          `pi-subagents@${PI_SUBAGENTS_VERSION} unavailable (npm registry unreachable)`,
+        );
+        return;
+      }
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      const settingsPath = path.join(ctx.piAgentDir, "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+        packages: string[];
+      };
+      settings.packages.push(pisPkg);
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+      // Run one loads bulky tagged filler into the PARENT session (persisted,
+      // with a leaf) — the raw material a forked child inherits. Inside the
+      // child it sits far enough behind the task prompt to leave the kernel's
+      // protected zone (last 5 messages / last 5000 tokens / most recent user
+      // message), so the scripted compress has a legal target.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      // Run two: the parent's scripted subagent call spawns the UNMODIFIED
+      // builtin delegate role in-process with an explicit fork; the child's
+      // task text scripts the CHILD'S queue (separate conversation key) into a
+      // real compress round trip plus a post-fold status call.
+      const fold = await piRun(
+        ctx,
+        '请调用subagent {"agent":"delegate","task":"请调用compress;请调用acp_status","context":"fork"}',
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+      assert.match(
+        fold.stdout,
+        /收到#done/,
+        `parent must finish the scripted loop; stdout:\n${fold.stdout}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      // The parent is the conversation whose model emitted the subagent tool
+      // call (the delegate whitelist cannot carry it); the forked child gets
+      // its own conversation id.
+      const parentConv = oracle.find((o) => o.toolName === "subagent")?.conv;
+      assert.ok(parentConv, "parent subagent-call request must be in the oracle");
+      const childRows = oracle.filter(
+        (o) => o.plugin === "pi" && o.conv !== parentConv,
+      );
+      // Forked-history turn + compress-result turn + acp_status-result turn.
+      assert.ok(
+        childRows.length >= 3,
+        `expected >=3 plugin-stamped child requests, got ${childRows.length} (oracle convs: ${JSON.stringify([...new Set(oracle.map((o) => o.conv))])}`,
+      );
+      // Fallback channel active on EVERY child request: the role's original
+      // whitelist survives AND the wire-injected ACP core four ride along.
+      const CORE_ACP = [
+        "compress",
+        "decompress",
+        "search_context",
+        "acp_status",
+      ];
+      const DELEGATE_WHITELIST = [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "edit",
+        "write",
+        "contact_supervisor",
+      ];
+      for (const o of childRows) {
+        for (const n of [...CORE_ACP, ...DELEGATE_WHITELIST]) {
+          assert.ok(
+            o.tools.includes(n),
+            `child request tools must include ${n}; got ${JSON.stringify(o.tools)}`,
+          );
+        }
+      }
+      // REAL compression inside the unmodified delegate child: the scripted
+      // compress folded the inherited filler server-side and the receipt came
+      // back into the child's conversation.
+      const compressRow = childRows.find((o) =>
+        o.toolResults.some((tr) => tr.name === "compress"),
+      );
+      assert.ok(
+        compressRow,
+        "compress must have executed server-side with its result fed back to the child",
+      );
+      const compressResult =
+        compressRow!.toolResults.find((tr) => tr.name === "compress")!.content;
+      assert.doesNotMatch(
+        compressResult,
+        /FAILED|Validation failed/,
+        `compress must succeed, got: ${compressResult.slice(0, 200)}`,
+      );
+      assert.match(
+        compressResult,
+        /\[Compressed m\d+[–-]m\d+ → \d+ block\(s\), ~\d+ tokens saved\.\]/,
+        `compress result must report the fold, got: ${compressResult.slice(0, 200)}`,
+      );
+      const statusRow = childRows.find((o) =>
+        o.toolResults.some((tr) => tr.name === "acp_status"),
+      );
+      assert.ok(
+        statusRow,
+        "post-fold acp_status must have executed with its result fed back",
+      );
+      assert.match(
+        statusRow.toolResults.find((tr) => tr.name === "acp_status")!.content,
+        /ACTIVE SURFACE[\s\S]*CONTEXT BREAKDOWN/,
+        "acp_status result must be the status report",
+      );
+      // The once-per-session channel-fallback log pins the detection itself
+      // (marker + allowlist verdict), including the extracted role name.
+      assert.match(
+        biliLog(ctx),
+        /\[pi-subagents\] child "delegate" role allowlist lacks ACP context tools/,
+        "proxy must log the pi-subagents channel fallback for the delegate child",
+      );
+      // The parent stays pure plugin mode: full ACP surface registered locally.
+      const parentLate = oracle.filter(
+        (o) =>
+          o.conv === parentConv &&
+          ACP_TOOLS.every((n) => o.tools.includes(n)),
+      );
+      assert.ok(
+        parentLate.length >= 1,
+        "parent session must keep its full plugin-mode ACP tool surface",
+      );
+      // Named identity persists for BOTH sessions, still plugin-bound; the
+      // compressed block lands in the CHILD's session (the parent never folds
+      // in this scenario).
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.ok(
+        sessions.length >= 2,
+        `expected parent + child persisted sessions, got ${sessions.length}`,
+      );
+      assert.ok(
+        sessions.every((s) => s.parsed.payload?.metadata?.pluginAgent === "pi"),
+        `all persisted sessions must bind pluginAgent=pi, got ${JSON.stringify(sessions.map((s) => s.parsed.payload?.metadata?.pluginAgent))}`,
+      );
+      const withBlocks = sessions.filter((s) => {
+        const blocks = s.parsed.payload?.state?.blocks;
+        return (
+          blocks !== undefined &&
+          blocks !== null &&
+          Object.keys(blocks as Record<string, unknown>).length >= 1
+        );
+      });
+      assert.ok(
+        withBlocks.length >= 1,
+        `the child's persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
+      );
+    },
+  );
+
+  test(
     "/acp command: exits clean and the status endpoint it consumes is live",
     { skip: suiteSkipReason },
     async (t) => {
