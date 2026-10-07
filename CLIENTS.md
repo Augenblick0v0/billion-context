@@ -617,6 +617,29 @@ Caveats worth knowing:
   lineage). Strictly more information, but anything keyed on `pfa-*`
   identities will observe different ids.
 
+## Adopting unlisted clients (any client with a configurable model base URL) (#2340)
+
+Every client that lets you **edit its model endpoint and carries an API key** (rather than a login) can ride compression today with a one-line change — no launcher, no code: prepend the proxy origin + `/bili/` to the base URL (`http://127.0.0.1:8787/bili/https://api.example.com/v1`), keep the API key as-is, and run the daemon (`bili start`). What you get is the full pure-proxy treatment: compression + wire-level tool injection. Details and examples: [CONFIGURATION.md → `/bili/` prefix](CONFIGURATION.md#bili-prefix-api-key-clients).
+
+Verified entry points (community-maintained list — the mechanism is generic):
+
+| Client | Where the base URL lives |
+|---|---|
+| **Cline / Roo Code / Kilo Code** (VS Code) | provider settings — "OpenAI Compatible" Base URL, or the Anthropic provider's base URL |
+| **Continue** | `~/.continue/config.yaml` — per-model `apiBase` |
+| **OpenHands** | `llm.base_url` (config or env) |
+| **Zed** | `settings.json` — `language_models.openai_compatible.api_url` |
+| **Void** | custom OpenAI-compatible endpoint setting |
+| **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
+| **Warp** | custom-model base URL setting |
+
+Notes:
+
+- **Crush** is a launcher lane now — prefer `bili crush` (config untouched, HTTPS domains MITM'd automatically).
+- Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
+- Plain **web apps** (browser-only products) have no local traffic to intercept.
+- VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.
+
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 
 Some clients (VS Code-based IDEs: CodeBuddy, Cursor, Windsurf, …) only offer an HTTP **proxy** setting (`http.proxy`, `codingcopilot.httpProxyURL`, …) — no model base-URL to rewrite. Such clients send `CONNECT <model-host>:443` through the proxy instead of plain `/bili/…` requests. That path is only decrypted when the model host is on bili's **MITM whitelist**; otherwise bili blind-tunnels the TLS bytes (opaque relay) and can never see — or compress — the model requests (#897).
