@@ -498,7 +498,7 @@ function sendStats(res: http.ServerResponse): void {
             protocol: s.meta.protocol,
             upstream: s.meta.upstreamOrigin,
             label: s.meta.label,
-            title: s.meta.title,
+            title: s.meta.hostTitle ?? s.meta.title,
             requests: s.stats.requests,
             contextTokens: s.stats.contextTokens,
             contextTokensSource: s.stats.contextTokensSource,
