@@ -69,20 +69,24 @@ test("openaiSystemTextForPersona: joins every system message's text", () => {
 
 type Rig = { proxyPort: number; upstreamPort: number; proxy: http.Server; upstream: http.Server };
 
-async function startRig(): Promise<Rig> {
-    const upstream = http.createServer((req, res) => {
-        let b = "";
-        req.on("data", (c: Buffer) => (b += c.toString("utf8")));
-        req.on("end", () => {
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({
-                id: "chatcmpl-1",
-                object: "chat.completion",
-                choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-                usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
-            }));
-        });
+type UpstreamHandler = (req: http.IncomingMessage, res: http.ServerResponse) => void;
+
+const chatCompletionUpstream: UpstreamHandler = (req, res) => {
+    let b = "";
+    req.on("data", (c: Buffer) => (b += c.toString("utf8")));
+    req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+            id: "chatcmpl-1",
+            object: "chat.completion",
+            choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+        }));
     });
+};
+
+async function startRig(upstreamHandler: UpstreamHandler = chatCompletionUpstream): Promise<Rig> {
+    const upstream = http.createServer(upstreamHandler);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
@@ -91,7 +95,6 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetPersonaAnchorsForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -246,6 +249,98 @@ test("e2e anthropic lane: the same persona fork applies to dsh-over-anthropic", 
         const fork = forkKey(CONV, REVIEW_SYSTEM);
         assert.ok(peekSession(fork), "review request forked onto its own session on the anthropic lane too");
         assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e responses lane #2203: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+    const rig = await startRig((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                id: "resp_1",
+                object: "response",
+                status: "completed",
+                output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+                usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+            }));
+        });
+    });
+    const CONV = "dshp-responses";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/responses`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const tools = [{ type: "function", name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+
+        // Phase 1 — main turn claims the raw key (anchor: MAIN_SYSTEM as `instructions`).
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_output_tokens: 64_000, instructions: MAIN_SYSTEM, input: mainMsgs(12), tools }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const main = getSession(CONV);
+        assert.ok(main, "main session exists under the raw conversation key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 12, "refs assigned to the main history");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
+
+        // Phase 2 — auto-review shape (fixed REVIEW_POLICY instructions +
+        // flattened blob) under the SAME conversation id: forks onto
+        // `|sub:<fp>` (#2203 — before the fix this request rode the main
+        // session on the responses wire and clobbered its snapshot/baseline).
+        const review = (blob: string) => ({
+            model: MODEL,
+            max_output_tokens: 384_000,
+            instructions: REVIEW_SYSTEM,
+            input: [{ role: "user", content: `Conversation transcript (flattened):\n${blob}\nDecide: risky?` }],
+        });
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it\nassistant: ok")) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, REVIEW_SYSTEM);
+        const fk = peekSession(fork);
+        assert.ok(fk, "review request landed on its own forked session");
+        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
+        assert.equal(fk.stats.requests, 1, "forked session served the review");
+        assert.equal(fk.metadata.personaNamespace, true, "fork stamped as a designed split (canary exemption, #2170 measure 4)");
+        assert.notEqual(getSession(CONV)?.metadata.personaNamespace, true, "main session is not namespaced");
+
+        // Phase 3 — a second review (same policy instructions, fresh blob)
+        // reuses the SAME forked session (persona stability, not a fork per call).
+        const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
+
+        // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
+        const r4 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_output_tokens: 64_000, instructions: MAIN_SYSTEM, input: mainMsgs(4), tools }),
+        });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
+
+        // Phase 5 — conversations map discipline (#970/#2156): the raw key
+        // points at the MAIN session even though the fork recorded itself
+        // (before the rawPersonaIdentity extension, the fork would have
+        // recorded under the raw id and flipped this map entry).
+        const mainId = getSession(CONV).id;
+        assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
+        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+
+        // Phase 6 — an instructions-less auxiliary call is non-anchoring:
+        // verbatim key, rides the main session (kernel empty-instructions path).
+        const r5 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_output_tokens: 64_000, input: mainMsgs(1) }) });
+        assert.equal(r5.status, 200);
+        await r5.text();
+        assert.equal(getSession(CONV)?.stats.requests, 3, "instructions-less request keeps the raw key");
     } finally {
         await closeRig(rig);
     }

@@ -1966,6 +1966,20 @@ async function handle(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
+                 : dshPersona && !sideRequestLike
+                   // #2203/#2241: parity with the anthropic/openai lanes —
+                   // dsh-over-Responses rides the same continuity-aware persona
+                   // anchor: a model switch (history continues the raw key's
+                   // chain) migrates the anchor on the raw key; a history-
+                   // discontinuous auto-review blob forks onto `|sub:<fp>`.
+                   // Must sit BEFORE the stableSystemAnchor branch below so a
+                   // plugin request never takes the plain-proxy verbatim anchor.
+                    ? personaNamespace(
+                          responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                          (parsed as ResponsesRequestBody).instructions ?? "",
+                          (parsed as ResponsesRequestBody).input,
+                          log,
+                      )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
                    // prepare* gates), instruction drift is the expected event —
@@ -2013,15 +2027,25 @@ async function handle(
             ? (openaiIdentity?.value ?? openaiSignal)
             : protocol === "anthropic"
               ? (anthropicIdentity?.value ?? anthropicSignal)
-              : undefined;
+              : protocol === "responses" && dshPersona
+                // #2203: dsh-responses forks record under their suffixed id
+                // (recordPluginSession keys on personaForked); without this
+                // case a fork would record under the raw id and steal the
+                // main session's entry from the single-valued conversations
+                // map (#970). Scoped to dsh: codexTurn keys verbatim and
+                // must keep personaForked false.
+                ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
+                : undefined;
         const personaForked = rawPersonaIdentity !== undefined && conversation !== rawPersonaIdentity;
         // #2170 measure 4: stamp sessions deliberately namespaced onto a
         // `|sub:` key — #970 claude subagents, #1916/#1307/#1314 dsh persona-
         // fork reviews, codex/claude-over-Responses instructions personas —
         // so the split-session canary can tell a DESIGNED split from the
         // #2165 drift shape (see splitSessionWarnings in src/session.ts).
-        // personaForked covers the anthropic/openai wires; the responses wire
-        // needs its own check (codexTurn keys verbatim and must not count).
+        // personaForked covers the anthropic/openai wires plus dsh-over-
+        // Responses (#2203); the explicit responses clause below stays for
+        // the codex/claude instructions personas (codexTurn keys verbatim
+        // and must not count).
         const designNamespaced = personaForked
             || (protocol === "responses"
                 && codexTurn === undefined
