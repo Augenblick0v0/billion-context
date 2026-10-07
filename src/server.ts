@@ -2640,7 +2640,10 @@ async function handle(
         // untouched. MARKER-DECISIVE since #2193: message count no longer gates
         // — rc.2 replays the full shadowed region (~1100+ msgs) and the old ≤4
         // bar made the guard silently pass through, letting a checkpoint land
-        // and destroy the compression substrate. Active by default, explicitly
+        // and destroy the compression substrate. Protocol coverage (#2360):
+        // openai + anthropic + responses lanes are all marker-decisive — the
+        // pre-#2360 whitelist short-circuited responses (dsh desktop's actual
+        // wire) before the marker was ever examined. Active by default, explicitly
         // opt-out-able (#2028) — auto pressure, overflow recovery, and manual
         // /compact share one envelope, and a landed checkpoint durably shadows
         // the raw history (irreversible), while every cost of refusing is
