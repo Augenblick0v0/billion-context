@@ -23,9 +23,8 @@ test("#2302: skeleton is line form — one string, one block per range", () => {
 test("#2302: tail frames one call and deferral, skips <2 ranges", () => {
     assert.equal(oneCallTail([range(1, 2)]), "", "nothing to batch");
     const tail = oneCallTail([range(1, 42), range(50, 121)]);
-    assert.ok(tail.includes("If you compress"), "#1198 conditional framing");
     assert.ok(tail.includes("never split"), "delete-don't-split licensing");
-    assert.ok(oneCallTail([range(1, 42), range(50, 121)], { conditional: false }).includes("When you compress"), "emergency variant stays unconditional");
+    assert.ok(!tail.includes("If you compress"), "the tail carries no directive of its own — the nudge text around it does (#1198)");
 });
 
 test("#2302: skeleton headers round-trip through the real compress parser", () => {

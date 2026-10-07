@@ -255,12 +255,6 @@ export function oneCallPayload(
   return blocks.join("\n\n") + tailMore;
 }
 
-export interface OneCallTailOptions {
-  /** Gentle nudges frame the skeleton conditionally (#1198 — "if you
-   *  compress"); emergency nudges keep their unconditional directive. */
-  conditional?: boolean;
-}
-
 /** #2302 root-cause fix, as a nudge tail. The nudge used to hand the model
  *  a LIST of recommended ranges plus a batching hint — and the model
  *  digests the list in groups, one compress call per group. Each separate
@@ -270,19 +264,14 @@ export interface OneCallTailOptions {
  *  session re-billed 1.38M tokens; one 9-range call on the same log paid
  *  once). Instructions about batching do not survive contact with the
  *  model — the arguments themselves now do. Empty when fewer than two
- *  ranges (nothing to batch). Keeps #1198 licensing: conditional framing
- *  where required, and delete-don't-split semantics — a model that still
- *  needs a range drops the block, it never folds the call in halves. */
+ *  ranges (nothing to batch). Keeps #1198 licensing: the gentle tip above
+ *  stays conditional, and delete-don't-split semantics mean a model that
+ *  still needs a range drops the block, never folds the call in halves. */
 export function oneCallTail(
   ranges: readonly CompressibleRange[],
-  options: OneCallTailOptions = {},
 ): string {
   if (ranges.length < 2) return "";
-  const when =
-    options.conditional === false
-      ? "When you compress"
-      : "If you compress";
-  return `\n\nONE CALL, ONE STRING — compress accepts a single string holding every range: one block per range, first line the refs (as shown below), remaining lines your summary. ${when}, send every block below in a single call; DELETE the blocks you still need (they reappear in later nudges) — never split them into several calls. Each separate call re-bills the whole remaining history; one call pays once.\n${oneCallPayload(ranges)}`;
+  return `\n\nONE CALL, ONE STRING — copy, fill each summary, DELETE the blocks you still need (they reappear in later nudges); never split into several calls:\n${oneCallPayload(ranges)}`;
 }
 
 
@@ -342,12 +331,11 @@ export function renderNudgeText(
         "",
         prompts.howToCompressRules,
         "",
-        `{ "topic": "...", "content": [{ "startId": "<ID>", "endId": "<ID>", "summary": "..." }] }`,
         "Only use IDs from visible messages above. Compress older work first.",
         "",
         rangesStr,
         ...(blockMapStr ? ["", blockMapStr] : []),
-        oneCallTail(decision.compressibleRanges, { conditional: false }),
+        oneCallTail(decision.compressibleRanges),
       ]).join("\n"),
     };
   }

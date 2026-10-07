@@ -409,8 +409,8 @@ test("#2302: emergency nudge keeps the skeleton but stays unconditional (#1198)"
     "emergency stays unconditional",
   );
   assert.ok(
-    emergency.text.includes("When you compress"),
-    "unconditional framing for the skeleton",
+    emergency.text.includes("ONE CALL, ONE STRING"),
+    "skeleton framing has no conditional of its own (the emergency header carries the directive)",
   );
 });
 

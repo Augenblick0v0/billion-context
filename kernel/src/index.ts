@@ -58,7 +58,6 @@ export type {
   NudgeVoice,
   RenderedNudge,
   NudgePromptSections,
-  OneCallTailOptions,
 } from "./nudge-text.js";
 export {
   resolveBlockSpan,
