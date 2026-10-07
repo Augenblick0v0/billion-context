@@ -893,6 +893,8 @@
 
 浅层键（`https://open.bigmodel.cn`）匹配该主机上的所有路径。深层键（`https://open.bigmodel.cn/api/anthropic`）仅匹配该端点。当两个键都匹配时，最长（最具体）的那个胜出。键末尾的斜杠会被自动去除。
 
+**上游匹配不到任何键的请求不应用任何 per-provider 覆盖项。** 若请求 URL 匹配不上上面任何键，该请求只按 registry/全局默认运行 —— 它的 `models.<m>.context`、`compress.modelContextLimit`、proxy、protocol 等全部被静默忽略。最常见的坑是把客户端切到*另一个中转 host*，而你的固定值还写在旧 host 的键下：新 host 是 route-miss，你在旧键下设的东西永远到不了它。自 #2317 起这不再是静默的 —— bili 会按 (upstream, model) 各记一条 `[route]` 警告并列出已知键，在 `[window]` / codex-clamp 行打上 `upstream=<…> route=miss`，超窗 payload 的 preflight 502 也会指向缺失的键，而不是让你重设 `compress.modelContextLimit`。给新 host（或其 URL 前缀）加一个 `providers` 条目即可让你的覆盖项在那里生效。这些行里的端点以指纹形式（`<host:xxxxxxxx>`）而非明文打印，与日志主机掩码策略（`BILI_LOG_MASK_HOSTS`）一致。
+
 ### MITM vs `/bili/` key schemes
 
 登录客户端（ZCode 经 MITM）与 API-key 客户端可能打向同一个主机（`open.bigmodel.cn`）。要让两者的配置可以不同，MITM 流量在 provider lookup key 里用 `mitm://` scheme，而 `/bili/` 流量用真实的 `https://`：

@@ -893,6 +893,8 @@ Keys are matched against the request's upstream URL by **longest-prefix wins**. 
 
 A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A deep key (`https://open.bigmodel.cn/api/anthropic`) matches only that endpoint. When two keys both match, the longest (most specific) one wins. Trailing slashes on keys are stripped automatically.
 
+**A request whose upstream matches no key applies NO per-provider override.** If the request URL matches none of the keys above, that request runs on registry/global defaults only — its `models.<m>.context`, `compress.modelContextLimit`, proxy, protocol, etc. are all silently ignored. The usual trap is switching your client to a *different relay host* while your pins live under the old host's key: the new host is a route-miss, so nothing you set under the old key ever reaches it. Since #2317 this is loud instead of silent — bili logs a once-per-(upstream, model) `[route]` warning naming the known keys, stamps `upstream=<…> route=miss` on the `[window]` / codex-clamp lines, and a preflight 502 for an over-window payload points at the missing key rather than telling you to re-set `compress.modelContextLimit`. Add a `providers` entry for the new host (or URL prefix) to make your overrides apply there. Endpoints in these lines are fingerprinted (`<host:xxxxxxxx>`) rather than printed verbatim, consistent with log host-masking (`BILI_LOG_MASK_HOSTS`).
+
 ### MITM vs `/bili/` key schemes
 
 A login client (ZCode via MITM) and an API-key client can both hit the same host (`open.bigmodel.cn`). To let their config differ, MITM traffic uses a `mitm://` scheme in the provider lookup key while `/bili/` traffic uses the real `https://`:
