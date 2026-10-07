@@ -6,6 +6,8 @@
 
 PR #2167 已通过 `src/external-summary-runtime.ts` 和 `src/external-summary-compress.ts`，将 `src/external-summary.ts` 独立执行器接入宿主压缩路径。`compress.externalSummary` 默认关闭，须显式启用；该链与其余 `compress` 字段一样存在全部三个层级（provider/model 层整链替换，无子字段合并），且沿请求 Config 轨道（`ctx.config` / `effectiveConfig`，#833）流动，不再有旁路配置文件。当前是评审分支中的实现，不是已发布版本，也未部署生产；配置面仍待仓库 owner 明确确认。
 
+链以**引用**形式表达（`"glm/glm-4.9-flash"`），指向 `providers` 表中的具名拨号配方（带 `baseUrl`/`api`/凭据/`models` 的非 URL 条目，详见 `CONFIGURATION.zh-CN.md`）。解析分两层：`src/external-summary-settings.ts` 在配置加载时做语法层链解析（`parseExternalSummaryChain`），在请求应用时做引用展开（`expandExternalSummaryChain` / `src/compress-settings.ts` 的 tolerant 变体），产出执行器轨道消费的展开型 `ExternalSummarySettings`。启用链中的不可解析引用会记录一次警告并禁用整条链 —— 绝不回退主模型。Web API 保存时对不可解析的启用链返回 HTTP 400；配方从即将保存的 `providers` 段收集（`src/config.ts` 的 `collectNamedProviders`）。
+
 执行器接收不可变的任务文本、指令、可选只读参考，有序的异步候选调用及明确的内部预算。协议、鉴权和范围选择由调用方负责；没有调用方就不会请求供应商或折叠历史。
 
 `src/external-summary-http.ts` 提供 Anthropic、OpenAI Chat、Responses 和 Google 的单次 HTTP 候选调用，复用现有摘要编解码；关闭态不改变既有 preflight 行为。它使用明确的摘要端点、模型及认证头快照，不继承主请求凭据；只读参考与被选内容分别传递。重定向、非法 UTF-8、响应字节超限、缺少完成标记、截断及工具调用都会被拒绝；中转改变返回格式时仍检查 SSE 帧及完成状态。HTTP 或流式失败交给既有候选链切换，不另加重试循环。隔离测试使用本机模拟上游；另有可选真实 Responses 烟测，验证事实保留和原文精确恢复。烟测不等于多供应商质量或费用基准。

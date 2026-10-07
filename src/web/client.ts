@@ -1770,6 +1770,13 @@ export const WEB_CLIENT = `(function () {
             try { draft = read(); } catch (e) { box.textContent = t("cfg.invalid_json"); return; }
             const s = (draft.compress && draft.compress.externalSummary) || { enabled: false, targets: [] };
             if (s.invalid || !Array.isArray(s.targets || [])) { box.textContent = t("summary.invalid"); return; }
+            // Recipes = named (non-URL) providers entries carrying dial fields;
+            // the raw editor below owns their bodies, this panel only wires the
+            // chain (references + budget) and the credential keys they cite.
+            const providers = draft.providers && typeof draft.providers === "object" && !Array.isArray(draft.providers) ? draft.providers : {};
+            const recipes = Object.keys(providers).filter((name) => name.indexOf("http://") !== 0 && name.indexOf("https://") !== 0 && providers[name] && typeof providers[name] === "object" && !Array.isArray(providers[name]) && (providers[name].baseUrl !== undefined || providers[name].api !== undefined)).map((name) => ({ name, recipe: providers[name] }));
+            const options = [];
+            recipes.forEach(({ name, recipe }) => { Object.keys(recipe.models && typeof recipe.models === "object" ? recipe.models : {}).forEach((model) => options.push(name + "/" + model)); });
             const head = document.createElement("div"); head.className = "summary-actions";
             const enabled = document.createElement("label");
             const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.id = "summary-enabled"; toggle.checked = s.enabled === true;
@@ -1778,48 +1785,56 @@ export const WEB_CLIENT = `(function () {
             enabled.append(toggle, document.createTextNode(" " + t("summary.enabled"))); head.appendChild(enabled);
             const add = button(head, t("summary.add"), () => mutate((v) => {
                 if (!v.targets) v.targets = [];
-                let n = 1; while (v.targets.some((target) => target.name === "summary-" + n)) n++;
-                v.targets.push({ name: "summary-" + n, protocol: "responses", url: "https://api.openai.com/v1/responses", model: "", credentialRef: "secret:summary-" + n, contextWindow: 128000, outputTokens: 8192, stream: false });
+                v.targets.push(options.find((option) => v.targets.indexOf(option) === -1) || "");
             }, true));
-            add.disabled = !!cfg.parseError || (s.targets || []).length >= 16;
+            add.disabled = !!cfg.parseError || (s.targets || []).length >= 16 || (options.length === 0 && (s.targets || []).length > 0);
             box.appendChild(head);
-            (s.targets || []).forEach((target, i) => {
+            if (options.length === 0) {
+                const hint = document.createElement("p"); hint.textContent = t("summary.no_recipes"); box.appendChild(hint);
+            }
+            (s.targets || []).forEach((ref, i) => {
                 const item = document.createElement("fieldset"); item.className = "summary-target";
-                const legend = document.createElement("legend"); legend.textContent = String(i + 1) + ". " + target.name; item.appendChild(legend);
+                const legend = document.createElement("legend"); legend.textContent = String(i + 1) + ". " + (ref || "—"); item.appendChild(legend);
                 const fields = document.createElement("div"); fields.className = "summary-grid";
-                const set = (key, value) => mutate((v) => { v.targets[i][key] = value; });
-                [["name", t("summary.name")], ["url", t("summary.url")], ["model", t("summary.model")], ["credentialRef", t("summary.credential")]].forEach(([key, label]) => field(fields, "summary-" + i + "-" + key, label, target[key], (value) => { set(key, value); if (key === "credentialRef") render(); }));
-                field(fields, "summary-" + i + "-protocol", t("summary.protocol"), target.protocol, (value) => set("protocol", value), null, ["responses", "openai", "anthropic", "google"]);
-                field(fields, "summary-" + i + "-contextWindow", t("summary.context"), target.contextWindow || 128000, (value) => set("contextWindow", value), "number");
-                field(fields, "summary-" + i + "-outputTokens", t("summary.output"), target.outputTokens || 8192, (value) => set("outputTokens", value), "number");
+                const refOptions = options.slice();
+                if (ref && refOptions.indexOf(ref) === -1) refOptions.unshift(ref);
+                const set = (value) => mutate((v) => { v.targets[i] = String(value).trim(); }, true);
+                field(fields, "summary-" + i + "-ref", t("summary.ref"), ref, set, refOptions.length ? null : "text", refOptions.length ? refOptions : undefined);
                 item.appendChild(fields);
                 const actions = document.createElement("div"); actions.className = "summary-actions";
-                const streamLabel = document.createElement("label"), stream = document.createElement("input"); stream.type = "checkbox"; stream.id = "summary-" + i + "-stream"; stream.checked = target.stream === true;
-                stream.addEventListener("change", () => set("stream", stream.checked));
-                streamLabel.append(stream, document.createTextNode(" " + t("summary.stream"))); actions.appendChild(streamLabel);
                 button(actions, t("summary.up"), () => mutate((v) => { const prev = v.targets[i - 1]; v.targets[i - 1] = v.targets[i]; v.targets[i] = prev; }, true), "&#8593;").disabled = i === 0;
                 button(actions, t("summary.down"), () => mutate((v) => { const next = v.targets[i + 1]; v.targets[i + 1] = v.targets[i]; v.targets[i] = next; }, true), "&#8595;").disabled = i === s.targets.length - 1;
                 button(actions, t("summary.remove"), () => mutate((v) => { v.targets.splice(i, 1); }, true), "&#215;");
-                const keyRow = document.createElement("div"); keyRow.className = "summary-actions";
-                const key = field(keyRow, "summary-" + i + "-key", t("summary.key"), "", () => {}, "password");
-                key.autocomplete = "new-password";
-                const badge = document.createElement("span"); badge.className = "badge " + (status[target.credentialRef] ? "ok" : "disk"); badge.textContent = status[target.credentialRef] ? t("summary.key_set") : t("summary.key_missing"); keyRow.appendChild(badge);
-                const editable = typeof target.credentialRef === "string" && target.credentialRef.indexOf("secret:") === 0;
-                async function saveKey(btn, value) {
-                    if (!editable) { toast(t("summary.secret_only"), "err"); return; }
-                    busy(btn, true);
-                    try {
-                        const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: target.credentialRef.slice(7), key: value }) });
-                        key.value = ""; status[target.credentialRef] = result.configured;
-                        badge.textContent = result.configured ? t("summary.key_set") : t("summary.key_missing"); badge.className = "badge " + (result.configured ? "ok" : "disk");
-                        toast(t("summary.key_saved"), "ok");
-                    } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
-                }
-                const save = button(keyRow, t("summary.key_save"), () => saveKey(save, key.value));
-                const del = button(keyRow, t("summary.key_delete"), () => { if (confirm(t("summary.key_delete") + "?")) saveKey(del, null); });
-                key.disabled = save.disabled = del.disabled = !editable;
-                item.append(actions, keyRow); item.disabled = !!cfg.parseError; box.appendChild(item);
+                item.appendChild(actions); item.disabled = !!cfg.parseError; box.appendChild(item);
             });
+            if (recipes.length) {
+                const creds = document.createElement("div"); creds.className = "summary-creds";
+                const title = document.createElement("h4"); title.textContent = t("summary.credentials"); creds.appendChild(title);
+                recipes.forEach(({ name, recipe }) => {
+                    const row = document.createElement("div"); row.className = "summary-actions";
+                    const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
+                    const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
+                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    if (ref && ref.indexOf("secret:") === 0) {
+                        const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
+                        key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
+                        async function saveKey(btn, value) {
+                            busy(btn, true);
+                            try {
+                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured;
+                                render();
+                                toast(t("summary.key_saved"), "ok");
+                            } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
+                        }
+                        const save = button(row, t("summary.key_save"), () => saveKey(save, key.value));
+                        const del = button(row, t("summary.key_delete"), () => { if (confirm(t("summary.key_delete") + "?")) saveKey(del, null); });
+                        save.disabled = del.disabled = !!cfg.parseError;
+                    }
+                    creds.appendChild(row);
+                });
+                box.appendChild(creds);
+            }
             const budget = document.createElement("div"); budget.className = "summary-grid";
             [["totalTimeoutMs", t("summary.total"), 50000], ["targetTimeoutMs", t("summary.timeout"), 25000], ["maxSummaryBytes", t("summary.bytes"), 65536]].forEach(([key, label, fallback]) => {
                 field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;

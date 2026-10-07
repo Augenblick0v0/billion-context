@@ -10,7 +10,7 @@ import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbS
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
-import { loadOptions, loadRoutes } from "./config.js";
+import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
@@ -1461,6 +1461,9 @@ async function handle(
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
+            opts.namedProviders ??= {};
+            for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+            Object.assign(opts.namedProviders, loadNamedProviders());
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
@@ -1530,7 +1533,7 @@ async function handle(
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress));
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, opts.namedProviders ?? {}));
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -2031,7 +2034,7 @@ async function handle(
                 native = capRegistryWindowByStandard(model, await contextFromRegistry(model, host), hasTierEvidence);
                 if (native) nativeFromFallback = false;
             }
-            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, opts.namedProviders ?? {});
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
@@ -7786,6 +7789,9 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
+    opts.namedProviders ??= {};
+    for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+    Object.assign(opts.namedProviders, loadNamedProviders());
     const reloaded = loadOptions();
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;

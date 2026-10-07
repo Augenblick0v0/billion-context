@@ -344,6 +344,8 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .summary-grid label { display: grid; gap: 5px; min-width: 0; font-size: 12px; }
 .summary-settings .field-input { width: 100%; min-width: 0; box-sizing: border-box; }
 .summary-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.summary-creds { margin: 14px 0; }
+.summary-creds h4 { margin: 0 0 8px; font-size: 13px; }
 .summary-actions label:has(input[type="password"]) { display: grid; gap: 5px; flex: 1 1 200px; min-width: 0; font-size: 12px; }
 .summary-actions .btn { min-height: 32px; }
 `;
