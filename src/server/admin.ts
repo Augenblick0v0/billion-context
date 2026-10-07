@@ -12,7 +12,7 @@ import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
@@ -392,6 +392,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginCompact(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/session-name") {
+        // #2322: host-provided conversation name (pi /name) — becomes the
+        // session's display title in the web UI (clear = empty string).
+        try {
+            const body = await readBody(req);
+            handlePluginSessionName(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
