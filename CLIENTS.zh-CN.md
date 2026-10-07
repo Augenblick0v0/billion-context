@@ -207,6 +207,7 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 注意:
 
 - **Crush** 已有启动器车道——直接用 `bili crush`(配置零改动,HTTPS 域自动 MITM)。
+- **Zed** 也已有启动器车道——直接用 `bili zed`(Linux;配置零改动,模型域自动 MITM,环回 provider 保持直连)。上面的 settings.json `api_url` 路径仍是跨平台替代。
 - **账号登录**型客户端(OAuth/订阅)通常焊死端点——前缀技巧不适用,改看[下方 MITM 节](#客户端用-httpproxyconnect接入但从不压缩)。
 - 纯 **web 应用**(只在浏览器里的产品)本地没有流量可截。
 - VS Code 扩展的 baseURL 字段在明文设置里,密钥在系统钥匙串——这里只需要改 baseURL。
