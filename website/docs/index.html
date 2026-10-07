@@ -235,6 +235,8 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
             <tr><td class="mono">imageTokenCap</td><td class="mech">number</td><td data-i18n="cr.itc">Per-image token cost cap for this route; unset = uncapped.</td></tr>
             <tr><td class="mono">resign</td><td class="mech">scheme → { enabled?, passthrough?, credentialRef? }</td><td data-i18n="cr.resign">Per-route overrides of the global resign map (level 2, deepest wins).</td></tr>
             <tr><td class="mono">bind</td><td class="mech">string (named entries only)</td><td data-i18n="cr.bind">Named (non-URL) entry: deep-merged onto the bound URL lane at config load as an alias. Without bind a named entry stays routing-inert.</td></tr>
+            <tr><td class="mono">apiKeyEnv</td><td class="mech">string (env var name)</td><td data-i18n="cr.lanekey">Lane credential override (#2336): requests forwarded through this lane carry this env variable's value instead of the client's own credential — x-api-key / x-goog-api-key replaced outright, Bearer authorization replaced, injected when absent. Exactly one of apiKeyEnv / credentialRef per entry.</td></tr>
+            <tr><td class="mono">credentialRef</td><td class="mech">string (store name)</td><td data-i18n="cr.lanecred">Lane credential override via the private summary-credential store (`secret:NAME` semantics); exactly one of apiKeyEnv / credentialRef per entry.</td></tr>
             <tr><td class="mono">compactionOptIn</td><td class="mech">boolean</td><td data-i18n="cr.optin">Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS.</td></tr>
 <!-- /bili:gen -->
           </tbody>
