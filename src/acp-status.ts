@@ -15,7 +15,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
-import { VERSION } from "./version.js";
+import { VERSION, BUILD_COMMIT } from "./version.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -51,7 +51,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         limit,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
-            host: `billion-context ${VERSION}`,
+            host: `billion-context ${VERSION} (${BUILD_COMMIT})`,
         },
     });
     if (scope) return toolOk(base);

@@ -1,0 +1,87 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import * as net from "node:net";
+import * as path from "node:path";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import { fileURLToPath } from "node:url";
+import { VERSION, BUILD_COMMIT, versionWithCommit, PACKAGE_NAME } from "../src/version.js";
+
+const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("BUILD_COMMIT resolves to a short hash (dev checkout) or explicit unknown", () => {
+    // In this repo's test environment the source tree IS a git checkout, so the
+    // dev path must produce a real short hash. CI tarball builds exercise the
+    // dist/build-info.json path instead.
+    assert.match(BUILD_COMMIT, /^([0-9a-f]{7,12})(-dirty)?$|^unknown$/);
+});
+
+test("versionWithCommit renders the banner form", () => {
+    assert.equal(versionWithCommit(), `${VERSION} (${BUILD_COMMIT})`);
+    assert.match(versionWithCommit(), /^\d+\.\d+\.\d+ \(/);
+});
+
+test("--version prints semver plus commit and stays regex-friendly", () => {
+    const entry = path.join(root, "dist", "index.js");
+    assert.ok(fs.existsSync(entry), "dist/index.js must exist (run npm run build first)");
+    const r = spawnSync(process.execPath, [entry, "--version"], { encoding: "utf8", timeout: 60_000 });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    // First token stays a bare semver (existing consumers match /x.y.z/);
+    // the parenthesised commit rides after it.
+    assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+ \([0-9a-f]{7,12}(-dirty)?\)$|^unknown/);
+    assert.ok(r.stdout.trim().startsWith(`${VERSION} `), `stdout must lead with ${VERSION}: ${r.stdout}`);
+});
+
+test("package name unchanged (sanity)", () => {
+    assert.equal(PACKAGE_NAME, "billion-context");
+});
+
+test("health and overview endpoints expose the commit", { timeout: 90_000 }, async (t) => {
+    // Boot a real proxy on a pre-probed free port (repo pattern: isolated XDG,
+    // parse the origin from the state-dir log, kill in after()). --port 0 is
+    // rejected by loadOptions, so we reserve a port ourselves first.
+    const port = await new Promise<number>((resolvePort) => {
+        const probe = net.createServer();
+        probe.listen(0, "127.0.0.1", () => {
+            const p = (probe.address() as net.AddressInfo).port;
+            probe.close(() => resolvePort(p));
+        });
+    });
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "bili-buildinfo-"));
+    const child = spawn(
+        process.execPath,
+        [path.join(root, "dist", "index.js"), "start", "--port", String(port)],
+        {
+            env: {
+                ...process.env,
+                XDG_STATE_HOME: sandbox,
+                XDG_CACHE_HOME: sandbox,
+                XDG_DATA_HOME: sandbox,
+                XDG_CONFIG_HOME: sandbox,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+        },
+    );
+    t.after(() => {
+        child.kill("SIGKILL");
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const origin = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + 30_000;
+    let health: { ok?: boolean; version?: string; commit?: string } | undefined;
+    while (Date.now() < deadline) {
+        try {
+            health = (await (await fetch(`${origin}/__bili/health`)).json()) as typeof health;
+            if (health?.ok) break;
+        } catch {
+            /* not up yet */
+        }
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(health?.ok, "proxy never became healthy");
+    assert.match(String(health.version), /^\d+\.\d+\.\d+$/);
+    assert.match(String(health.commit), /^([0-9a-f]{7,12})(-dirty)?$|^unknown$/);
+    const overview = (await (await fetch(`${origin}/__bili/overview`)).json()) as { commit?: string };
+    assert.match(String(overview.commit), /^([0-9a-f]{7,12})(-dirty)?$|^unknown$/);
+});
