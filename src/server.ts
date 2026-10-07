@@ -1973,13 +1973,13 @@ async function handle(
                    // discontinuous auto-review blob forks onto `|sub:<fp>`.
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
-                    ? dshPersonaNamespace(
+                    ? personaNamespace(
                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                           (parsed as ResponsesRequestBody).instructions ?? "",
                           (parsed as ResponsesRequestBody).input,
                           log,
                       )
-                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
+                 : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
                    // prepare* gates), instruction drift is the expected event —
                    // the sticky head-system anchor absorbs it (trailing update
