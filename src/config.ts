@@ -866,7 +866,7 @@ function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null
     // A dialing recipe (baseUrl/api/...) re-scopes "models": on a recipe entry
     // it is the model REGISTRY the summary chain references, not routing — so
     // only warn for fields that are genuinely dead routing config there.
-    const recipe = NAMED_PROVIDER_RECIPE_FIELDS.some((f) => obj[f] !== undefined);
+    const recipe = obj.baseUrl !== undefined || obj.api !== undefined;
     const inert = NAMED_PROVIDER_ROUTING_FIELDS.filter((f) => f in obj && obj[f] !== undefined && !(recipe && f === "models"));
     if (inert.length === 0) return;
     warnNamedProviderOnce(
