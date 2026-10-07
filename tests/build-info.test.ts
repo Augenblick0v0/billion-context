@@ -9,6 +9,11 @@ import { fileURLToPath } from "node:url";
 import { VERSION, BUILD_COMMIT, versionWithCommit, PACKAGE_NAME } from "../src/version.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const distEntry = path.join(root, "dist", "index.js");
+// ci.yml runs `npm test` BEFORE `npm run build` — the two end-to-end tests
+// below need a built dist, so they skip when absent (same convention as
+// writeDshClientShim's "tests running before a build" no-op). The unit-level
+// BUILD_COMMIT tests still run everywhere.
 
 test("BUILD_COMMIT resolves to a short hash (dev checkout) or explicit unknown", () => {
     // In this repo's test environment the source tree IS a git checkout, so the
@@ -22,8 +27,8 @@ test("versionWithCommit renders the banner form", () => {
     assert.match(versionWithCommit(), /^\d+\.\d+\.\d+ \(/);
 });
 
-test("--version prints semver plus commit and stays regex-friendly", () => {
-    const entry = path.join(root, "dist", "index.js");
+test("--version prints semver plus commit and stays regex-friendly", { skip: !fs.existsSync(distEntry) && "dist not built yet (npm run build)" }, () => {
+    const entry = distEntry;
     assert.ok(fs.existsSync(entry), "dist/index.js must exist (run npm run build first)");
     const r = spawnSync(process.execPath, [entry, "--version"], { encoding: "utf8", timeout: 60_000 });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
@@ -37,7 +42,7 @@ test("package name unchanged (sanity)", () => {
     assert.equal(PACKAGE_NAME, "billion-context");
 });
 
-test("health and overview endpoints expose the commit", { timeout: 90_000 }, async (t) => {
+test("health and overview endpoints expose the commit", { timeout: 90_000, skip: !fs.existsSync(distEntry) && "dist not built yet (npm run build)" }, async (t) => {
     // Boot a real proxy on a pre-probed free port (repo pattern: isolated XDG,
     // parse the origin from the state-dir log, kill in after()). --port 0 is
     // rejected by loadOptions, so we reserve a port ourselves first.
