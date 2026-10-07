@@ -51,9 +51,9 @@ function personaFingerprint(systemText: string): string {
     return createHash("sha256").update(systemText, "utf8").digest("hex").slice(0, 16);
 }
 
-export type PersonaAnchorAction = "claim" | "match" | "migrate" | "fork" | "passthrough";
+type PersonaAnchorAction = "claim" | "match" | "migrate" | "fork" | "passthrough";
 
-export interface PersonaKeyResolution {
+interface PersonaKeyResolution {
     key: string;
     action: PersonaAnchorAction;
 }

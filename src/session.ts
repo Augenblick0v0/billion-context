@@ -339,7 +339,19 @@ export type Session = {
      *  before the rework may still carry ccr:true entries; the reconcile/
      *  commit/drop machinery below handles them (they are never re-created). */
     pendingRetrievals: PendingRetrieval[];
-    /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
+    /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
+     *  index built per request from the INBOUND body while stripImages is armed,
+     *  so decompress({ imageRef }) can pull a stripped/folded image's original
+     *  pixels back. Latest-wins (the client re-sends full history every turn, so
+     *  each request's index is complete); cleared when stripImages is off. Values
+     *  hold only metadata + the on-disk path (bytes are spilled at index-time and
+     *  never retained), so residency stays O(refs) regardless of image volume. */
+    incomingImageIndex?: Map<string, Array<{ mediaType: string; bytes: number; width?: number; height?: number; path: string }>>;
+    /** #1995 in-memory only: timestamp of the last best-effort
+     *  pruneRetrieveImgExports sweep for this session (throttled to once a
+     *  minute in the request path). */
+    lastImgPrune?: number;
+     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache
      *  invariant), so this is a pure CPU cache, never a correctness source. */
@@ -385,25 +397,12 @@ export type Session = {
 /** Server-stamped anonymous-prefix-affinity record (#1115/#1486 lane, written
  *  in src/server.ts when an anonymous request resolves onto a pfa-* chain or
  *  mints a fresh one). Typed here so readers don't cast the Record bag. */
-export type AnonymousPrefixAffinityStamp = {
+type AnonymousPrefixAffinityStamp = {
     depth: number;
     tailHash: string;
     via: "prefix" | "new";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
 };
-
-export function peekAnonymousPrefixAffinity(session: Session): AnonymousPrefixAffinityStamp | undefined {
-    const v = session.metadata.anonymousPrefixAffinity;
-    if (!v || typeof v !== "object") return undefined;
-    return v as AnonymousPrefixAffinityStamp;
-}
-
-/** Per-request-resolved context limit stamped by the server (src/server.ts) —
- *  the window actually in force for this session's traffic. */
-export function peekEffectiveContextLimit(session: Session): number | undefined {
-    const v = session.metadata.effectiveContextLimit;
-    return typeof v === "number" ? v : undefined;
-}
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
 // model compress settings + self-heal + output headroom), while the plugin
@@ -770,7 +769,7 @@ export function listSessions(): Session[] {
 // The #2165 report itself was "empty raw twin + live fork", so a traffic-less
 // raw twin does NOT disqualify a warning — only the stale (>freshness window)
 // and the fully idle (nothing ever carried traffic) groups stay silent.
-export interface SplitSessionWarning {
+interface SplitSessionWarning {
     base: string;
     sessions: { id: string; requests: number; lastSeen: number }[];
 }
@@ -1080,7 +1079,7 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // (stale map entries linger until session end); a false positive is fatal.
 export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
-export interface RewriteDetection {
+interface RewriteDetection {
     detected: boolean;
     knownBefore: number;
     incomingTotal: number;
@@ -1115,7 +1114,7 @@ export function detectUnannouncedHistoryRewrite(
  *  compress result already reported them as saved. Returns how many of the
  *  covered ids are present in the resent history, or null when coverage is
  *  complete (or nothing was covered). */
-export interface FoldCoverage {
+interface FoldCoverage {
     expected: number;
     matched: number;
 }

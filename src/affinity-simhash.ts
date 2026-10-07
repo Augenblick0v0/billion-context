@@ -125,7 +125,3 @@ export function sketchForCanonical(canonical: string, itemHash?: string): string
     return sketch;
 }
 
-/** Test seam: drop the memo (determinism/cap assertions). */
-export function _resetSimhashMemoForTest(): void {
-    sketchMemo.clear();
-}

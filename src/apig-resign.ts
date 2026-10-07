@@ -65,7 +65,7 @@ export const APIG_RESIGN_SCHEME = RESIGN_BUILTIN_SCHEME;
  *  messages, startup reminders, and the web UI can say WHAT the scheme is
  *  instead of just its token. The list converges: every newly discovered
  *  gateway scheme gets one entry (with the issue it came from). */
-export interface KnownSignatureScheme {
+interface KnownSignatureScheme {
     label: string;
     source: string;
     builtIn?: boolean;
@@ -119,7 +119,7 @@ export function resignPassthroughEnabled(route?: ProviderRoute, scheme: string =
     return resolveResignSettings(process.env, route?.resign, scheme).passthrough;
 }
 
-export interface SignedRefusal {
+interface SignedRefusal {
     status: number;
     contentType: string;
     body: string;
@@ -228,7 +228,7 @@ function apigDateStamp(now: Date): string {
     return now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 }
 
-export interface ApigSignOptions {
+interface ApigSignOptions {
     /** Extra headers that join the signature (e.g. `maas_type: benefit`). */
     extraSignedHeaders?: Record<string, string>;
     /** Clock injection for deterministic tests. */
@@ -331,7 +331,7 @@ export function resignApig(
 // a reminder aid, never a correctness path: read/write failures degrade to
 // "no reminder", never to a broken request.
 
-export interface ResignPendingEntry {
+interface ResignPendingEntry {
     origin: string;
     firstSeen: string;
     lastSeen: string;

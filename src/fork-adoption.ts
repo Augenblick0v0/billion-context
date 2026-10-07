@@ -75,7 +75,7 @@ import type { WireProtocol } from "./util.js";
  *  and re-folded everything the parent had already folded. */
 const SUPPORTED: ReadonlySet<WireProtocol> = new Set<WireProtocol>(["openai", "anthropic", "responses", "google"]);
 
-export interface ForkAdoptionPlan {
+interface ForkAdoptionPlan {
     /** Blocks to seed (active adoptables + their tier children, inactive). */
     blocks: CompressionBlock[];
     /** blockIds in `blocks` (for blockContents lookup). */
@@ -134,12 +134,6 @@ export function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): C
         return openaiToCore(clone as Parameters<typeof openaiToCore>[0]).msgs;
     }
     return anthropicToCore(clone as Parameters<typeof anthropicToCore>[0]).msgs;
-}
-
-/** Core message ids of the incoming request (see incomingCoreMessages). */
-export function incomingCoreIds(protocol: WireProtocol, parsed: unknown): Set<string> | null {
-    const msgs = incomingCoreMessages(protocol, parsed);
-    return msgs ? new Set(msgs.map((m) => m.id)) : null;
 }
 
 /** Refs cited by placeholder-shaped incoming messages (#1341). Such a
@@ -248,7 +242,7 @@ export function planForkAdoption(
 
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
-export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
+function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
     for (const b of plan.blocks) {
         session.state.blocks.push(b);
         const content = parent.blockContents.get(b.blockId);

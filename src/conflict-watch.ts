@@ -12,7 +12,7 @@
 import { markDirty, type Session } from "./session.js";
 import { isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
 
 export interface ConflictEvent {
     at: number;
@@ -96,7 +96,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     return lines;
 }
 
-export interface ConflictSummary {
+interface ConflictSummary {
     sessions: number;
     events: number;
     /** #2102: events within CONFLICT_ACTIVE_WINDOW_MS of `now` (live risk). */

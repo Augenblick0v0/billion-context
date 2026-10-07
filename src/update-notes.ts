@@ -37,9 +37,9 @@ import { CHECK_INTERVAL_MS, egressDispatcher, findInstallDir, readDiskVersion, r
 const RELEASE_NOTES_PACKAGE = "billion-context-release-notes";
 const SUPPORTED_SCHEMA = 1;
 /** Producer-side cap (release-notes/README): the doc keeps ~20 entries. */
-export const MAX_RELEASE_NOTES_ENTRIES = 20;
+const MAX_RELEASE_NOTES_ENTRIES = 20;
 
-export type ReleaseTier = "routine" | "recommended" | "critical";
+type ReleaseTier = "routine" | "recommended" | "critical";
 
 export type ReleaseNoteEntry = {
     /** Exact released version this entry describes. */
@@ -51,7 +51,7 @@ export type ReleaseNoteEntry = {
     summary: string;
 };
 
-export type ReleaseNotesState = {
+type ReleaseNotesState = {
     /** Newest-first as published; empty until the first successful check. */
     entries: ReleaseNoteEntry[];
     /** Disk version captured by the last watcher cycle (restart-pending
@@ -62,10 +62,6 @@ export type ReleaseNotesState = {
 };
 
 let state: ReleaseNotesState = { entries: [] };
-
-export function getReleaseNotesState(): ReleaseNotesState {
-    return state;
-}
 
 /** Test seam: replace the live state without driving the watcher. */
 export function _setReleaseNotesStateForTest(s: ReleaseNotesState): void {
@@ -83,7 +79,7 @@ export function _resetReleaseNotesWatcherForTest(): void {
  *  configured registry as the updater (BILI_UPDATE_REGISTRY aware via
  *  registryUrlFor) — mirroring the advisory source. An explicit override wins
  *  verbatim. */
-export function resolveReleaseNotesUrl(configured: string | undefined): string {
+function resolveReleaseNotesUrl(configured: string | undefined): string {
     const v = configured?.trim();
     if (v) return v;
     return registryUrlFor(RELEASE_NOTES_PACKAGE, "latest");
@@ -146,16 +142,7 @@ export function spanNotes(entries: ReleaseNoteEntry[], fromVersion: string): Rel
         .sort((a, b) => semver.compare(a.version, b.version));
 }
 
-/** The newest valid entry, or undefined when the feed is empty/unknown. */
-export function latestKnownVersion(entries: ReleaseNoteEntry[]): string | undefined {
-    let best: string | undefined;
-    for (const e of entries) {
-        if (best === undefined || semver.gt(e.version, best)) best = e.version;
-    }
-    return best;
-}
-
-export type UpdateVisibility = {
+type UpdateVisibility = {
     runningVersion: string;
     /** Disk version if the watcher saw one (undefined = unknown). */
     diskVersion?: string;
@@ -234,7 +221,7 @@ async function writeLastCheck(ts: number): Promise<void> {
     }
 }
 
-export type ReleaseNotesWatcherOptions = {
+type ReleaseNotesWatcherOptions = {
     packageName: string;
     /** Running process version (disk wins when readable, same rule as the
      *  updater). */
@@ -262,7 +249,7 @@ function warnOnce(log: Logger, key: string, message: string): void {
 
 /** Run one release-notes check (throttled unless `force`). Fetches the notes
  *  doc and re-reads the disk version — visibility only, NEVER installs. */
-export async function runReleaseNotesCheck(opts: ReleaseNotesWatcherOptions, force = false): Promise<void> {
+async function runReleaseNotesCheck(opts: ReleaseNotesWatcherOptions, force = false): Promise<void> {
     if (inFlight) return;
     inFlight = true;
     const log = opts.log ?? loggerLog;
@@ -325,7 +312,7 @@ export function startReleaseNotesWatcher(opts: ReleaseNotesWatcherOptions): void
 }
 
 /** Stop the periodic check loop (for tests / clean shutdown). */
-export function stopReleaseNotesWatcher(): void {
+function stopReleaseNotesWatcher(): void {
     if (timer) {
         clearInterval(timer);
         timer = undefined;

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { FetchOptions } from "./fetch-util.js";
 
-export type FetchTransport = (url: string, options: FetchOptions) => Promise<Response>;
+type FetchTransport = (url: string, options: FetchOptions) => Promise<Response>;
 
 const transports = new AsyncLocalStorage<FetchTransport>();
 

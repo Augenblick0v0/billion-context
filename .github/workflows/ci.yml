@@ -183,3 +183,16 @@ jobs:
           echo "::error::Side-lane logic changed without updating any dedicated side-lane suite ($LANE_SUITE_RE)."
           echo "The lane gates are truth-table-pinned (tests/side-lane-truth-table.test.ts) and behavior-pinned (tests/side-lane-invariants.test.ts, fork-side-request-lane, side-request-isolation) — a gate edit must land with the suite edit. See #2170."
           exit 1
+
+  # #1440 P6: mechanical defense against export bloat — fails when a non-entry
+  # source file exports a symbol nobody references outside its own file
+  # (DEAD = definition line only; INTERNAL_ONLY = own file only). Zero-dep:
+  # plain node, no install step.
+  unused-exports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-unused-exports.mjs

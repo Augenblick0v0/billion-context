@@ -33,7 +33,7 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
 
 const MESSAGE_MARK_CAP = 3;
 
-export type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
+type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
 
 export function computeAnthropicMessageMarks(
     processed: { id?: string }[],

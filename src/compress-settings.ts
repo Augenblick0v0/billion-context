@@ -153,7 +153,7 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
 
 let warnedUnknownPack = new Set<string>();
 
-export interface SurfaceResolution {
+interface SurfaceResolution {
     surface: PackSurface;
     /** Effective pack name — "default" when unset/invalid/unresolvable
      *  (the surface that actually serves requests). Feeds status-report

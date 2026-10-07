@@ -8,6 +8,7 @@ import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.j
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
+import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -209,7 +210,7 @@ function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undef
  *  streak arms. The breaker NEVER refuses execution — it only changes what a
  *  FAILED call tells the model, so a legitimate call can always still succeed
  *  and reset the streak via clearCompressLoopStreak. */
-export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
+function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
@@ -225,7 +226,7 @@ export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): str
     return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed and further attempts will keep failing. STOP calling compress now: do not try other ranges, do not re-issue any previous range, and do not poll acp_status. Continue your actual task without compressing — compression happens again only when there is genuinely new content to fold.]`;
 }
 
-export function clearCompressLoopStreak(session: Session): void {
+function clearCompressLoopStreak(session: Session): void {
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
 }
 
@@ -504,6 +505,30 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const newBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
             if (newBlocks.length > 0) {
                 adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
+            }
+        }
+        // #1995 review ④: preflight summaries render host-side image notes with
+        // refs, but a MODEL-driven fold's summary is whatever the model wrote —
+        // sidecar images covered by the fold (e.g. responses tool-output
+        // screenshots, which are foldable) lose their discoverability pointer.
+        // Append the same ref-carrying notes as a compact footer so a later
+        // turn can still find decompress({ imageRef }). Appended AFTER the
+        // kernel's length validation — the footer is host bookkeeping, not
+        // model output, and stays bounded (one short note per covered image).
+        {
+            const view = ctx.compressMessages ?? ctx.messages;
+            const byRaw = ctx.session.state.messageRefs?.byRaw;
+            for (const b of res.state.blocks) {
+                if (beforeIds.has(b.blockId)) continue;
+                const notes: string[] = [];
+                for (const id of b.directMessageIds) {
+                    const m = view.find((msg) => msg.id === id);
+                    if (!m) continue;
+                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
+                }
+                if (notes.length > 0) {
+                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                }
             }
         }
         const r = res.result;

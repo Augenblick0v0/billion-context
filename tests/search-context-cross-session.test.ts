@@ -48,7 +48,7 @@ function compressInto(session: Session) {
     return core;
 }
 
-type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; parameters?: Record<string, unknown> } };
+type FlatTool = { name?: string; description?: string; input_schema?: Record<string, unknown>; parameters?: Record<string, unknown>; function?: { name?: string; description?: string; parameters?: Record<string, unknown> } };
 
 function searchEntry(arr: readonly unknown[], shape: "flat" | "openai"): FlatTool | undefined {
     return arr.find((t) => {
@@ -83,21 +83,24 @@ test("#841 schema: BILI arrays no longer add conversation_id to search_context (
             const e = t as FlatTool;
             return shape === "openai" ? e.function?.name : e.name;
         };
-        // #1179: decompress gains exactly two optional range params; everything else stays identical
+        // #1179: decompress gains exactly two optional range params; #1995 adds one optional imageRef param plus its exact description note; everything else stays identical
+        const IMAGE_NOTE = ` Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:"list" shows what is restorable.`;
         const stripRange = (e: FlatTool): FlatTool => {
             const params = paramsOf(e) as Record<string, unknown>;
             const props = { ...(params.properties as Record<string, unknown>) };
             delete props.startId;
             delete props.endId;
+            delete props.imageRef;
             const p = { ...params, properties: props };
-            if (e.function) return { ...e, function: { ...e.function, parameters: p } };
-            if (e.input_schema) return { ...e, input_schema: p };
-            return { ...e, parameters: p };
+            const note = (d?: string) => (d?.endsWith(IMAGE_NOTE) ? d.slice(0, -IMAGE_NOTE.length) : d);
+            if (e.function) return { ...e, function: { ...e.function, parameters: p, description: note(e.function.description) } };
+            if (e.input_schema) return { ...e, input_schema: p, description: note(e.description) };
+            return { ...e, parameters: p, description: note(e.description) };
         };
         const biliDec = bili.find((t) => nameOf(t) === DECOMPRESS_TOOL_NAME) as FlatTool | undefined;
         const kernelDec = kernel.find((t) => nameOf(t) === DECOMPRESS_TOOL_NAME) as FlatTool | undefined;
         assert.ok(biliDec && kernelDec, `decompress missing in ${shape} array`);
-        assert.deepEqual(stripRange(biliDec), stripRange(kernelDec), "decompress differs only by the added range params");
+        assert.deepEqual(stripRange(biliDec), stripRange(kernelDec), "decompress differs only by the added range params + #1995 imageRef note");
         const biliProps = paramsOf(biliDec).properties as Record<string, Record<string, unknown>>;
         assert.equal(biliProps.startId?.type, "string");
         assert.equal(biliProps.endId?.type, "string");

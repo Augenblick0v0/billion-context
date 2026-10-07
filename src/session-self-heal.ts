@@ -47,16 +47,9 @@ import type { Session } from "./session.js";
  * (#2155: no new config knobs); recorded in TECHNICAL-NOTES.md. */
 export const SELF_HEAL_WINDOW = 5;
 
-export type SelfHealAction = "degrade-to-proxy" | "suppress-nudge";
+type SelfHealAction = "degrade-to-proxy" | "suppress-nudge";
 
-export type SelfHealState = {
-    /** "plugin-lane-gone" (D2) | "nudge-idle" (D1) */
-    detected: "plugin-lane-gone" | "nudge-idle";
-    action: SelfHealAction;
-    since: number;
-};
-
-export type SelfHealStateView = { detected: string; action: string; since: number };
+type SelfHealStateView = { detected: string; action: string; since: number };
 
 type SelfHealCounters = {
     /** last observed reduction fingerprint (nextBlockId:lastCompress.at) */
@@ -67,7 +60,7 @@ type SelfHealCounters = {
 
 const counters = new WeakMap<Session, SelfHealCounters>();
 
-export function selfHealOf(session: Session): SelfHealStateView | undefined {
+function selfHealOf(session: Session): SelfHealStateView | undefined {
     const raw = session.metadata["selfHeal"];
     if (raw === null || typeof raw !== "object") return undefined;
     const rec = raw as Record<string, unknown>;
@@ -120,7 +113,7 @@ function reductionKey(session: Session): string {
 /** A bili-owned tool name as it can appear on the wire: the proxy-injected
  * bare ACP names (compress/…, also used by pi/omp extensions) or the
  * MCP-prefixed form (mcp__bili__compress, zcode/claude-code lanes). */
-export function isBiliToolName(name: string): boolean {
+function isBiliToolName(name: string): boolean {
     return name.startsWith("mcp__bili__") || PROXY_TOOL_NAMES.has(name);
 }
 
@@ -130,7 +123,7 @@ export function countBiliToolUses(messages: CoreMessage[]): number {
     return n;
 }
 
-export type SelfHealRoundInputs = {
+type SelfHealRoundInputs = {
     /** x-bili-plugin header present on this request */
     pluginHeaderPresent: boolean;
     /** the request's own tools array declares bili tools (live MCP lane) */

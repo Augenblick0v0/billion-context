@@ -374,3 +374,49 @@ The egress audit net (#2248) stays log-only: raw exits (unrecognized frames,
 parse failures) forward as-is and log `[tag-echo] raw exit` so new leak shapes
 become visible without changing the wire. Pinned by
 `tests/unified-acp-invariants.test.ts` (eight tests, both lanes).
+
+## Cache-ledger accrual is coverage-conditioned (#2202)
+
+The ledger books each request against every elapsed fold
+(`requestsAfter += 1` per sample), and the panel turns that counter into
+`netSaved = Σ (S − σ) × requestsAfter`. Booking is a *claim that this
+request benefited from the fold* — which is only true while the fold's
+covered bytes actually ride the resent wire. When a host removes them
+outside bili's knowledge (dsh native compaction, #2193), the old counter
+kept climbing on a destroyed substrate: the #2193 incident showed
+netSaved at 355M while 1510 covered ids were permanently gone.
+
+The fix is writer-side, at the claim site: `reconcileFoldCoverage`
+already inspects every inbound pass for exactly this evidence, so it now
+also records per-block presence into
+`session.metadata["foldCoverageByBlock"]` — `{p, r, t, e}` per blockId
+(present verbatim / reclaimed via re-anchor / total covered / ever-present
+latch). The ledger links each fold to its block with a sparse
+`LedgerFold.bid` (set once in `recordCacheFoldsFromBlocks`, the single
+choke point for both the eager proxy path and the lazy plugin-mode path),
+and scales the increment by the measured fraction `(p + r) / t`:
+
+- **1** — full coverage, or no usable record → byte-identical to the
+  pre-#2202 counter (healthy sessions and all legacy entries);
+- **f** — partial coverage → proportional accrual;
+- **0** — verified coverage-lost → accrual frozen until coverage returns.
+
+Two classes are self-calibrated by the `e` latch: a fold whose covered ids
+were *ever* seen present is verifiable, so total absence means loss; a fold
+whose ids *never* appeared post-creation is structurally unverifiable
+(view-folding hosts that resend folded views instead of raw originals) and
+keeps status-quo booking rather than being silently zeroed. Coverage-lost
+is live-computed (`e === 1 && p + r === 0`), so recovery resumes accrual
+with no sticky state; one warn/info log fires per flip
+(`foldCoverageLostLogged` dedup key).
+
+Evidence hygiene mirrors the #1195 guard: side-request-shaped passes
+(< 10 inbound messages — title-gen, WebSearch refinement) take NO
+evidence at all (no records, no backbone roll, no drift-streak movement,
+no resets), because a short pass would skew the next pass's alignment and
+manufacture phantom total-loss.
+
+Panel presentation keeps lost folds out of the headline number: the web
+sessions view shows them as separate labeled segments (row tooltip,
+overview sub-line, detail stat) — frozen pre-loss savings stay visible,
+post-loss growth stops.

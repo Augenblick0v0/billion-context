@@ -200,15 +200,18 @@ export type CompressSettings = {
      *  instance is the source of truth — protecting ALL of them (via
      *  `protectedTools`) would make that tool's history grow unboundedly,
      *  while protecting the LATEST keeps the live snapshot in context and
-     *  lets every superseded instance fold normally. Patterns match like
-     *  kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`,
-     *  `"TodoWrite"`, `"todo*"`). Protection is a HARD exclusion: neither
+     *  lets every superseded instance fold normally. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"todo_list"`, `"todo*"`); a pattern
+     *  containing `/` matches the canonical skill path instead — skill loads
+     *  project to `skill/<name>` on every client (#1947) — and protects the
+     *  latest instance PER path (`"skill/*"` keeps the newest load of every
+     *  skill, not just one). Protection is a HARD exclusion: neither
      *  suggested nor explicit compress ranges can cover the latest instance.
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
-    /** Tool-name patterns whose tool-calls AND paired results are NEVER
+    /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
      *  nor explicit compress ranges can cover them; applies identically in
@@ -219,8 +222,12 @@ export type CompressSettings = {
      *  supersedes, so folding older loads loses it permanently (#1109).
      *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
      *  cumulative-snapshot tool makes its history grow unboundedly — use
-     *  `protectedLatestTools` for those instead. Patterns match like kernel
-     *  tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`).
+     *  `protectedLatestTools` for those instead. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"skill"`, `"skill_*"`); a pattern
+     *  containing `/` selects skills by name on every client (#1947): skill
+     *  loads project to `skill/<name>`, so `"skill/release-orchestrator"`
+     *  protects each load of that one skill and `"skill/review-*"` glob-
+     *  matches within the name segment (`*` never crosses `/`).
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
@@ -410,10 +417,23 @@ export type CompressSettings = {
      *  the most recent {@link stripImagesKeepRecent} has its image parts dropped
      *  before the wire rebuild (image-only content collapses to an "[image]"
      *  placeholder). Off by default — the #488 image floor / overflow 502 stays
-     *  the opt-in signal until this is enabled. */
+     *  the opt-in signal until this is enabled.
+     *
+     *  [#1995] On anthropic sessions the strip boundary is FOLD-ANCHORED when
+     *  an active compression fold exists: instead of the sliding `len -
+     *  keepRecent` window (which moves the byte boundary every turn and breaks
+     *  the prompt cache at the most expensive content), the cutoff sticks to
+     *  the last fold-covered wire message and only moves on compression
+     *  events — the stripped prefix is byte-stable between folds. Recovery for
+     *  stripped pixels: `decompress({ imageRef })` (files under
+     *  <state>/retrieve/img/<session>/, one-week TTL) and the ref-carrying
+     *  `[image: … · mNNNNN]` notes summaries emit. The other wires keep the
+     *  sliding window until their strip placeholders are made id-stable
+     *  (openai/google flip ids on strip; see src/image-restore.ts). */
     stripImages?: boolean;
     /** With {@link stripImages}, how many trailing messages keep their images
-     *  verbatim (default 5). Ignored unless stripImages is true. */
+     *  verbatim (default 5). Ignored unless stripImages is true. Serves as the
+     *  FALLBACK window on anthropic when no active fold anchors the boundary. */
     stripImagesKeepRecent?: number;
     /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
      *  tool calls at request time (src/reasoning-drop.ts, aligned with
@@ -475,7 +495,7 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-export type PromptCacheRouting = "auto" | "enabled" | "disabled";
+type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -1153,7 +1173,7 @@ function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: Compre
  *  sessions actually execute. In plugin mode the static manifest is the ONLY
  *  declaration of the retrieve surface, so the whole ccr block follows the base
  *  config; such overrides only take effect on proxy-mode sessions. */
-export interface CcrOverrideDivergence {
+interface CcrOverrideDivergence {
     /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
     level: string;
     field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
@@ -1822,7 +1842,7 @@ export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>):
     }
 }
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
-export interface ResignFileSettings {
+interface ResignFileSettings {
     enabled?: boolean;
     passthrough?: boolean;
     credentialRef?: string;
@@ -1839,7 +1859,7 @@ export const RESIGN_BUILTIN_SCHEME = "sdk-hmac-sha256";
  *  (e.g. "sdk-hmac-sha256"). The built-in key resolves out of the box
  *  (defaults below); other body-covering schemes can be scoped their own
  *  `passthrough` opt-in without opening the built-in one. */
-export type ResignSchemeMap = Record<string, ResignFileSettings>;
+type ResignSchemeMap = Record<string, ResignFileSettings>;
 
 /** Resolved #1884 re-sign settings: env vars win over the config file, the
  *  file wins over the defaults (same precedence family as
@@ -1884,7 +1904,7 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
 // body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
 // when the set changes, stay quiet while it stays fixed or empty.
 let inertResignPassthroughSignature: string | null = null;
-export function warnInertResignPassthrough(obj: Record<string, unknown>): void {
+function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
     const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
         if (!map || typeof map !== "object" || Array.isArray(map)) return;
@@ -2054,7 +2074,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     return undefined;
 }
 
-export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
@@ -2074,7 +2094,7 @@ export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
 }
 
