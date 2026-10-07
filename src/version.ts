@@ -8,13 +8,18 @@ import { execFileSync } from "node:child_process";
 // ../package.json). Single source for the CLI banner, the /acp panel header,
 // and the acp_status surface-meta host line.
 function readPkgField(field: string, fallback: string): string {
-    try {
-        const here = fileURLToPath(import.meta.url);
-        const pkg = path.join(path.dirname(here), "..", "package.json");
-        return (JSON.parse(readFileSync(pkg, "utf8"))[field] as string) ?? fallback;
-    } catch {
-        return fallback;
+    const here = fileURLToPath(import.meta.url);
+    // Flat dist entries sit at dist/<entry>.js (one level up = package root);
+    // subdirectory bundles (dist/agent/*.js) need one more level — the flat
+    // assumption made every subdirectory entry report VERSION="dev".
+    for (const rel of ["..", "../.."]) {
+        try {
+            return (JSON.parse(readFileSync(path.join(path.dirname(here), rel, "package.json"), "utf8"))[field] as string) ?? fallback;
+        } catch {
+            // try the next candidate, then the fallback
+        }
     }
+    return fallback;
 }
 
 export const VERSION = readPkgField("version", "dev");
@@ -36,12 +41,15 @@ function resolveBuildCommit(): string {
     const here = fileURLToPath(import.meta.url);
     const fromSrc = path.basename(path.dirname(here)) === "src";
     if (!fromSrc) {
-        try {
-            const infoPath = path.join(path.dirname(here), "build-info.json");
-            const commit = (JSON.parse(readFileSync(infoPath, "utf8")) as { commit?: unknown }).commit;
-            if (typeof commit === "string" && commit) return (cachedCommit = commit);
-        } catch {
-            // fall through to git, then unknown
+        // The stamp lives at dist/build-info.json; subdirectory bundles
+        // (dist/agent/*.js) sit one level below it — check both levels.
+        for (const dir of [path.dirname(here), path.dirname(path.dirname(here))]) {
+            try {
+                const commit = (JSON.parse(readFileSync(path.join(dir, "build-info.json"), "utf8")) as { commit?: unknown }).commit;
+                if (typeof commit === "string" && commit) return (cachedCommit = commit);
+            } catch {
+                // next candidate, then fall through to git, then unknown
+            }
         }
     }
     try {
