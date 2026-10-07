@@ -111,6 +111,8 @@ import { rewriteGoogleJsonResponseAsync } from "./stream-google.js";
 import { rewriteResponsesJsonResponseAsync } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
+import { applyLaneCredential, laneCredential } from "./lane-credentials.js";
+import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, shouldStampRelayAffinityPck, type ConversationIdentity } from "./session-id.js";
 import { personaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
@@ -1689,7 +1691,9 @@ async function handle(
                 native = capRegistryWindowByStandard(model, await contextFromRegistry(model, host), hasTierEvidence);
                 if (native) nativeFromFallback = false;
             }
-            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, opts.namedProviders ?? {});
+            // #2336: agent-registry recipes are the FALLBACK layer — bili's
+            // own named providers (file) win per provider name.
+            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
@@ -6125,6 +6129,19 @@ async function forward(
             : undefined;
     if (resignCtx !== undefined) {
         log("info", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign arm active (${APIG_RESIGN_SCHEME}) — every egress body is re-signed (#1884)`);
+    }
+    // #2336 lane credential override: providers[URL].apiKeyEnv/credentialRef
+    // replaces the client's credential with the lane's own key. Applied ONCE
+    // to the shared `headers` record (every egress below reuses it), and
+    // skipped when the re-sign arm is active — the re-signer owns
+    // Authorization there. Resolution failures keep the client's headers
+    // (warned once per route+reference inside laneCredential).
+    if (resignCtx === undefined) {
+        const laneCred = laneCredential(opts.routes, upstreamUrl, (message) => log("warn", `[${prepared?.session.id ?? "passthrough"}] ${message}`));
+        if (laneCred !== undefined) {
+            applyLaneCredential(headers, laneCred, (message) => log("warn", `[${prepared?.session.id ?? "passthrough"}] ${message}`));
+            log("debug", `[${prepared?.session.id ?? "passthrough"}] [lane-credential] applied ${laneCred.reference} for ${upstreamUrl} (#2336)`);
+        }
     }
     const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
         if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;

@@ -284,6 +284,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `imageTokenCap` | number | unset (uncapped) | — | Per-image token cost cap for this route. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | Per-route overrides of the global resign map (level 2, deepest wins). |
 | `bind` | string (named entries only) | unset | — | Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert. |
+| `apiKeyEnv` | string (env var name) | unset | — | Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref). |
+| `credentialRef` | string (store name) | unset | — | Lane credential override via the private summary-credential store (secret:NAME semantics). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
 
 **Environment-only variables**
@@ -866,7 +868,7 @@ Three more #2030 keys extend existing blocks: [`mitm.handshakeTimeoutMs`](#clien
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, a client-side direct exemption, and a lane credential override ([`apiKeyEnv`](#lane-credentials-apikeyenv--credentialref)). Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
 ```jsonc
 {
   "providers": {
@@ -933,6 +935,24 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
   }
 }
 ```
+
+### Lane credentials (`apiKeyEnv` / `credentialRef`)
+
+A URL-keyed lane (or a named entry with `bind`) can send **its own** credential upstream instead of the client's — the lane owner's key replaces whatever the agent client put on the wire (#2336). Typical case: a shared machine proxy where the owner's `deepseek` lane authenticates with the owner's key no matter which client (and whose personal key) is talking through it.
+
+```jsonc
+{
+  "providers": {
+    "https://api.deepseek.com": { "apiKeyEnv": "DEEPSEEK_LANE_KEY" }
+  }
+}
+```
+
+- **Type:** `string` — `apiKeyEnv` is an environment-variable NAME (`env:VAR` semantics), `credentialRef` is a NAME in the private [summary-credential store](#shared-external-summary-service) (`secret:NAME` semantics). Exactly one of the two per entry; invalid values reject the config (#1909 discipline — startup failure / web-UI 400).
+- **Replacement rules:** `x-api-key` and `x-goog-api-key` are replaced outright. `authorization` is replaced **only** when the client's value is a Bearer token — any other scheme (SDK-HMAC signatures, mTLS fingerprints…) is signature-owned and left untouched, with a warning. A request carrying none of the three gains `authorization: Bearer <key>`.
+- **#1884 interplay:** skipped whenever the CodeArts re-sign arm is active on the request — the re-signer owns `Authorization` there.
+- **Failure posture:** if the env var is unset or the secret is absent, bili keeps the client's own headers and warns once per lane+reference (visible, never silently degrading to a guaranteed 401). The warning re-arms after a successful resolution.
+- Applied once to the shared forward-header set, so every egress of the request — initial send, role-ladder retry, overflow refold, compress-loop rounds, continuation refetch — carries the lane credential.
 
 ### `models`
 
@@ -1088,6 +1108,10 @@ Targets are **references into the `providers` table**: each entry is the string 
 A recipe carries: `baseUrl` (HTTPS; loopback HTTP allowed for local development; no embedded credentials, proxy-recursion paths, or arbitrary query parameters), `api` (one of `openai` | `anthropic` | `responses` | `google`; selects the wire protocol and derives the request path from `baseUrl`), exactly one credential reference — `apiKeyEnv: "VAR_NAME"` (an environment variable read at call time) or `credentialRef: "NAME"` (a value stored via the Web UI) — and a `models` map whose per-model fields are `contextWindow` (default 128000), `outputTokens` (default `min(8192, window/4)`), and `stream` (default false). Recipes can also be split into `recipe`/`bind` routing form like URL entries; a named entry is routing-inert unless bound.
 
 Up to 16 targets per chain are supported. Saving an enabled chain through the Web API validates that every reference resolves (unknown provider or model → HTTP 400). At runtime an unresolvable reference is logged once and disables the chain until fixed — it never falls back to summarizing with the main model. `secret:` values are stored separately from the main JSON configuration in the private `billion-context.json.summary-credentials.json` file and are never returned by the configuration API. On Windows, protect this file and its parent directory with an administrator-only ACL; stale `.lock` files require manual removal after confirming no proxy process is writing the store. The total budget is shared across all targets and compression entry points, and cancellation or session-state changes discard generated results without folding.
+
+#### Agent-reported providers (fallback layer)
+
+An ACP-native agent (currently the `pi` extension) reports its own configured providers to the proxy once per process (`POST /__bili/agent-providers`): provider name, base URL, wire protocol, resolved API key, and model list. These recipes form a **fallback layer** — a chain may reference `"zhipu/glm-5"` without the dial fields being duplicated in the file, so a provider configured once in the agent's own config is directly usable as a summary target. Merge order is **file wins**: a file recipe with the same name shadows the agent's contribution for that provider entirely (including its models). The agent layer never persists to disk: keys live only in proxy process memory, are never returned by the configuration API, and never appear in logs. Skip rules on the reporting side: OAuth-authenticated providers, `auth.json` ("stored") credentials, providers whose endpoint points back at the proxy itself, and wire protocols without a summary dial (`bedrock`, `vertex`, `mistral`, `pi-messages`) are not reported. The Web UI marks agent-reported models with an `(agent)` badge in the target dropdown.
 
 The three levels, from broadest to most specific:
 

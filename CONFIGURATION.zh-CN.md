@@ -284,6 +284,8 @@
 | `imageTokenCap` | number | unset (uncapped) | — | 本路由单张图片 token 成本上限。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | 按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。 |
 | `bind` | string (named entries only) | unset | — | 把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。 |
+| `apiKeyEnv` | string (env var name) | unset | — | 通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。 |
+| `credentialRef` | string (store name) | unset | — | 经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
 
 **仅环境变量（无配置文件键）**
@@ -866,7 +868,7 @@
 
 ## Providers
 
-`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、wire 协议声明、压缩覆盖项、图片计费模式、按路由的透传开关，以及客户端侧直连豁免。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
+`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、wire 协议声明、压缩覆盖项、图片计费模式、按路由的透传开关，客户端侧直连豁免，以及通道凭据覆盖（[`apiKeyEnv`](#lane-credentials-apikeyenv--credentialref)）。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
 ```jsonc
 {
   "providers": {
@@ -933,6 +935,24 @@
   }
 }
 ```
+
+### 通道凭据（`apiKeyEnv` / `credentialRef`）
+
+URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的**凭据而非客户端的 —— lane 主人的 key 替换 agent 客户端放在 wire 上的任何凭据（#2336）。典型场景：共享机器代理中，主人的 `deepseek` lane 无论哪个客户端（带谁的私人 key）接入，都用主人的 key 认证。
+
+```jsonc
+{
+  "providers": {
+    "https://api.deepseek.com": { "apiKeyEnv": "DEEPSEEK_LANE_KEY" }
+  }
+}
+```
+
+- **类型：** `string` —— `apiKeyEnv` 是环境变量名（`env:VAR` 语义）；`credentialRef` 是私有[摘要凭据存储](#共享外部摘要服务)中的名称（`secret:NAME` 语义）。每个条目二选一；非法值拒绝整个配置（#1909 纪律 —— 启动失败 / Web UI 400）。
+- **替换规则：** `x-api-key` 与 `x-goog-api-key` 直接替换。`authorization` **仅当**客户端值是 Bearer token 时才替换 —— 其它方案（SDK-HMAC 签名、mTLS 指纹…）属签名所有，原样保留并告警。三者皆无的请求会注入 `authorization: Bearer <key>`。
+- **#1884 交互：** 请求上 CodeArts 重签名臂活跃时跳过 —— 那里重签名器拥有 `Authorization`。
+- **失败姿态：** env 未设或 secret 缺失时，bili 保留客户端自己的头，并按通道+引用告警一次（可见，绝不静默退化成必 401）。解析成功后告警槽重新武装。
+- 在共享的转发头集合上一次性生效，请求的每次出站（初次发送、角色阶梯重试、溢出重折、压缩循环、续读重取）都携带通道凭据。
 
 ### `models`
 
@@ -1091,6 +1111,10 @@
 配方包含：`baseUrl`（必须 HTTPS，本地开发可用回环 HTTP；拒绝内嵌凭据、代理递归路径与任意 query 参数）；`api`（`openai` | `anthropic` | `responses` | `google` 四选一，决定线上协议并从 `baseUrl` 推导请求路径）；恰好一个凭据引用 —— `apiKeyEnv: "变量名"`（调用时读环境变量）或 `credentialRef: "名字"`（通过 Web UI 存储的值）；以及 `models` 表，每个模型可设 `contextWindow`（默认 128000）、`outputTokens`（默认 `min(8192, 窗口/4)`）、`stream`（默认 false）。配方也可以像 URL 条目一样拆成 `recipe`/`bind` 路由形态；具名条目未绑定时对路由不生效（routing-inert）。
 
 每条链最多 16 个目标。通过 Web API 保存启用的链时会校验每个引用可解析（未知 provider 或 model → HTTP 400）。运行时遇到不可解析的引用会记录一次警告并禁用整条链直至修复 —— 绝不会回退用主模型写摘要。`secret:` 值单独存储在私有的 `billion-context.json.summary-credentials.json` 文件中，不随主 JSON 配置下发，配置 API 也不会返回。Windows 上请用仅管理员的 ACL 保护该文件及其父目录；确认没有代理进程在写存储后，残留的 `.lock` 文件需手工删除。总预算由全部目标与压缩入口共享；取消或会话状态变化会丢弃已生成但未落盘的结果。
+
+#### Agent 上报的 providers（兜底层）
+
+ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报自己已配置的 providers（`POST /__bili/agent-providers`）：provider 名、base URL、线上协议、已解析的 API key 与模型清单。这些 recipes 构成一个**兜底层** —— 链可以直接引用 `"zhipu/glm-5"`，无需在文件里重复拨号字段；在 agent 自身配置过的 provider 可直接用作摘要目标。合并序为**文件优先**：同名 file recipe 会完全遮蔽 agent 对该 provider 的贡献（含模型清单）。agent 层永不落盘：key 只存在于代理进程内存，配置 API 不返回，也不进日志。上报侧的跳过规则：OAuth 认证的 provider、`auth.json`（“stored”）凭据、端点指回代理自身的 provider、以及没有摘要拨号协议的 provider（`bedrock`、`vertex`、`mistral`、`pi-messages`）都不会上报。Web 面板的目标下拉里 agent 上报的模型带 `(agent)` 标记。
 
 三个层级，从最宽泛到最具体：
 

@@ -16,12 +16,15 @@ export class ConfiguredSummaryPlan {
     // from a hand-edited file — re-parse here so invalid settings fail
     // loudly at plan build, never silently use main-model summaries.
     constructor(raw: unknown, store = new SummaryCredentialStore(), env: NodeJS.ProcessEnv = process.env) {
-        this.settings = parseExternalSummarySettings(raw);
+        // inlineKeys: the rail may carry agent-registry recipes whose keys
+        // were resolved in the agent's memory (#2336) — literal apiKey bytes
+        // instead of a credentialRef.
+        this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
         this.deadline = performance.now() + this.settings.budget.totalTimeoutMs;
         this.candidates = this.settings.targets.map((target) => {
             try {
-                const key = store.resolve(target.credentialRef, env);
+                const key = target.apiKey !== undefined ? target.apiKey : store.resolve(target.credentialRef ?? "", env);
                 if (!key) throw new Error();
                 const headers: Record<string, string> = target.protocol === "anthropic" ? { "x-api-key": key }
                     : target.protocol === "google" ? { "x-goog-api-key": key }

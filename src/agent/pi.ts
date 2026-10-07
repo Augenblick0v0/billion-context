@@ -15,7 +15,7 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
-type Ctx = {
+export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
     // #2186: acp_delegate surface notifies stand-downs through the host toast
@@ -25,7 +25,15 @@ type Ctx = {
     // optional because older hosts lack it. The real ModelRegistry surface is
     // find(provider, modelId) — there is no getModel (verified against pi
     // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
-    modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
+    modelRegistry?: {
+        find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined;
+        // #2336 agent-registry fallback: the fuller surface (verified against
+        // pi v0.99.1 model-registry.d.ts) — all optional, older hosts lack them.
+        getAll?: () => Array<{ id: string; provider: string; api?: unknown; contextWindow?: unknown; maxTokens?: unknown }>;
+        getProvider?: (provider: string) => { baseUrl?: unknown; auth?: { oauth?: unknown; apiKey?: unknown } | undefined } | undefined;
+        getProviderAuthStatus?: (provider: string) => { configured?: unknown; source?: unknown } | undefined;
+        getApiKeyForProvider?: (provider: string) => Promise<string | undefined> | undefined;
+    } | undefined;
     cwd?: string;
 };
 
@@ -110,6 +118,94 @@ function latestPhysicalResponse(branchEntries: unknown): { provider: string; mod
         if (provider.length > 0 && modelId.length > 0) return { provider, modelId };
     }
     return undefined;
+}
+
+/** pi KnownApi → summary protocol (#2336). Unmappable apis (bedrock, vertex,
+ *  mistral, pi-messages) are skipped — the summary chain only speaks the four
+ *  wire protocols bili knows how to dial. */
+const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | "google"> = {
+    "anthropic-messages": "anthropic",
+    "openai-completions": "openai",
+    "openai-responses": "responses",
+    "azure-openai-responses": "responses",
+    "openai-codex-responses": "responses",
+    "google-generative-ai": "google",
+};
+
+/** #2336: report the host's own provider dialing recipes — baseUrl + api +
+ *  the RESOLVED api key, in memory only — so summary chains can reference
+ *  them ("glm/glm-5") without duplicating the dialing config in bili's
+ *  file. Skips OAuth providers, auth.json credentials ("stored" — never
+ *  collected by design), unmappable apis and baseUrls that point back at
+ *  this proxy. Returns true when done (or permanently unavailable) so the
+ *  caller can stop retrying; throws on transient failures. */
+export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
+    const proxyBase = proxyBaseForCtx(ctx);
+    if (proxyBase === undefined) return false;
+    const registry = ctx.modelRegistry;
+    if (registry?.getAll === undefined || registry.getProvider === undefined || registry.getProviderAuthStatus === undefined || registry.getApiKeyForProvider === undefined) return true;
+    type ProviderAcc = { api: "anthropic" | "openai" | "responses" | "google"; models: Array<{ id: string; contextWindow?: number; outputTokens?: number }> };
+    const byProvider = new Map<string, ProviderAcc>();
+    for (const model of registry.getAll()) {
+        const api = typeof model.api === "string" ? AGENT_PROVIDER_API[model.api] : undefined;
+        if (api === undefined || typeof model.provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(model.provider) || model.provider.length === 0 || typeof model.id !== "string" || model.id.length === 0 || model.id.length > 200) continue;
+        let entry = byProvider.get(model.provider);
+        if (entry === undefined) {
+            entry = { api, models: [] };
+            byProvider.set(model.provider, entry);
+        }
+        // A provider speaking two wire apis dials them differently; the
+        // recipe carries ONE api, so keep only the first one's models.
+        if (entry.api !== api || entry.models.length >= 16) continue;
+        entry.models.push({
+            id: model.id,
+            ...(typeof model.contextWindow === "number" && Number.isSafeInteger(model.contextWindow) && model.contextWindow >= 2048 && model.contextWindow <= 10_000_000 ? { contextWindow: model.contextWindow } : {}),
+            ...(typeof model.maxTokens === "number" && Number.isSafeInteger(model.maxTokens) && model.maxTokens >= 128 ? { outputTokens: model.maxTokens } : {}),
+        });
+    }
+    const providers: Record<string, { baseUrl: string; api: "anthropic" | "openai" | "responses" | "google"; apiKey: string; models: Record<string, { contextWindow?: number; outputTokens?: number }> }> = {};
+    for (const [id, entry] of byProvider) {
+        if (entry.models.length === 0) continue;
+        const provider = registry.getProvider(id);
+        const baseUrl = provider?.baseUrl;
+        if (typeof baseUrl !== "string" || !(baseUrl.startsWith("https://") || baseUrl.startsWith("http://"))) continue;
+        // Self-loop guard: skip providers whose endpoint IS this proxy — in
+        // the /bili/<upstream> prefix form the baseUrl embeds the proxy
+        // origin, and in MITM form detectProxyBase(baseUrl) resolves EVERY
+        // url through the env base, so compare origins instead of just
+        // testing detectProxyBase() !== undefined (which would skip the
+        // whole table whenever BILLION_CONTEXT_PROXY is set).
+        let selfLoop = true;
+        try { selfLoop = new URL(baseUrl).origin === new URL(proxyBase).origin; } catch { selfLoop = true; }
+        if (selfLoop) continue;
+        const status = registry.getProviderAuthStatus(id);
+        if (status?.configured !== true || status.source === "stored") continue;
+        if (provider?.auth?.oauth !== undefined) continue;
+        let apiKey: string | undefined;
+        try {
+            apiKey = await registry.getApiKeyForProvider(id);
+        } catch {
+            continue;
+        }
+        if (typeof apiKey !== "string" || apiKey.length === 0) continue;
+        const models: Record<string, { contextWindow?: number; outputTokens?: number }> = {};
+        for (const model of entry.models) {
+            models[model.id] = {
+                ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+                ...(model.outputTokens !== undefined ? { outputTokens: model.outputTokens } : {}),
+            };
+        }
+        providers[id] = { baseUrl, api: entry.api, apiKey, models };
+    }
+    if (Object.keys(providers).length === 0) return true;
+    const res = await fetch(`${proxyBase}/__bili/agent-providers`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent, providers }),
+        signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`agent-providers HTTP ${res.status}`);
+    return true;
 }
 
 function virtualModelProxyBase(ctx: Ctx, branchEntries: unknown): string | undefined {
@@ -431,6 +527,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #2336: one successful agent-providers report per plugin instance;
+        // retried on later session_starts while the proxy base is unknown
+        // (native mode resolves it asynchronously).
+        let agentProvidersDone = false;
         // #2185 方案 A: this bundle's own file path, registered per session so
         // pi-subagents children load it deterministically (see module header).
         const subagentReg: SubagentSelfRegState = {};
@@ -889,6 +989,17 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
+            if (!agentProvidersDone) {
+                agentProvidersDone = true;
+                reportAgentProviders(ctx, agent).then((done) => {
+                    if (done) return;
+                    // Proxy base not resolvable yet — retry on the next session.
+                    agentProvidersDone = false;
+                }).catch((err: unknown) => {
+                    agentProvidersDone = false;
+                    console.warn(`bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
+                });
+            }
             if (agent === "pi") {
                 const regReason = selfRegisterForSession(subagentReg, {
                     env: process.env,

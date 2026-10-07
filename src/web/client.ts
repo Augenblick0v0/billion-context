@@ -1763,7 +1763,7 @@ export const WEB_CLIENT = `(function () {
             lab.appendChild(title);
             const inp = document.createElement(options ? "select" : "input");
             inp.id = id; inp.className = "field-input";
-            if (options) options.forEach((v) => { const opt = document.createElement("option"); opt.value = v; opt.textContent = v; inp.appendChild(opt); });
+            if (options) options.forEach((v) => { const opt = document.createElement("option"); opt.value = typeof v === "object" ? v.value : v; opt.textContent = typeof v === "object" ? v.label : v; inp.appendChild(opt); });
             else { inp.type = type || "text"; if (type === "number") { inp.min = "1"; inp.step = "1"; } }
             inp.value = value === undefined ? "" : String(value);
             inp.addEventListener("change", () => change(type === "number" ? Number(inp.value) : inp.value));
@@ -1783,7 +1783,21 @@ export const WEB_CLIENT = `(function () {
             const recipes = Object.keys(providers).filter((name) => name.indexOf("http://") !== 0 && name.indexOf("https://") !== 0 && providers[name] && typeof providers[name] === "object" && !Array.isArray(providers[name]) && (providers[name].baseUrl !== undefined || providers[name].api !== undefined)).map((name) => ({ name, recipe: providers[name] }));
             const options = [];
             recipes.forEach(({ name, recipe }) => { Object.keys(recipe.models && typeof recipe.models === "object" ? recipe.models : {}).forEach((model) => options.push(name + "/" + model)); });
+            // #2336: agent-registry fallback — providers the host agent
+            // reported live (dialing lives in its memory, not in this file).
+            // Offered with an agent marker so the operator knows editing them
+            // here is not possible; the ref itself saves as provider/model.
+            (Array.isArray(cfg.agentProviders) ? cfg.agentProviders : []).forEach((group) => {
+                (group.providers || []).forEach((p) => {
+                    (p.models || []).forEach((model) => {
+                        const ref = p.name + "/" + model;
+                        if (options.some((o) => (typeof o === "object" ? o.value : o) === ref)) return;
+                        options.push({ value: ref, label: ref + " (" + (group.agent || "agent") + ")" });
+                    });
+                });
+            });
             const head = document.createElement("div"); head.className = "summary-actions";
+            const plain = (v) => typeof v === "object" ? v.value : v;
             const enabled = document.createElement("label");
             const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.id = "summary-enabled"; toggle.checked = s.enabled === true;
             toggle.disabled = !!cfg.parseError;
@@ -1791,7 +1805,7 @@ export const WEB_CLIENT = `(function () {
             enabled.append(toggle, document.createTextNode(" " + t("summary.enabled"))); head.appendChild(enabled);
             const add = button(head, t("summary.add"), () => mutate((v) => {
                 if (!v.targets) v.targets = [];
-                v.targets.push(options.find((option) => v.targets.indexOf(option) === -1) || "");
+                v.targets.push(plain(options.find((option) => v.targets.indexOf(plain(option)) === -1)) || "");
             }, true));
             add.disabled = !!cfg.parseError || (s.targets || []).length >= 16 || (options.length === 0 && (s.targets || []).length > 0);
             box.appendChild(head);
@@ -1803,7 +1817,7 @@ export const WEB_CLIENT = `(function () {
                 const legend = document.createElement("legend"); legend.textContent = String(i + 1) + ". " + (ref || "—"); item.appendChild(legend);
                 const fields = document.createElement("div"); fields.className = "summary-grid";
                 const refOptions = options.slice();
-                if (ref && refOptions.indexOf(ref) === -1) refOptions.unshift(ref);
+                if (ref && refOptions.map(plain).indexOf(ref) === -1) refOptions.unshift(ref);
                 const set = (value) => mutate((v) => { v.targets[i] = String(value).trim(); }, true);
                 field(fields, "summary-" + i + "-ref", t("summary.ref"), ref, set, refOptions.length ? null : "text", refOptions.length ? refOptions : undefined);
                 item.appendChild(fields);

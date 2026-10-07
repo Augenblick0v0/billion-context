@@ -13,6 +13,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
@@ -281,7 +282,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, opts.namedProviders ?? {}));
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }));
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -355,6 +356,24 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/agent-providers") {
+        // #2336 agent-registry fallback: a plugin host reports its dialing
+        // recipes (key bytes resolved in the agent's memory). Names only in
+        // the response — the key never crosses a log or GET surface.
+        try {
+            const body = await readBody(req);
+            const report = parseAgentProviderReport(JSON.parse(body.toString("utf8")));
+            recordAgentProviders(report.agent, report.providers);
+            log("info", `[agent-providers] ${report.agent} registered: ${Object.keys(report.providers).sort().join(", ")} (#2336)`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, agent: report.agent, providers: Object.keys(report.providers) }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
             return;
         }
     }

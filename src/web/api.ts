@@ -22,6 +22,7 @@ import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
 import { SummaryCredentialStore } from "../external-summary-credentials.js";
 import { parseExternalSummaryChain, expandExternalSummaryChain } from "../external-summary-settings.js";
+import { agentProviderRecipes, agentRegistryStatus } from "../agent-providers.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -129,6 +130,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         externalSummaryCredentials: credentialStatus,
+        agentProviders: agentRegistryStatus(),
         passthrough: passthroughState(process.env),
         allowDshCompaction: allowDshCompactionState(process.env),
         ...(existsSync(configFile()) ? { raw: hideInvalidSummary ? JSON.stringify(config, null, 2) : readFileSync(configFile(), "utf8") } : {}),
@@ -220,9 +222,14 @@ export async function handleConfigPut(
         if (next.compress !== undefined && next.compress !== null) {
             const parsed = parseCompressSettings(next.compress);
             if (parsed?.externalSummary?.enabled === true) {
-                const recipes = next.providers !== undefined && typeof next.providers === "object" && !Array.isArray(next.providers)
+                // #2336: agent-registry recipes are a fallback layer — a
+                // chain may reference them without duplicating the dialing
+                // config in the file (file recipes win on name collision,
+                // matching the request-path merge order).
+                const fileRecipes = next.providers !== undefined && typeof next.providers === "object" && !Array.isArray(next.providers)
                     ? collectNamedProviders(next.providers as Record<string, unknown>)
                     : loadNamedProviders();
+                const recipes = { ...agentProviderRecipes(), ...fileRecipes };
                 try { expandExternalSummaryChain(parsed.externalSummary, recipes); } catch (error) {
                     return sendError(res, 400, `compress.externalSummary cannot be resolved: ${String(error)}`);
                 }
@@ -298,6 +305,18 @@ export async function handleConfigPut(
     if (hasCompress) {
         compress = body.compress === null ? {} : parseCompressSettings(body.compress);
         if (compress === undefined) return sendError(res, 400, "invalid compress settings");
+        // Same dangling-reference guard as the whole-file save: the chain
+        // must expand against the providers BEING SAVED (or the on-disk
+        // table when providers are untouched) plus the agent-registry
+        // fallback layer (#2336 — file recipes win on name collision).
+        if (compress.externalSummary?.enabled === true) {
+            const fileRecipes = hasProviders && body.providers !== null && typeof body.providers === "object" && !Array.isArray(body.providers)
+                ? collectNamedProviders(body.providers as Record<string, unknown>)
+                : loadNamedProviders();
+            try { expandExternalSummaryChain(compress.externalSummary, { ...agentProviderRecipes(), ...fileRecipes }); } catch (error) {
+                return sendError(res, 400, `compress.externalSummary cannot be resolved: ${String(error)}`);
+            }
+        }
     }
 
     // #405: the panel must be able to READ and CLEAR passthrough. An env
