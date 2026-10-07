@@ -40,6 +40,8 @@ const BILI_INJECTABLE_TOOL_NAMES = new Set([
     "image_full",
 ]);
 
+// module-local type: only this file's exported detectors return it (internal-only export
+// would trip the unused-export gate; fixed in-passing in the crush PR like 52d44540)
 type PiSubagentChildSignal = { present: false } | { present: true; agent?: string };
 
 /** Detect the pi-subagents child marker in the raw request body. The marker

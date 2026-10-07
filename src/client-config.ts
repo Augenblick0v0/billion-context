@@ -226,6 +226,17 @@ export interface GooseConfig {
     customProviders: Record<string, string>;
 }
 
+/** crush.json discovery result — kept module-local: nobody imports the type
+ *  by name (the unused-export gate would flag it), only readCrushConfig's
+ *  return value and ClientConfig.crush carry it. */
+interface CrushConfig {
+    /** Custom provider base URLs discovered from crush.json
+     *  (`providers.<id>.base_url`, https only). Read-only discovery — crush
+     *  has no in-process plugin seam, so the launcher cert-MITMs these hosts
+     *  on top of the built-in provider defaults (#2340). */
+    baseUrls?: string[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -245,6 +256,7 @@ export interface ClientConfig {
     mcode?: McodeConfig;
     aider?: AiderConfig;
     goose?: GooseConfig;
+    crush?: CrushConfig;
 }
 
 /** qoder's default model-inference hosts, hardcoded in the binary (no config
@@ -1162,6 +1174,47 @@ export const COPILOT_DEFAULT_MODEL_HOSTS = [
  *  model leg and the control plane (/api/internal, /api/telemetry). */
 export const AMP_DEFAULT_MODEL_HOSTS = ["ampcode.com"];
 
+/** Crush (charmbracelet) built-in provider hosts, cert-MITM'd so
+ *  `bili crush` compresses the model traffic. Open-source Go binary —
+ *  net/http honors HTTPS_PROXY and trusts the CA via SSL_CERT_FILE (#2340).
+ *  Custom provider base_urls from crush.json are discovered on top
+ *  (readCrushConfig); exotic relays ride --mitm-domain. */
+export const CRUSH_DEFAULT_MODEL_HOSTS = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "openrouter.ai",
+];
+
+/** #2340: read crush.json ($CRUSH_CONFIG, else $XDG_CONFIG_HOME|~/.config
+ *  /crush/crush.json) and collect providers.<id>.base_url values — https
+ *  only (http legs cannot be cert-MITM'd and stay direct). Soft-fails on
+ *  any unreadable/corrupt file: discovery must never block the launcher. */
+export function readCrushConfig(env: NodeJS.ProcessEnv = process.env): CrushConfig {
+    const home = os.homedir();
+    const file = nonEmpty(env.CRUSH_CONFIG)
+        ? env.CRUSH_CONFIG!
+        : path.join(nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME! : path.join(home, ".config"), "crush", "crush.json");
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+            providers?: Record<string, { base_url?: unknown }>;
+        };
+        const baseUrls: string[] = [];
+        for (const provider of Object.values(parsed.providers ?? {})) {
+            const raw = provider?.base_url;
+            if (typeof raw !== "string" || raw.trim() === "") continue;
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+            } catch {
+                continue;
+            }
+            if (!baseUrls.includes(raw)) baseUrls.push(raw);
+        }
+        return baseUrls.length > 0 ? { baseUrls } : {};
+    } catch {
+        return {};
+    }
+}
+
 /** goose directory layout (mirrors its paths.rs): GOOSE_PATH_ROOT (absolute)
  *  holds config/, data/, state/, .agents/; without it the home scatters across
  *  XDG dirs under author "Block" (state falls back to data when
@@ -1808,6 +1861,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.mcode = readMcodeConfig(env);
     config.aider = readAiderConfig(env, cwd);
     config.goose = readGooseConfig(resolveGooseDirs(env), env);
+    config.crush = readCrushConfig(env);
     return config;
 }
 
@@ -1932,7 +1986,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

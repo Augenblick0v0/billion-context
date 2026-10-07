@@ -113,8 +113,11 @@ import {
     MCODE_DEFAULT_MODEL_HOSTS,
     buildCopilotEnv,
     buildAmpEnv,
+    buildCrushEnv,
     COPILOT_DEFAULT_MODEL_HOSTS,
     AMP_DEFAULT_MODEL_HOSTS,
+    CRUSH_DEFAULT_MODEL_HOSTS,
+    readCrushConfig,
     resolveGooseDirs,
     readGooseConfig,
     prepareGooseHome,
@@ -184,6 +187,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("aider"), true);
     assert.equal(isLaunchClient("copilot"), true);
     assert.equal(isLaunchClient("amp"), true);
+    assert.equal(isLaunchClient("crush"), true);
     assert.equal(isLaunchClient("goose"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
@@ -5637,6 +5641,14 @@ test("buildAmpEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv 
     assert.equal(env.FOO, "bar");
 });
 
+test("buildCrushEnv: HTTPS_PROXY + SSL_CERT_FILE + BILLION_CONTEXT_PROXY, baseEnv preserved (#2340)", () => {
+    const env = buildCrushEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.FOO, "bar");
+});
+
 test("discoverRoutes: copilot whitelists api.githubcopilot.com + plan subdomains (#1049)", () => {
     const routes = discoverRoutes("copilot", {});
     assert.deepEqual(routes.httpsDomains, [...COPILOT_DEFAULT_MODEL_HOSTS]);
@@ -5649,6 +5661,50 @@ test("discoverRoutes: amp whitelists ampcode.com (#1049)", () => {
     assert.deepEqual(routes.httpsDomains, [...AMP_DEFAULT_MODEL_HOSTS]);
     assert.deepEqual(routes.httpRewrites, []);
     assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: crush whitelists built-in provider hosts (#2340)", () => {
+    const routes = discoverRoutes("crush", {});
+    assert.deepEqual(routes.httpsDomains, [...CRUSH_DEFAULT_MODEL_HOSTS]);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: crush adds crush.json base_url hosts, deduped, https only (#2340)", () => {
+    const config: ClientConfig = { crush: { baseUrls: [
+        "https://relay.example.com/v1",
+        "https://api.anthropic.com/v1", // dup of the built-ins — must not repeat
+        "http://127.0.0.1:11434/v1",    // http loopback — cannot be cert-MITM'd
+        "not-a-url",
+    ] } };
+    const routes = discoverRoutes("crush", config);
+    assert.deepEqual(routes.httpsDomains, [...CRUSH_DEFAULT_MODEL_HOSTS, "relay.example.com"]);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("readCrushConfig: collects https base_urls from crush.json, tolerates junk (#2340)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-crush-cfg-"));
+    fs.mkdirSync(path.join(home, "crush"), { recursive: true });
+    fs.writeFileSync(path.join(home, "crush", "crush.json"), JSON.stringify({
+        providers: {
+            openai: { base_url: "https://relay.example.com/v1" },
+            custom: { base_url: "https://api.deepseek.com/bili" },
+            loopback: { base_url: "http://127.0.0.1:11434/v1" },
+            junk: { base_url: 12345 },
+            none: { api_key: "sk-x" },
+        },
+    }));
+    assert.deepEqual(readCrushConfig({ XDG_CONFIG_HOME: home }), { baseUrls: ["https://relay.example.com/v1", "https://api.deepseek.com/bili"] });
+    // CRUSH_CONFIG points straight at the file, bypassing the XDG layout
+    assert.deepEqual(
+        readCrushConfig({ XDG_CONFIG_HOME: "/nonexistent", CRUSH_CONFIG: path.join(home, "crush", "crush.json") }),
+        { baseUrls: ["https://relay.example.com/v1", "https://api.deepseek.com/bili"] },
+    );
+    // missing / corrupt files must soft-fail to an empty config
+    assert.deepEqual(readCrushConfig({ XDG_CONFIG_HOME: "/nonexistent" }), {});
+    fs.writeFileSync(path.join(home, "crush", "crush.json"), "{not json");
+    assert.deepEqual(readCrushConfig({ XDG_CONFIG_HOME: home }), {});
 });
 
 test("discoverRoutes: goose rewrites custom provider base_urls (incl. loopback), no MITM domains (#1049)", () => {
@@ -6676,6 +6732,15 @@ test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), i
 
 test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
     const seenEnv = await captureLaunchedClientEnv("amp");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
+    assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined);
+    assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch crush: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#2340)", async () => {
+    const seenEnv = await captureLaunchedClientEnv("crush");
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
     assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
     assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
