@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-<code>npm install -g billion-context</code>
+<code>npm install -g billion-context --prefix=~/.local</code>
 </p>
 
 <p align="center">
@@ -129,11 +129,23 @@ Pick by your client:
 
 ## Install
 
+Linux / macOS — install with a user-level prefix (no `sudo`, no npm config
+changes, and `bili`'s self-update never hits permission errors):
+
 ```bash
-npm install -g billion-context
+npm install -g billion-context --prefix=~/.local
 ```
 
-This installs the `bili` command (`bili-proxy` is kept as an alias).
+The `bili` command lands in `~/.local/bin` — already on PATH in most distros;
+if not, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or
+`~/.zshrc`. On nvm or Homebrew Node the default prefix is already user-owned —
+a plain `npm install -g billion-context` works as-is. On Windows the default
+prefix (`%APPDATA%\npm`) is also user-writable — plain `npm install -g billion-context`.
+
+This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
+`EACCES` with an old root-owned prefix? Reinstall with `--prefix=~/.local`
+(pass the flag again on any future npm reinstall of `bili`) — that is the
+permanent fix; avoid `sudo`.
 
 ## Quickstart
 

@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-<code>npm install -g billion-context</code>
+<code>npm install -g billion-context --prefix=~/.local</code>
 </p>
 
 <p align="center">
@@ -131,11 +131,15 @@ QQ群:
 
 ## 安装
 
+Linux / macOS —— 指定用户级 prefix 安装(全程不需要 `sudo`，也不改你的 npm 配置，`bili` 自更新不会再遇到权限问题)：
+
 ```bash
-npm install -g billion-context
+npm install -g billion-context --prefix=~/.local
 ```
 
-这会安装 `bili` 命令(`bili-proxy` 保留为别名)。
+`bili` 命令装在 `~/.local/bin`——多数发行版默认已在 PATH 中；没有的话把 `export PATH="$HOME/.local/bin:$PATH"` 写进 `~/.bashrc` 或 `~/.zshrc`。用 nvm 或 Homebrew Node 的，默认 prefix 本来就属于当前用户，直接 `npm install -g billion-context` 即可；Windows 的默认 prefix(`%APPDATA%\npm`)同样用户可写，直接 `npm install -g billion-context`。
+
+这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
 ## 快速上手
 
