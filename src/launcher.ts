@@ -64,7 +64,7 @@ import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
@@ -142,6 +142,8 @@ export {
     AMP_DEFAULT_MODEL_HOSTS,
     CRUSH_DEFAULT_MODEL_HOSTS,
     readCrushConfig,
+    ZED_DEFAULT_MODEL_HOSTS,
+    readZedConfig,
     resolveGooseDirs,
     readGooseConfig,
     type GooseConfig,
@@ -150,9 +152,9 @@ export {
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "goose", "antigravity", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -847,6 +849,31 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 }
             } catch {}
         }
+    } else if (client === "zed") {
+        // #2340: open-source Rust editor — cert-MITM like jcode (reqwest
+        // honors HTTPS_PROXY; CA rides SSL_CERT_FILE via openssl-probe env
+        // probing on Linux). Whitelist the built-in provider hosts plus
+        // custom provider api_urls discovered from settings.json
+        // (readZedConfig, https only); exotic relays ride --mitm-domain.
+        for (const h of ZED_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+        for (const raw of config.zed?.baseUrls ?? []) {
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+                const host = new URL(raw).hostname.toLowerCase();
+                if (host && !httpsSeen.has(host)) {
+                    httpsSeen.add(host);
+                    httpsDomains.push(host);
+                }
+            } catch {
+                continue;
+            }
+        }
     } else if (client === "goose") {
         // #1049: release builds wire reqwest with rustls (webpki roots), so the
         // proxy's CA is untrusted and cert-MITM cannot reach goose at all — every
@@ -933,7 +960,7 @@ export function buildPiEnv(
 // https entry wins, matching the historical sequential assignment). buildPiEnv
 // (JSON manifest + host list envs) and buildClaudePluginEnv (direct-URL mode,
 // returns baseEnv untouched) stay bespoke above/below this table. ---
-type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity";
+type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed";
 
 interface EnvClientPreset {
     /** CA path is written to every listed env var. */
@@ -989,6 +1016,18 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
      *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
      *  No base-URL rewrite of any kind. */
     qoder: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false },
+    // #2340: Zed is a Rust reqwest client — same env contract as jcode. The
+    // CA rides SSL_CERT_FILE: Zed's rustls resolves roots through
+    // rustls-platform-verifier -> rustls-native-certs -> openssl-probe, which
+    // reads SSL_CERT_FILE/SSL_CERT_DIR first (Linux; macOS/Windows platform
+    // verifiers ignore env files — system trust store there). NO_PROXY keeps
+    // loopback providers (ollama/lmstudio) and MCP legs direct.
+    zed: {
+        caKeys: ["SSL_CERT_FILE"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
     // No proxy/CA env: model traffic goes straight to the loopback proxy via
     // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
     gemini: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["GOOGLE_GEMINI_BASE_URL"] },
@@ -1061,6 +1100,13 @@ export function buildCrushEnv(origin: string, caPath: string, baseEnv: NodeJS.Pr
     // (net/http honors HTTPS_PROXY; the combined CA bundle replaces Go's
     // system trust store via SSL_CERT_FILE).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildZedEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #2340: Rust reqwest + rustls (roots via openssl-probe read
+    // SSL_CERT_FILE first on Linux) — the jcode env contract; NO_PROXY keeps
+    // loopback providers direct.
+    return buildClientEnv(ENV_CLIENTS.zed, origin, caPath, baseEnv);
 }
 
 export function buildCodexArgs(
@@ -1433,7 +1479,7 @@ function isPrivateIPv4(host: string): boolean {
  *  (#2115): its model channel is a closed Go binary with no MCP-injection
  *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -5060,6 +5106,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // and the combined CA bundle via SSL_CERT_FILE. Whitelist = built-in
         // provider hosts + crush.json custom base_urls (discoverRoutes).
         env = buildCrushEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "zed") {
+        // #2340: cert-MITM like jcode — Rust reqwest honors HTTPS_PROXY; the
+        // combined CA bundle rides SSL_CERT_FILE (openssl-probe reads it first
+        // on Linux). Whitelist = built-in provider hosts + settings.json
+        // custom api_urls (discoverRoutes). Loopback legs stay direct
+        // (NO_PROXY).
+        env = buildZedEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "goose") {
         // #1049: rustls release builds won't trust bili's CA, so no proxy envs
         // at all — every model leg is redirected straight at the proxy as

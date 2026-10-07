@@ -1827,6 +1827,7 @@ Clients you configure with an **API key** (not a login) let you change the upstr
 
 **OpenCode note.** This is the **no-plugin** path for OpenCode. If the native plugin is also installed over such a config, the runtime warns once per session with a fix-it guide (remove the prefix or remove the plugin); the requests themselves keep riding the plain-proxy path. The three mutually exclusive OpenCode access paths are documented in [CLIENTS.md](CLIENTS.md#opencode).
 
+**Other clients.** The same one-line prefix works for any client whose model base URL you can edit (Cline / Roo Code / Kilo Code, Continue, OpenHands, Zed, Void, Cursor single-model override, …) — verified entry points are listed in [CLIENTS.md → Adopting unlisted clients](CLIENTS.md#adopting-unlisted-clients-any-client-with-a-configurable-model-base-url-2340).
 **Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
 
 ```toml
