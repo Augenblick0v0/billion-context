@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-<code>npm install -g billion-context</code>
+<code>npm install -g billion-context --prefix=~/.local</code>
 </p>
 
 <p align="center">
