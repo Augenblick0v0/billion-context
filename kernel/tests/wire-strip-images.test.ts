@@ -214,7 +214,10 @@ test("anthropic: strips images nested inside tool_result content", () => {
       type: "tool_result",
       tool_use_id: "t2",
       is_error: false,
-      content: [{ type: "text", text: "[image]" }],
+      // #1995: image-only tool_result collapses to the EMPTY STRING (not a
+      // "[image]" text part) so the converter's derived id — seeded from the
+      // concatenated TEXT parts — stays byte-identical across the strip.
+      content: "",
     },
   ]);
   assert.equal(m[1], body.messages[1]);
@@ -257,7 +260,8 @@ test("anthropic: counts top-level and nested images in the same message", () => 
       {
         type: "tool_result",
         tool_use_id: "t1",
-        content: [{ type: "text", text: "[image]" }],
+        // #1995: id-stable empty-string collapse (see wire-strip-cutoff.test.ts)
+        content: "",
       },
     ],
   });

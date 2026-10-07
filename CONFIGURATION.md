@@ -207,7 +207,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
-| `compress.stripImagesKeepRecent` | number | 5 | — | With stripImages on, images inside the N newest messages are kept. |
+| `compress.stripImagesKeepRecent` | number | 5 | — | With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary). |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). |
@@ -1318,14 +1318,14 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `boolean`
 - **Default:** `false`
 - **Status:** ACTIVE
-- **Description:** Opt-in removal of historical image payloads. When `true`, every message **except** the most recent `stripImagesKeepRecent` has its image parts dropped before the wire rebuild; an image-only message collapses to a single `[image]` text placeholder (mixed text+image messages keep their text). Recent-N images are forwarded verbatim, and a freshly-sent image always falls inside that window on the turn it arrives. Off by default — while off, the #488 image-token floor and its overflow `502` stay the opt-in signal for image-heavy payloads. Applies to both compression modes (in plugin mode the agent's own history is untouched; only the upstream-bound wire is slimmed). See issue #617.
+- **Description:** Opt-in removal of historical image payloads. When `true`, aged-out messages have their image parts dropped before the wire rebuild; an image-only message collapses to a single `[image]` text placeholder (mixed text+image messages keep their text). **Strip boundary (#1995):** on anthropic sessions with an active compression fold, the boundary is FOLD-ANCHORED — only wire messages covered by active folds are stripped, and the boundary moves only on compression events, so the stripped prefix stays byte-stable between folds (the prompt cache stops re-billing it every turn) and un-folded images stay live. Without an active fold, or on the other wires (whose strip placeholders would flip kernel message ids), the classic sliding window applies: every message except the most recent `stripImagesKeepRecent` is stripped. A freshly-sent image always sits in the un-stripped tail on the turn it arrives. **Recovery:** stripped pixels are recoverable via `decompress({ imageRef })` — each stripped image is indexed by its `mNNNNN` ref and spilled under `<state>/retrieve/img/<session>/` (best-effort 7-day TTL); preflight fold summaries carry the ref in their notes (`[image: png 1024x768 · m00042]`). Off by default — while off, the #488 image-token floor and its overflow `502` stay the opt-in signal for image-heavy payloads. Applies to both compression modes (in plugin mode the agent's own history is untouched; only the upstream-bound wire is slimmed). See issue #617.
 
 #### `stripImagesKeepRecent`
 
 - **Type:** `number`
 - **Default:** `5`
 - **Status:** ACTIVE
-- **Description:** With `stripImages: true`, how many trailing messages keep their images verbatim. Ignored unless `stripImages` is enabled.
+- **Description:** With `stripImages: true`, how many trailing messages keep their images verbatim. Ignored unless `stripImages` is enabled. **Fallback role (#1995):** on anthropic sessions an active fold anchors the strip boundary instead; this window applies when no fold anchors it (and on all other wires).
 
 #### `visibilityMarkers`
 

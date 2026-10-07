@@ -83,7 +83,14 @@ function stripNestedImages(
     return {
       part: {
         ...part,
-        content: kept.length > 0 ? kept : placeholderContent(protocol),
+        // #1995: an image-only tool_result collapses to the EMPTY STRING, not
+        // a "[image]" text part. anthropicToCore seeds the tool_result id from
+        // its concatenated TEXT parts (images contribute ""), so "" keeps the
+        // derived id byte-identical pre/post strip — a "[image]" part would
+        // flip the id and churn the ref projection / fold anchoring state
+        // (stripImages anchoring, src/image-restore.ts). String content is
+        // valid Anthropic tool_result shape.
+        content: kept.length > 0 ? kept : "",
       },
       removed,
     };
@@ -140,19 +147,31 @@ function stripParts(
 /** Drop image parts from every message older than the most recent `keepRecent`.
  *  `protocol` selects the wire dialect; `null` (unparseable) is a no-op. Returns
  *  `{ body, removed }` where `body` is the input reference untouched (and
- *  `removed` is 0) when there was nothing to strip. */
+ *  `removed` is 0) when there was nothing to strip.
+ *
+ *  `opts.cutoffIndex` (protocol-neutral, #1995): when present, replaces the
+ *  sliding `len - keepRecent` cutoff with an explicit wire-message index —
+ *  strip messages at index < cutoffIndex. Hosts use this to anchor the strip
+ *  boundary to fold coverage so the stripped prefix only moves on compression
+ *  events (prompt-cache stability) instead of every turn. When absent the
+ *  historical sliding-window behavior applies. */
 export function stripHistoricalImages(
   body: unknown,
   protocol: StripProtocol,
   keepRecent: number,
+  opts?: { cutoffIndex?: number },
 ): StripResult {
   if (!protocol || !isObj(body)) return { body, removed: 0 };
   const recentCount = Math.max(0, Math.floor(keepRecent));
+  const explicitCutoff =
+    opts?.cutoffIndex !== undefined && Number.isFinite(opts.cutoffIndex)
+      ? Math.max(0, Math.floor(opts.cutoffIndex))
+      : undefined;
 
   if (protocol === "responses") {
     const input = body.input;
     if (!Array.isArray(input)) return { body, removed: 0 };
-    const cutoff = input.length - recentCount;
+    const cutoff = explicitCutoff ?? input.length - recentCount;
     let removed = 0;
     let touched = false;
     const nextInput = input.map((item, i) => {
@@ -178,7 +197,7 @@ export function stripHistoricalImages(
   if (protocol === "google") {
     const contents = body.contents;
     if (!Array.isArray(contents)) return { body, removed: 0 };
-    const cutoff = contents.length - recentCount;
+    const cutoff = explicitCutoff ?? contents.length - recentCount;
     let removed = 0;
     let touched = false;
     const nextContents = contents.map((c, i) => {
@@ -198,7 +217,7 @@ export function stripHistoricalImages(
 
   const messages = body.messages;
   if (!Array.isArray(messages)) return { body, removed: 0 };
-  const cutoff = messages.length - recentCount;
+  const cutoff = explicitCutoff ?? messages.length - recentCount;
   let removed = 0;
   let touched = false;
   const nextMessages = messages.map((m, i) => {

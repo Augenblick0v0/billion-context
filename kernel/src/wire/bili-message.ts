@@ -42,6 +42,13 @@ export interface BiliMessage extends CoreMessage {
    *  the content from these when present, so parts the core does not model
    *  survive a round-trip. */
   rawGoogleParts?: unknown[];
+  /** Source wire-message ordinal for this core message, tagged by the
+   *  converters (`wireIndex` of the protocol message it was flattened from).
+   *  Host-side consumers use it to translate core-space fold coverage back
+   *  into wire positions (e.g. #1995's fold-anchored stripImages cutoff)
+   *  without re-deriving each codec's block-split behavior. Optional:
+   *  converters adopt it incrementally; absence means "unknown". */
+  wireIndex?: number;
   /** Anthropic thinking signature. Anthropic verifies thinking+signature
    *  pairs; without it the request is rejected. Stored alongside the
    *  reasoning text so coreToAnthropic can reattach it. */

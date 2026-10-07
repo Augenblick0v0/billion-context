@@ -404,10 +404,23 @@ export type CompressSettings = {
      *  the most recent {@link stripImagesKeepRecent} has its image parts dropped
      *  before the wire rebuild (image-only content collapses to an "[image]"
      *  placeholder). Off by default — the #488 image floor / overflow 502 stays
-     *  the opt-in signal until this is enabled. */
+     *  the opt-in signal until this is enabled.
+     *
+     *  [#1995] On anthropic sessions the strip boundary is FOLD-ANCHORED when
+     *  an active compression fold exists: instead of the sliding `len -
+     *  keepRecent` window (which moves the byte boundary every turn and breaks
+     *  the prompt cache at the most expensive content), the cutoff sticks to
+     *  the last fold-covered wire message and only moves on compression
+     *  events — the stripped prefix is byte-stable between folds. Recovery for
+     *  stripped pixels: `decompress({ imageRef })` (files under
+     *  <state>/retrieve/img/<session>/, one-week TTL) and the ref-carrying
+     *  `[image: … · mNNNNN]` notes summaries emit. The other wires keep the
+     *  sliding window until their strip placeholders are made id-stable
+     *  (openai/google flip ids on strip; see src/image-restore.ts). */
     stripImages?: boolean;
     /** With {@link stripImages}, how many trailing messages keep their images
-     *  verbatim (default 5). Ignored unless stripImages is true. */
+     *  verbatim (default 5). Ignored unless stripImages is true. Serves as the
+     *  FALLBACK window on anthropic when no active fold anchors the boundary. */
     stripImagesKeepRecent?: number;
     /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
      *  tool calls at request time (src/reasoning-drop.ts, aligned with

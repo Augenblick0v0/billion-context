@@ -135,7 +135,7 @@
       },
       {
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -158,6 +158,10 @@
             "endId": {
               "type": "string",
               "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [
@@ -395,7 +399,7 @@
         "type": "function",
         "function": {
           "name": "decompress",
-          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -418,6 +422,10 @@
               "endId": {
                 "type": "string",
                 "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
+              },
+              "imageRef": {
+                "type": "string",
+                "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
               }
             },
             "required": [
@@ -671,7 +679,7 @@
       {
         "type": "function",
         "name": "decompress",
-        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context. Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -686,6 +694,10 @@
             "full": {
               "type": "boolean",
               "description": "Restore all the way to original messages"
+            },
+            "imageRef": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR."
             }
           },
           "required": [

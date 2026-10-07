@@ -190,10 +190,24 @@ function withRangeParams(schema: JsonSchemaObject): JsonSchemaObject {
     return { ...schema, properties: { ...schema.properties, startId: DECOMPRESS_RANGE_PARAM_START, endId: DECOMPRESS_RANGE_PARAM_END } };
 }
 
-export const BILI_DECOMPRESS_TOOL = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description, input_schema: withRangeParams(DECOMPRESS_TOOL.input_schema) };
-export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description, parameters: withRangeParams(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
-export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description, parameters: withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters) };
-export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description, parameters: withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters) };
+// #1995: image-recovery extension of decompress. An optional imageRef (an mNNNNN
+// ref, or "list") restores a stripped/folded image's original pixels to a
+// host-readable file. It is independent of blockId/range AND of CCR, so — unlike
+// startId/endId (#1712, which are advertised only where CCR can arm them) — it is
+// offered in EVERY decompress variant, range and no-range alike.
+const DECOMPRESS_IMAGE_PARAM = {
+    type: "string",
+    description: "Optional mNNNNN message ref whose IMAGE payload you want restored (an image that was stripped or folded away). Pass \"list\" to enumerate every image currently restorable. Restored images are written to host-readable files and their paths returned — open them with the read tool. Independent of blockId/range and of CCR.",
+};
+const DECOMPRESS_IMAGE_NOTE = " Pass imageRef (an mNNNNN ref) to restore a stripped/folded image's original pixels to a file you open with the read tool; imageRef:\"list\" shows what is restorable.";
+function withImageRestoreParam(schema: JsonSchemaObject): JsonSchemaObject {
+    return { ...schema, properties: { ...schema.properties, imageRef: DECOMPRESS_IMAGE_PARAM } };
+}
+
+export const BILI_DECOMPRESS_TOOL = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description + DECOMPRESS_IMAGE_NOTE, input_schema: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL.input_schema)) };
+export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_OPENAI.function.parameters)) } };
+export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters)) };
+export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters)) };
 
 export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
 export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
@@ -202,12 +216,17 @@ export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEA
 
 // #1712: no-range variants — identical except decompress lacks startId/endId.
 // Served where range restore cannot be armed so the advertised schema never
-// offers what execution will refuse (see the #1179 note above).
-export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
-export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+// offers what execution will refuse (see the #1179 note above). Image recovery
+// still applies here (it does not require CCR), so these keep imageRef.
+const BILI_DECOMPRESS_IMG_ANTHROPIC = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description + DECOMPRESS_IMAGE_NOTE, input_schema: withImageRestoreParam(DECOMPRESS_TOOL.input_schema) };
+const BILI_DECOMPRESS_IMG_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
+const BILI_DECOMPRESS_IMG_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_RESPONSES.parameters) };
+const BILI_DECOMPRESS_IMG_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_GOOGLE.parameters) };
+export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_ANTHROPIC : t));
+export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_GOOGLE : t));
+export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
