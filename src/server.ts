@@ -3964,8 +3964,9 @@ async function prepareAnthropic(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text), externalSummaryEnabled(config)), visibilityMarkers) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
                 }
             } catch {
             }
@@ -4213,8 +4214,9 @@ async function prepareOpenai(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text), externalSummaryEnabled(config)), visibilityMarkers) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
                 }
             } catch {
             }
@@ -4464,8 +4466,9 @@ async function prepareGoogle(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
-                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text), visibilityMarkers));
+                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(renderedWithPayload), visibilityMarkers));
                 }
             } catch {
             }
@@ -4792,11 +4795,12 @@ async function prepareResponses(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text), externalSummaryEnabled(config)), visibilityMarkers) });
+                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
                     rebuiltInput = inputItems;
                     log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                 }
