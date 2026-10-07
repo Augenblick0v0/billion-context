@@ -967,7 +967,7 @@ function fillRouteGaps(winner: unknown, filler: unknown): unknown {
 /** Per-model knobs a named recipe exposes to referencing chains. These are
  *  the same fields an inline external-summary target carried; defaults come
  *  from the chain expansion, not from here. */
-export interface NamedProviderModel {
+interface NamedProviderModel {
     contextWindow?: number;
     outputTokens?: number;
     stream?: boolean;
@@ -1020,7 +1020,7 @@ export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
 
 /** True when the entry carries recipe fields (used to re-scope the inert
  *  warning: on a recipe entry `models` is a registry, not routing). */
-export function isNamedProviderRecipeShape(value: unknown): boolean {
+function isNamedProviderRecipeShape(value: unknown): boolean {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const obj = value as Record<string, unknown>;
     return obj.baseUrl !== undefined || obj.api !== undefined;

@@ -16,12 +16,12 @@ export interface SummaryBudget {
     readonly maxSummaryBytes: number;
 }
 
-export interface SummaryAttempt {
+interface SummaryAttempt {
     readonly targetIndex: number;
     readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled";
 }
 
-export type ExternalSummaryResult =
+type ExternalSummaryResult =
     | { status: "success"; summary: string; targetIndex: number; attempts: SummaryAttempt[] }
     | { status: "failed"; reason: "invalid_plan" | "exhausted"; attempts: SummaryAttempt[] }
     | { status: "cancelled" | "deadline"; attempts: SummaryAttempt[] };

@@ -1017,7 +1017,7 @@ const CODEX_BOOLEAN_FLAGS = new Set([
  * flag or itself a positional) — never between a value-taking flag and its
  * value, and never into flags we do not recognise (those keep the legacy
  * append, which is at worst today's behavior). */
-export function codexRewriteInsertionIndex(extra: readonly string[]): number {
+function codexRewriteInsertionIndex(extra: readonly string[]): number {
     const sep = extra.indexOf("--");
     if (sep !== -1) return sep;
     const resume = extra.indexOf("resume");

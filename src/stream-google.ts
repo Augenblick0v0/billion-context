@@ -2,14 +2,10 @@ import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { GooglePart } from "acp-kernel/wire";
 import type { Session } from "./session.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
-import { executeProxyTool, executeProxyToolAsync } from "./loop/core.js";
+import { executeProxyToolAsync } from "./loop/core.js";
 import { drainPendingRetrievals } from "./store.js";
-import { runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
+import { runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
-
-export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
-    return runJsonRewrite(rewriteGoogleJsonSteps(body, ctx), (call) => executeProxyTool(call.name, call.args as Record<string, unknown>, ctx, call.id).text);
-}
 
 export async function rewriteGoogleJsonResponseAsync(body: unknown, ctx: RewriteCtx, signal?: AbortSignal): Promise<unknown> {
     return runJsonRewriteAsync(rewriteGoogleJsonSteps(body, ctx), async (call) => (await executeProxyToolAsync(call.name, call.args as Record<string, unknown>, ctx, call.id, undefined, signal)).text);

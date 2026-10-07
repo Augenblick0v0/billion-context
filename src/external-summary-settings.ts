@@ -3,7 +3,7 @@ import type { NamedProviderRecipe } from "./config.js";
 import type { SummaryBudget } from "./external-summary.js";
 import type { PreflightProtocol } from "./preflight.js";
 
-export interface ExternalSummaryTarget {
+interface ExternalSummaryTarget {
     name: string;
     protocol: PreflightProtocol;
     url: string;
@@ -29,7 +29,7 @@ export interface ExternalSummaryChain {
     budget: SummaryBudget;
 }
 
-export const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
+const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
     totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 64 * 1024,
 };
 
