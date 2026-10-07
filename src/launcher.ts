@@ -977,9 +977,57 @@ export function buildCodexArgs(
         rewrites.push("-c", `${r.key}=${r.realUpstream}`);
     }
     if (rewrites.length === 0) return [...extra];
+    const at = codexRewriteInsertionIndex(extra);
+    return [...extra.slice(0, at), ...rewrites, ...extra.slice(at)];
+}
+
+/** codex subcommand flags that take NO value (clap booleans). Used only to
+ * decide whether the trailing non-dash token is a free-standing positional
+ * (safe insertion point) — see codexRewriteInsertionIndex. */
+const CODEX_BOOLEAN_FLAGS = new Set([
+    "--skip-git-repo-check",
+    "--last",
+    "--full-auto",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--no-daemon",
+    "--search",
+    "--no-search",
+    "--help",
+    "--version",
+]);
+
+/** Where buildCodexArgs splices its rewrites into the user's argv.
+ *
+ * #2260(D): everything past a `--` is positional to codex's parser, so the
+ * rewrites must land BEFORE it (appending turned them into prompt text and
+ * silently bypassed the proxy).
+ *
+ * #2281: codex-cli 0.147.0 parses `exec resume` such that a `-c` flag placed
+ * AFTER the positional prompt silently DROPS an earlier `-c model=…` on the
+ * same command line (bisected 2026-10-07: resume + trailing `-c` loses the
+ * override; fresh exec, or resume without a trailing `-c`, both keep it).
+ * Since the rewrites ARE trailing `-c` flags, appending them after the user's
+ * prompt broke every `bili codex exec resume … <prompt>` turn for users
+ * passing `-c model=…` — the model silently reverted to the config default.
+ * Insert before the `resume` subcommand when present (any `-c` AFTER
+ * `resume` suppresses the user's earlier `-c`s — verified against 0.147.0:
+ * [-c model=B, resume, --last, -c provider…, prompt] still drops model=B),
+ * otherwise before the trailing prompt — but ONLY when the last token is
+ * provably a free-standing positional (its predecessor is a known boolean
+ * flag or itself a positional) — never between a value-taking flag and its
+ * value, and never into flags we do not recognise (those keep the legacy
+ * append, which is at worst today's behavior). */
+export function codexRewriteInsertionIndex(extra: readonly string[]): number {
     const sep = extra.indexOf("--");
-    if (sep === -1) return [...extra, ...rewrites];
-    return [...extra.slice(0, sep), ...rewrites, ...extra.slice(sep)];
+    if (sep !== -1) return sep;
+    const resume = extra.indexOf("resume");
+    if (resume !== -1) return resume; // keep every -c ahead of the resume subcommand
+    const last = extra.length - 1;
+    if (last < 0) return 0;
+    if (extra[last].startsWith("-")) return extra.length; // flags-only tail — append
+    const prev = last >= 1 ? extra[last - 1] : undefined;
+    if (prev === undefined || !prev.startsWith("-") || CODEX_BOOLEAN_FLAGS.has(prev)) return last;
+    return extra.length; // prev may be a value-taking flag whose value IS the last token — do not split
 }
 
 /**

@@ -54,9 +54,9 @@
         <h2 id="quickstart" data-i18n="d.toc_qs">Quickstart</h2>
         <p data-i18n="d.qs.p">One npm package, Node 22+. Install it, then start the local compression proxy:</p>
         <div class="codebox">
-          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context&#10;bili" data-i18n="common.copy">Copy</button></div>
-          <pre class="mono"><code>npm install -g billion-context     # Node 22+
-bili                               # start the proxy (or: bili pi / claude / codex / omp / … to launch an agent through it)</code></pre>
+          <div class="codebox-head"><span class="mono">terminal</span><button class="copy-btn" type="button" data-copy="npm install -g billion-context --prefix=~/.local&#10;bili" data-i18n="common.copy">Copy</button></div>
+          <pre class="mono"><code>npm install -g billion-context --prefix=~/.local   # Node 22+ (nvm / Homebrew / Windows: drop --prefix)
+bili                                               # start the proxy (or: bili pi / claude / codex / omp / … to launch an agent through it)</code></pre>
 </div>
         <p data-i18n="d.qs.p2">Everything binds loopback only — nothing is exposed externally. Every instance serves the same built-in dashboard under its own address:</p>
         <div class="codebox">
