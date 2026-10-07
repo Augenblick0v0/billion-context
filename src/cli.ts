@@ -31,7 +31,7 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
@@ -86,7 +86,7 @@ Usage:
                                     global install, dsh bundles refresh through
                                     dsh's channel, host-owned copies are pointed
                                     at their host's updater — never overwritten
-  bili plugin list                 show install status for every host
+   bili plugin list                 show install status + installed (on-disk) version for every host
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
@@ -437,10 +437,7 @@ export async function main(): Promise<void> {
         // proxy-origin discovery file would silently win over the flag.
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
-            for (const row of pluginStatusAll()) {
-                const channel = row.status === "not installed" || row.status.startsWith("error") ? "" : ` | updates via ${row.channel}`;
-                console.log(`${row.agent.padEnd(10)} ${row.status}${channel}`);
-            }
+            process.stdout.write(renderPluginList(pluginStatusAll()));
             return;
         }
         if (pluginAction === "update") {
