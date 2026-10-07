@@ -34,7 +34,7 @@ test("--version prints semver plus commit and stays regex-friendly", { skip: !fs
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     // First token stays a bare semver (existing consumers match /x.y.z/);
     // the parenthesised commit rides after it.
-    assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+ \([0-9a-f]{7,12}(-dirty)?\)$|^unknown/);
+    assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+ \([0-9a-f]{7,12}(-dirty)?\)$|^unknown$/);
     assert.ok(r.stdout.trim().startsWith(`${VERSION} `), `stdout must lead with ${VERSION}: ${r.stdout}`);
 });
 
