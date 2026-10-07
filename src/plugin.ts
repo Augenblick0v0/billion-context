@@ -15,7 +15,7 @@ import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.j
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
@@ -2458,16 +2458,25 @@ export async function pipePluginChatWithStrip(
         return rawEvent + "\n\n";
     };
     try {
+        let pendingFinal: string | null = null;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
                 if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
-                break;
+                // #2323: a CRLF/lone-CR whose final byte arrived last is held back
+                // by the streaming normalizer; resolve it and re-drive the completed
+                // event through the same path below before deciding truncation.
+                const resolved = finalizeSseLineEndings(buf);
+                if (resolved === buf) break;
+                buf = "";
+                pendingFinal = resolved;
+            } else {
+                pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
-            if (value && value.length > 0) {
-                buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
+            if (pendingFinal !== null) {
+                buf = normalizeSseLineEndings(buf + pendingFinal);
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
                     const rawEvent = buf.slice(0, idx);
@@ -2532,6 +2541,7 @@ export async function pipePluginChatWithStrip(
                     if (out.length > 0) await write(offsetRetryIndices(out));
                 }
             }
+            if (done) break;
             if (res.destroyed || res.writableEnded) break;
         }
         // #721: upstream EOF without a terminal event must not close the
@@ -3028,16 +3038,25 @@ export async function pipePluginResponsesWithStrip(
         return out;
     };
     try {
+        let pendingFinal: string | null = null;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
                 if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
-                break;
+                // #2323: a CRLF/lone-CR whose final byte arrived last is held back
+                // by the streaming normalizer; resolve it and re-drive the completed
+                // event through the same path below before deciding truncation.
+                const resolved = finalizeSseLineEndings(buf);
+                if (resolved === buf) break;
+                buf = "";
+                pendingFinal = resolved;
+            } else {
+                pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
-            if (value && value.length > 0) {
-                buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
+            if (pendingFinal !== null) {
+                buf = normalizeSseLineEndings(buf + pendingFinal);
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
                     const rawEvent = buf.slice(0, idx);
@@ -3250,6 +3269,7 @@ export async function pipePluginResponsesWithStrip(
                     await write(rawEvent + "\n\n");
                 }
             }
+            if (done) break;
             if (res.destroyed || res.writableEnded) break;
         }
         // Stream cut without a done-family event: flush whatever the tag
