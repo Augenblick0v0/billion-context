@@ -205,6 +205,13 @@ skipping bili commands entirely:
   for you too: set `"compaction": { "auto": false }` in the same config
   (otherwise OpenCode's native auto-compaction double-compresses) and keep a
   manual backup of the file first.
+- **claude:** this repository doubles as a Claude Code plugin marketplace —
+  `/plugin marketplace add ranxianglei/billion-context`, then
+  `/plugin install billion-context@billion-context`, then run
+  `/billion-context:bili-setup` (it drives `bili plugin install claude` for
+  you and tells you to restart). Same end state as the bili installer; the
+  plugin ships no hooks or MCP entries of its own, so nothing
+  double-registers.
 
 For pi / omp / kimi / claude there is no client-side channel — `bili plugin
 install <client>` writes their config entries for you (kimi's declarative
