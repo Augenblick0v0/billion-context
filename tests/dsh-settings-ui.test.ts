@@ -289,14 +289,18 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const calls: ElementNode[] = [];
     // Minimal hook emulation (#1809): per-mount state persisting across
-    // component() re-renders; effects run synchronously, cleanups collected.
+    // component() re-renders; effects follow React semantics (#2288) — run on
+    // mount, re-run only when their deps change (prior cleanup first). The old
+    // run-on-every-render stub masked the removed snapshot guard by silently
+    // starting duplicate probes on each re-render.
+    type EffectSlot = { deps: readonly unknown[] | undefined; cleanup: (() => void) | undefined };
     let hookStates: unknown[] = [];
     let hookIndex = 0;
-    const cleanups: Array<() => void> = [];
+    let effectSlots: EffectSlot[] = [];
     const resetHooks = (): void => {
         hookStates = [];
         hookIndex = 0;
-        cleanups.length = 0;
+        effectSlots = [];
     };
     const reactStub = {
         createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
@@ -309,10 +313,16 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
             return [hookStates[i], (v: unknown) => { hookStates[i] = v; }];
         },
-        useEffect: (fn: () => unknown | (() => void)): void => {
-            hookIndex++;
+        useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+            const i = hookIndex++;
+            const prev = effectSlots[i];
+            const prevDeps = prev?.deps;
+            const unchanged = prevDeps !== undefined && deps !== undefined &&
+                deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
+            if (unchanged) return;
+            prev?.cleanup?.();
             const r = fn();
-            if (typeof r === "function") cleanups.push(r as () => void);
+            effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
         },
     };
     const requireStub = (spec: string): unknown => {
@@ -427,7 +437,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(degBundleTexts.some((t) => t.includes("/acp")), "the bundle degraded hint points at /acp");
 });
 
-test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots); #2187 keeps probing in a slow phase past the fast attempts", async () => {
+test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades on success, stays degraded and cancels when absent (both slots); slow phase continues past the fast attempts; #2288 corrects a stale boot snapshot and follows mid-session re-binds", async () => {
     const { build } = await import("esbuild");
     const configs = ((await import("../tsup.config.ts")).default) as unknown as Array<{
         entry: Record<string, string>;
@@ -462,9 +472,10 @@ test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on su
         vm.runInContext(code, sandbox, { filename: "dsh-native-client.bundle.js" });
         assert.equal(registrations.length, 1);
         const calls: ElementNode[] = [];
+        type EffectSlot = { deps: readonly unknown[] | undefined; cleanup: (() => void) | undefined };
         let hookStates: unknown[] = [];
         let hookIndex = 0;
-        const cleanups: Array<() => void> = [];
+        let effectSlots: EffectSlot[] = [];
         const reactStub = {
             createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
                 const el = { type, props, children };
@@ -476,10 +487,17 @@ test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on su
                 if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
                 return [hookStates[i], (v: unknown) => { hookStates[i] = v; }];
             },
-            useEffect: (fn: () => unknown | (() => void)): void => {
-                hookIndex++;
+            // React semantics (#2288): run on mount, re-run only on dep change.
+            useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+                const i = hookIndex++;
+                const prev = effectSlots[i];
+                const prevDeps = prev?.deps;
+                const unchanged = prevDeps !== undefined && deps !== undefined &&
+                    deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
+                if (unchanged) return;
+                prev?.cleanup?.();
                 const r = fn();
-                if (typeof r === "function") cleanups.push(r as () => void);
+                effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
             },
         };
         const requireStub = (spec: string): unknown => {
@@ -516,10 +534,11 @@ test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on su
             resetHooks: () => {
                 hookStates = [];
                 hookIndex = 0;
-                cleanups.length = 0;
+                effectSlots = [];
             },
             runCleanups: () => {
-                for (const c of cleanups.splice(0)) c();
+                // Positions held by non-effect hooks (useState) stay as holes.
+                for (const slot of effectSlots.splice(0)) slot?.cleanup?.();
             },
         };
     };
@@ -547,7 +566,85 @@ test("#1809/#2125: client polls /bili/origin while unresolved — upgrades on su
         assert.ok(button !== undefined, "resolved origin upgrades the entry without a reload");
         (button.props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
-        assert.deepEqual(fetched, ["/bili/origin"], "one probe suffices once the origin arrives");
+        // #2288: resolution no longer STOPs the probe — exactly one fast probe
+        // ran so far; the slow follow-up is still pending and gets cancelled
+        // by runCleanups below.
+        assert.equal(fetched.length, 1, "resolution took exactly the initial fast probe (slow follow-up still pending)");
+        m.runCleanups();
+    }
+
+    {
+        // #2288 regression core: a stale boot snapshot (the attach-mode env
+        // origin published at page render, before the host re-bound the proxy)
+        // must be corrected in place by the live route — the old guard froze
+        // it for the whole session.
+        const opened: string[] = [];
+        const m = mount({
+            __BILI__: { origin: "http://127.0.0.1:8787" },
+            open: (url: string) => opened.push(url),
+            fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:18798" }) }),
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        const firstTexts: string[] = [];
+        collectText(first, firstTexts);
+        assert.ok(firstTexts.some((x) => x.includes("http://127.0.0.1:8787")), "the snapshot paints immediately (first-paint hint)");
+        await tick();
+        const second = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(second, texts);
+        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18798")), `stale snapshot upgraded to the live origin: ${JSON.stringify(texts)}`);
+        assert.ok(!texts.some((x) => x.includes(":8787")), "the stale origin is gone from the label");
+        const button = findButton(second);
+        assert.ok(button !== undefined, "the upgraded entry keeps its button");
+        (button.props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:18798/__bili/"]);
+        m.runCleanups();
+    }
+
+    {
+        // #2288: after the first resolution the slow phase KEEPS following the
+        // live route — a mid-session re-bind (runtime re-spawn, routed-origin
+        // convergence) moves the button without a reload. Manual clock as in
+        // the #2187 blocks below.
+        const pending: Array<{ id: number; delay: number; fn: () => void }> = [];
+        let nextId = 1;
+        let polls = 0;
+        const fakeSetTimeout = ((fn: () => void, delay?: number): unknown => {
+            const id = nextId++;
+            pending.push({ id, delay: delay ?? 0, fn });
+            return id;
+        }) as unknown as typeof setTimeout;
+        const fakeClearTimeout = ((id: unknown): void => {
+            const i = pending.findIndex((p) => p.id === id);
+            if (i >= 0) pending.splice(i, 1);
+        }) as unknown as typeof clearTimeout;
+        const m = mount({
+            fetch: async () => {
+                polls += 1;
+                return { ok: true, json: async () => ({ origin: polls < 4 ? "http://127.0.0.1:18798" : "http://127.0.0.1:18800" }) };
+            },
+            setTimeout: fakeSetTimeout,
+            clearTimeout: fakeClearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        for (let i = 0; i < 3; i++) {
+            await tick();
+            if (pending.length === 0) throw new Error("polling stopped after resolution — the entry would freeze on a stale origin");
+            const t = pending.shift()!;
+            assert.equal(t.delay, 10000, "post-resolution follow-ups use the slow cadence");
+            t.fn();
+        }
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18800")), `mid-session re-bind follows the live origin: ${JSON.stringify(texts)}`);
+        assert.ok(!texts.some((x) => x.includes(":18798")), "the pre-re-bind origin is gone from the label");
         m.runCleanups();
     }
 
