@@ -5157,33 +5157,34 @@ function injectSystem(
 // every opencode request body — the v1 tool registry is process-global and
 // cannot be filtered per request) are dropped here so the upstream sees
 // exactly one definition per name, and it is bili's (its arg schemas are what
-// the compress loop dispatches on). Plugin mode never calls these helpers.
+// the compress loop dispatches on). Plugin mode never calls the wrappers below.
+// Shared merge core for the flat-shape wrappers (anthropic/openai/responses):
+// wanted = acp ∪ extras; input entries whose nameOf hits wanted are dropped;
+// result = kept + wanted.
+function mergeOwnedTools<T>(tools: readonly T[] | undefined, acp: readonly T[], extras: readonly T[], nameOf: (t: T) => unknown): T[] {
+    const owned = new Set<string>();
+    for (const t of [...acp, ...extras]) {
+        const n = nameOf(t);
+        if (typeof n === "string") owned.add(n);
+    }
+    if (!Array.isArray(tools)) return [...acp, ...extras];
+    const kept = tools.filter((t) => {
+        const n = nameOf(t);
+        return typeof n !== "string" || !owned.has(n);
+    });
+    return [...kept, ...acp, ...extras];
+}
+
 function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): unknown[] {
     // #1712: decompress's startId/endId execute only on CCR-armed sessions
     // (#1179), so serve the no-range schema when CCR is off.
     const acp = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalOn);
-    const list = extras ?? [];
-    if (!Array.isArray(tools)) return [...acp, ...list];
-    const owned = new Set<string>(acp.map((t) => t.name));
-    for (const e of list) owned.add(e.name);
-    const kept = tools.filter((t) => {
-        const n = (t as { name?: string })?.name;
-        return typeof n !== "string" || !owned.has(n);
-    });
-    return [...kept, ...acp, ...list];
+    return mergeOwnedTools<unknown>(tools, acp, extras ?? [], (t) => (t as { name?: string })?.name);
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): OpenAITool[] {
     const acp = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalOn) as OpenAITool[];
-    const list = extras ?? [];
-    if (!Array.isArray(tools)) return [...acp, ...list] as OpenAITool[];
-    const owned = new Set<string>(acp.map((t) => t.function.name));
-    for (const e of list) owned.add(e.function.name);
-    const kept = tools.filter((t) => {
-        const n = t?.function?.name;
-        return typeof n !== "string" || !owned.has(n);
-    });
-    return [...kept, ...acp, ...list];
+    return mergeOwnedTools<OpenAITool>(tools, acp, extras ?? [], (t) => t?.function?.name);
 }
 
 /** Merge the ACP declarations into the client's Gemini `tools` array. Gemini
@@ -5215,15 +5216,9 @@ const FORCE_TEXT_PROTOCOL = knobForceTextProtocol();
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
 function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
+    // #920 rule via mergeOwnedTools: bili owns these names (see core above).
     const base = withExternalSummaryTools(applyAcpToolOverrides(toolsToAdd, toolPrompts), externalOn);
-    if (!Array.isArray(tools)) return [...base];
-    // Same #920 rule as injectTool/injectOpenaiTool: bili owns these names.
-    const owned = new Set<string>(base.map((t) => t.name));
-    const kept = tools.filter((t) => {
-        const n = (t as { name?: string })?.name;
-        return typeof n !== "string" || !owned.has(n);
-    });
-    return [...kept, ...base];
+    return mergeOwnedTools<unknown>(tools, base, [], (t) => (t as { name?: string })?.name);
 }
 
 type ForwardTarget = {
