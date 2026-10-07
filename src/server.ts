@@ -1680,7 +1680,13 @@ async function handle(
                 : (providerKeys.length > 0 ? "miss" : "none");
             let diagOrigin: string | undefined;
             if (embeddedUrl) {
-                try { diagOrigin = new URL(embeddedUrl).origin; } catch {}
+                try {
+                    const u = new URL(embeddedUrl);
+                    // .origin is the string "null" for non-special schemes (mitm://),
+                    // which would collapse every MITM relay into one dedupe bucket —
+                    // derive scheme+host directly instead (#2317 review).
+                    if (u.host) diagOrigin = `${u.protocol}//${u.host}`;
+                } catch {}
             }
             const peekWindow = capRegistryWindowByStandard(model, peekRegistryContext(model, host), hasTierEvidence);
             let native = betaWindow
