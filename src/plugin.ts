@@ -21,7 +21,7 @@ import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
-import { degenerateTurnWarning } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -1860,9 +1860,16 @@ export async function pipePluginChatWithStrip(
      *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (refetch === undefined || truncationRetried) return false;
+        // #2303: a terminal turn whose visible prose ends with a compression-draft
+        // closing tag and no tool call is non-converged even though it has visible
+        // text — the model wrote a handoff/compression draft in prose instead of
+        // issuing the action it described (149 silent stops / 70 sessions, DSH
+        // native). Treat it like the empty-turn shape below so at worst the client
+        // gets one extra continuation instead of losing the whole turn.
+        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
-        if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
+        if (!draftTail && (visibleTextChars > releasedMarkupChars || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
         if (degenerateRetried) {
@@ -1877,10 +1884,13 @@ export async function pipePluginChatWithStrip(
         // A turn the model left genuinely bare — no thought, no stripped echo,
         // no released markup — is the upstream's own empty answer, not a stall:
         // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop).
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -2953,16 +2963,22 @@ export async function pipePluginResponsesWithStrip(
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
-        if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
+        // #2303: same shape as the chat-pipe twin — visible prose ending in a
+        // compression-draft closing tag with no function call is non-converged.
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
-        // the compress loop).
-        if (!sawReasoning && !sawStrippedEcho) return false;
+        // the compress loop). A draft-tail turn delivered a full handoff draft:
+        // precisely the stall signal.
+        if (!sawReasoning && !sawStrippedEcho && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
