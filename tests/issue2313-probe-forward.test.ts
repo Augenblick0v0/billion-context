@@ -32,7 +32,8 @@ import { normalizeUpstreamOrigin } from "../src/util.ts";
 //       current-route evidence — without it the #1195 in-request refold would
 //       re-probe the raw body, take a second 400 and lock the session again.
 // Also pinned: with evidence present (usage on the current route) the
-// fold-first behavior is unchanged.
+// fold-first behavior is unchanged, and the window-not-parseable arm
+// (fallback branch) carries the same origin stamp as the stated-window arm.
 
 const WINDOW = 20_000;
 const SUMMARY_TEXT =
@@ -249,6 +250,35 @@ test("e2e #2313 c: with a current-route usage baseline the fold-first behavior i
         assert.equal(forwards.length, 2, "turn 1 + exactly one (folded) forward");
         assert.ok(calls.some((c) => c.summary), "preflight folds BEFORE forwarding when evidence exists");
         assert.ok(forwards[1]!.contentChars < rawChars, "the forward carries the folded payload");
+    } finally {
+        await close();
+    }
+});
+
+test("e2e #2313 d: probe 400 without a parseable window arms the fallback shrink origin-stamped — the #1195 refold still recovers", async () => {
+    // No window number in the rejection → armOverflowShrink's fallback branch
+    // (arm at min(declared, payload estimate)) — the branch test b's stated-
+    // window rejection never reaches. Without ITS origin stamp the arm keeps
+    // the stale #2313 origin, #1933 F2 demotes it on the refold's re-prepare,
+    // the probe gate re-forwards the raw body and the second 400 passes through.
+    const rejectBody = JSON.stringify({ error: { message: "context length exceeded" } });
+    const { ctx, calls, close } = await setup(rejectBody);
+    try {
+        await seedStuckMeter(ctx, "i2313-d");
+
+        const r = await post(ctx, bigMessages());
+        assert.equal(r.status, 200, "rejected probe + in-request refold recovers the turn (no stated window)");
+        await r.text();
+
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 3, "turn 1 + raw probe forward + one folded retry");
+        assert.ok(calls.some((c) => c.summary), "the refold made summarization call(s)");
+        assert.ok(forwards[2]!.contentChars < forwards[1]!.contentChars, "the retry carries the folded payload");
+
+        const s = getSession("i2313-d");
+        assert.ok(s);
+        assert.equal(s.stats.lastInputTokensOrigin, normalizeUpstreamOrigin(`http://127.0.0.1:${ctx.upstreamPort}`), "fallback arm origin is stamped from the rejecting upstream");
+        assert.equal(s.stats.lastInputTokensSource, "usage", "the folded retry settles the final baseline");
     } finally {
         await close();
     }
