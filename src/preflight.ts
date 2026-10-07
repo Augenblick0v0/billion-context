@@ -100,7 +100,7 @@ const FUTILITY_SLACK = 1.2;
 // removes CHUNK_FRACTION x window); larger entry overshoots scale both
 // budgets proportionally, capped at 2x the base (see preflightCompress).
 
-export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
+type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
 // #2189: subscription-OAuth credentials (Claude Code login) accept only
 // requests whose system carries the client's billing-attribution block; every
@@ -178,9 +178,9 @@ export interface PreflightDeps {
     billingBlock?: { type: "text"; text: string };
 }
 
-export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
+type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
 
-export interface PreflightFailure {
+interface PreflightFailure {
     kind: PreflightFailureKind;
     /** A temporary transport failure, not evidence that this context cannot be compressed. */
     retryable?: boolean;

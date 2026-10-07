@@ -175,12 +175,9 @@ export { WARNED_CHAIN_SESSION_CAP, _resetChainVerdictsForTest as _resetChainWarn
 // attachment flows resend the same history every turn. Same bounded-FIFO shape
 // as warnedChainSessions above.
 const warnedWireDropKeys = new Set<string>();
-export const WARNED_WIREDROP_KEY_CAP = 4096;
+const WARNED_WIREDROP_KEY_CAP = 4096;
 export function _resetWireDropWarningsForTest(): void {
     warnedWireDropKeys.clear();
-}
-export function _wireDropWarnSetForTest(): Set<string> {
-    return warnedWireDropKeys;
 }
 export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: (level: string, msg: string) => void): void {
     const report = droppedOpenaiParts(parsed);
@@ -364,9 +361,9 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
  *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
  *  `:countTokens`. Returns null for every other path (model listing, files,
  *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror). */
-export type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
+type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
 
-export function googlePathKind(urlPath: string): GooglePathKind | null {
+function googlePathKind(urlPath: string): GooglePathKind | null {
     if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
     if (urlPath.includes(":generateContent")) return "generate";
     if (urlPath.includes(":countTokens")) return "count-tokens";
@@ -379,7 +376,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  adapter, degenerate-turn analysis) reads it from here instead of
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
-export function googleModelFromPath(urlPath: string): string | undefined {
+function googleModelFromPath(urlPath: string): string | undefined {
     const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
@@ -4763,7 +4760,7 @@ async function prepareGoogle(
  *  prepareCountTokens: the client measures the payload the proxy would
  *  actually forward. Gemini's endpoint reads `contents`/`systemInstruction`
  *  and answers `{totalTokens}`, so only the contents array is rewritten. */
-export function prepareGoogleCountTokens(
+function prepareGoogleCountTokens(
     parsed: GoogleRequestBody,
     core: CompressionCore,
     config: Config,
@@ -5876,7 +5873,7 @@ function outboundPayloadBreakdown(
  *  estimateCoreMessages + system/tools wire overhead. imageTokens is the
  *  separate image term (learned per-route #1843/#1857), kept out of both so
  *  callers can recombine per channel. */
-export interface OutboundContextEstimates {
+interface OutboundContextEstimates {
     upperBound: number;
     textOverhead: number;
     imageTokens: number;

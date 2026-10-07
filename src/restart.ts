@@ -62,7 +62,7 @@ const POLL_MS = 200;
 /** Grace for the close callback after force-closing idle sockets down. */
 const FORCE_CLOSE_GRACE_MS = 1_000;
 
-export type AutoRestartInput = {
+type AutoRestartInput = {
     enabled: boolean;
     runningVersion: string;
     diskVersion: string | undefined;
@@ -73,7 +73,7 @@ export type AutoRestartInput = {
     cooldownMs: number;
 };
 
-export type AutoRestartDecision = { go: boolean; reason: string };
+type AutoRestartDecision = { go: boolean; reason: string };
 
 /** Pure gate for one self-restart attempt — exported for tests. Reasons, in
  *  evaluation order: disabled | restart-in-progress | not-stale |
@@ -154,7 +154,7 @@ export function selfRestartSpawnOptions(platform: NodeJS.Platform): SpawnOptions
     return { stdio: "inherit", env: process.env };
 }
 
-export type SelfRestartDeps = {
+type SelfRestartDeps = {
     server: http.Server;
     host: string;
     port: number;
@@ -186,7 +186,7 @@ export type SelfRestartDeps = {
     platform?: NodeJS.Platform;
 };
 
-export type SelfRestartResult = { ok: boolean; error?: string; childPid?: number };
+type SelfRestartResult = { ok: boolean; error?: string; childPid?: number };
 
 /**
  * Hand the port over to a freshly spawned copy of this process running the
@@ -333,9 +333,9 @@ function defaultFinish(): void {
     });
 }
 
-export type StaleInstallInfo = { diskVersion: string; runningVersion: string };
+type StaleInstallInfo = { diskVersion: string; runningVersion: string };
 
-export type AutoRestartHandlerConfig = {
+type AutoRestartHandlerConfig = {
     enabled: boolean;
     packageName: string;
     server: http.Server;

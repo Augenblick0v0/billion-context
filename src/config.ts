@@ -489,7 +489,7 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-export type PromptCacheRouting = "auto" | "enabled" | "disabled";
+type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -1058,7 +1058,7 @@ function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: Compre
  *  sessions actually execute. In plugin mode the static manifest is the ONLY
  *  declaration of the retrieve surface, so the whole ccr block follows the base
  *  config; such overrides only take effect on proxy-mode sessions. */
-export interface CcrOverrideDivergence {
+interface CcrOverrideDivergence {
     /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
     level: string;
     field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
@@ -1725,7 +1725,7 @@ export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>):
     }
 }
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
-export interface ResignFileSettings {
+interface ResignFileSettings {
     enabled?: boolean;
     passthrough?: boolean;
     credentialRef?: string;
@@ -1742,7 +1742,7 @@ export const RESIGN_BUILTIN_SCHEME = "sdk-hmac-sha256";
  *  (e.g. "sdk-hmac-sha256"). The built-in key resolves out of the box
  *  (defaults below); other body-covering schemes can be scoped their own
  *  `passthrough` opt-in without opening the built-in one. */
-export type ResignSchemeMap = Record<string, ResignFileSettings>;
+type ResignSchemeMap = Record<string, ResignFileSettings>;
 
 /** Resolved #1884 re-sign settings: env vars win over the config file, the
  *  file wins over the defaults (same precedence family as
@@ -1787,7 +1787,7 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
 // body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
 // when the set changes, stay quiet while it stays fixed or empty.
 let inertResignPassthroughSignature: string | null = null;
-export function warnInertResignPassthrough(obj: Record<string, unknown>): void {
+function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
     const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
         if (!map || typeof map !== "object" || Array.isArray(map)) return;
@@ -1957,7 +1957,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     return undefined;
 }
 
-export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
@@ -1977,7 +1977,7 @@ export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
 }
 

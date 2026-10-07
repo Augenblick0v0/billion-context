@@ -34,7 +34,7 @@ import { createHash } from "node:crypto";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 
-export type FoldReconcileMode = "off" | "warn" | "repair";
+type FoldReconcileMode = "off" | "warn" | "repair";
 
 const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
@@ -95,7 +95,7 @@ export interface FoldAnchor {
     b: number;
 }
 
-export interface ReconciliationPlan {
+interface ReconciliationPlan {
     /** old covered id → new inbound id it was matched to. */
     claims: Map<string, string>;
     byTool: number;
@@ -105,7 +105,7 @@ export interface ReconciliationPlan {
     unmatched: string[];
 }
 
-export interface FoldReconcileResult {
+interface FoldReconcileResult {
     kind: "off" | "noop" | "resend" | "reanchored" | "unmatched";
     missing: number;
     claims: number;

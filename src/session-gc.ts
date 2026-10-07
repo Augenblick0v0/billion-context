@@ -67,7 +67,7 @@ import { gcSettings as knobGcSettings } from "./knobs.js";
  *     guess at unreadable files).
  */
 
-export interface GcConfig {
+interface GcConfig {
     enabled: boolean;
     maxAgeMs: number;
     maxTokens: number;
@@ -171,7 +171,7 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
     return out;
 }
 
-export interface GcResult {
+interface GcResult {
     removed: number;
     kept: number;
     unreadable: number;

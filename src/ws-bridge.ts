@@ -21,7 +21,7 @@ import { isLoopbackAddress } from "./util.js";
 // codec table is the extension point: a new wire protocol is a new codec
 // file plus one registration entry, with zero shell changes.
 
-export type WsBridgeLog = (level: "debug" | "info" | "warn", message: string) => void;
+type WsBridgeLog = (level: "debug" | "info" | "warn", message: string) => void;
 
 export interface WsBridgeSession {
     /** A client frame arrived. */

@@ -79,8 +79,8 @@ const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 // into a synchronized retry storm). Deliberately a fixed constant, not a config
 // knob: no user-facing surface for a lane nobody tunes (Configuration Surface
 // Discipline); revisit only with explicit owner sign-off.
-export const OWNER_LANE_CHECK_BASE_MS = 30 * 60 * 1000;
-export const OWNER_LANE_CHECK_JITTER_MS = 15 * 60 * 1000;
+const OWNER_LANE_CHECK_BASE_MS = 30 * 60 * 1000;
+const OWNER_LANE_CHECK_JITTER_MS = 15 * 60 * 1000;
 
 /** Pure interval decision for the owner-lane throttle — exported for tests. */
 export function ownerLaneIntervalMs(rand: () => number = Math.random): number {
@@ -667,7 +667,7 @@ export async function isGitWorkingTree(dir: string): Promise<boolean> {
     }
 }
 
-export interface HostManagedInstall {
+interface HostManagedInstall {
     /** Who owns and updates this copy: "pnpm", "pi", "opencode", "dsh". */
     owner: string;
     /** User-facing instruction for updating this copy through its owner. */
@@ -1880,7 +1880,7 @@ export async function detectStaleInstall(
 /** Fetch one published version's registry doc (#1481): tarball URL plus
  *  integrity/shasum for verification. Returns undefined when the version does
  *  not exist or the fetch fails — callers treat that as "do nothing". */
-export async function fetchVersionDoc(
+async function fetchVersionDoc(
     opts: Pick<UpdateOptions, "resolveProxy">,
     packageName: string,
     version: string,
@@ -1979,12 +1979,4 @@ export function startAutoUpdate(opts: UpdateOptions): void {
         void checkForUpdate(opts);
     }, CHECK_INTERVAL_MS);
     timer.unref?.();
-}
-
-/** Stop the periodic check loop (for tests / clean shutdown). */
-export function stopAutoUpdate(): void {
-    if (timer) {
-        clearInterval(timer);
-        timer = undefined;
-    }
 }

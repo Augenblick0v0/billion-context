@@ -30,7 +30,7 @@ import { isLegacyBcpEntry } from "./agent/native-bootstrap.js";
 import { isCodexClient } from "./codex-compact.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 
-export type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
 
 export interface ThirdPartyFinding {
     client: ScanClient;
@@ -40,7 +40,7 @@ export interface ThirdPartyFinding {
     knownId?: string;
 }
 
-export interface ScanResult {
+interface ScanResult {
     client: string;
     findings: ThirdPartyFinding[];
     sourcesScanned: number;
@@ -76,7 +76,7 @@ export function isSiblingConflictDetail(detail: string): boolean {
     return isLegacyBcpEntry(entry) || isOpencodeAcpEntry(entry);
 }
 
-export const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
+const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Compression-ACTION tokens only. Bare "context" is deliberately EXCLUDED
 // (#1736): it names the domain (context management), not the act of
