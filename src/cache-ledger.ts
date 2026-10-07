@@ -255,8 +255,11 @@ export interface SeamEvent {
     /** Byte offset of the first differing byte (a LOWER bound — bodies are
      *  capped at SEAM_BODY_CAP for storage, so huge prefixes report the cap). */
     lcpBytes: number;
-    /** Index of the first message element whose serialized form differs. */
-    msgIndex: number;
+    /** Index of the first message element whose serialized form differs.
+     *  `null` = position unknowable (a side clipped at SEAM_BODY_CAP or an
+     *  unparseable body yields no message list to walk) — never a real index;
+     *  renderers must show an unknown token, not 0 (#2339). */
+    msgIndex: number | null;
     prevMsgs: number;
     curMsgs: number;
 }
@@ -443,13 +446,20 @@ export function learnedImageReserve(session: Session, host: string, nImages: num
     return per * nImages;
 }
 
-function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; prevMsgs: number; curMsgs: number } {
+function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number | null; prevMsgs: number; curMsgs: number } {
     let lcp = 0;
     const n = Math.min(a.length, b.length);
     while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
+    // #2339: the message array lives under `messages` (Anthropic/chat), `input`
+    // (Responses) or `contents` (Google native) — same caliber as the send-time
+    // count captures (server.ts / loop/core.ts). Reading only `.messages` made
+    // every Responses/Google pair parse to zero messages: msgIndex degenerated
+    // to a fallback 0 that rendered as a real "message[0]", and the count-based
+    // classification arms went dead on those wires.
     const msgsOf = (s: string): unknown[] => {
         try {
-            const arr = (JSON.parse(s) as { messages?: unknown }).messages;
+            const p = JSON.parse(s) as { messages?: unknown; input?: unknown; contents?: unknown };
+            const arr = p.messages ?? p.input ?? p.contents;
             return Array.isArray(arr) ? arr : [];
         } catch {
             return [];
@@ -460,7 +470,9 @@ function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; pr
     let i = 0;
     const eq = (x: unknown, y: unknown): boolean => JSON.stringify(x) === JSON.stringify(y);
     while (i < Math.min(ma.length, mb.length) && eq(ma[i], mb[i])) i++;
-    return { lcpBytes: lcp, msgIndex: i, prevMsgs: ma.length, curMsgs: mb.length };
+    // null = position unknowable (neither side yielded a message list — capped or
+    // unparseable body). A bare 0 would be a real head-break index, not a fallback.
+    return { lcpBytes: lcp, msgIndex: ma.length > 0 && mb.length > 0 ? i : null, prevMsgs: ma.length, curMsgs: mb.length };
 }
 
 // #2131: byte-LCP WITHOUT the JSON parse seamLcp does — the per-call stability
@@ -576,7 +588,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
         const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct ?? 0, ...forensics, prevMsgs: prev.msgs ?? forensics.prevMsgs, curMsgs: cur.msgs ?? forensics.curMsgs };
         (led.seamEvents ?? (led.seamEvents = [])).push(ev);
         if (agg.seamSuspects === 1) {
-            loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
+            loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex ?? "?"}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
         }
     } else if (agg.seamSuspects === 1) {
         loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); outbound body pair unavailable (lane without body capture) — aggregate flag only`);
@@ -1438,7 +1450,7 @@ function formatSeam(r: BiliCacheReport): string {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
         for (const e of r.seam.events) {
-            out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex}] of ${e.prevMsgs}→${e.curMsgs}`);
+            out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
         if (r.seam.events.length === 0) {
             out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
