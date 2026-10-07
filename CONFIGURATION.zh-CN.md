@@ -284,6 +284,8 @@
 | `imageTokenCap` | number | unset (uncapped) | — | 本路由单张图片 token 成本上限。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | 按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。 |
 | `bind` | string (named entries only) | unset | — | 把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。 |
+| `apiKeyEnv` | string（环境变量名） | unset | — | 通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。 |
+| `credentialRef` | string（存储名） | unset | — | 经私有摘要凭据存储的通道凭据覆盖（`secret:NAME` 语义）。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
 
 **仅环境变量（无配置文件键）**
@@ -866,7 +868,7 @@
 
 ## Providers
 
-`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、wire 协议声明、压缩覆盖项、图片计费模式、按路由的透传开关，以及客户端侧直连豁免。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
+`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、wire 协议声明、压缩覆盖项、图片计费模式、按路由的透传开关，客户端侧直连豁免，以及通道凭据覆盖（[`apiKeyEnv`](#lane-credentials-apikeyenv--credentialref)）。 也允许**命名**的非 URL 键：它们本身对路由惰性无效，可通过 [`bind`](#named-provider-entries-bind) 成为真实 lane。
 ```jsonc
 {
   "providers": {
@@ -933,6 +935,24 @@
   }
 }
 ```
+
+### 通道凭据（`apiKeyEnv` / `credentialRef`）
+
+URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的**凭据而非客户端的 —— lane 主人的 key 替换 agent 客户端放在 wire 上的任何凭据（#2336）。典型场景：共享机器代理中，主人的 `deepseek` lane 无论哪个客户端（带谁的私人 key）接入，都用主人的 key 认证。
+
+```jsonc
+{
+  "providers": {
+    "https://api.deepseek.com": { "apiKeyEnv": "DEEPSEEK_LANE_KEY" }
+  }
+}
+```
+
+- **类型：** `string` —— `apiKeyEnv` 是环境变量名（`env:VAR` 语义）；`credentialRef` 是私有[摘要凭据存储](#共享外部摘要服务)中的名称（`secret:NAME` 语义）。每个条目二选一；非法值拒绝整个配置（#1909 纪律 —— 启动失败 / Web UI 400）。
+- **替换规则：** `x-api-key` 与 `x-goog-api-key` 直接替换。`authorization` **仅当**客户端值是 Bearer token 时才替换 —— 其它方案（SDK-HMAC 签名、mTLS 指纹…）属签名所有，原样保留并告警。三者皆无的请求会注入 `authorization: Bearer <key>`。
+- **#1884 交互：** 请求上 CodeArts 重签名臂活跃时跳过 —— 那里重签名器拥有 `Authorization`。
+- **失败姿态：** env 未设或 secret 缺失时，bili 保留客户端自己的头，并按通道+引用告警一次（可见，绝不静默退化成必 401）。解析成功后告警槽重新武装。
+- 在共享的转发头集合上一次性生效，请求的每次出站（初次发送、角色阶梯重试、溢出重折、压缩循环、续读重取）都携带通道凭据。
 
 ### `models`
 

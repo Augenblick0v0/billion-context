@@ -106,6 +106,20 @@ export type ProviderRoute = {
      *  both). The model-level knob lives one level deeper —
      *  `models.<name>.benefit` on this same provider key (#1884 level 3). */
     resign?: ResignSchemeMap;
+    /** #2336 lane credential override (forward path): name of the environment
+     *  variable holding the key bili sends upstream INSTEAD of the client's
+     *  own credential for this lane. Exactly one of apiKeyEnv/credentialRef;
+     *  replacement rules — `authorization` is replaced only when the client's
+     *  value is a Bearer token (other schemes are signature-owned and kept),
+     *  `x-api-key`/`x-goog-api-key` are replaced outright, and a request with
+     *  none of the three gains `authorization: Bearer <key>`. Never applied
+     *  when the #1884 re-sign arm owns the signature. Invalid values THROW
+     *  (#1909 discipline). */
+    apiKeyEnv?: string;
+    /** #2336 lane credential override: NAME in the private summary-credential
+     *  store (`billion-context.json.summary-credentials.json`) — same
+     *  semantics as apiKeyEnv, for keys kept out of the environment. */
+    credentialRef?: string;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -2048,7 +2062,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -2067,6 +2081,27 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageBilling) route.imageBilling = imageBilling;
         const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
+        // #2336 lane credential override. Only parsed for NON-recipe-shaped
+        // entries: a dialing recipe (baseUrl/api present) validates its own
+        // credential fields in parseNamedProviderRecipe, and letting this
+        // parser run first would surface recipe errors with route-flavored
+        // wording. A named non-recipe entry carrying `bind` folds these onto
+        // the bound lane via fillRouteGaps (generic field copy) — free.
+        if (obj.baseUrl === undefined && obj.api === undefined) {
+            if (obj.apiKeyEnv !== undefined || obj.credentialRef !== undefined) {
+                if (obj.apiKeyEnv !== undefined && obj.credentialRef !== undefined)
+                    throw new Error("[acp-config] providers entry carries both apiKeyEnv and credentialRef — exactly one lane credential is allowed");
+                if (obj.apiKeyEnv !== undefined) {
+                    if (typeof obj.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(obj.apiKeyEnv))
+                        throw new Error(`[acp-config] providers entry apiKeyEnv must be an environment variable name (got ${JSON.stringify(obj.apiKeyEnv)})`);
+                    route.apiKeyEnv = obj.apiKeyEnv;
+                } else {
+                    if (typeof obj.credentialRef !== "string" || !validSummaryCredentialName(obj.credentialRef))
+                        throw new Error(`[acp-config] providers entry credentialRef must be a name in the summary-credential store (got ${JSON.stringify(obj.credentialRef)})`);
+                    route.credentialRef = obj.credentialRef;
+                }
+            }
+        }
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
