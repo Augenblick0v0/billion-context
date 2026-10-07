@@ -637,6 +637,15 @@ export function extractSummaryText(protocol: PreflightProtocol, json: Record<str
         const chunks = Array.isArray(json) ? (json as unknown[]) : [json];
         return chunks.map((c) => (c && typeof c === "object" ? googleChunkText(c as Record<string, unknown>) : "")).join("");
     }
+    // #2309: an HTTP-200 Responses body declares its terminal state in
+    // `status`. incomplete/failed means whatever text rides below is NOT a
+    // finished summary, whatever its length — the SSE path already rejects
+    // those terminals (#780/#784); mirror them on the JSON path too, across
+    // both the flat output_text shortcut and the output[] walk, or a 95-char
+    // fragment sails past MIN_SUMMARY_CHARS into a compression block.
+    // Omitted status stays accepted (compat gateways that never send it).
+    const status = typeof json.status === "string" ? json.status : undefined;
+    if (status === "incomplete" || status === "failed") return "";
     if (typeof json.output_text === "string") return json.output_text;
     const output = json.output;
     if (!Array.isArray(output)) return "";
@@ -707,6 +716,36 @@ function extractStreamError(o: Record<string, unknown>): string | null {
     return null;
 }
 
+// #2309: an HTTP-200 Responses body can declare a bad terminal state while
+// still carrying partial text past MIN_SUMMARY_CHARS — the generic
+// "plain-JSON completion with empty content" string is false for such a body
+// (the content IS present, just unfinished). Name the terminal precisely and
+// embed the raw reason/error verbatim: the operator sees WHY without a log
+// cross-reference, and emptySummaryIsSizeDriven sees the size signal
+// (reason=max_output_tokens halves like finish_reason=length).
+function responsesTerminalDiagnosis(json: Record<string, unknown>): string | null {
+    const status = typeof json.status === "string" ? json.status : undefined;
+    if (status !== "incomplete" && status !== "failed") return null;
+    if (!Array.isArray(json.output) && typeof json.output_text !== "string") return null;
+    const parts: string[] = [`status=${status}`];
+    if (status === "incomplete") {
+        const details = json.incomplete_details;
+        const reason = details && typeof details === "object" && typeof (details as Record<string, unknown>).reason === "string"
+            ? (details as Record<string, unknown>).reason as string
+            : undefined;
+        if (reason) parts.push(`reason=${reason}`);
+    } else {
+        const e = json.error;
+        if (e && typeof e === "object") {
+            const eo = e as Record<string, unknown>;
+            if (typeof eo.code === "string") parts.push(eo.code);
+            if (typeof eo.message === "string") parts.push(eo.message.slice(0, 200));
+        }
+    }
+    const article = status === "incomplete" ? "an" : "a";
+    return `the upstream returned ${article} ${status} Responses summary (${parts.join(", ")})`;
+}
+
 // #1767: classify a diagnosis from diagnoseEmptySummary. Only explicit SIZE
 // signals mean "the span is too big" (halving is the recovery — #726); every
 // other empty shape (content_filter, empty body, truncated stream, in-stream
@@ -716,12 +755,20 @@ function extractStreamError(o: Record<string, unknown>): string | null {
 // diagnosis strings are test-pinned, so matching them keeps the classifier in
 // lockstep with what the operator sees.
 export function emptySummaryIsSizeDriven(diagnosis: string): boolean {
-    return /context_length_exceeded|too long|finish_reason=length\b|stop_reason=max_tokens\b/i.test(diagnosis);
+    // #2309: reason=max_output_tokens is the Responses-side spelling of the
+    // same size signal — the span outgrew the summarizer's output budget.
+    return /context_length_exceeded|too long|finish_reason=length\b|stop_reason=max_tokens\b|reason=max_output_tokens\b/i.test(diagnosis);
 }
 
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
     if (json && typeof json === "object") {
-        const err = extractStreamError(json as Record<string, unknown>);
+        // #2309: the Responses terminal check runs FIRST — a failed response
+        // also carries a top-level error object that extractStreamError would
+        // otherwise claim with the weaker bare-error framing.
+        const o = json as Record<string, unknown>;
+        const terminal = responsesTerminalDiagnosis(o);
+        if (terminal) return terminal;
+        const err = extractStreamError(o);
         if (err) return err;
     }
     let sseEvents = 0;
