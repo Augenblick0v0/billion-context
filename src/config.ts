@@ -194,15 +194,18 @@ export type CompressSettings = {
      *  instance is the source of truth — protecting ALL of them (via
      *  `protectedTools`) would make that tool's history grow unboundedly,
      *  while protecting the LATEST keeps the live snapshot in context and
-     *  lets every superseded instance fold normally. Patterns match like
-     *  kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`,
-     *  `"TodoWrite"`, `"todo*"`). Protection is a HARD exclusion: neither
+     *  lets every superseded instance fold normally. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"todo_list"`, `"todo*"`); a pattern
+     *  containing `/` matches the canonical skill path instead — skill loads
+     *  project to `skill/<name>` on every client (#1947) — and protects the
+     *  latest instance PER path (`"skill/*"` keeps the newest load of every
+     *  skill, not just one). Protection is a HARD exclusion: neither
      *  suggested nor explicit compress ranges can cover the latest instance.
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
-    /** Tool-name patterns whose tool-calls AND paired results are NEVER
+    /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
      *  nor explicit compress ranges can cover them; applies identically in
@@ -213,8 +216,12 @@ export type CompressSettings = {
      *  supersedes, so folding older loads loses it permanently (#1109).
      *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
      *  cumulative-snapshot tool makes its history grow unboundedly — use
-     *  `protectedLatestTools` for those instead. Patterns match like kernel
-     *  tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`).
+     *  `protectedLatestTools` for those instead. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"skill"`, `"skill_*"`); a pattern
+     *  containing `/` selects skills by name on every client (#1947): skill
+     *  loads project to `skill/<name>`, so `"skill/release-orchestrator"`
+     *  protects each load of that one skill and `"skill/review-*"` glob-
+     *  matches within the name segment (`*` never crosses `/`).
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */

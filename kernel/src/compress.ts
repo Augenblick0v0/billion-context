@@ -28,9 +28,11 @@ import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
   collectLatestProtected,
+  collectProtectedToolCallIds,
   hasMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
+  isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
@@ -846,13 +848,28 @@ const assignRefsNode: PipelineNode = {
     const latest = hasProtection
       ? collectLatestProtected(io.messages, ctx.config)
       : undefined;
+    // Refs keep the exact pre-#1947 layout for name-only patterns (a
+    // protected call's unnamed result keeps a foldable ref; actual folding
+    // paths pair via filterProtectedToolMessages). #1947 path patterns
+    // ("skill/<name>") carry the skill identity in the CALL's input only, so
+    // with any "/" pattern the refs pair as well — no pre-#1947 config can
+    // contain "/", so the legacy layout stays byte-for-byte unchanged.
+    const hasPathPatterns = (ctx.config.protectedTools ?? []).some((p) =>
+      p.includes("/"),
+    );
+    const pathProtectedCallIds =
+      hasProtection && hasPathPatterns
+        ? collectProtectedToolCallIds(io.messages, ctx.config)
+        : undefined;
     // Media payloads (image/file sidecars) ride outside msg.text; folding one
     // destroys it permanently (#1188), so media messages always get a BLOCKED
     // ref — never advertised, never folded — regardless of tool-protection config.
     const protectedFn = (m: CoreMessage) =>
       hasMediaPayload(m) ||
       (hasProtection
-        ? isMessageProtected(m, ctx.config) ||
+        ? (pathProtectedCallIds
+            ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
+            : isMessageProtected(m, ctx.config)) ||
           (latest ? isMessageLatestProtected(m, latest) : false)
         : false);
     const refResult = assignRefs(io.messages, {

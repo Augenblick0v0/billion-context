@@ -209,8 +209,8 @@
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
-| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。 |
-| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。 |
+| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
+| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
@@ -1140,16 +1140,16 @@
 - **类型：** `string[]`（工具名模式，如 `["todo_list"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"todo_list"`、`"TodoWrite"`、`"todo*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`。
+- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配为精确工具名或 `*` 通配（如 `"todo_list"`、`"todo*"`）。含 `/` 的模式改按规范 skill 路径匹配，且按路径分组各保最新（#1947）：skill 装载在所有客户端投影为 `skill/<name>` —— opencode `skill({name})`、Claude Code/ZCode `Skill({skill})`、任意工具读 `<dir>/<name>/SKILL.md` —— 因此 `"skill/*"` 保住**每个** skill 的最新一次装载（每个名字一个受保实例），而无斜杠的 `"skill"` 维持单一最新实例语义。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "skill/*"] } }`。
 
 #### `protectedTools`
 
 - **类型：** `string[]`（工具名模式，如 `["skill"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"skill"`、`"skill_*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedTools": ["skill"] } }`。
+- **说明：** 工具名模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。模式匹配为精确工具名或 `*` 通配（如 `"skill"`、`"skill_*"`）。含 `/` 的模式可跨客户端按名选定 skill（#1947）：skill 装载投影为规范路径 `skill/<name>` —— opencode `skill({name})`、Claude Code/ZCode `Skill({skill})`、任意工具读 `<dir>/<name>/SKILL.md` —— 因此 `"skill/release-orchestrator"` 只保护该 skill 的每次装载，`"skill/review-*"` 在名字段内通配（`*` 不跨 `/`），`"skill"` ≡ `"skill/*"`（节点含全部后代）。无 `/` 的模式行为不变。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedTools": ["skill/release-orchestrator"] } }`。
 - **⚠ 两个旋钮何时用哪个（配置前必读）：** 按工具的各次结果之间的关系选择：
-  - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。
+  - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。用 `skill/<name>` 路径模式可只保护某个编排 skill 的全部装载、让轻量 skill 照常折叠（`protectedTools: ["skill/release-orchestrator"]`，#1947）。
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
 

@@ -362,10 +362,15 @@ export {
 } from "./search.js";
 export {
   collectLatestProtected,
+  collectProtectedToolCallIds,
   hasMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
+  isMessageProtectedWithPairing,
+  matchToolMessagePattern,
+  matchToolPath,
   matchToolPattern,
+  toolPathOf,
   type LatestProtected,
 } from "./protected.js";
 export {
