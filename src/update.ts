@@ -74,13 +74,15 @@ const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 // #2192: owner-managed lanes are non-critical background housekeeping — they do
 // not need the global 3-min cadence, and a persistently failing lane used to
 // burn a full tarball download (desktop) or a CLI spawn per cycle forever.
-// Host-managed instances therefore throttle their own check at 30 min base +
-// up to 15 min jitter (jitter de-syncs fleets so a registry blip does not turn
+// Host-managed instances therefore throttle their own check at 10 min base +
+// up to 5 min jitter (jitter de-syncs fleets so a registry blip does not turn
 // into a synchronized retry storm). Deliberately a fixed constant, not a config
 // knob: no user-facing surface for a lane nobody tunes (Configuration Surface
-// Discipline); revisit only with explicit owner sign-off.
-const OWNER_LANE_CHECK_BASE_MS = 30 * 60 * 1000;
-const OWNER_LANE_CHECK_JITTER_MS = 15 * 60 * 1000;
+// Discipline); revisit only with explicit owner sign-off. Cadence set by owner
+// (2026-10-07, #2305 review): 30 min held broken host copies stale for too long
+// relative to the check cost (a few-KB version-doc fetch).
+const OWNER_LANE_CHECK_BASE_MS = 10 * 60 * 1000;
+const OWNER_LANE_CHECK_JITTER_MS = 5 * 60 * 1000;
 
 /** Pure interval decision for the owner-lane throttle — exported for tests. */
 export function ownerLaneIntervalMs(rand: () => number = Math.random): number {
