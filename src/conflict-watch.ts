@@ -163,6 +163,10 @@ interface ConflictSummary {
      *  opencode-acp) — display-time classification of recorded details, additive
      *  to `kinds`, so surfaces can stop calling first-party siblings "third-party". */
     sibling: number;
+    /** #2324: name-only [suspected] plugin events — a subset of kinds["third-party-plugin"],
+     *  additive, so display surfaces can stop treating unverified name matches as
+     *  confirmed compressors. Disjoint from `sibling` (siblings are never suspected). */
+    suspected: number;
     latest: Array<{ sessionId: string; at: number; kind: ConflictKind; detail: string }>;
     /** #2219: distinct resolved clients of sessions carrying events (first-seen
      *  order) — lets the web banner show per-client remediation hints. */
@@ -170,7 +174,7 @@ interface ConflictSummary {
 }
 
 export function summarizeConflicts(sessions: Session[], now: number = Date.now()): ConflictSummary {
-    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, clients: [] };
+    const summary: ConflictSummary = { sessions: 0, events: 0, active: 0, historical: 0, lastAt: null, kinds: {}, latest: [], sibling: 0, suspected: 0, clients: [] };
     for (const s of sessions) {
         const events = conflictEventsOf(s);
         if (events.length === 0) continue;
@@ -181,6 +185,7 @@ export function summarizeConflicts(sessions: Session[], now: number = Date.now()
         for (const e of events) {
             summary.kinds[e.kind] = (summary.kinds[e.kind] ?? 0) + 1;
             if (e.kind === "third-party-plugin" && isSiblingConflictDetail(e.detail)) summary.sibling += 1;
+            if (isSuspectedEvent(e)) summary.suspected += 1;
             if (now - e.at <= CONFLICT_ACTIVE_WINDOW_MS) summary.active += 1; else summary.historical += 1;
             if (summary.lastAt === null || e.at > summary.lastAt) summary.lastAt = e.at;
         }
