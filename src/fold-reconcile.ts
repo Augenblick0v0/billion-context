@@ -38,7 +38,10 @@ type FoldReconcileMode = "off" | "warn" | "repair";
 
 const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
-const METADATA_SYSTEM_FP = "systemFp";
+/** #1921: last-noted system-prompt fingerprint ({fp, size}), consumed by both
+ *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
+ *  attribution (#2350). */
+export const METADATA_SYSTEM_FP = "systemFp";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
