@@ -3874,7 +3874,7 @@ async function prepareAnthropic(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -4121,7 +4121,7 @@ async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -4396,7 +4396,7 @@ async function prepareGoogle(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -4703,7 +4703,7 @@ async function prepareResponses(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
@@ -7499,16 +7499,45 @@ export function isContextualUserFragment(text: string): boolean {
         asciiCI(t.slice(0, open.length), open) && asciiCI(t.slice(t.length - close.length), close));
 }
 
+// Host-injected notification user fragments (dsh / deepseek-harness): machine-
+// generated notices spliced into the conversation as USER-role messages ahead
+// of the first real question — using one locks the set-once title to launch
+// boilerplate forever (#2286). Same evidence-permitlist discipline as #2118 —
+// extend only with source evidence, never keyword filters. Sources
+// (deepseek-ai/deepseek-harness, MIT):
+//   packages/interaction/user-approval/src/index.ts:
+//     `The approval policy changed from "${previous}" to "${policy}" ...`
+//   packages/core/system-prompt/src/index.ts joinContextSections +
+//   packages/core/agent-loop/src/runtime-context.ts CLEARED:
+//     `Current runtime context ...`
+//   packages/context/time-context/src/index.ts:
+//     `Time sampled while preparing turn N, step M: <ts>` — its
+//     `Browser time zone for this request:` line is embedded in that ONE
+//     message, never sent standalone, so no separate prefix for it.
+const AUTO_INJECTED_NOTIFICATION_PREFIXES: ReadonlyArray<string> = [
+    "The approval policy changed from",
+    "Current runtime context",
+    "Time sampled while preparing turn",
+];
+
+export function isAutoInjectedNotification(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    return AUTO_INJECTED_NOTIFICATION_PREFIXES.some((p) => asciiCI(t.slice(0, p.length), p));
+}
+
 /** Derive a short human-readable title from the first real user text message.
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
- *  Contextual fragments (#2118) are skipped — if no real question has arrived
- *  yet, no title is set and derivation retries on later requests. */
+ *  Contextual fragments (#2118) and host-injected notifications (#2286) are
+ *  skipped — if no real question has arrived yet, no title is set and
+ *  derivation retries on later requests. */
 export function deriveTitle(messages: CoreMessage[]): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
         const raw = m.text ?? "";
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
+        if (isAutoInjectedNotification(raw)) continue;
         const clean = raw.replace(/\s+/g, " ").trim();
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
