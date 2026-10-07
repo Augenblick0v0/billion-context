@@ -36,7 +36,7 @@ import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launche
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
-import { VERSION, PACKAGE_NAME } from "./version.js";
+import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -391,7 +391,9 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "version") {
-        process.stdout.write(VERSION + "\n");
+        // "0.1.187 (8f9faf9e)" — the commit identifies the exact build for
+        // locally-installed test trees whose semver matches a released version.
+        process.stdout.write(`${VERSION} (${BUILD_COMMIT})\n`);
         return;
     }
     if (command === "acp-cache") {
