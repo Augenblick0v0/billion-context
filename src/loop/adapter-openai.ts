@@ -4,6 +4,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 
 import type {
@@ -93,13 +94,20 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
             }
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            buf = buf.replace(/\r\n|\r/g, "\n");
+            buf = normalizeSseLineEndings(buf);
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
                 const raw = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
                 if (raw.trim().length > 0) yield raw;
             }
+        }
+        buf = finalizeSseLineEndings(buf);
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+            const raw = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (raw.trim().length > 0) yield raw;
         }
         if (buf.trim().length > 0) yield buf;
     } finally {
