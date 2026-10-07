@@ -213,7 +213,10 @@ test("hermetic npm -g install e2e (real npm client, real global layout)", { skip
         ? spawnSync(`"${shim}" --version`, { shell: true, encoding: "utf8", timeout: 60_000, env: biliSpawnEnv(envBase) })
         : spawnSync(shim, ["--version"], { encoding: "utf8", timeout: 60_000, env: biliSpawnEnv(envBase) });
     const shimVersion = (probe.stdout ?? "").trim();
-    assert.match(shimVersion, new RegExp(`^v?${escapeRe(NEW_VERSION)}$`), `bili shim must report the flipped version, got: ${JSON.stringify(shimVersion)}`);
+    // #2345: --version now renders "<semver> (<commit>)" — the flip assertion
+    // targets the bare semver (first token), which is what the updater owns.
+    const shimSemver = shimVersion.split(/\s+/)[0];
+    assert.match(shimSemver, new RegExp(`^v?${escapeRe(NEW_VERSION)}$`), `bili shim must report the flipped version, got: ${JSON.stringify(shimVersion)}`);
 
     // No-op re-run: already sitting at the registry's latest — must exit
     // clean, say so, and touch nothing on disk (no re-download, no churn).
