@@ -1801,6 +1801,8 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 
 **OpenCode 注意。**这是 OpenCode 的**无插件**路径。若在此类配置之上还装了原生插件,运行时每会话警告一次并附修复指引(去前缀或卸插件);请求本身继续走纯代理路径。三条互斥的 OpenCode 接入路径见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#opencode)。
 
+**其他客户端。**同样的单行前缀适用于任何模型 baseURL 可编辑的客户端(Cline / Roo Code / Kilo Code、Continue、OpenHands、Zed、Void、Cursor 单模型通道等)——已核实的入口清单见 [CLIENTS.zh-CN.md → 收养未列表的客户端](CLIENTS.zh-CN.md#收养未列表的客户端任何模型-baseurl-可配的客户端2340)。
+
 **Codex（API key 模式）** —— 编辑 `~/.codex/config.toml`，改 provider 的 `base_url`：
 
 ```toml
