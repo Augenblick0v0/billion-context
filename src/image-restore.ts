@@ -427,17 +427,24 @@ function extFor(mediaType: string): string {
  *  content is not world-readable on multi-user hosts) and return its absolute
  *  path. Addressed by session + ref (+index) — refs alone are per-session, so
  *  the session id is what keeps concurrent sessions from overwriting each
- *  other; a repeated call skips the rewrite when the file is already present
- *  (idempotent within one session, where refs are deterministic). Returns null
- *  on write failure. */
+ *  other. The filename additionally carries a short hash of the bytes: mNNNNN
+ *  numbering restarts at m00001 on a rebase (resetSessionCompression) while old
+ *  spill files survive on disk, so a ref-only name plus skip-if-exists would
+ *  silently return the PREVIOUS generation's pixels for a new image under a
+ *  reused ref (#1995 review F1). With the content salt, same name implies same
+ *  bytes — the skip stays a correct idempotency check — and different content
+ *  lands in a different file, so a stale hit is impossible (orphaned old-gen
+ *  files age out via the 7d prune). Returns null on write failure. */
 export function writeRestoredImage(ref: string, idx: number, img: RestorableImage, sessionId: string): string | null {
     const safeRef = ref.replace(/[^a-zA-Z0-9_-]/g, "-");
     const dir = restoreExportDir(sessionId);
-    const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}.${extFor(img.mediaType)}`);
+    const body = Buffer.from(img.b64, "base64");
+    const digest = createHash("sha256").update(body).digest("hex").slice(0, 8);
+    const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}-${digest}.${extFor(img.mediaType)}`);
     try {
         if (existsSync(path)) return path;
         mkdirSync(dir, { recursive: true });
-        writeFileSync(path, Buffer.from(img.b64, "base64"), { mode: 0o600 });
+        writeFileSync(path, body, { mode: 0o600 });
         return path;
     } catch (e) {
         loggerLog("warn", `[image-restore] write failed (${path}): ${String(e)}`);
