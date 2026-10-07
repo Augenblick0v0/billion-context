@@ -8,7 +8,13 @@ interface ExternalSummaryTarget {
     protocol: PreflightProtocol;
     url: string;
     model: string;
-    credentialRef: string;
+    /** Reference form (env:VAR / secret:NAME) — exactly one of
+     *  credentialRef/apiKey is set. apiKey is the #2336 agent-registry form:
+     *  a key resolved in the agent's memory (never persisted to a file),
+     *  accepted only on the request rail (parseExternalSummarySettings
+     *  inlineKeys mode) — the file/legacy form rejects it. */
+    credentialRef?: string;
+    apiKey?: string;
     contextWindow: number;
     outputTokens: number;
     stream: boolean;
@@ -97,8 +103,10 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
 /** Expand chain references against the named providers table. THROWS on an
  *  unresolvable reference — callers decide the failure policy (web save:
  *  400; request path: warn + treat the chain as disabled, never brick the
- *  request over a config typo). */
-export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes: Record<string, NamedProviderRecipe>): ExternalSummarySettings {
+ *  request over a config typo). Recipes may carry an in-memory `apiKey`
+ *  (#2336 agent-registry form) — it expands to an inline-key target instead
+ *  of a credential reference. */
+export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes: Record<string, NamedProviderRecipe & { apiKey?: string }>): ExternalSummarySettings {
     if (!chain.enabled) return { enabled: false, targets: [], budget: chain.budget };
     const names = new Set<string>();
     const targets = chain.targets.map((ref): ExternalSummaryTarget => {
@@ -116,8 +124,9 @@ export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes:
         const outputTokens = integer(knobs.outputTokens, Math.min(8192, Math.floor(contextWindow / 4)), 128, contextWindow - 1);
         if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error("External summary stream must be boolean");
         const stream = knobs.stream === true;
+        const inlineKey = recipe.apiKey;
         const credentialRef = recipe.apiKeyEnv ? `env:${recipe.apiKeyEnv}` : `secret:${recipe.credentialRef}`;
-        return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, credentialRef, contextWindow, outputTokens, stream };
+        return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream };
     });
     return { enabled: true, targets, budget: chain.budget };
 }
@@ -148,8 +157,12 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
 /** EXPANDED-shape parser — the settings object as it rides the request
  *  Config rail after expandExternalSummaryChain. Re-parsed by
  *  ConfiguredSummaryPlan at execution time so a hand-built rail value gets
- *  the same validation as a file-driven one. */
-export function parseExternalSummarySettings(value: unknown): ExternalSummarySettings {
+ *  the same validation as a file-driven one. `inlineKeys` (#2336) admits
+ *  literal `apiKey` values on targets — the agent-registry recipes resolve
+ *  their key in memory and hand bili the bytes; the FILE form keeps
+ *  rejecting them (a plaintext key must never enter a config file). */
+export function parseExternalSummarySettings(value: unknown, options: { inlineKeys?: boolean } = {}): ExternalSummarySettings {
+    const inlineKeys = options.inlineKeys === true;
     const settings = object(value);
     knownKeys(settings, ["enabled", "targets", "budget"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
@@ -163,7 +176,7 @@ export function parseExternalSummarySettings(value: unknown): ExternalSummarySet
     const names = new Set<string>();
     const targets = values.map((value): ExternalSummaryTarget => {
         const target = object(value);
-        knownKeys(target, ["name", "protocol", "url", "model", "credentialRef", "contextWindow", "outputTokens", "stream"]);
+        knownKeys(target, inlineKeys ? ["name", "protocol", "url", "model", "credentialRef", "apiKey", "contextWindow", "outputTokens", "stream"] : ["name", "protocol", "url", "model", "credentialRef", "contextWindow", "outputTokens", "stream"]);
         const name = text(target.name, 64);
         if (!validSummaryCredentialName(name) || names.has(name)) throw new Error("External summary target names must be unique identifiers");
         names.add(name);
@@ -176,9 +189,15 @@ export function parseExternalSummarySettings(value: unknown): ExternalSummarySet
         if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
             || [...url.searchParams.keys()].some((key) => key !== "alt")
             || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error("Invalid external summary endpoint; use HTTPS and no embedded credentials or proxy recursion");
-        const credentialRef = text(target.credentialRef, 128);
-        if (!/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)
-            && !(credentialRef.startsWith("secret:") && validSummaryCredentialName(credentialRef.slice(7)))) throw new Error("Invalid external summary credential reference");
+        const inlineKey = inlineKeys ? target.apiKey : undefined;
+        if (inlineKey !== undefined && (typeof inlineKey !== "string" || inlineKey.length === 0 || inlineKey.length > 8192 || /[\x00-\x20\x7f]/.test(inlineKey))) throw new Error("Invalid external summary api key");
+        if (inlineKey !== undefined && target.credentialRef !== undefined) throw new Error("External summary target carries both apiKey and credentialRef — exactly one credential is allowed");
+        let credentialRef: string | undefined;
+        if (inlineKey === undefined) {
+            credentialRef = text(target.credentialRef, 128);
+            if (!/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)
+                && !(credentialRef.startsWith("secret:") && validSummaryCredentialName(credentialRef.slice(7)))) throw new Error("Invalid external summary credential reference");
+        }
         const contextWindow = integer(target.contextWindow, 128_000, 2048, 10_000_000);
         const outputTokens = integer(target.outputTokens, Math.min(8192, Math.floor(contextWindow / 4)), 128, contextWindow - 1);
         if (target.stream !== undefined && typeof target.stream !== "boolean") throw new Error("External summary stream must be boolean");
@@ -187,7 +206,7 @@ export function parseExternalSummarySettings(value: unknown): ExternalSummarySet
             const suffix = target.stream === true ? "streamGenerateContent" : "generateContent";
             if (!url.pathname.endsWith(`/models/${encodeURIComponent(model.replace(/^models\//, ""))}:${suffix}`)) throw new Error("Google summary endpoint must match the model and stream mode");
         }
-        return { name, protocol, url: url.href, model, credentialRef, contextWindow, outputTokens, stream: target.stream === true };
+        return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
     });
     return { enabled: true, targets, budget: parseBudget(settings.budget) };
 }
