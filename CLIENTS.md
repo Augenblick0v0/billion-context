@@ -213,6 +213,18 @@ two small node scripts that do the work around the client:
   happens per session. Remove with `bili plugin remove zcode` (strips only
   bili's entries, reverts `hooks.enabled` when it was the one to enable it,
   and restores the provider store from its snapshot).
+- **Open sessions after removal (#2155):** `bili plugin remove zcode` cannot
+  reach into already-open client windows — their MCP child is gone but the
+  proxy-side binding (session metadata) survives. Such zombie sessions are
+  detected after 5 consecutive nudged rounds with no plugin header, no bili
+  tools on the wire, and no compression: the session self-heals by
+  **degrading to proxy mode** — the ACP tools are re-injected wire-side and
+  the proxy owns compression again (the nudge stays). When wire injection is
+  unavailable (`compress.injectTool=false`) the nudge is suppressed instead
+  until a compression reduction resumes. A returning plugin header (client
+  restarted / reinstalled) restores plugin mode on the first request. The
+  remove command prints a note when live sessions were seen in the last 10
+  minutes; the web UI badges such sessions ("heal").
 - **Per-session bootstrap:** each ZCode session spawns the MCP child as a
   direct process; at startup it attaches to a healthy proxy
   (`BILLION_CONTEXT_PROXY`) or spawns its own on an ephemeral port, then
@@ -237,6 +249,12 @@ two small node scripts that do the work around the client:
   against the live proxy manifest, the routed entries gain
   `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
   Tool calls bind via the per-call `conversation_id` argument (#760).
+- **What gets cleaned vs. never touched (unified ACP invariants):** model
+  prose may have bili render-tag echoes / marker lines / degenerate residue
+  stripped in transit; the **thinking channel** (anthropic `thinking`, google
+  `thought`, openai `reasoning_content`/`reasoning`, responses reasoning
+  summaries), **tool-call arguments** (model-written file content) and
+  **user messages** are byte-for-byte untouched.
 - **Routing scope (#1622):** native mode wraps **every** provider entry with
   a usable http(s) `baseURL` — the same "all providers ride compression"
   semantics as the in-process natives (pi/dsh) — not just the bigmodel
@@ -569,15 +587,29 @@ HTTP transports; WS row documented from #2073, no live cell):
 
 Caveats worth knowing:
 
-- **Restrictive `tools:` allowlists filter ACP tools.** An agent definition
-  whose frontmatter `tools:` list omits the ACP tool names (e.g. the builtin
-  `scout` lists only `read`/`bash`/…) will not expose them in the child, even
-  though the session is named and compressed. Pre-fix foreground children
-  happened to have the tools via proxy wire injection regardless of the
-  allowlist — so such agents see fewer tools after the upgrade. Restore them
-  by omitting the `tools:` field or adding
-  `compress,decompress,search_context,acp_status,acp_cache`. The filtering is
-  pi-subagents' pre-existing behavior, not a regression of this fix.
+- **Roles with restrictive `tools:` allowlists get the ACP channel back
+  automatically (#2268).** An agent definition whose frontmatter `tools:` list
+  omits the ACP tool names — all seven builtin roles ship like this (e.g.
+  `delegate` lists `read,grep,find,ls,bash,edit,write,contact_supervisor`) —
+  no longer loses interactive compression after the #2185 named-plugin fix.
+  bili detects such children per request (pi-subagents stamps every child
+  session's system prompt with an `<active_agent name="…">` marker; the gate
+  also requires the request's tools array to expose none of the names bili
+  would inject) and serves them through the **proxy-style compression
+  channel**: wire-injected ACP tools + nudge, server-side execution,
+  `acp_summary` carrier — while keeping the named plugin-session identity
+  from #2185. No configuration change required; the role's original allowlist
+  stays intact on the wire, and a mid-session whitelist change self-heals on
+  the next request. Scoped to nicobailon/pi-subagents children only (the
+  marker is theirs); every other plugin host is unaffected. If upstream ever
+  drops the marker, these roles degrade to pre-#2268 behavior (named session,
+  no local ACP tools).
+  - A role exposing **any** ACP/bili-injectable name stays in pure plugin
+    mode (duplicate tool declarations are rejected by providers), so
+    **partial grants are unsupported** — grant none, or grant all
+    (`compress,decompress,search_context,acp_status[,acp_cache]`).
+  - Want locally registered (plugin-carrier) tools for a specific role? Keep
+    the manual grant: omit the `tools:` field or add the ACP names to it.
 - **One-request registration race in background children** (ACP tools present
   from the second request on) is pre-existing in all modes.
 - **Behavior change disclosure:** foreground children move from anonymous

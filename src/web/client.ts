@@ -232,14 +232,20 @@ export const WEB_CLIENT = `(function () {
         const href = "#/session/" + encodeURIComponent(s.id);
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
+            + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
     // to the local tokensSaved estimate; neither present => honest dash, never fake 0.
     function savedTd(x) {
         const v = x.netSaved != null ? x.netSaved : (x.tokensSaved || 0);
-        if (v > 0) return '<td class="num good-num">' + fmtW(v) + "</td>";
-        if (v) return '<td class="num" title="' + escapeHtml(t("ov.saved_neg_tip")) + '">' + fmtW(v) + "</td>";
+        // #2202: name the frozen share in the tooltip when any fold lost
+        // coverage — the number is honest now, but the operator must see it.
+        const clTip = x.coverageLostFolds
+            ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
+            : "";
+        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
+        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
@@ -305,7 +311,7 @@ export const WEB_CLIENT = `(function () {
             $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
             $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
-            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") : "";
+            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
             if (hs) {
@@ -374,11 +380,17 @@ export const WEB_CLIENT = `(function () {
                 // #2102: attribute per kind family present; split active from historical
                 // stock; detail pointer must target a cross-session surface (acp_status
                 // renders conflicts for the CURRENT session only).
+                // #2261: bili's own siblings (billion-context-pi / opencode-acp) are NOT
+                // third-party plugins — the server counts them separately so the sentence
+                // never mislabels them or commands removal of something that stands down.
                 const pluginN = (c.kinds && c.kinds["third-party-plugin"]) || 0;
+                const siblingN = Math.max(0, Math.min(typeof c.sibling === "number" ? c.sibling : 0, pluginN));
+                const tpN = pluginN - siblingN;
                 const nativeN = c.events - pluginN;
-                const what = [pluginN > 0 ? t("conflict.what_plugin") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
+                const what = [tpN > 0 ? t("conflict.what_plugin") : "", siblingN > 0 ? t("conflict.what_sibling") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
                 const active = typeof c.active === "number" ? c.active : c.events;
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical")) + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                const risk = tpN === 0 && nativeN === 0 ? t("conflict.risk_sibling") : (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical"));
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 cb.classList.toggle("info", active === 0);
                 cb.classList.toggle("warn", active > 0);
                 const btn = $("conflicts-clear-btn");
@@ -865,6 +877,7 @@ export const WEB_CLIENT = `(function () {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
@@ -898,7 +911,8 @@ export const WEB_CLIENT = `(function () {
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
-        mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0);
+        mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
+            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
@@ -1352,9 +1366,10 @@ export const WEB_CLIENT = `(function () {
             }
             if (fe) cfgSavedSnap = fe.value;
             hydrateQuickConfig(cfg);
+            hydrateSummaryConfig(cfg);
             refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -1710,6 +1725,131 @@ export const WEB_CLIENT = `(function () {
         if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); refreshDirtyFlag(); });
         syncAll();
     }
+    function hydrateSummaryConfig(cfg) {
+        const box = $("summary-fields"), fe = $("cfg-file-edit");
+        if (!box || !fe) return;
+        const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        function read() {
+            const draft = JSON.parse(fe.value || "{}");
+            if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
+            return draft;
+        }
+        function mutate(fn, repaint) {
+            try {
+                const draft = read();
+                if (!draft.compress) draft.compress = {};
+                if (!draft.compress.externalSummary) draft.compress.externalSummary = { enabled: false, targets: [] };
+                fn(draft.compress.externalSummary);
+                fe.value = JSON.stringify(draft, null, 2);
+                refreshDirtyFlag();
+                if (repaint) render();
+            } catch (e) { toast(e.message, "err"); }
+        }
+        function button(parent, label, action, symbol) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.title = label;
+            btn.setAttribute("aria-label", label);
+            if (symbol) btn.innerHTML = symbol; else btn.textContent = label;
+            btn.addEventListener("click", action);
+            parent.appendChild(btn);
+            return btn;
+        }
+        function field(parent, id, label, value, change, type, options) {
+            const lab = document.createElement("label");
+            lab.htmlFor = id;
+            const title = document.createElement("span"); title.textContent = label;
+            lab.appendChild(title);
+            const inp = document.createElement(options ? "select" : "input");
+            inp.id = id; inp.className = "field-input";
+            if (options) options.forEach((v) => { const opt = document.createElement("option"); opt.value = v; opt.textContent = v; inp.appendChild(opt); });
+            else { inp.type = type || "text"; if (type === "number") { inp.min = "1"; inp.step = "1"; } }
+            inp.value = value === undefined ? "" : String(value);
+            inp.addEventListener("change", () => change(type === "number" ? Number(inp.value) : inp.value));
+            lab.appendChild(inp); parent.appendChild(lab);
+            return inp;
+        }
+        function render() {
+            box.replaceChildren();
+            let draft;
+            try { draft = read(); } catch (e) { box.textContent = t("cfg.invalid_json"); return; }
+            const s = (draft.compress && draft.compress.externalSummary) || { enabled: false, targets: [] };
+            if (s.invalid || !Array.isArray(s.targets || [])) { box.textContent = t("summary.invalid"); return; }
+            // Recipes = named (non-URL) providers entries carrying dial fields;
+            // the raw editor below owns their bodies, this panel only wires the
+            // chain (references + budget) and the credential keys they cite.
+            const providers = draft.providers && typeof draft.providers === "object" && !Array.isArray(draft.providers) ? draft.providers : {};
+            const recipes = Object.keys(providers).filter((name) => name.indexOf("http://") !== 0 && name.indexOf("https://") !== 0 && providers[name] && typeof providers[name] === "object" && !Array.isArray(providers[name]) && (providers[name].baseUrl !== undefined || providers[name].api !== undefined)).map((name) => ({ name, recipe: providers[name] }));
+            const options = [];
+            recipes.forEach(({ name, recipe }) => { Object.keys(recipe.models && typeof recipe.models === "object" ? recipe.models : {}).forEach((model) => options.push(name + "/" + model)); });
+            const head = document.createElement("div"); head.className = "summary-actions";
+            const enabled = document.createElement("label");
+            const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.id = "summary-enabled"; toggle.checked = s.enabled === true;
+            toggle.disabled = !!cfg.parseError;
+            toggle.addEventListener("change", () => mutate((v) => { v.enabled = toggle.checked; }));
+            enabled.append(toggle, document.createTextNode(" " + t("summary.enabled"))); head.appendChild(enabled);
+            const add = button(head, t("summary.add"), () => mutate((v) => {
+                if (!v.targets) v.targets = [];
+                v.targets.push(options.find((option) => v.targets.indexOf(option) === -1) || "");
+            }, true));
+            add.disabled = !!cfg.parseError || (s.targets || []).length >= 16 || (options.length === 0 && (s.targets || []).length > 0);
+            box.appendChild(head);
+            if (options.length === 0) {
+                const hint = document.createElement("p"); hint.textContent = t("summary.no_recipes"); box.appendChild(hint);
+            }
+            (s.targets || []).forEach((ref, i) => {
+                const item = document.createElement("fieldset"); item.className = "summary-target";
+                const legend = document.createElement("legend"); legend.textContent = String(i + 1) + ". " + (ref || "—"); item.appendChild(legend);
+                const fields = document.createElement("div"); fields.className = "summary-grid";
+                const refOptions = options.slice();
+                if (ref && refOptions.indexOf(ref) === -1) refOptions.unshift(ref);
+                const set = (value) => mutate((v) => { v.targets[i] = String(value).trim(); }, true);
+                field(fields, "summary-" + i + "-ref", t("summary.ref"), ref, set, refOptions.length ? null : "text", refOptions.length ? refOptions : undefined);
+                item.appendChild(fields);
+                const actions = document.createElement("div"); actions.className = "summary-actions";
+                button(actions, t("summary.up"), () => mutate((v) => { const prev = v.targets[i - 1]; v.targets[i - 1] = v.targets[i]; v.targets[i] = prev; }, true), "&#8593;").disabled = i === 0;
+                button(actions, t("summary.down"), () => mutate((v) => { const next = v.targets[i + 1]; v.targets[i + 1] = v.targets[i]; v.targets[i] = next; }, true), "&#8595;").disabled = i === s.targets.length - 1;
+                button(actions, t("summary.remove"), () => mutate((v) => { v.targets.splice(i, 1); }, true), "&#215;");
+                item.appendChild(actions); item.disabled = !!cfg.parseError; box.appendChild(item);
+            });
+            if (recipes.length) {
+                const creds = document.createElement("div"); creds.className = "summary-creds";
+                const title = document.createElement("h4"); title.textContent = t("summary.credentials"); creds.appendChild(title);
+                recipes.forEach(({ name, recipe }) => {
+                    const row = document.createElement("div"); row.className = "summary-actions";
+                    const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
+                    const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
+                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    if (ref && ref.indexOf("secret:") === 0) {
+                        const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
+                        key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
+                        async function saveKey(btn, value) {
+                            busy(btn, true);
+                            try {
+                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured;
+                                render();
+                                toast(t("summary.key_saved"), "ok");
+                            } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
+                        }
+                        const save = button(row, t("summary.key_save"), () => saveKey(save, key.value));
+                        const del = button(row, t("summary.key_delete"), () => { if (confirm(t("summary.key_delete") + "?")) saveKey(del, null); });
+                        save.disabled = del.disabled = !!cfg.parseError;
+                    }
+                    creds.appendChild(row);
+                });
+                box.appendChild(creds);
+            }
+            const budget = document.createElement("div"); budget.className = "summary-grid";
+            [["totalTimeoutMs", t("summary.total"), 50000], ["targetTimeoutMs", t("summary.timeout"), 25000], ["maxSummaryBytes", t("summary.bytes"), 65536]].forEach(([key, label, fallback]) => {
+                field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;
+            });
+            box.appendChild(budget);
+        }
+        render();
+        fe.onchange = render;
+    }
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
@@ -1907,6 +2047,8 @@ export const WEB_CLIENT = `(function () {
         });
         // #1426: single raw config-file editor — the server validates every known field
         const sf = $("save-file");
+        const ss = $("save-summary");
+        if (ss) ss.addEventListener("click", () => putCfg(ss, { file: $("cfg-file-edit").value }));
         if (sf) sf.addEventListener("click", async () => {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";

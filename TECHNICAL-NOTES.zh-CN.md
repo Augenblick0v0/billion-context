@@ -95,3 +95,24 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 | **hermes** | `~/.hermes/plugins/billion-context/`(拷贝文件 + 指向全局 dist 的 `bili.json` sidecar) | **`bili plugin update hermes`** 重新拷文件;sidecar 跟随全局安装 |
 
 这在代码里强制,不只是约定:自更新器(`src/update.ts` → `hostManagedInstall`)识别 pnpm 虚拟 store(`.pnpm`)或宿主 agent 树(pi / opencode / dsh / kimi / omp home)下的安装目录并**跳过**它们;`installViaTarball` 从结构上拒绝它们,直接调用方也无法损坏 store。混用*命令*没问题(`dsh plugin add` ≡ `bili plugin install dsh` —— 同一通道、同一记录);混用*写者*才是守卫禁止的事。`bili plugin update [client]` 是唯一能驱动每条 lane 走各自 owner 的命令,并打印逐 lane 更新路径(`bili plugin list` 显示同样的逐 lane 通道)。
+
+## 会话卡死自愈 —— 检测常量与补救(#2155)
+
+三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
+
+- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
+- **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除。
+- **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
+
+可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。
+
+## ACP 标签回声统一整治 —— 四条不变量(#2023/#2066/#2190/#2248)
+
+一个 PR 把三条整治腿合并(refs-run 残留 #2023、退化闭名剥离+出口审计网 #2190、emission 整段丢弃+签名思考 verbatim #2066),并统一受四条硬规则约束 —— 覆盖**所有**文本改写面(loop 适配器、插件直通、JSON strip 函数、出口审计):
+
+1. **思考通道逐字节不动。** Anthropic `thinking`、Google `thought`、OpenAI `reasoning_content`/`reasoning`、Responses reasoning summaries 原样透传 —— 哪怕长得像标签回声。理由:reasoning 回放(DeepSeek 式)与签名校验验证的就是这些字节,任何改写都会让它们失步并卡死会话(#1960/KDD#10)。适配器侧走 `createIdentityStreamFilter`,strip 函数(`stripOpenaiChatText`、`stripResponsesText`)同样不动它们(纵深防御)。**注意:这翻转了 #1881 时代的 reasoning 回声剥离 —— 思考通道不再清洗。**
+2. **模型的正文输出可以治理。** 渲染标签回声、marker 行、bili 内部文本、退化开/闭名残骸,以及(absorb 受指令时)整段工具调用 emission,只在可见文本通道剥离。
+3. **模型写入文件的内容逐字节不变(#1039)。** 工具调用 arguments 无论携带什么字节都不进任何过滤器。
+4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
+
+出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。

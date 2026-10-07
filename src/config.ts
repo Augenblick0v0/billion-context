@@ -12,6 +12,7 @@ import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
+import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -131,6 +132,11 @@ export type ModelEntry = {
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
 export type CompressSettings = {
+    /** External summary chain — three-level like every other compress field
+     *  (whole-chain replace at provider/model level, no sub-merge). File shape:
+     *  references into the named providers table ("glm/glm-4.9-flash"),
+     *  expanded at request-config time (see NamedProviderRecipe). */
+    externalSummary?: ExternalSummaryChain;
     /** Effective context window used by the compression engine — this is the
      *  model's context size. It is the **denominator** the kernel uses for its
      *  usage ratio (`usage = tokens / modelContextLimit`); it is NOT a
@@ -194,15 +200,18 @@ export type CompressSettings = {
      *  instance is the source of truth — protecting ALL of them (via
      *  `protectedTools`) would make that tool's history grow unboundedly,
      *  while protecting the LATEST keeps the live snapshot in context and
-     *  lets every superseded instance fold normally. Patterns match like
-     *  kernel tool patterns (exact name or `*` glob, e.g. `"todo_list"`,
-     *  `"TodoWrite"`, `"todo*"`). Protection is a HARD exclusion: neither
+     *  lets every superseded instance fold normally. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"todo_list"`, `"todo*"`); a pattern
+     *  containing `/` matches the canonical skill path instead — skill loads
+     *  project to `skill/<name>` on every client (#1947) — and protects the
+     *  latest instance PER path (`"skill/*"` keeps the newest load of every
+     *  skill, not just one). Protection is a HARD exclusion: neither
      *  suggested nor explicit compress ranges can cover the latest instance.
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedLatestTools?: string[];
-    /** Tool-name patterns whose tool-calls AND paired results are NEVER
+    /** Tool patterns whose tool-calls AND paired results are NEVER
      *  compressed — every instance, full history (kernel `protectedTools`,
      *  hard exclusion: matching refs render as `BLOCKED`, so neither suggested
      *  nor explicit compress ranges can cover them; applies identically in
@@ -213,8 +222,12 @@ export type CompressSettings = {
      *  supersedes, so folding older loads loses it permanently (#1109).
      *  ⚠ Trade-off (#639 rationale): protecting ALL instances of a chatty or
      *  cumulative-snapshot tool makes its history grow unboundedly — use
-     *  `protectedLatestTools` for those instead. Patterns match like kernel
-     *  tool patterns (exact name or `*` glob, e.g. `"skill"`, `"skill_*"`).
+     *  `protectedLatestTools` for those instead. Patterns match by exact
+     *  tool name or `*` glob (e.g. `"skill"`, `"skill_*"`); a pattern
+     *  containing `/` selects skills by name on every client (#1947): skill
+     *  loads project to `skill/<name>`, so `"skill/release-orchestrator"`
+     *  protects each load of that one skill and `"skill/review-*"` glob-
+     *  matches within the name segment (`*` never crosses `/`).
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
@@ -404,10 +417,23 @@ export type CompressSettings = {
      *  the most recent {@link stripImagesKeepRecent} has its image parts dropped
      *  before the wire rebuild (image-only content collapses to an "[image]"
      *  placeholder). Off by default — the #488 image floor / overflow 502 stays
-     *  the opt-in signal until this is enabled. */
+     *  the opt-in signal until this is enabled.
+     *
+     *  [#1995] On anthropic sessions the strip boundary is FOLD-ANCHORED when
+     *  an active compression fold exists: instead of the sliding `len -
+     *  keepRecent` window (which moves the byte boundary every turn and breaks
+     *  the prompt cache at the most expensive content), the cutoff sticks to
+     *  the last fold-covered wire message and only moves on compression
+     *  events — the stripped prefix is byte-stable between folds. Recovery for
+     *  stripped pixels: `decompress({ imageRef })` (files under
+     *  <state>/retrieve/img/<session>/, one-week TTL) and the ref-carrying
+     *  `[image: … · mNNNNN]` notes summaries emit. The other wires keep the
+     *  sliding window until their strip placeholders are made id-stable
+     *  (openai/google flip ids on strip; see src/image-restore.ts). */
     stripImages?: boolean;
     /** With {@link stripImages}, how many trailing messages keep their images
-     *  verbatim (default 5). Ignored unless stripImages is true. */
+     *  verbatim (default 5). Ignored unless stripImages is true. Serves as the
+     *  FALLBACK window on anthropic when no active fold anchors the boundary. */
     stripImagesKeepRecent?: number;
     /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
      *  tool calls at request time (src/reasoning-drop.ts, aligned with
@@ -469,7 +495,7 @@ export type CompressSettings = {
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
 };
-export type PromptCacheRouting = "auto" | "enabled" | "disabled";
+type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -658,6 +684,12 @@ export type ProxyOptions = {
     host: string;
     upstream: string;
     routes: ProviderRoutes;
+    /** Named dialing recipes from the providers table (pi/opencode idiom) —
+     *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
+     *  Populated by loadOptions; optional so inline test fixtures (which
+     *  never reference chains) stay terse. Refreshed together with `routes`
+     *  on web Apply. */
+    namedProviders?: Record<string, NamedProviderRecipe>;
     /** Global default upstream HTTP proxy. Per-URL `proxy` overrides this.
      *  Empty string explicitly disables environment/system proxy fallback. */
     proxy?: string;
@@ -753,6 +785,15 @@ export type ProxyOptions = {
      *  blocks with resumeInheritance (#1834, default on).
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
+    /** Simhash chain-alignment adoption (#2265, default ON). A client-side
+     *  pervasive decorative rewrite (Trae re-stamps model tags on every
+     *  assistant message after a model switch) breaks the exact hash chain;
+     *  without this rung every request mints a fresh pfa-* session and
+     *  re-folds the full history from zero. Chain-level similarity
+     *  re-attaches the existing session and its compression state; the next
+     *  request resolves by the exact fast path again.
+     *  Disable with `affinitySimhash: false` or env BILI_AFFINITY_SIMHASH=0. */
+    affinitySimhash?: boolean;
     /** Resume-fork inheritance (#1486, default ON). Identified clients that
      *  resume a conversation under a NEW client-provided session id (Claude
      *  Code --resume forks a fresh UUID while replaying the full transcript)
@@ -842,7 +883,11 @@ function warnNamedProviderOnce(signature: string, message: string): void {
 
 function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null): void {
     if (!obj) return;
-    const inert = NAMED_PROVIDER_ROUTING_FIELDS.filter((f) => f in obj && obj[f] !== undefined);
+    // A dialing recipe (baseUrl/api/...) re-scopes "models": on a recipe entry
+    // it is the model REGISTRY the summary chain references, not routing — so
+    // only warn for fields that are genuinely dead routing config there.
+    const recipe = obj.baseUrl !== undefined || obj.api !== undefined;
+    const inert = NAMED_PROVIDER_ROUTING_FIELDS.filter((f) => f in obj && obj[f] !== undefined && !(recipe && f === "models"));
     if (inert.length === 0) return;
     warnNamedProviderOnce(
         `inert:${key}:${inert.join(",")}`,
@@ -919,6 +964,105 @@ function fillRouteGaps(winner: unknown, filler: unknown): unknown {
  *  `compactionOptIn` only); if it nevertheless carries routing fields, a
  *  startup warning names the key and the inert fields instead of failing
  *  silently. */
+/** Per-model knobs a named recipe exposes to referencing chains. These are
+ *  the same fields an inline external-summary target carried; defaults come
+ *  from the chain expansion, not from here. */
+interface NamedProviderModel {
+    contextWindow?: number;
+    outputTokens?: number;
+    stream?: boolean;
+}
+
+/** Dialing recipe on a NAMED providers-table key (pi/opencode idiom): the
+ *  name maps to {baseUrl, api, credential, models}. Routing-inert by itself
+ *  — same as every named entry without `bind` — and referenced by
+ *  `compress.externalSummary.targets` ("glm/glm-4.9-flash"). Credentials are
+ *  references only (env var name or secret-store name); a plaintext key in
+ *  the config file is rejected by the unknown-key check, keeping the file
+ *  non-secret (web GET echoes it verbatim). */
+export interface NamedProviderRecipe {
+    baseUrl: string;
+    api: "anthropic" | "openai" | "responses" | "google";
+    apiKeyEnv?: string;
+    credentialRef?: string;
+    models: Record<string, NamedProviderModel>;
+}
+
+const NAMED_PROVIDER_RECIPE_FIELDS = ["baseUrl", "api", "apiKeyEnv", "credentialRef", "models"] as const;
+
+/** Parse one named-entry recipe. THROWS on an invalid shape — the web save
+ *  path surfaces it as a 400; loadNamedProviders catches and warns instead
+ *  (a broken recipe disables its chain references loudly, never the proxy). */
+export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("a named provider recipe must be an object");
+    const obj = value as Record<string, unknown>;
+    const unknownKeys = Object.keys(obj).filter((key) => ![...NAMED_PROVIDER_RECIPE_FIELDS, "bind", "compactionOptIn"].includes(key));
+    if (unknownKeys.length > 0) throw new Error(`unknown recipe fields on named provider entry [${unknownKeys.join(", ")}] — routing fields need "bind"; credentials must use apiKeyEnv/credentialRef`);
+    if (typeof obj.baseUrl !== "string" || !obj.baseUrl.trim() || obj.baseUrl.length > 2048) throw new Error("recipe baseUrl must be a non-empty string");
+    if (obj.api !== "anthropic" && obj.api !== "openai" && obj.api !== "responses" && obj.api !== "google") throw new Error(`recipe api must be one of: anthropic, openai, responses, google (got ${JSON.stringify(obj.api)})`);
+    if (obj.apiKeyEnv !== undefined && (typeof obj.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(obj.apiKeyEnv))) throw new Error("recipe apiKeyEnv must be an environment variable name");
+    if (obj.credentialRef !== undefined && (typeof obj.credentialRef !== "string" || !validSummaryCredentialName(obj.credentialRef))) throw new Error("recipe credentialRef must be a secret-store credential name");
+    if (obj.apiKeyEnv !== undefined && obj.credentialRef !== undefined) throw new Error("recipe carries both apiKeyEnv and credentialRef — pick one");
+    if (obj.apiKeyEnv === undefined && obj.credentialRef === undefined) throw new Error("recipe needs a credential reference (apiKeyEnv or credentialRef)");
+    if (!obj.models || typeof obj.models !== "object" || Array.isArray(obj.models) || Object.keys(obj.models).length === 0) throw new Error("recipe models must be a non-empty object of model entries");
+    const models: Record<string, NamedProviderModel> = {};
+    for (const [id, raw] of Object.entries(obj.models)) {
+        const knobs = (raw && typeof raw === "object" && !Array.isArray(raw)) ? raw as Record<string, unknown> : {};
+        const unknown = Object.keys(knobs).filter((key) => !["contextWindow", "outputTokens", "stream"].includes(key));
+        if (unknown.length > 0) throw new Error(`unknown fields on recipe model "${id}" [${unknown.join(", ")}]`);
+        if (knobs.contextWindow !== undefined && (typeof knobs.contextWindow !== "number" || !Number.isSafeInteger(knobs.contextWindow) || knobs.contextWindow < 2048 || knobs.contextWindow > 10_000_000)) throw new Error(`recipe model "${id}" contextWindow must be an integer in [2048, 10000000]`);
+        if (knobs.outputTokens !== undefined && (typeof knobs.outputTokens !== "number" || !Number.isSafeInteger(knobs.outputTokens) || knobs.outputTokens < 128)) throw new Error(`recipe model "${id}" outputTokens must be an integer >= 128`);
+        if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error(`recipe model "${id}" stream must be a boolean`);
+        models[id] = { ...(knobs.contextWindow !== undefined ? { contextWindow: knobs.contextWindow } : {}), ...(knobs.outputTokens !== undefined ? { outputTokens: knobs.outputTokens } : {}), ...(knobs.stream !== undefined ? { stream: knobs.stream } : {}) };
+    }
+    return { baseUrl: obj.baseUrl.trim().replace(/\/+$/, ""), api: obj.api, ...(obj.apiKeyEnv !== undefined ? { apiKeyEnv: obj.apiKeyEnv } : {}), ...(obj.credentialRef !== undefined ? { credentialRef: obj.credentialRef } : {}), models };
+}
+
+/** True when the entry carries recipe fields (used to re-scope the inert
+ *  warning: on a recipe entry `models` is a registry, not routing). */
+function isNamedProviderRecipeShape(value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const obj = value as Record<string, unknown>;
+    return obj.baseUrl !== undefined || obj.api !== undefined;
+}
+
+export function collectNamedProviders(providers: Record<string, unknown>): Record<string, NamedProviderRecipe> {
+    const out: Record<string, NamedProviderRecipe> = {};
+    for (const [key, value] of Object.entries(providers)) {
+        if (isUrlLikeKey(key) || value === null || typeof value !== "object" || Array.isArray(value)) continue;
+        if (!isNamedProviderRecipeShape(value)) continue;
+        if (!validSummaryCredentialName(key)) {
+            warnNamedProviderOnce(`recipe-name:${key}`, `providers."${key}" is not a valid recipe name ([A-Za-z0-9][A-Za-z0-9_-]{0,63}) — the entry is ignored`);
+            continue;
+        }
+        try {
+            out[key] = parseNamedProviderRecipe(value);
+        } catch (error) {
+            warnNamedProviderOnce(`recipe:${key}`, `providers."${key}" has an invalid recipe (${error instanceof Error ? error.message : String(error)}) — chains referencing it are disabled`);
+        }
+    }
+    return out;
+}
+
+/** Named dialing recipes from the same sources `loadRoutes` reads (external
+ *  ACP_PROVIDERS file entries replace inline ones wholesale). Re-read per
+ *  call like every other config-file consumer; the server snapshots it next
+ *  to routes and refreshes both on web Apply. */
+export function loadNamedProviders(env: NodeJS.ProcessEnv = process.env): Record<string, NamedProviderRecipe> {
+    const fileConfig = loadConfigFile();
+    const out: Record<string, NamedProviderRecipe> = {};
+    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
+    if (routesPath) {
+        const parsed = safeReadJson(routesPath);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(out, collectNamedProviders(parsed as Record<string, unknown>));
+    }
+    if (fileConfig.providers) {
+        const inline = collectNamedProviders(fileConfig.providers as unknown as Record<string, unknown>);
+        for (const [name, recipe] of Object.entries(inline)) if (out[name] === undefined) out[name] = recipe;
+    }
+    return out;
+}
+
 export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes {
     const fileConfig = loadConfigFile();
     const routes: ProviderRoutes = {};
@@ -1029,7 +1173,7 @@ function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: Compre
  *  sessions actually execute. In plugin mode the static manifest is the ONLY
  *  declaration of the retrieve surface, so the whole ccr block follows the base
  *  config; such overrides only take effect on proxy-mode sessions. */
-export interface CcrOverrideDivergence {
+interface CcrOverrideDivergence {
     /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
     level: string;
     field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
@@ -1096,6 +1240,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
+    const namedProviders = loadNamedProviders(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
@@ -1174,6 +1319,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         upstream,
         auxProxyFallback,
         routes,
+        namedProviders,
         proxy,
         proxyMode,
         proxySource,
@@ -1222,6 +1368,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
+        affinitySimhash: (env.BILI_AFFINITY_SIMHASH ?? (fileConfig.affinitySimhash === false ? "0" : "1")) !== "0",
         resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
@@ -1394,6 +1541,9 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
+    /** Set `false` to disable simhash chain-alignment adoption (#2265,
+     *  default ON; env BILI_AFFINITY_SIMHASH=0 wins over the file). */
+    affinitySimhash?: boolean;
     /** Set `false` to disable resume-fork inheritance (#1486, default ON;
      *  env BILI_RESUME_INHERITANCE=0 wins over the file). */
     resumeInheritance?: boolean;
@@ -1578,7 +1728,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
-    "subagentSplit", "forkAdoption", "resumeInheritance",
+    "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
@@ -1649,6 +1799,7 @@ export function loadConfigFile(): FileConfig {
             const obj = parsed as Record<string, unknown>;
             normalizeLegacyAllowDshCompaction(obj);
             warnUnknownTopLevelKeys(obj);
+            warnInertResignPassthrough(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1691,7 +1842,7 @@ export function normalizeLegacyAllowDshCompaction(obj: Record<string, unknown>):
     }
 }
 /** File shape of ONE scheme's `resign` block (see FileConfig.resign). */
-export interface ResignFileSettings {
+interface ResignFileSettings {
     enabled?: boolean;
     passthrough?: boolean;
     credentialRef?: string;
@@ -1708,7 +1859,7 @@ export const RESIGN_BUILTIN_SCHEME = "sdk-hmac-sha256";
  *  (e.g. "sdk-hmac-sha256"). The built-in key resolves out of the box
  *  (defaults below); other body-covering schemes can be scoped their own
  *  `passthrough` opt-in without opening the built-in one. */
-export type ResignSchemeMap = Record<string, ResignFileSettings>;
+type ResignSchemeMap = Record<string, ResignFileSettings>;
 
 /** Resolved #1884 re-sign settings: env vars win over the config file, the
  *  file wins over the defaults (same precedence family as
@@ -1743,6 +1894,53 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
             : file.passthrough === true;
     const credentialRef = env.BILI_CODEARTS_REF?.trim() || providerBlock.credentialRef || file.credentialRef || undefined;
     return { enabled, passthrough, credentialRef };
+}
+
+// #2260(B)/#2090: pre-v0.1.186 configs may carry `passthrough: true` under a
+// NON-built-in scheme key. Since the compress-or-refuse contract the unsigned
+// pass-through exists ONLY for sdk-hmac-sha256 (both guard sites gate on it),
+// so such a key is inert while its requests stay refused — "my opt-in does
+// nothing". Name the dead key(s) at config load instead of letting the 403
+// body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
+// when the set changes, stay quiet while it stays fixed or empty.
+let inertResignPassthroughSignature: string | null = null;
+function warnInertResignPassthrough(obj: Record<string, unknown>): void {
+    const inert: string[] = [];
+    const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
+        if (!map || typeof map !== "object" || Array.isArray(map)) return;
+        for (const [key, val] of Object.entries(map as Record<string, unknown>)) {
+            if (key === RESIGN_BUILTIN_SCHEME) continue;
+            const block = val !== null && typeof val === "object" && !Array.isArray(val) ? (val as Record<string, unknown>) : {};
+            if (block["passthrough"] !== true) continue;
+            // Same enabled cascade as resolveResignSettings (env > provider >
+            // file > default-true), read straight off the parsed object so the
+            // hook never re-enters loadConfigFile (it runs mid-parse).
+            const fileBlock = ((obj.resign as Record<string, ResignFileSettings> | undefined) ?? {})[key];
+            const providerBlock = providerBlockFor(key);
+            const enabled = process.env.BILI_RESIGN !== undefined
+                ? process.env.BILI_RESIGN !== "0"
+                : providerBlock?.enabled !== undefined
+                    ? providerBlock.enabled
+                    : fileBlock?.enabled !== false;
+            if (enabled) inert.push(key);
+        }
+    };
+    consider(obj.resign, () => undefined);
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const entry of Object.values(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const pmap = (entry as Record<string, unknown>).resign;
+            if (pmap === undefined) continue;
+            consider(pmap, (key) => ((pmap as Record<string, ResignFileSettings> | undefined) ?? {})[key]);
+        }
+    }
+    inert.sort();
+    const sig = inert.join(",");
+    if (sig === "" || sig === inertResignPassthroughSignature) return;
+    inertResignPassthroughSignature = sig;
+    const list = inert.map((k) => `resign["${k}"].passthrough`).join(", ");
+    loggerLog("warn", `[acp-config] ${list}=true is INERT — since the #2090 compress-or-refuse contract, unsigned pass-through exists ONLY for the built-in scheme "${RESIGN_BUILTIN_SCHEME}"; those signed requests stay REFUSED until bili ships a re-signer for them. Restore pre-resign handling with resign["<scheme>"].enabled=false or BILI_RESIGN=0 (the upstream will then reject the rewritten bodies).`);
 }
 
 /** #1660: the self-managed zone port base. Every launcher-spawned lane
@@ -1876,7 +2074,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     return undefined;
 }
 
-export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
@@ -1896,7 +2094,7 @@ export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
-export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
 }
 
@@ -1912,6 +2110,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
+    if (obj.externalSummary !== undefined) {
+        try { out.externalSummary = parseExternalSummaryChain(obj.externalSummary); }
+        catch (error) {
+            // Keep the "unparseable values reject the whole compress block"
+            // contract, but make the rejection VISIBLE with the specific
+            // reason — silently dropping the block also reverts custom
+            // prompts/knobs to defaults, which must never pass unnoticed.
+            loggerLog("warn", `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`);
+            return undefined;
+        }
+    }
     const numberOrPercent = (value: unknown): value is number | string =>
         typeof value === "number" && Number.isFinite(value)
         || (typeof value === "string" && /^\d+(\.\d+)?%$/.test(value.trim()));

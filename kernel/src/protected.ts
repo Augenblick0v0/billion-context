@@ -88,6 +88,98 @@ export function matchToolPattern(toolName: string, pattern: string): boolean {
   return name === pat;
 }
 
+// No boundary class before the name: `/home/u/skills/review-loop/SKILL.md`
+// must capture `review-loop` (the segment immediately before the anchor), and
+// the preceding `/` is exactly the case a boundary class would break. The
+// separator runs on RAW JSON text, where a Windows `\` arrives escaped as a
+// backslash PAIR — so accept `\\` (escaped pair), `\` (unescaped text) or `/`.
+const SKILL_MD_ANCHOR_RE = /([A-Za-z0-9][A-Za-z0-9._-]*)(?:\\\\|\\|\/)SKILL\.md/i;
+
+function isValidSkillName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name.length <= 128 &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)
+  );
+}
+
+function skillNameFromCallText(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const args = parsed as Record<string, unknown>;
+  for (const key of ["skill", "name", "command"]) {
+    const value = args[key];
+    if (typeof value === "string" && isValidSkillName(value)) return value;
+  }
+  return undefined;
+}
+
+/** Canonical path of a tool exchange: skill loads project to `skill/<name>`,
+ *  everything else is the bare tool name. Skill identity lives in the call
+ *  input, not the tool name — opencode calls `skill({name})`, Claude
+ *  Code/ZCode call `Skill({skill})`, and pi has no skill tool at all: any
+ *  tool reading `<dir>/<name>/SKILL.md` loads one (#1947). Projection runs on
+ *  tool-CALL input only; a tool-result projects to its bare tool name (the
+ *  result half of a protected call is covered by toolCallId pairing). */
+export function toolPathOf(msg: CoreMessage): string {
+  const toolName = msg.toolName ?? "";
+  if (!toolName || msg.contentType !== "tool-call") return toolName;
+  if (toolName.toLowerCase() === "skill") {
+    const name = skillNameFromCallText(msg.text);
+    if (name) return `skill/${name}`;
+  }
+  const anchored = (msg.text ?? "").match(SKILL_MD_ANCHOR_RE)?.[1];
+  if (anchored && isValidSkillName(anchored)) return `skill/${anchored}`;
+  return toolName;
+}
+
+/** Match a canonical tool path against a protectedTools/protectedLatestTools
+ *  pattern. Segments split on `/`; within a segment an exact name or a
+ *  trailing-`*` prefix glob (case-insensitive like matchToolPattern — `*`
+ *  never crosses `/`). A single-segment pattern matches the first path
+ *  segment, i.e. the node and ALL its descendants: `skill` ≡ `skill/*`
+ *  (#1947). */
+export function matchToolPath(path: string, pattern: string): boolean {
+  const patSegs = pattern.toLowerCase().split("/");
+  const patFirst = patSegs[0] ?? "";
+  const pathFirst = path.toLowerCase().split("/")[0] ?? "";
+  if (patSegs.length === 1) {
+    return matchToolPattern(pathFirst, patFirst);
+  }
+  const pathSegs = path.toLowerCase().split("/");
+  if (patSegs.length === 2 && patSegs[1] === "*") {
+    return matchToolPattern(pathFirst, patFirst);
+  }
+  return (
+    patSegs.length === pathSegs.length &&
+    patSegs.every((seg, i) => matchToolPattern(pathSegs[i] ?? "", seg))
+  );
+}
+
+/** True when a protectedTools/protectedLatestTools pattern matches a tool
+ *  exchange: by canonical path, or — monotonic fallback — by bare tool name,
+ *  so every match that held before path syntax still holds (a `read` of
+ *  SKILL.md keeps matching a plain `read` pattern; #1947). */
+export function matchToolMessagePattern(
+  msg: CoreMessage,
+  pattern: string,
+): boolean {
+  const toolName = msg.toolName ?? "";
+  if (!toolName) return false;
+  return (
+    matchToolPath(toolPathOf(msg), pattern) ||
+    matchToolPattern(toolName, pattern)
+  );
+}
+
 export function isMessageProtected(
   msg: CoreMessage,
   config: Pick<Config, "protectedTools" | "isToolProtected">,
@@ -107,7 +199,7 @@ export function isMessageProtected(
   }
 
   for (const pattern of config.protectedTools) {
-    if (matchToolPattern(msg.toolName, pattern)) return true;
+    if (matchToolMessagePattern(msg, pattern)) return true;
   }
 
   if (config.isToolProtected?.(msg.toolName, msg.text)) return true;
@@ -177,12 +269,28 @@ export function collectLatestProtected(
   const patterns = config.protectedLatestTools ?? [];
   if (patterns.length === 0) return { callIds, msgIds };
   for (const pattern of patterns) {
+    // Path patterns (containing `/`) protect the latest instance PER PATH —
+    // `skill/*` keeps the newest load of every skill, not just one (#1947).
+    // Plain tool-name patterns keep the single-latest semantics.
+    if (pattern.includes("/")) {
+      const lastByPath = new Map<string, CoreMessage>();
+      for (const m of messages) {
+        if (m.contentType !== "tool-call" || !m.toolName) continue;
+        if (!matchToolMessagePattern(m, pattern)) continue;
+        lastByPath.set(toolPathOf(m), m);
+      }
+      for (const last of lastByPath.values()) {
+        if (last.toolCallId) callIds.add(last.toolCallId);
+        else msgIds.add(last.id);
+      }
+      continue;
+    }
     let last: CoreMessage | undefined;
     for (const m of messages) {
       if (
         m.contentType === "tool-call" &&
         m.toolName &&
-        matchToolPattern(m.toolName, pattern)
+        matchToolMessagePattern(m, pattern)
       ) {
         last = m;
       }

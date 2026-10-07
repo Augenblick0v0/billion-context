@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.185",
+  "version": "0.1.187",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -21,6 +21,7 @@
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "pretypecheck": "npm --prefix kernel run build",
     "typecheck": "tsc --noEmit --project tsconfig.json",
+    "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "pretest": "npm --prefix kernel run build",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",

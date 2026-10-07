@@ -18,7 +18,7 @@ import { once } from "node:events";
 
 export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
 
-export interface WireRule {
+interface WireRule {
     readonly id: string;
     readonly wire: Wire;
     readonly summary: string;
@@ -147,7 +147,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /** WC-001..WC-003, WC-007, WC-010 on an Anthropic /v1/messages body. Returns violation strings. */
-export function validateAnthropicBody(body: unknown): string[] {
+function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     if ("prompt_cache_key" in body)
@@ -340,7 +340,7 @@ export function validateResponsesWsCreate(body: unknown): string[] {
 }
 
 /** WC-006 on a Gemini generateContent/streamGenerateContent body. */
-export function validateGoogleBody(body: unknown): string[] {
+function validateGoogleBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
     body.tools.forEach((entry, i) => {
@@ -376,7 +376,7 @@ export interface CapturedRequest {
     body: unknown;
 }
 
-export interface FakeUpstream {
+interface FakeUpstream {
     wire: Wire;
     port: number;
     url: string;

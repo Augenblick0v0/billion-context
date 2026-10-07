@@ -92,8 +92,10 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 三种对齐模式:`/bili/` URL 前缀、GUI「设置 → 网络」证书 MITM(HTTP 代理 + 根 CA 路径)、原生插件模式(`bili plugin install zcode`,#1145)。ZCode 的扩展面是 Claude-Code 形状但纯声明式:`~/.zcode/cli/config.json` 里的用户级 hooks 与 stdio MCP server,没有进程内 JS 接缝。所以原生通道随包带两个小 node 脚本,在客户端外围干活:
 
 - **安装:** `bili plugin install zcode` 写 `~/.zcode/cli/config.json`:置 `hooks.enabled = true`、追加一条 `SessionStart` process hook(`node <root>/dist/zcode/bootstrap-hook.js`)、注册 stdio MCP server `mcp.servers.bili`(`node <root>/dist/zcode/mcp-entry.js`)。已存在的用户自有 `mcp.servers.bili` 条目**绝不覆盖** —— 安装器会响亮地拒绝。安装时不冻结任何 URL;路由按会话发生。卸载:`bili plugin remove zcode`(只剥离 bili 自己的条目、由 bili 启用的 `hooks.enabled` 予以还原、provider store 从快照恢复)。
+- **卸载后的已开会话(#2155):**`bili plugin remove zcode` 无法触及已开着的客户端窗口 —— 它们的 MCP 子进程已死,但代理侧的会话绑定(session metadata)仍在。这类僵尸会话在连续 5 轮“有 nudge、无插件头、线上无 bili 工具、零压缩”后被检测到,随即**自愈降级为代理模式** —— ACP 工具改由代理线上回注、压缩重新由代理接管(nudge 保留)。若线上注入不可用(`compress.injectTool=false`)则改为静默 nudge,直到出现一次压缩缩减自动解除。插件头重现(客户端重启/重装)即在同一请求内恢复 plugin 模式。remove 命令在近 10 分钟内见过活跃会话时会打印提示;web UI 会为这类会话挂“自愈”徽标。
 - **每会话自举:** 每个 ZCode 会话把 MCP 子进程作为直接子进程拉起;启动时附着到健康代理(`BILLION_CONTEXT_PROXY`)或在临时端口自拉起,然后在 mkdir 锁文件下对生效的 provider store 做幂等 JSON 手术:每个可路由 provider 条目的 `baseURL` 变为 `http://127.0.0.1:<port>/bili/<上游>`(你设的自定义 baseURL 原样保留在包装之内)。两代 store 都处理:legacy `~/.zcode/v2/config.json`(`provider.<id>.options.baseURL`)与 v3.14+ personal store `~/.zcode/v2/provider_config.json`(`config.providerConfigRules.providerRules[].config.api.baseUrl`)—— 两者并存时以新 store 为准(其中哪些条目路由、哪些被跳过见下方路由范围)。原始文件按每次用户编辑快照到 `<file>.bili-bak`(快照永远反映你最后一次真实状态,绝不记录 bili 自己的写入);其余所有键逐字节保留。旧世代客户端在启动时加载 provider 配置 —— 安装后重启一次 ZCode;新版构建可在会话中途感知路由变化(约 1 s 轮询)。`SessionStart` hook 机会性地跑同一套自举(仅附着 —— 绝不 spawn);它的非阻塞竞态被设计为可容忍:第一轮可以走 wire 模式,不变量是 `baseURL` 永不指向死端口。
 - **Plugin 模式盖章:** MCP 子进程对着存活代理清单核验 ACP 工具列表之后,才给路由条目加 `headers["x-bili-plugin"] = "zcode"` —— 此前流量走 wire 模式。工具调用经每次调用的 `conversation_id` 参数绑定(#760)。
+- **清洗什么、绝不动什么(统一 ACP 不变量):** 模型正文中 bili 渲染标签回声 / marker 行 / 退化残骸可在传输中被剥离;**思考通道**(anthropic `thinking`、google `thought`、openai `reasoning_content`/`reasoning`、responses reasoning summaries)、**工具调用参数**(模型写往文件的内容)与**用户消息**逐字节原样透传。
 - **路由范围(#1622):** 原生模式包装**每一个**有可用 http(s) `baseURL` 的 provider 条目 —— 与进程内原生(pi/dsh)的「所有 provider 都吃压缩」语义一致 —— 而不是只包 bigmodel coding-plan 账号。无法安全包装的条目会被跳过并记录原因,而非静默丢弃:
   - **客户端签名账号(#1621):** v3.14+ personal store 上的 coding-plan 账号保持直连(见已知局限);其余 provider 照常路由。
   - **环回目标(#809):** http 环回 `baseURL`(localhost / 127.x.x.x / ::1)永不二次代理 —— 包装它会把 bili 叠在自己或你自己的本地中继上。
@@ -180,7 +182,9 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 
 值得知道的注意事项:
 
-- **限制性 `tools:` 白名单会滤掉 ACP 工具。** frontmatter `tools:` 列表未包含 ACP 工具名的 agent 定义(如内建 `scout` 只列了 `read`/`bash`/…),child 里不会出现这些工具——尽管会话是具名的、压缩也成立。修复前的前台 child 恰好靠代理 wire 注入绕过了白名单拿到工具——所以这类 agent 升级后可用的工具变少了。恢复方式:省略 `tools:` 字段,或补上 `compress,decompress,search_context,acp_status,acp_cache`。该过滤是 pi-subagents 的既有行为,不是本修复引入的回归。
+- **限制性 `tools:` 白名单的角色会自动拿回 ACP 通道(#2268)。** frontmatter `tools:` 列表未包含任何 ACP 工具名的角色——全部 7 个内置角色都是如此(如 `delegate` 只列 `read,grep,find,ls,bash,edit,write,contact_supervisor`)——在 #2185 具名 plugin 化之后**不再**丢失交互式压缩。bili 按请求检测这类 child(pi-subagents 会在每个子会话的 system prompt 打上 `<active_agent name="…">` 标记;门控还要求请求的 tools 数组未暴露任何 bili 可注入的工具名),并为其走 **proxy-style 压缩通道**:wire 注入 ACP 工具 + nudge、服务端执行、`acp_summary` carrier——同时保留 #2185 的具名 plugin 会话身份。无需任何配置改动;角色的原白名单在 wire 上原样保留,白名单中途变更会在下一个请求自愈。范围仅限 nicobailon/pi-subagents 的 child(标记是它的),其他 plugin host 不受影响。若上游日后移除该标记,这些角色会退回 #2268 之前的行为(具名会话、无本地 ACP 工具)。
+  - 暴露**任一** ACP/bili 可注入名的角色保持纯 plugin 模式(重复的工具声明会被上游拒绝),因此**部分授予不受支持**——要么一个都不给,要么全给(`compress,decompress,search_context,acp_status[,acp_cache]`)。
+  - 想让某个特定角色用本地注册(plugin-carrier)的工具?保留手动授权:省略 `tools:` 字段或在其中补上 ACP 工具名即可。
 - **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
 - **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
 

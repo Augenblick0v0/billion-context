@@ -9,8 +9,14 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-05",
+    "updated": "2026-10-06",
     "releases": [
+      {
+        "version": "0.1.186",
+        "date": "2026-10-06",
+        "tier": "critical",
+        "summary": "修复codex 启动器模式启动失败问题,修复claude code账号版本无法使用的问题,修复dsh重试不再泄漏挂死的代理子进程（#2187）。"
+      },
       {
         "version": "0.1.185",
         "date": "2026-10-05",

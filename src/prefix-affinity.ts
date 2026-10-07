@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hammingHex, sketchForCanonical } from "./affinity-simhash.js";
 
 /**
  * Anonymous prefix-affinity session resolution (#309, replaces the #286
@@ -92,15 +93,76 @@ export interface AnonymousAffinity {
     incomingDepth: number;
     /** Chain hash of the incoming tail (log correlation). */
     tailHash: string;
-    /** How the session was resolved: a full-prefix match or a brand-new
-     *  session. (Truncated replays no longer reattach — #1115.) */
-    via: "prefix" | "new";
+    /** How the session was resolved: a full-prefix match, a brand-new
+     *  session, or (#2265) a simhash chain-alignment adoption — the incoming
+     *  history is a near-similar rewrite of the stored chain (client-side
+     *  decorative mutation, e.g. Trae re-stamping model tags on a model
+     *  switch), so the existing session and its fold state are kept.
+     *  (Truncated replays no longer reattach — #1115.) */
+    via: "prefix" | "new" | "simhash";
     /** Per-item hashes of the incoming (trailing, capped at MAX_STORED_ITEMS) —
      *  passed to note() so the tracked chain can serve fork-lineage lookups. */
     itemHashes: string[];
+    /** #2265: per-position simhash sketches of the incoming list (full
+     *  depth, head-anchored) — the server forwards them to note() so the
+     *  adoption rung has current sketches on every outcome, including the
+     *  exact-prefix fast path (an entry noted without sketches would lose
+     *  adoption eligibility on its next request). */
+    sketches?: string[];
+    /** #2265: per-position user-role flags of the incoming (trailing,
+     *  MAX_STORED_ITEMS) — the ownership-anchor gate requires a byte-identical
+     *  USER message for adoption (user words are the conversation's
+     *  fingerprint; harness machinery is not). */
+    userFlags?: boolean[];
+    /** #2265: alignment statistics when via === "simhash" (observability). */
+    adoption?: { coverage: number; meanHamming: number };
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
+}
+
+/** #2265 simhash-adoption policy. Second rung of the identity ladder: run
+ *  only when the exact chain (step 1) did NOT match, i.e. right before a
+ *  re-mint that would orphan the session's fold state. */
+/** Per-position Hamming gates: ≤ SIMILAR counts toward coverage; > DIVERGENT
+ *  (a completely different message anywhere) fails the whole candidate. */
+const ALIGN_SIMILAR_HAMMING = 10;
+const ALIGN_DIVERGENT_HAMMING = 32;
+/** Fraction of aligned positions that must be SIMILAR for adoption. */
+const ALIGN_COVERAGE_MIN = 0.9;
+/** #629 separation guard: a rewrite is PERVASIVE (most positions mutated,
+ *  e.g. a model tag re-stamped on every assistant message); an edit-fork is
+ *  POINT (one or two messages edited, everything else byte-identical). Both
+ *  pass the coverage gate — same per-position Hamming — but only the former
+ *  is a client-side decorative rewrite. Requiring a minimum fraction of
+ *  MUTATED-but-similar positions keeps edit-and-resend/regenerate forks
+ *  minting their own session (#629 block adoption path) instead of merging
+ *  into the parent. */
+const ALIGN_PERVASIVE_MIN_FRACTION = 0.2;
+const ALIGN_PERVASIVE_MIN_POSITIONS = 2;
+/** Minimum byte-identical USER-message positions required for adoption. */
+const ALIGN_EXACT_ANCHOR_MIN = 1;
+/** Shortest list the alignment will judge — a handful of positions is not
+ *  ownership evidence (a shallow match is exactly the #1115 symmetry risk). */
+const ALIGN_MIN_DEPTH = 8;
+/** Incoming may be deeper than the stored chain (client appended turns since
+ *  the last note) but not arbitrarily: a much deeper list is a different
+ *  conversation sharing a head, not an append. */
+const ALIGN_TAIL_APPEND_MAX = 64;
+/** Sketch retention: kept only on the most recently noted anonymous chains
+ *  (memory and snapshot bounds — ~64 chains × depth × 17B ≈ 1MB at depth
+ *  936) and only for chains seen in the last 24h (older chains keep
+ *  exact-hash resolution only, which is what they have always had). */
+const SKETCH_MAX_CHAINS = 64;
+const SKETCH_MAX_DEPTH = 2048;
+const SKETCH_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** #2265 kill-switch: BILI_AFFINITY_SIMHASH=0 disables the simhash adoption
+ *  rung (exact-hash resolution and lineage are unaffected — the ladder simply
+ *  falls through to a fresh mint, the pre-#2265 behavior). */
+let simhashAdoptionEnabled = true;
+export function setSimhashAdoptionEnabled(v: boolean): void {
+    simhashAdoptionEnabled = v;
 }
 
 interface ChainEntry {
@@ -116,6 +178,16 @@ interface ChainEntry {
      *  the anonymous world keeps its own pfa-* ids (#309) even when a client
      *  later replays the same transcript anonymously. */
     identified: boolean;
+    /** #2265: per-position simhash sketches (16-hex each, head-anchored,
+     *  capped at SKETCH_MAX_DEPTH) for the simhash-adoption rung. Present
+     *  only on the SKETCH_MAX_CHAINS most recently noted anonymous chains —
+     *  older/identified chains resolve by exact hash only, as before. */
+    sketches?: string[];
+    /** #2265: per-position user-role flags aligned with itemHashes
+     *  (trailing). The ownership-anchor gate counts exact-hash matches only
+     *  at user positions — user words are the conversation's fingerprint,
+     *  harness machinery is not. Present iff sketches are. */
+    userFlags?: boolean[];
 }
 
 /** On-disk snapshot entry (#499 P1a): the tracked chains persisted across
@@ -129,6 +201,10 @@ export interface AffinitySnapshotEntry {
     itemHashes: string[];
     lastSeen: number;
     identified?: boolean;
+    /** #2265 optional simhash sketches (see ChainEntry.sketches). */
+    sketches?: string[];
+    /** #2265: user-role flags aligned with itemHashes (present iff sketches). */
+    userFlags?: boolean[];
 }
 
 /** Deterministic JSON with recursively sorted object keys, so two replays
@@ -206,6 +282,25 @@ function perItemHashes(messages: unknown[]): string[] {
     return messages.map((m) => sha256(canonicalForHash(m)));
 }
 
+/** #2265: fused per-item fingerprints — one canonical stringify per message
+ *  yields BOTH the position-independent item hash (unchanged semantics) and
+ *  the simhash sketch (memoized by item hash, so unchanged histories cost
+ *  Map lookups on re-resolution). Same total stringify cost as the old
+ *  separate pass; the sketch is the extra product. */
+function itemFingerprints(messages: unknown[]): { itemHashes: string[]; sketches: string[]; userFlags: boolean[] } {
+    const itemHashes: string[] = [];
+    const sketches: string[] = [];
+    const userFlags: boolean[] = [];
+    for (const message of messages) {
+        const canonical = canonicalForHash(message);
+        const h = sha256(canonical);
+        itemHashes.push(h);
+        sketches.push(sketchForCanonical(canonical, h));
+        userFlags.push(!!message && typeof message === "object" && (message as { role?: unknown }).role === "user");
+    }
+    return { itemHashes, sketches, userFlags };
+}
+
 /** Length of the longest common prefix of two per-item hash arrays. */
 function lcpLength(a: string[], b: string[]): number {
     const n = Math.min(a.length, b.length);
@@ -265,7 +360,14 @@ export class PrefixAffinityResolver {
         if (hashes.length === 0 || !hasUserMessage(messages)) return null;
         const incomingDepth = hashes.length;
         const tailHash = hashes[incomingDepth - 1]!;
-        const incItemHashes = perItemHashes(messages);
+        // #2265: one stringify pass yields both the per-item hashes and the
+        //  simhash sketches (memoized by item hash, so an unchanged history
+        //  costs one Map lookup per message). Sketches ride every outcome so
+        //  note() always has current ones — including the fast path below.
+        const fingerprints = itemFingerprints(messages);
+        const incItemHashes = fingerprints.itemHashes;
+        const incSketches = fingerprints.sketches;
+        const incUserFlags = fingerprints.userFlags;
         const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
 
@@ -286,7 +388,41 @@ export class PrefixAffinityResolver {
                 tailHash,
                 via: "prefix",
                 itemHashes: storedItemHashes,
+                sketches: incSketches,
+                userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
             };
+        }
+
+        // 1.5 #2265 simhash chain alignment — before minting fresh, try to
+        //     recognize the incoming list as a NEAR-SIMILAR REWRITE of a
+        //     tracked chain: same length (or a short tail append), every
+        //     position within a small Hamming distance. That shape is a
+        //     client-side decorative mutation (Trae model-tag re-stamp), not
+        //     a different conversation — adopting keeps the session and its
+        //     fold state, and note() below re-anchors the stored chain on the
+        //     mutated bytes so the NEXT request resolves by exact prefix
+        //     again (self-healing back to the fast path). Guards: unique
+        //     candidate only (two passing chains = ambiguity, refuse to
+        //     guess, same ladder discipline as #1692), and any position with
+        //     a completely different message fails the candidate — a forked
+        //     conversation diverges hard somewhere, which is exactly what
+        //     distinguishes adoption from the #1115 symmetric mid-chain match.
+        if (simhashAdoptionEnabled) {
+            const adopted = this.simhashAdopt(incomingDepth, incSketches, incItemHashes, incUserFlags);
+            if (adopted) {
+                return {
+                    sessionId: adopted.sessionId,
+                    matchedDepth: adopted.depth,
+                    storedDepth: adopted.depth,
+                    incomingDepth,
+                    tailHash,
+                    via: "simhash",
+                    itemHashes: storedItemHashes,
+                    sketches: incSketches,
+                    userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
+                    adoption: { coverage: adopted.coverage, meanHamming: adopted.meanHamming },
+                };
+            }
         }
 
         // 2. New session, anchored deterministically on its current tail so an
@@ -333,17 +469,106 @@ export class PrefixAffinityResolver {
             tailHash,
             via: "new",
             itemHashes: storedItemHashes,
+            sketches: incSketches,
+            userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
             ...(lineage ? { lineage } : {}),
         };
     }
 
+    /** #2265: the simhash-adoption scan (policy in the constants above —
+     *  this method is the mechanics). Returns the single passing candidate
+     *  or null; two passing candidates return null (ambiguity refuses to
+     *  guess). Candidates: anonymous chains with fresh sketches, seen within
+     *  SKETCH_TTL_MS, whose depth the incoming list equals or exceeds by at
+     *  most ALIGN_TAIL_APPEND_MAX. Alignment is head-anchored over the
+     *  positions both sides have sketches for. */
+    private simhashAdopt(incomingDepth: number, incSketches: string[], itemHashes: string[], incUserFlags: boolean[]): { sessionId: string; depth: number; coverage: number; meanHamming: number } | null {
+        if (incSketches.length < ALIGN_MIN_DEPTH) return null;
+        const now = Date.now();
+        let winner: { entry: ChainEntry; coverage: number; meanHamming: number } | null = null;
+        let passing = 0;
+        for (const entry of this.trackedChains.values()) {
+            if (entry.identified) continue;
+            if (!entry.sketches || entry.sketches.length < ALIGN_MIN_DEPTH) continue;
+            if (now - entry.lastSeen > SKETCH_TTL_MS) continue;
+            if (incomingDepth < entry.depth) continue;
+            if (incomingDepth - entry.depth > ALIGN_TAIL_APPEND_MAX) continue;
+            const alignLen = Math.min(entry.depth, entry.sketches.length, incSketches.length);
+            if (alignLen < ALIGN_MIN_DEPTH) continue;
+            let similar = 0;
+            let mutated = 0;
+            let total = 0;
+            for (let i = 0; i < alignLen; i++) {
+                const d = hammingHex(incSketches[i]!, entry.sketches![i]!);
+                if (d < 0 || d > ALIGN_DIVERGENT_HAMMING) { similar = -1; break; }
+                total += d;
+                if (d <= ALIGN_SIMILAR_HAMMING) {
+                    similar++;
+                    if (d > 0) mutated++; // similar but NOT byte-identical
+                }
+            }
+            if (similar < 0) continue;
+            const coverage = similar / alignLen;
+            if (coverage < ALIGN_COVERAGE_MIN) continue;
+            if (mutated < Math.max(ALIGN_PERVASIVE_MIN_POSITIONS, alignLen * ALIGN_PERVASIVE_MIN_FRACTION)) continue;
+            // Ownership anchor (#2265): a decorative client-side rewrite
+            // mutates harness/model-authored items (model tags on assistant
+            // messages, reminder wrappers) but leaves the user's own words
+            // byte-identical. Two genuinely DIFFERENT conversations — even
+            // ones whose boilerplate is 95% shared, so every position passes
+            // the Hamming gate and their machinery items hash identically —
+            // never share a USER message. The anchor therefore only counts
+            // exact matches at user positions: the user's words are the
+            // conversation's fingerprint.
+            const entryHashes = entry.itemHashes;
+            const entryUsers = entry.userFlags;
+            if (!entryUsers) continue;
+            let exactUser = 0;
+            for (let i = 0; i < entryHashes.length && i < entryUsers.length; i++) {
+                if (!entryUsers[i]) continue;
+                const rawPos = entry.depth - entryHashes.length + i;
+                if (rawPos < 0 || rawPos >= itemHashes.length || rawPos >= incUserFlags.length) continue;
+                if (incUserFlags[rawPos] && itemHashes[rawPos] === entryHashes[i]) exactUser++;
+            }
+            if (exactUser < ALIGN_EXACT_ANCHOR_MIN) continue;
+            passing++;
+            if (passing > 1) return null; // ambiguous — refuse to guess
+            winner = { entry, coverage, meanHamming: total / alignLen };
+        }
+        return winner ? { sessionId: winner.entry.sessionId, depth: winner.entry.depth, coverage: winner.coverage, meanHamming: winner.meanHamming } : null;
+    }
+
     /** Record the chain of a session (on creation and after every anonymous
      *  request — the incoming history is the truth, appends extend it).
-     *  `identified` marks client-provided-id chains (#1486); see ChainEntry. */
-    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false): void {
+     *  `identified` marks client-provided-id chains (#1486); see ChainEntry.
+     *  `sketches` (#2265) carries the incoming list's simhash sketches so the
+     *  adoption rung has current ones; stored head-anchored, capped at
+     *  SKETCH_MAX_DEPTH, and only on the SKETCH_MAX_CHAINS most recently
+     *  noted anonymous chains (older chains keep exact-hash resolution). */
+    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false, sketches?: string[], userFlags?: boolean[]): void {
         const tracked = this.trackedChains;
         tracked.delete(sessionId);
-        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now(), identified });
+        const storedSketches = !identified && sketches && sketches.length > 0 ? sketches.slice(0, SKETCH_MAX_DEPTH) : undefined;
+        const storedUsers = storedSketches !== undefined && userFlags && userFlags.length > 0 ? userFlags.slice(-MAX_STORED_ITEMS) : undefined;
+        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now(), identified, sketches: storedSketches, userFlags: storedUsers });
+        // #2265 sketch retention: bound how many chains carry sketches. A
+        //  fresh note re-anchors the winner, so an eviction from the sketch
+        //  window only degrades that chain to exact-hash resolution.
+        if (storedSketches !== undefined) {
+            const withSketches = [...tracked.values()].filter((e) => e.sketches !== undefined);
+            if (withSketches.length > SKETCH_MAX_CHAINS) {
+                const drop = new Set(
+                    withSketches
+                        .sort((a, b) => a.lastSeen - b.lastSeen)
+                        .slice(0, withSketches.length - SKETCH_MAX_CHAINS)
+                        .map((e) => e.sessionId),
+                );
+                for (const id of drop) {
+                    const e = tracked.get(id);
+                    if (e) { delete e.sketches; delete e.userFlags; }
+                }
+            }
+        }
         while (tracked.size > MAX_TRACKED_SESSIONS) {
             const oldest = [...tracked.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0];
             if (!oldest) break;
@@ -407,6 +632,25 @@ export class PrefixAffinityResolver {
         return best ? { sessionId: best.sessionId, sharedDepth: best.sharedDepth } : null;
     }
 
+    /** #2241: does `messages` continue the tracked chain of `sessionId`?
+     * True when the session's stored chain is a byte-exact head-anchored
+     * prefix of the incoming list — the progressive hash at the stored
+     * depth equals the stored tail hash (equal depth = byte-exact replay,
+     * which also counts). The building block for the dsh persona anchor
+     * migration: a system-text change whose history continues the raw
+     * key's chain is the SAME conversation (model switch), not a new
+     * persona. Cryptographic equality of the whole prefix is the
+     * discriminator — no depth floor beyond chainHashes' MIN_CANONICAL_BYTES. */
+    chainContinues(messages: unknown[], sessionId: string): boolean {
+        const entry = this.trackedChains.get(sessionId);
+        if (!entry) return false;
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return false;
+        const hashes = chainHashes(msgs);
+        if (hashes.length === 0 || msgs.length < entry.depth) return false;
+        return hashes[entry.depth - 1] === entry.tailHash;
+    }
+
     /** Drop tracking for a removed session. */
     forget(sessionId: string): void {
         this.trackedChains.delete(sessionId);
@@ -425,6 +669,7 @@ export class PrefixAffinityResolver {
             itemHashes: e.itemHashes,
             lastSeen: e.lastSeen,
             identified: e.identified,
+            ...(e.sketches ? { sketches: e.sketches, ...(e.userFlags ? { userFlags: e.userFlags } : {}) } : {}),
         }));
     }
 
@@ -441,6 +686,23 @@ export class PrefixAffinityResolver {
             if (typeof e.sessionId !== "string" || typeof e.depth !== "number" || typeof e.tailHash !== "string") continue;
             if (!Array.isArray(e.itemHashes) || e.itemHashes.some((h) => typeof h !== "string")) continue;
             if (typeof e.lastSeen !== "number") continue;
+            // #2265: optional per-position simhash sketches — defensive, a
+            //  malformed list degrades the entry to exact-hash resolution.
+            let sketches: string[] | undefined;
+            if (Array.isArray(e.sketches)) {
+                const valid = (e.sketches as unknown[]).filter(
+                    (s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s),
+                );
+                if (valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
+            }
+            // #2265: user-role flags for the ownership-anchor gate — optional,
+            //  malformed lists simply degrade the entry (no user anchor → the
+            //  simhash rung skips it, exact-hash resolution still works).
+            let userFlags: boolean[] | undefined;
+            if (sketches !== undefined && Array.isArray(e.userFlags)) {
+                const validU = (e.userFlags as unknown[]).filter((u): u is boolean => typeof u === "boolean");
+                if (validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
+            }
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
                 depth: e.depth,
@@ -448,6 +710,8 @@ export class PrefixAffinityResolver {
                 itemHashes: (e.itemHashes as string[]).slice(-MAX_STORED_ITEMS),
                 lastSeen: e.lastSeen,
                 identified: e.identified === true,
+                sketches,
+                ...(userFlags ? { userFlags } : {}),
             };
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);

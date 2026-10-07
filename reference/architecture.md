@@ -12,6 +12,7 @@ billion-context/
 │   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launcher
 │   ├── server.ts                 # HTTP proxy server, request pipeline (hot file — §7.2)
 │   ├── server/                   # Server-side support modules
+│   │   ├── admin.ts              #   /__bili/* + /__acp/* admin route surface (stats/status/overview/sessions/detail/logs/config/plugin/watcher/upstream endpoints), loopback + trusted-origin gated (#1440)
 │   │   ├── budget.ts             #   chars/4 overhead measure outside the kernel fold space
 │   │   ├── chain-artifacts.ts    #   Allocation-free byte pre-filter for chain artifacts (#1421)
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
@@ -96,6 +97,14 @@ billion-context/
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
+│   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
+│   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs
+│   ├── external-summary-settings.ts # Global external-summary target and budget validation
+│   ├── external-summary-config.ts # Strict external-summary config loading
+│   ├── external-summary-credentials.ts # Separate atomic credential store
+│   ├── external-summary-runtime.ts # Configured candidate plan and shared executor
+│   ├── external-summary-compress.ts # External summary fold coordinator and state checks
+│   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)

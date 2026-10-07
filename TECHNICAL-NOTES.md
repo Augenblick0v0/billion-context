@@ -298,3 +298,125 @@ so direct callers cannot corrupt a store either. Mixing *commands* is fine
 mixing *writers* is what the guard forbids. `bili plugin update [client]`
 is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
+
+## Stuck-session self-heal — detection constants and remedies (#2155)
+
+Three failure shapes share one detector family in `src/session-self-heal.ts`,
+evaluated once per request (after `prepare`, on the nudge-carrying lanes only;
+bypass and side lanes never earn credit):
+
+- **D2 zombie plugin lane** — the plugin was uninstalled (or its MCP child
+  died) but already-open client windows keep the session plugin-bound
+  (sticky `metadata.pluginAgent`, `src/server.ts`). Signal: 5 consecutive
+  rounds (`SELF_HEAL_WINDOW`) that were nudged, carried **no** `x-bili-plugin`
+  header, declared **no** bili tools on the wire, and produced **no**
+  compression reduction. Remedy: **degrade to proxy mode** — the single
+  `pluginMode` flip (`pluginAgent !== undefined && !pluginLaneDegraded(session)`)
+  re-injects the ACP tools wire-side, re-arms the compress rewriter, CCR
+  stamping and absorb, and **keeps the nudge** (the tools are back). When wire
+  injection is unavailable (`compress.injectTool=false` → `degradeAvailable`
+  false) the remedy falls back to **suppress-nudge**. Recovery: the live
+  plugin header (`pluginLaneRestore`, hoisted BEFORE the `pluginMode` flip so
+  the first header-bearing request is already plugin mode — the sticky
+  `pluginAgent` must NOT be used as the restore signal or the degrade clears
+  one round after arming). The binding is kept, never erased.
+- **D1 nudge idle** (non-plugin generalization) — 5 consecutive nudged rounds
+  with zero reduction and zero bili tool uses. Remedy: suppress the nudge at
+  all four `willInjectNudge` gates (`&& !nudgeSuppressed(session)`, covering
+  the emergency path too). Recovery: any compression reduction or bili tool
+  use lifts the suppression.
+- **D3 gateway-killed summaries** — a **non-streaming** preflight summary that
+  dies with HTTP 524/504 (Cloudflare class) is not retried in place (the old
+  transient-retry path burned ~100 s per attempt against a dead gateway);
+  instead the session learns `metadata.preflightStreamSummary = true` on the
+  **first** hit and the summary is re-requested as SSE — the same learned
+  store as the manual `compress.streamSummary` knob (#2133), auto-armed.
+  The cascade is honored in both directions: an explicit `streamSummary:
+  false` anywhere (global → provider → model) is the operator's opt-out —
+  neither learn path arms and a stale learned flag is ignored
+  (`streamSummaryOff` in `PreflightDeps`).
+
+Observability: `session.metadata.selfHeal = { detected, action, since }` is
+exposed in `/__bili/sessions`, badged in the web UI ("heal"), and every
+transition logs one `[self-heal]` line (detect + recovery). `bili plugin
+remove <client>` best-effort queries the live proxy (instance file →
+`GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
+when sessions of that client were active within the last **10 minutes**.
+
+## Unified ACP tag-echo remediation — the four invariants (#2023/#2066/#2190/#2248)
+
+One PR folds the three remediation legs together (refs-run residue #2023,
+degenerate-close stripping + egress audit net #2190, emission drop +
+signed-thinking verbatim #2066) under a single set of hard rules that govern
+EVERY text-rewriting surface (loop adapters, plugin passthrough, JSON strip
+functions, exit audits):
+
+1. **The thinking channel is byte-verbatim.** Anthropic `thinking`, Google
+   `thought`, OpenAI `reasoning_content`/`reasoning`, and Responses reasoning
+   summaries ride as-is — echo-shaped reasoning included. Rationale: reasoning
+   replay (DeepSeek-style) and signature verification validate these bytes;
+   any rewrite desyncs them and bricks the session (#1960/KDD#10). The
+   adapters route these fields through `createIdentityStreamFilter`, and the
+   strip functions (`stripOpenaiChatText`, `stripResponsesText`) leave them
+   untouched (defense in depth). NOTE: this REVERSES the pre-#1881-era
+   reasoning-echo strip — the thinking channel is no longer cleaned.
+2. **Model prose is manageable.** Render-tag echoes, marker lines,
+   bili-internal text, degenerate open/close residue, and (when
+   absorb-instructed) whole tool-call emissions are stripped from the visible
+   text channel only.
+3. **Model output bound for files is byte-identical (#1039).** Tool-call
+   arguments never enter any filter, whatever bytes they carry.
+4. **User-sent bytes are never rewritten.** A verbatim echo of the user's own
+   fragment survives even when stripping is armed (#463 exemption, keyed on
+   the request text, not shape).
+
+The egress audit net (#2248) stays log-only: raw exits (unrecognized frames,
+parse failures) forward as-is and log `[tag-echo] raw exit` so new leak shapes
+become visible without changing the wire. Pinned by
+`tests/unified-acp-invariants.test.ts` (eight tests, both lanes).
+
+## Cache-ledger accrual is coverage-conditioned (#2202)
+
+The ledger books each request against every elapsed fold
+(`requestsAfter += 1` per sample), and the panel turns that counter into
+`netSaved = Σ (S − σ) × requestsAfter`. Booking is a *claim that this
+request benefited from the fold* — which is only true while the fold's
+covered bytes actually ride the resent wire. When a host removes them
+outside bili's knowledge (dsh native compaction, #2193), the old counter
+kept climbing on a destroyed substrate: the #2193 incident showed
+netSaved at 355M while 1510 covered ids were permanently gone.
+
+The fix is writer-side, at the claim site: `reconcileFoldCoverage`
+already inspects every inbound pass for exactly this evidence, so it now
+also records per-block presence into
+`session.metadata["foldCoverageByBlock"]` — `{p, r, t, e}` per blockId
+(present verbatim / reclaimed via re-anchor / total covered / ever-present
+latch). The ledger links each fold to its block with a sparse
+`LedgerFold.bid` (set once in `recordCacheFoldsFromBlocks`, the single
+choke point for both the eager proxy path and the lazy plugin-mode path),
+and scales the increment by the measured fraction `(p + r) / t`:
+
+- **1** — full coverage, or no usable record → byte-identical to the
+  pre-#2202 counter (healthy sessions and all legacy entries);
+- **f** — partial coverage → proportional accrual;
+- **0** — verified coverage-lost → accrual frozen until coverage returns.
+
+Two classes are self-calibrated by the `e` latch: a fold whose covered ids
+were *ever* seen present is verifiable, so total absence means loss; a fold
+whose ids *never* appeared post-creation is structurally unverifiable
+(view-folding hosts that resend folded views instead of raw originals) and
+keeps status-quo booking rather than being silently zeroed. Coverage-lost
+is live-computed (`e === 1 && p + r === 0`), so recovery resumes accrual
+with no sticky state; one warn/info log fires per flip
+(`foldCoverageLostLogged` dedup key).
+
+Evidence hygiene mirrors the #1195 guard: side-request-shaped passes
+(< 10 inbound messages — title-gen, WebSearch refinement) take NO
+evidence at all (no records, no backbone roll, no drift-streak movement,
+no resets), because a short pass would skew the next pass's alignment and
+manufacture phantom total-loss.
+
+Panel presentation keeps lost folds out of the headline number: the web
+sessions view shows them as separate labeled segments (row tooltip,
+overview sub-line, detail stat) — frozen pre-loss savings stay visible,
+post-loss growth stops.

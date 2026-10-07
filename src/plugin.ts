@@ -11,17 +11,18 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
+import { externalSummaryEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
-import { executeProxyTool } from "./loop/core.js";
+import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
-import { degenerateTurnWarning } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -62,23 +63,23 @@ const PROXY_VERSION = (() => {
 //      args}, under the session lock, against the same executeProxyTool the
 //      wire-mode compress loop uses.
 
-export const PLUGIN_AGENT_HEADER = "x-bili-plugin";
-export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
+const PLUGIN_AGENT_HEADER = "x-bili-plugin";
+const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
 /** #920: legacy-lane marker. Set by the absorbed opencode-acp wrapper for
  *  sessions that still run through the legacy DCP machinery — the proxy
  *  forwards such requests VERBATIM (no wire injection, no session binding,
  *  no compress loop): the legacy extension owns compression for them. */
-export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
-export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
-export const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
-export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
+const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
+const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
+const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
+const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
 /** #1102/#1106: stamped "1" by plugins whose host mints one conversation id per
  *  persona (opencode: subagents get their own child session ids). Since the
  *  instructions fingerprint became an allowlist (#1106 — exempt is the
  *  default for every non-codex/non-claude signal), this declaration is
  *  vestigial: hosts keep stamping it for protocol compatibility with older
  *  proxies, but current proxies key verbatim regardless. */
-export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
 /** #1699: the host's per-request persona/agent id (opencode v2 stamps its own
  *  taxonomy — "title", "build", "plan", ...). Carries INTENT the request body
  *  cannot express: opencode v2 title-gen requests carry NO max_tokens (options
@@ -87,15 +88,15 @@ export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mu
  *  compress prompt + tool injected into the title model. Known side-request
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
-export const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
-export const PLUGIN_PROTOCOL_VERSION = 1;
+const PLUGIN_PROTOCOL_VERSION = 1;
 
 /** #1567: folds executed through POST /__bili/plugin/tool are minted this
  *  synthetic callId, which the client can never echo back — its own re-sent
  *  compress pair is the summary carrier for such blocks, so the kernel's
  *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
-export const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
+const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
 export function isPluginFoldCallId(callId: string | undefined): boolean {
     return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
 }
@@ -125,15 +126,11 @@ export function pluginConversationHeader(headers: Record<string, string | string
     return headerValue(headers, PLUGIN_CONVERSATION_HEADER);
 }
 
-export function pluginBypassHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
-    return headerValue(headers, PLUGIN_BYPASS_HEADER);
-}
-
 /** The plugin reports its agent's own model context window (what the agent
  *  configured, e.g. a pinned/overridden contextWindow). It replaces the
  *  native-window source (built-in table / models.dev registry) in the config
  *  cascade — operator tuning (compress.modelContextLimit) still outranks it. */
-export function pluginContextWindowHeader(headers: Record<string, string | string[] | undefined>): number | undefined {
+function pluginContextWindowHeader(headers: Record<string, string | string[] | undefined>): number | undefined {
     const raw = headerValue(headers, PLUGIN_CONTEXT_WINDOW_HEADER);
     if (raw === undefined) return undefined;
     const n = Number.parseInt(raw, 10);
@@ -468,7 +465,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // (server.ts binding step): that session becomes plugin-mode (native tools,
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
-export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
+type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
 
 /** Runtime-info protocol entry (#955): what the client's OWN config says it
  *  will run — reported at plugin bootstrap and on model switch, before (and
@@ -480,7 +477,7 @@ export type PendingPluginRegister = { conversationId: string; agent: string; ts:
  *  many sessions (main + subagents) that share the agent name but report
  *  different windows, and a single per-agent slot let the last reporter
  *  clobber everyone else's entry. */
-export type PluginRuntimeInfo = {
+type PluginRuntimeInfo = {
     agent: string;
     model: string;
     contextWindow?: number;
@@ -742,13 +739,14 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
-    const acpAnthropic = ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE;
-    const acpOpenai = ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE;
+    const externalSummary = externalSummaryEnabled(config);
+    const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
+    const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = BILI_ACP_TOOLS_RESPONSES_NO_RANGE;
+    const acpResponses = withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -765,7 +763,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
-        capabilities: { fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint" } } : {}), fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
     }));
 }
 
@@ -776,6 +774,7 @@ export type PluginToolDeps = {
     // Browser-reachable origin of THIS proxy (http://host:port) for the human-facing
     // Web UI deep links inside panels/reports; absent in test harnesses/embeds.
     webOrigin?: string;
+    signal?: AbortSignal;
 };
 
 /** Reverse-lookup the conversation id bound to a session id. #656: the
@@ -1124,7 +1123,7 @@ export function recordChainVerdict(sessionId: string, kind: string, protocol: st
     }
     return first;
 }
-export function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
+function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
     return chainVerdicts.get(conversationId);
 }
 export function _resetChainVerdictsForTest(): void {
@@ -1494,7 +1493,7 @@ export async function handlePluginTool(
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
             const pendingBefore = new Set(session.pendingRetrievals.map((p) => p.ref));
-            const toolResult = executeProxyTool(tool, args, {
+            const toolResult = await executeProxyToolAsync(tool, args, {
                 core: deps.core,
                 // #833: run proxy tools under the session's last resolved Config
                 // (same values the wire path used), not the base kernelConfig.
@@ -1502,7 +1501,7 @@ export async function handlePluginTool(
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
-            }, callId);
+            }, callId, undefined, deps.signal);
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -1723,6 +1722,14 @@ export async function pipePluginChatWithStrip(
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
+    // True when the outbound request carried the [ACP absorb] instruction:
+    // the model may then answer with a tool call written as prose, and the
+    // filters apply the whole-field emission drop (gated on request
+    // provenance, not string shape — m00885).
+    absorbInstructed?: boolean,
+    // The shipped request text: an emission-shaped span the user asked to
+    // output verbatim is echoed, not dropped (m00885).
+    requestText?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -1734,6 +1741,12 @@ export async function pipePluginChatWithStrip(
         sawStrippedEcho = true;
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
+    // #2190: the filter released bytes that still carry echo-residue shape —
+    // the leak is now observable instead of silent. Log-only; the bytes were
+    // already decided by the state machine.
+    const onResidueWarn = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const onMarkerDrop = (snippet: string) => {
         sawStrippedEcho = true;
@@ -1758,7 +1771,15 @@ export async function pipePluginChatWithStrip(
         const key = `${field}:${index}`;
         let s = streams.get(key);
         if (!s) {
-            s = { filter: composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            // #1960/KDD#10: signed thinking (Anthropic `thinking_delta`, Gemini
+            // `thought` parts) must ride byte-for-byte — any rewrite desyncs its
+            // signature and bricks replay. Route it through an identity filter
+            // instead of the prose filters (matches the loop adapters).
+            // Unified ACP invariant (#2229): the same treatment extends to the
+            // openai reasoning fields — the thinking channel is NEVER
+            // rewritten, only the visible text channel is.
+            const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
+            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -1842,9 +1863,16 @@ export async function pipePluginChatWithStrip(
      *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (refetch === undefined || truncationRetried) return false;
+        // #2303: a terminal turn whose visible prose ends with a compression-draft
+        // closing tag and no tool call is non-converged even though it has visible
+        // text — the model wrote a handoff/compression draft in prose instead of
+        // issuing the action it described (149 silent stops / 70 sessions, DSH
+        // native). Treat it like the empty-turn shape below so at worst the client
+        // gets one extra continuation instead of losing the whole turn.
+        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
-        if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
+        if (!draftTail && (visibleTextChars > releasedMarkupChars || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
         if (degenerateRetried) {
@@ -1859,10 +1887,13 @@ export async function pipePluginChatWithStrip(
         // A turn the model left genuinely bare — no thought, no stripped echo,
         // no released markup — is the upstream's own empty answer, not a stall:
         // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop).
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -2079,6 +2110,9 @@ export async function pipePluginChatWithStrip(
         }
         const choices = ev["choices"];
         if (!Array.isArray(choices)) {
+            // #2190: no-choices frames bypass the state machine — audit them.
+            // No tool_calls exclusion needed: arguments live under choices.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         let rebuilt: Record<string, unknown> | null = null;
@@ -2135,10 +2169,17 @@ export async function pipePluginChatWithStrip(
                 // leap ahead of a held tail.
                 if (v.length > 0) hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !anyPending()) {
+                // An absorb-instructed request may carry a whole-field
+                // tool-call emission: route it to the filter so the
+                // whole-field decision runs (m00885). Degenerate-close
+                // residue (#2190) rides the same routing.
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !(absorbInstructed === true && mayStartToolCallEmission(v)) && !anyPending()) {
                     if (v.length > 0) {
                         keptText = true;
                         proseAcc += v;
+                        // #2190: residue audit — bytes that bypassed the state
+                        // machine must be observable, not silent.
+                        if (containsEchoResidue(v)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${v.slice(0, 80).replace(/\n/g, " ")}`);
                     }
                     if (field === "content") visibleTextChars += v.length;
                     continue;
@@ -2199,6 +2240,9 @@ export async function pipePluginChatWithStrip(
             }
             return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        // #2190: these exits forward frames whose text lived outside the
+        // managed fields — audit them (argument frames excluded: #1039).
+        if (!openaiFrameHasToolCalls(choices)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
@@ -2220,9 +2264,13 @@ export async function pipePluginChatWithStrip(
                     args: "",
                 });
             } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
+            // #2248: raw exit — content_block_start payloads never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         if (ev["type"] !== "content_block_delta") {
+            // #2248: raw exit — non-delta events never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         const d = ev["delta"] as Record<string, unknown> | undefined;
@@ -2238,12 +2286,22 @@ export async function pipePluginChatWithStrip(
         }
         const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
         if (field === null || typeof d?.[field] !== "string") {
+            // #2248: raw exit — unmanaged delta types never enter the filter.
+            // input_json_delta excluded: tool-call arguments are user intent (#1039).
+            if (d?.["type"] !== "input_json_delta") auditRawForward(rawEvent);
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
-            if (raw.length > 0) proseAcc += raw;
+        // Whole-field tool-call emission on an absorb-instructed request
+        // (m00885): the filter's field-start hold decides on the complete
+        // field, so the fast path must not pre-empt it.
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+            if (raw.length > 0) {
+                proseAcc += raw;
+                // #2190: residue audit — see the twin above.
+                if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
+            }
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -2276,6 +2334,8 @@ export async function pipePluginChatWithStrip(
         if (ev["error"] !== undefined) sawTerminal = true;
         const candidates = ev["candidates"];
         if (!Array.isArray(candidates)) {
+            // #2248: raw exit — non-candidates frames never enter the filter.
+            auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         let rebuilt: Record<string, unknown> | null = null;
@@ -2329,10 +2389,15 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
+                // Whole-field tool-call emission on an absorb-instructed
+                // request (m00885) — see processOpenai. Degenerate-close
+                // residue (#2190) rides the same routing.
+                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
                     if (raw.length > 0) {
                         keptText = true;
                         proseAcc += raw;
+                        // #2190: residue audit — see the twin above.
+                        if (containsEchoResidue(raw)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${raw.slice(0, 80).replace(/\n/g, " ")}`);
                     }
                     if (field === "text") visibleTextChars += raw.length;
                     continue;
@@ -2397,6 +2462,10 @@ export async function pipePluginChatWithStrip(
             if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
             return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        // #2248: raw exit — text outside managed parts never enters the filter.
+        // Frames carrying non-text parts (functionCall/functionResponse, ...) hold
+        // structured or user data (#1039) and are excluded from the audit.
+        if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
@@ -2429,6 +2498,8 @@ export async function pipePluginChatWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        // #2190: unparseable frames bypass every filter — audit them.
+                        auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
@@ -2546,6 +2617,44 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
     return false;
 }
 
+// #2190: residue audit for frames forwarded verbatim by a raw exit — i.e. a
+// frame whose text lives OUTSIDE the managed fields (or is not parseable) and
+// therefore never touches the tag-echo state machine. Log-only: the bytes are
+// forwarded exactly as received (#1039 wire fidelity); the point is that such
+// a leak is observable in the log instead of silent.
+function auditRawForward(rawEvent: string): void {
+    if (containsEchoResidue(rawEvent)) {
+        loggerLog("warn", `[tag-echo] raw forward carried echo-residue-shaped bytes (#2190): ${rawEvent.slice(0, 80).replace(/\n/g, " ")}`);
+    }
+}
+
+// #2190 companion to auditRawForward: tool-call argument fragments are user
+// intent (#1039) and may legitimately match the residue shape, so frames
+// carrying them are excluded from the audit.
+function openaiFrameHasToolCalls(choices: unknown): boolean {
+    if (!Array.isArray(choices)) return false;
+    for (const c of choices) {
+        const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
+        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
+    }
+    return false;
+}
+
+// #2248 companion to auditRawForward (responses wire): tool-call argument
+// streams (response.function_call_arguments.*, response.custom_tool_call_input.*)
+// fall through the unrecognized-type exit and are user intent (#1039) — exclude.
+function responsesFrameHasToolCalls(ev: Record<string, unknown>): boolean {
+    const t = ev["type"];
+    if (typeof t === "string" && (t.includes("function_call") || t.includes("custom_tool_call"))) return true;
+    if (ev["arguments"] !== undefined) return true;
+    const item = ev["item"];
+    if (item && typeof item === "object") {
+        const it = (item as Record<string, unknown>)["type"];
+        if (it === "function_call" || it === "custom_tool_call") return true;
+    }
+    return false;
+}
+
 /** The Gemini counterpart of hadTextOtherThanTextFields: does a frame whose
  *  text parts were all stripped still carry something the client needs? A
  *  finishReason, a functionCall/functionResponse part, usageMetadata or
@@ -2601,6 +2710,11 @@ export async function pipePluginResponsesWithStrip(
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
+    // See pipePluginChatWithStrip: whole-field tool-call emission drop,
+    // gated on the request carrying the [ACP absorb] instruction (m00885).
+    absorbInstructed?: boolean,
+    // m00885: echoed (user-requested verbatim) emission spans survive.
+    requestText?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2610,13 +2724,17 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
+    // #2190: log-only residue audit — see the twin above.
+    const onResidueWarn = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
     const onBiliDrop = (snippet: string) => {
         loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
     };
     const tagFilter = composeStreamFilters(
         composeStreamFilters(
-            createTagEchoFilter(onTagDrop),
+            createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText),
             createMarkerLineFilter((snippet) => {
                 loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
@@ -2848,16 +2966,22 @@ export async function pipePluginResponsesWithStrip(
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
-        if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
+        // #2303: same shape as the chat-pipe twin — visible prose ending in a
+        // compression-draft closing tag with no function call is non-converged.
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
-        // the compress loop).
-        if (!sawReasoning && !sawStrippedEcho) return false;
+        // the compress loop). A draft-tail turn delivered a full handoff draft:
+        // precisely the stall signal.
+        if (!sawReasoning && !sawStrippedEcho && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -2905,7 +3029,7 @@ export async function pipePluginResponsesWithStrip(
             for (const k of ["item_id", "output_index", "summary_index"]) {
                 if (ev[k] !== undefined) meta[k] = ev[k];
             }
-            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createBiliArtifactFilter(onBiliDrop)), type, field, meta };
+            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createBiliArtifactFilter(onBiliDrop)), type, field, meta };
             argStreams.set(key, s);
         }
         return s;
@@ -2949,6 +3073,8 @@ export async function pipePluginResponsesWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        // #2190: unparseable frames bypass every filter — audit them.
+                        auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
@@ -3000,12 +3126,12 @@ export async function pipePluginResponsesWithStrip(
                     // The done is not visible text to the degenerate-turn retry below, so it
                     // is stripped and released directly.
                     if (type === "response.reasoning_summary_part.done") {
-                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
-                        if (hadEcho) sawStrippedEcho = true;
-                        const evOut = hadEcho ? stripResponsesText(ev) : ev;
-                        proseAcc += responsesEventText(evOut);
-                        const out = hadEcho ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
-                        await write(flushArgTails() + flushTail(out));
+                        // Unified ACP invariant: reasoning summaries are the
+                        // thinking channel — byte-verbatim, no strip pass. The
+                        // text still feeds proseAcc so degenerate-turn
+                        // accounting sees it.
+                        proseAcc += responsesEventText(ev);
+                        await write(flushArgTails() + flushTail(rawEvent + "\n\n"));
                         continue;
                     }
                     if (type === "response.output_text.done" || type === "response.content_part.done" || type === "response.output_item.done") {
@@ -3013,11 +3139,15 @@ export async function pipePluginResponsesWithStrip(
                         // retryEmptyTurn): releasing it earlier would hand the
                         // client the echo's own text exactly when the retry is
                         // about to replace it.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
+                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+                        // Whole-field tool-call emission (m00885) — an absorb-instructed
+                        // turn may answer as prose; drop the span, not just the tags.
+                        const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
-                        if (rebuild) evOut = stripResponsesText(ev);
+                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
                         const doneText = responsesEventText(evOut);
                         heldVisibleChars += doneText.length;
@@ -3063,11 +3193,15 @@ export async function pipePluginResponsesWithStrip(
                         heldVisibleChars = 0;
                         // The completion frame itself closes the turn: strip it if it
                         // carries echoed text, rewrite retry ids onto the first attempt's.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
+                        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+                        // Whole-field tool-call emission (m00885) — an absorb-instructed
+                        // turn may answer as prose; drop the span, not just the tags.
+                        const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
-                        if (rebuild) evOut = stripResponsesText(ev);
+                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
                         rewriteRetryIds(evOut);
                         // Hosts finish on this frame, before EOF settles billing and late usage.
                         if (session && acc.inputTokens !== undefined && acc.inputTokens > 0) {
@@ -3084,10 +3218,15 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !tagFilter.pending()) {
+                        // Whole-field emission head (m00885): the filter's
+                        // field-start hold must see the first bytes. Degenerate
+                        // close (#2190) rides the same routing.
+                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDegenerateRenderTag(delta) && !(absorbInstructed === true && mayStartToolCallEmission(delta)) && !tagFilter.pending()) {
                             proseAcc += delta;
                             visibleTextChars += delta.length;
                             fastPathChars += delta.length;
+                            // #2190: residue audit — see the twin above.
+                            if (delta.length > 0 && containsEchoResidue(delta)) loggerLog("warn", `[tag-echo] fast path forwarded echo-residue-shaped bytes (#2190): ${delta.slice(0, 80).replace(/\n/g, " ")}`);
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -3112,32 +3251,21 @@ export async function pipePluginResponsesWithStrip(
                         await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
-                    // Reasoning summary deltas carry visible prose; function_call
-                    // argument deltas are user intent and pass through verbatim
-                    // (#1039), falling into the generic rawEvent write below.
-                    const argField = type === "response.reasoning_summary_text.delta" ? "delta" : null;
-                    if (argField !== null && typeof type === "string") {
-                        const v = ev[argField];
-                        if (typeof v !== "string" || v.length === 0) {
-                            await write(rawEvent + "\n\n");
-                            continue;
-                        }
-                        if (!mayStartRenderTag(v) && !mayStartBiliInternal(v) && !argAnyPending() && !tagFilter.pending()) {
-                            proseAcc += v;
-                            await write(rawEvent + "\n\n");
-                            continue;
-                        }
-                        const s = argStreamFor(type, argField, ev);
-                        const clean = s.filter.push(v);
-                        if (clean.length === 0) continue;
-                        proseAcc += clean;
-                        if (clean === v) {
-                            await write(flushArgTails() + rawEvent + "\n\n");
-                            continue;
-                        }
-                        await write(flushArgTails() + rebuildEvent(rawEvent, { ...ev, [argField]: clean }));
+                    // Reasoning summary deltas are the thinking channel —
+                    // byte-verbatim under the unified ACP invariant (never
+                    // filtered). Function_call argument deltas are user intent
+                    // and pass through verbatim (#1039), falling into the
+                    // generic rawEvent write below.
+                    if (type === "response.reasoning_summary_text.delta" && typeof ev["delta"] === "string") {
+                        const v = ev["delta"] as string;
+                        if (v.length > 0) proseAcc += v;
+                        await write(rawEvent + "\n\n");
                         continue;
                     }
+                    // #2248: raw exit — unrecognized event types never enter the
+                    // filter. Tool-call argument streams are user intent (#1039)
+                    // and are excluded from the audit.
+                    if (!responsesFrameHasToolCalls(ev)) auditRawForward(rawEvent);
                     await write(rawEvent + "\n\n");
                 }
             }
@@ -3210,7 +3338,7 @@ function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
 // `thought:true` reasoning parts share that one field. Mirrors
 // stripOpenaiChatText / stripAnthropicText; mutates in place (the returned
 // reference is the input's).
-function stripGoogleChunk<T>(obj: T): T {
+function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     const candidates = o["candidates"];
@@ -3227,8 +3355,9 @@ function stripGoogleChunk<T>(obj: T): T {
             content: {
                 ...cont,
                 parts: (cont["parts"] as unknown[]).map((p) =>
-                    p && typeof p === "object" && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string) }
+                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
+                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
+                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
                         : p,
                 ),
             },
@@ -3239,14 +3368,14 @@ function stripGoogleChunk<T>(obj: T): T {
 
 // Without `alt=sse` a Gemini streaming response is a JSON ARRAY of the same
 // chunk objects, so the non-stream strip applies to each element as well.
-function stripGoogleText<T>(obj: T): T {
+function stripGoogleText<T>(obj: T, drop: boolean = false, requestText?: string): T {
     if (Array.isArray(obj)) {
         obj.forEach((c) => {
-            stripGoogleChunk(c);
+            stripGoogleChunk(c, drop, requestText);
         });
         return obj;
     }
-    return stripGoogleChunk(obj);
+    return stripGoogleChunk(obj, drop, requestText);
 }
 
 export async function pipePluginJson(
@@ -3255,6 +3384,12 @@ export async function pipePluginJson(
     session?: Session,
     protocol?: WireProtocol,
     upstreamOrigin?: string,
+    // m00885 provenance gate: the request body carried the kernel's
+    // "[ACP absorb]" instruction. Off ⇒ whole-field tool-call text in the
+    // JSON body is legitimate prose and survives the strip.
+    absorbInstructed?: boolean,
+    // m00885: echoed (user-requested verbatim) emission spans survive.
+    requestText?: string,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -3321,16 +3456,21 @@ export async function pipePluginJson(
         // one full-body parse this path already does. Observe-only (#1039).
         if (session) recordJsonToolWitnesses(session.id, json, protocol);
     } catch { /* non-JSON body — forward verbatim */ }
-        if (json && (containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text))) {
+        // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
+        // m00885: an absorb-instructed turn may answer with a whole-field
+        // tool-call emission written as prose — the raw-body probe is
+        // escape-tolerant so it fires on the serialized JSON too.
+        const dropEmission = absorbInstructed === true && containsToolCallEmissionText(text);
+        if (json && (dropEmission || containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsEchoResidue(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in
         // place, so this composes with the #408 usage backfill above — one
         // parse, one reserialize.
-        json = protocol === "responses" ? stripResponsesText(json)
-            : protocol === "anthropic" ? stripAnthropicText(json)
-            : protocol === "google" ? stripGoogleText(json)
-            : stripOpenaiChatText(json);
+        json = protocol === "responses" ? stripResponsesText(json, dropEmission, requestText)
+            : protocol === "anthropic" ? stripAnthropicText(json, dropEmission, requestText)
+            : protocol === "google" ? stripGoogleText(json, dropEmission, requestText)
+            : stripOpenaiChatText(json, dropEmission, requestText);
         mutated = true;
     }
     if (mutated && json) {

@@ -4,8 +4,8 @@
 // partial / refused) because a partially-applied fold is neither; every other
 // tool is binary success | failure. Consumers that only know the old envelope
 // shape ignore the extra fields and keep working off result text.
-export type CompressOutcomeKind = "applied" | "partial" | "refused";
-export type ToolOutcomeKind = CompressOutcomeKind | "success" | "failure";
+type CompressOutcomeKind = "applied" | "partial" | "refused";
+type ToolOutcomeKind = CompressOutcomeKind | "success" | "failure";
 
 export interface ProxyToolResult {
     text: string;

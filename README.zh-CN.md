@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-<code>npm install -g billion-context</code>
+<code>npm install -g billion-context --prefix=~/.local</code>
 </p>
 
 <p align="center">
@@ -131,11 +131,15 @@ QQ群:
 
 ## 安装
 
+Linux / macOS —— 指定用户级 prefix 安装(全程不需要 `sudo`，也不改你的 npm 配置，`bili` 自更新不会再遇到权限问题)：
+
 ```bash
-npm install -g billion-context
+npm install -g billion-context --prefix=~/.local
 ```
 
-这会安装 `bili` 命令(`bili-proxy` 保留为别名)。
+`bili` 命令装在 `~/.local/bin`——多数发行版默认已在 PATH 中；没有的话把 `export PATH="$HOME/.local/bin:$PATH"` 写进 `~/.bashrc` 或 `~/.zshrc`。用 nvm 或 Homebrew Node 的，默认 prefix 本来就属于当前用户，直接 `npm install -g billion-context` 即可；Windows 的默认 prefix(`%APPDATA%\npm`)同样用户可写，直接 `npm install -g billion-context`。
+
+这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
 ## 快速上手
 
@@ -168,6 +172,7 @@ bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照�
 
 - **dsh:** `dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令 —— 两种走法终态一致(pnpm 装进 profile、patch 层由 dsh 自己挂载);经同一通道卸载。见下文 dsh 段。
 - **opencode:** 把裸 npm 包名直接写进你真实配置的插件列表 —— `"plugin": ["billion-context"]`(仅 npm 形态;git checkout 没有已发布入口)。包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载,插件自拉起的行为与 bili 安装的形态完全一致。另外要做两件 bili 安装器会替你做的事:在同一份配置里设 `"compaction": { "auto": false }`(否则 OpenCode 的原生自动压缩会双重压缩),并先手工备份该配置文件。
+- **claude:** 本仓库同时是一个 Claude Code 插件市场 —— `/plugin marketplace add ranxianglei/billion-context`,再 `/plugin install billion-context@billion-context`,然后运行 `/billion-context:bili-setup`(它会替你驱动 `bili plugin install claude` 并提示重启)。终态与 bili 安装器一致;插件自身不携带 hooks 或 MCP 条目,不会双重注册。
 
 pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。
 
@@ -312,6 +317,8 @@ bili --no-auto-update        # 本次启动禁用自动更新
 **自 v0.1.183 起,更新提示默认静默(#1977):**routine/recommended 版本不再在 `/acp` 面板脚注或 `acp_status` 中渲染更新行 —— 只有 `critical` 级别的版本会在那里显示(`CRITICAL UPDATE READY/AVAILABLE`)。检查"已安装未重启"版本的常设途径即上文所列的过期线索:Web UI 横幅、`/acp` 单行警告、以及 `GET /__bili/status`。刻意不设常驻提醒;严重缺陷公告通道(#1481)仍是唯一自动可见的严重路径。
 
 当安装反复失败(目录不可写或受宿主托管、网络错误等)时,自动更新不再每个 3 分钟周期都重复下载并重试。连续失败三次后,它按指数退避(5 分钟 → 10 → 20 …,上限 6 小时),打印一次性的可操作提示(修复权限 / npm prefix、以用户级重装,或用 `"autoUpdate": false` / `ACP_AUTO_UPDATE=0` 禁用),并在冷却期间不再为这次失败输出日志(不下载、不打重试行);一旦故障消除或目标版本变化即恢复(#1603)。
+
+同样的有界重试现在也覆盖全局自更新代为驱动的 **owner 托管通道** —— dsh desktop 原位副本、dsh profile bundle 与 pi 的 npm 副本(#2192)。每条通道按「通道 + 目标版本」维护独立的失败计数,desktop 布局持续损坏时不再每周期重新下载整个 tarball(修复前每台受影响机器每天最多约 480 次下载);连续失败三次进入同样的指数冷却,一次性提示会指明出错的通道与手动修复方式(`dsh plugin --profile <name> add …`、`pi update --extension …`,或重建 desktop profile)。宿主托管实例另走更慢的独立检查节奏 —— 30 分钟加最多 15 分钟抖动,记在独立的节流标记里 —— 不再占用全局 3 分钟预算。失败计数通过缓存目录下的一个小状态文件(`.install-backoff.json`)在机器上所有 bili 进程间共享,多个运行中的实例不会各自烧掉独立的重试预算;`bili plugin update` 成功一次会立即解除 dsh profile 通道的冷却。该文件以原子方式写入(tmp+rename),且每次写入都与磁盘上已有内容合并,并发实例互相协作而不是覆盖彼此的计数;长驻进程会在文件变化时重新读取,任一副本执行的手动解除会在其它副本的下次检查时可见。它的一切失败模式都偏向重试 —— 损坏的文件或时钟跳跃会被丢弃,绝不允许长期沉默某条更新通道。`bili plugin update` 清除 dsh profile 通道的键;修复好的 desktop 通道则在下次成功的原位刷新时清除自己的键。
 
 ### 严重缺陷公告(强制更新)
 

@@ -24,7 +24,7 @@ import { promisify } from "node:util";
 import { resolvePiHome } from "./client-config.js";
 import { planDshSpawn, decodeChildOutput } from "./dsh-channel.js";
 
-export const PI_PACKAGE = "billion-context";
+const PI_PACKAGE = "billion-context";
 
 /** The unpinned spec form `bili plugin install pi` writes (plugin-install's
  *  PI_NPM_ENTRY). Only this form self-refreshes — a pinned variant is user

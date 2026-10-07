@@ -149,7 +149,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdp
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -191,7 +191,7 @@ export type SpawnFn = (
     options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean; windowsHide?: boolean },
 ) => SpawnChild;
 
-export interface LaunchOptions {
+interface LaunchOptions {
     host: string;
     port: number;
     passthrough: boolean;
@@ -225,7 +225,7 @@ export interface LaunchOptions {
     lane?: string;
 }
 
-export interface ProxyHandle {
+interface ProxyHandle {
     origin: string;
     port: number;
     child?: SpawnChild;
@@ -963,14 +963,71 @@ export function buildCodexArgs(
     // bypasses the proxy. The TARGET itself is already chosen from the merged
     // effective view (profile + CLI overrides), so appending never hides a
     // user-selected endpoint behind a stale one.
-    const args = [...extra];
+    // #2260(D): "after the user's argv" means after the user's FLAGS, not
+    // after their positionals — everything past a `--` is positional to
+    // codex's parser, so appending there turns the rewrites into prompt text
+    // and the traffic bypasses the proxy. Insert before the first `--` when
+    // one exists; all user flag tokens still precede the rewrites, keeping
+    // last-wins intact.
+    const rewrites: string[] = [];
     for (const r of httpRewrites) {
-        args.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
+        rewrites.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
     }
     for (const r of httpsRewrites) {
-        args.push("-c", `${r.key}=${r.realUpstream}`);
+        rewrites.push("-c", `${r.key}=${r.realUpstream}`);
     }
-    return args;
+    if (rewrites.length === 0) return [...extra];
+    const at = codexRewriteInsertionIndex(extra);
+    return [...extra.slice(0, at), ...rewrites, ...extra.slice(at)];
+}
+
+/** codex subcommand flags that take NO value (clap booleans). Used only to
+ * decide whether the trailing non-dash token is a free-standing positional
+ * (safe insertion point) — see codexRewriteInsertionIndex. */
+const CODEX_BOOLEAN_FLAGS = new Set([
+    "--skip-git-repo-check",
+    "--last",
+    "--full-auto",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--no-daemon",
+    "--search",
+    "--no-search",
+    "--help",
+    "--version",
+]);
+
+/** Where buildCodexArgs splices its rewrites into the user's argv.
+ *
+ * #2260(D): everything past a `--` is positional to codex's parser, so the
+ * rewrites must land BEFORE it (appending turned them into prompt text and
+ * silently bypassed the proxy).
+ *
+ * #2281: codex-cli 0.147.0 parses `exec resume` such that a `-c` flag placed
+ * AFTER the positional prompt silently DROPS an earlier `-c model=…` on the
+ * same command line (bisected 2026-10-07: resume + trailing `-c` loses the
+ * override; fresh exec, or resume without a trailing `-c`, both keep it).
+ * Since the rewrites ARE trailing `-c` flags, appending them after the user's
+ * prompt broke every `bili codex exec resume … <prompt>` turn for users
+ * passing `-c model=…` — the model silently reverted to the config default.
+ * Insert before the `resume` subcommand when present (any `-c` AFTER
+ * `resume` suppresses the user's earlier `-c`s — verified against 0.147.0:
+ * [-c model=B, resume, --last, -c provider…, prompt] still drops model=B),
+ * otherwise before the trailing prompt — but ONLY when the last token is
+ * provably a free-standing positional (its predecessor is a known boolean
+ * flag or itself a positional) — never between a value-taking flag and its
+ * value, and never into flags we do not recognise (those keep the legacy
+ * append, which is at worst today's behavior). */
+function codexRewriteInsertionIndex(extra: readonly string[]): number {
+    const sep = extra.indexOf("--");
+    if (sep !== -1) return sep;
+    const resume = extra.indexOf("resume");
+    if (resume !== -1) return resume; // keep every -c ahead of the resume subcommand
+    const last = extra.length - 1;
+    if (last < 0) return 0;
+    if (extra[last].startsWith("-")) return extra.length; // flags-only tail — append
+    const prev = last >= 1 ? extra[last - 1] : undefined;
+    if (prev === undefined || !prev.startsWith("-") || CODEX_BOOLEAN_FLAGS.has(prev)) return last;
+    return extra.length; // prev may be a value-taking flag whose value IS the last token — do not split
 }
 
 /**
@@ -1767,7 +1824,7 @@ function recordSqliteOrigin(overlay: string, base: string): void {
  *     deletion): NOTHING can be claimed about this side's age; callers must
  *     fall back conservatively instead of assuming a winner.
  *  The same snapshot serves both sides because the copy is byte-exact. */
-export type SqliteSideState = "unchanged" | "changed" | "unknown";
+type SqliteSideState = "unchanged" | "changed" | "unknown";
 
 function sqliteSideVsOrigin(overlay: string, dir: string, base: string): SqliteSideState {
     const rec = readSqliteOrigin(overlay)[base];
@@ -1881,7 +1938,7 @@ function freeConflictName(dst: string): string {
  *  shared link is dropped here — its per-path -wal/-shm sidecars cannot be
  *  replayed against a main the other path may have advanced, so they are
  *  quarantined as conflicts, never merged (#1917). */
-export function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
+function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
     const members = sqliteSetMembers(base);
     const statFile = (dir: string, m: string): fs.Stats | undefined => {
         try {
@@ -2332,7 +2389,7 @@ export function piPluginInstalled(piHome: string): boolean {
  *  fallback — that leaves pi with no plugin at all: no /acp, no provider
  *  rewrites, and the traffic silently bypasses the proxy (#1318). Same
  *  discipline ompPluginLoadedFrom already applies to omp config entries. */
-export function piEntryLoadable(entry: string): boolean {
+function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
@@ -2447,7 +2504,7 @@ export function prepareDshHome(
     return overlay;
 }
 
-export interface GooseOverlay {
+interface GooseOverlay {
     root: string;
     realConfigDir: string;
     patchedFiles: Set<string>;
@@ -2481,14 +2538,14 @@ export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrite
             if (st.isSymbolicLink()) {
                 if (fs.readlinkSync(link) !== target) {
                     fs.rmSync(link);
-                    fs.symlinkSync(target, link);
+                    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
                 }
             } else {
                 return undefined;
             }
         } catch {
             try {
-                fs.symlinkSync(target, link);
+                fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
             } catch {
                 return undefined;
             }
@@ -2774,6 +2831,11 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
             try {
                 fs.rmSync(p, { recursive: true, force: true });
             } catch {}
+            // Cold-start thread records keep absolute rollout paths in the overlay.
+            if (st.isDirectory() && !linkOverlayEntry(realHome, overlay, entry)) {
+                ok = false;
+                console.error(`bili: could not relink ${p} after exit-time write-back — data is in ${realHome}, but recorded overlay paths may not resolve.`);
+            }
         } else {
             ok = false;
             console.error(`bili: could not merge ${p} into ${realHome} at exit — kept in the overlay, resolve manually.`);
@@ -3298,7 +3360,7 @@ async function probeHealth(
     }
 }
 
-export interface HealthInfo {
+interface HealthInfo {
     ok: boolean;
     instanceId?: string;
     /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
@@ -3426,7 +3488,7 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-export function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
     if (attachExternal) return true;
     return health.watchdog?.armed === true;
 }
@@ -3562,7 +3624,7 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
     });
 }
 
-export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     return new Promise((resolve, reject) => {
         const srv = net.createServer();
         srv.once("error", reject);
@@ -4043,10 +4105,43 @@ export async function ensureProxyRunning(
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
             throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
+        // #2260(A)/#2187: the timeout is the ONE terminal path where the
+        // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
+        // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
+        // persistently slow host accumulated ~1 zombie per ~70s (each also
+        // stranding the lane sticky-port ladder). Hard-kill before failing.
+        killAbandonedChild(child);
+        console.error(
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — it never became ready and would otherwise outlive this failure (log: ${logPath})`,
+        );
         throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms (log: ${logPath})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
+}
+
+/** #2260(A)/#2187: unconditional hard-kill of a spawned-but-abandoned proxy
+ *  child, all platforms. Deliberately NOT stopProxy(): its win32 path returns
+ *  without killing because the #414 design assumes THIS process exits ≤2s
+ *  later, letting the child's BILI_PARENT_PID watch run the graceful path —
+ *  an assumption that does not hold when the spawner keeps living (plugin
+ *  lane: long-lived desktop host), where the abandoned child would leak
+ *  forever. The victim never became healthy, so it served no traffic and
+ *  holds no sessions; SIGKILL loses nothing and reaches even a hung event
+ *  loop (SIGTERM would wait for a stuck loop to drain). Stale instance
+ *  records left behind are inert by the dead-pid checks in discovery. */
+function killAbandonedChild(child: SpawnChild | undefined): void {
+    if (!child || child.pid === undefined || child.pid <= 0) return;
+    if (process.platform !== "win32") {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+        } catch {
+            /* group already gone */
+        }
+    }
+    try {
+        child.kill?.("SIGKILL");
+    } catch {}
 }
 
 export function stopProxy(handle: ProxyHandle): void {
@@ -4344,7 +4439,7 @@ export function resolveClientCommand(
         const resolved = resolveOnPath("mcode", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
         const binBase = path.join(resolveMcodeInstallDir(env), "bin", "mcode");
-        for (const ext of process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""]) {
             const candidate = binBase + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
@@ -4360,10 +4455,10 @@ export function resolveClientCommand(
         // %LOCALAPPDATA%\agy\bin\agy.exe).
         const resolved = resolveOnPath("agy", env);
         if (resolved) return { command: resolved, prefixArgs: [] };
-        const base = process.platform === "win32"
+        const base = platform === "win32"
             ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "agy", "bin", "agy")
             : path.join(os.homedir(), ".local", "bin", "agy");
-        for (const ext of process.platform === "win32" ? [".exe", ""] : [""]) {
+        for (const ext of platform === "win32" ? [".exe", ""] : [""]) {
             const candidate = base + ext;
             try {
                 if (fs.existsSync(candidate)) return { command: candidate, prefixArgs: [] };
@@ -4388,7 +4483,7 @@ export function resolveClientCommand(
     return { command: resolved ?? client, prefixArgs: [] };
 }
 
-export interface RunLaunchParams {
+interface RunLaunchParams {
     client: ClientName;
     clientArgs: string[];
     mitmDomains?: string[];
@@ -5088,7 +5183,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     process.exit(code ?? 0);
 }
 
-export interface RunTestPiParams {
+interface RunTestPiParams {
     overrides: Record<string, string | undefined>;
     mitmDomains?: string[];
 }

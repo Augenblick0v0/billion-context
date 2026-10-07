@@ -85,6 +85,8 @@ export type Session = {
          *  forensics can tell which surface served the session without config
          *  archaeology. */
         activePack?: string;
+        /** Resolved request prompt for external summaries, including pack sections. */
+        summaryInstructions?: string;
     };
     /** Cumulative usage stats, summed across all requests. Each sample =
      *  one upstream usage report. Persisted; survives restart. */
@@ -337,7 +339,19 @@ export type Session = {
      *  before the rework may still carry ccr:true entries; the reconcile/
      *  commit/drop machinery below handles them (they are never re-created). */
     pendingRetrievals: PendingRetrieval[];
-    /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
+    /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
+     *  index built per request from the INBOUND body while stripImages is armed,
+     *  so decompress({ imageRef }) can pull a stripped/folded image's original
+     *  pixels back. Latest-wins (the client re-sends full history every turn, so
+     *  each request's index is complete); cleared when stripImages is off. Values
+     *  hold only metadata + the on-disk path (bytes are spilled at index-time and
+     *  never retained), so residency stays O(refs) regardless of image volume. */
+    incomingImageIndex?: Map<string, Array<{ mediaType: string; bytes: number; width?: number; height?: number; path: string }>>;
+    /** #1995 in-memory only: timestamp of the last best-effort
+     *  pruneRetrieveImgExports sweep for this session (throttled to once a
+     *  minute in the request path). */
+    lastImgPrune?: number;
+     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache
      *  invariant), so this is a pure CPU cache, never a correctness source. */
@@ -383,25 +397,12 @@ export type Session = {
 /** Server-stamped anonymous-prefix-affinity record (#1115/#1486 lane, written
  *  in src/server.ts when an anonymous request resolves onto a pfa-* chain or
  *  mints a fresh one). Typed here so readers don't cast the Record bag. */
-export type AnonymousPrefixAffinityStamp = {
+type AnonymousPrefixAffinityStamp = {
     depth: number;
     tailHash: string;
     via: "prefix" | "new";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
 };
-
-export function peekAnonymousPrefixAffinity(session: Session): AnonymousPrefixAffinityStamp | undefined {
-    const v = session.metadata.anonymousPrefixAffinity;
-    if (!v || typeof v !== "object") return undefined;
-    return v as AnonymousPrefixAffinityStamp;
-}
-
-/** Per-request-resolved context limit stamped by the server (src/server.ts) —
- *  the window actually in force for this session's traffic. */
-export function peekEffectiveContextLimit(session: Session): number | undefined {
-    const v = session.metadata.effectiveContextLimit;
-    return typeof v === "number" ? v : undefined;
-}
 
 // #833: wire paths resolve the kernel Config per request (global → provider →
 // model compress settings + self-heal + output headroom), while the plugin
@@ -555,6 +556,52 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
     session.metadata["warnedNoUsage"] = true;
     markDirty(session);
     loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
+}
+
+// #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
+// usage-grade baseline is momentarily absent (the rebuild request's own report
+// hasn't landed yet, or the upstream never reports one), so effectiveTokenCount
+// falls through to branches that size on the INCOMING RAW history — the very
+// mass the rebuild just folded away — inflating the meter ~3.4× (char-count
+// upper bound) and firing a phantom EMERGENCY nudge into an already-at-window
+// context. The rebuilt payload's measured size (the same quantity the preflight
+// fit gate checked) is stamped here and consumed by the meter for a bounded
+// number of prepares: a real usage-grade sample supersedes it immediately
+// (settleUsageReport clears it), and when no sample ever comes the counter
+// runs out and legacy sizing resumes instead of freezing the meter.
+const POST_REBUILD_ANCHOR_PREPARES = 3;
+
+export function setPostRebuildAnchor(session: Session, tokens: number): void {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    session.metadata["postRebuildAnchor"] = { tokens, remainingPrepares: POST_REBUILD_ANCHOR_PREPARES };
+    markDirty(session);
+}
+
+/** Metadata is persisted user-editable JSON — re-validate on read; a corrupt
+ *  stamp degrades to "no anchor" (legacy sizing) instead of poisoning the meter. */
+export function postRebuildAnchorTokens(session: Session | undefined): number {
+    const a = session?.metadata?.["postRebuildAnchor"];
+    if (!a || typeof a !== "object") return 0;
+    const t = (a as Record<string, unknown>).tokens;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : 0;
+}
+
+/** One prepare consumed. The last one deletes the anchor so never-reporting
+ *  upstreams fall back to legacy per-turn sizing. */
+export function tickPostRebuildAnchor(session: Session): void {
+    const a = session.metadata?.["postRebuildAnchor"];
+    if (!a || typeof a !== "object") return;
+    const o = a as Record<string, unknown>;
+    const rem = typeof o.remainingPrepares === "number" ? o.remainingPrepares - 1 : 0;
+    if (rem <= 0) delete session.metadata["postRebuildAnchor"];
+    else o.remainingPrepares = rem;
+    markDirty(session);
+}
+
+export function clearPostRebuildAnchor(session: Session): void {
+    if (session.metadata?.["postRebuildAnchor"] === undefined) return;
+    delete session.metadata["postRebuildAnchor"];
+    markDirty(session);
 }
 
 const sessions = new Map<string, Session>();
@@ -722,7 +769,7 @@ export function listSessions(): Session[] {
 // The #2165 report itself was "empty raw twin + live fork", so a traffic-less
 // raw twin does NOT disqualify a warning — only the stale (>freshness window)
 // and the fully idle (nothing ever carried traffic) groups stay silent.
-export interface SplitSessionWarning {
+interface SplitSessionWarning {
     base: string;
     sessions: { id: string; requests: number; lastSeen: number }[];
 }
@@ -904,6 +951,8 @@ export function resetSessionCompression(session: Session): void {
     // let the next forward re-measure instead of displaying a stale reading.
     delete session.stats.contextEstimateTokens;
     delete session.stats.contextEstimateCalibrated;
+    // #1820: same lineage argument — the anchored rebuilt payload is gone too.
+    delete session.metadata.postRebuildAnchor;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
     session.metadata.nativeCompactionAt = Date.now();
@@ -1030,7 +1079,7 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // (stale map entries linger until session end); a false positive is fatal.
 export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
-export interface RewriteDetection {
+interface RewriteDetection {
     detected: boolean;
     knownBefore: number;
     incomingTotal: number;
@@ -1065,7 +1114,7 @@ export function detectUnannouncedHistoryRewrite(
  *  compress result already reported them as saved. Returns how many of the
  *  covered ids are present in the resent history, or null when coverage is
  *  complete (or nothing was covered). */
-export interface FoldCoverage {
+interface FoldCoverage {
     expected: number;
     matched: number;
 }

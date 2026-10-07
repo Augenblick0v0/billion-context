@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 import { rmrf } from "./tmp-rm.ts";
+import { supportsFileSymlink } from "./platform-capabilities.ts";
 type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
@@ -2746,6 +2747,99 @@ test("buildCodexArgs: no rewrites → just extra args", () => {
     assert.deepEqual(buildCodexArgs("http://h:p", [], [], ["--foo"]), ["--foo"]);
 });
 
+// #2260(D): cli.ts only eats a LEADING `--` right after the client name, so a
+// non-leading one reaches buildCodexArgs inside extra — and everything past it
+// is positional to codex's parser. Appending there turned the rewrites into
+// prompt text and silently bypassed the proxy (`bili codex exec -- "-p"`).
+test("buildCodexArgs: #2260(D) rewrites land BEFORE a user `--` separator, not after its positionals", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, [], ["exec", "--", "-p"]), [
+        "exec",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
+test("buildCodexArgs: #2260(D) last-wins holds across `--` — a user -c before the separator still loses to bili's rewrite", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["-c", "model_providers.x.base_url=https://user-picked.local/v1", "--", "-p"],
+    );
+    assert.deepEqual(out, [
+        "-c", "model_providers.x.base_url=https://user-picked.local/v1",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "https://up.local/v1")}`,
+        "--",
+        "-p",
+    ]);
+});
+
+test("buildCodexArgs: #2281 resume — rewrites insert BEFORE the `resume` subcommand so the user's -c model=… survives codex's exec-resume parsing", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["exec", "--skip-git-repo-check", "-c", "model=gpt-5-codex", "resume", "--last", "turn two prompt"],
+    );
+    // rewrites sit ahead of `resume` — a -c AFTER the resume subcommand makes
+    // codex-cli 0.147.0 drop the earlier `-c model=…` on exec resume (bisected
+    // against the real binary: [-c model=B, resume, --last, -c provider…, prompt]
+    // still loses model=B; see issue #2281).
+    assert.deepEqual(out, [
+        "exec", "--skip-git-repo-check", "-c", "model=gpt-5-codex",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+        "resume", "--last", "turn two prompt",
+    ]);
+});
+
+test("buildCodexArgs: #2281 never splits a value-taking flag from its value — trailing `-c <value>` keeps the legacy append", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["exec", "-c", "model=gpt-5-codex"],
+    );
+    assert.deepEqual(out, [
+        "exec", "-c", "model=gpt-5-codex",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+    ]);
+});
+
+test("buildCodexArgs: #2281 flags-only tail and unknown-flag tails keep the append behavior", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    assert.deepEqual(
+        buildCodexArgs("http://h:p", rewrites, [], ["exec", "--some-unknown-flag", "maybe-a-value"]).slice(-2),
+        ["-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`],
+    );
+});
+
+test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the rewrites before it", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    assert.deepEqual(
+        buildCodexArgs("http://h:p", rewrites, [], ["exec", "resume", "--last"]),
+        ["exec",
+            "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+            "resume", "--last"],
+    );
+});
+
 test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
@@ -3500,7 +3594,11 @@ test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", (
     }
 });
 
-test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare entry, missing or broken shim falls back to the file URL (#1590)", () => {
+test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare entry, missing or broken shim falls back to the file URL (#1590)", (t) => {
+    if (!supportsFileSymlink()) {
+        t.skip("the shim contract requires file symlinks for live bundle updates");
+        return;
+    }
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-shim-"));
     try {
         // os.tmpdir() sits inside this repo: a differently-named package.json
@@ -3571,6 +3669,10 @@ test("writeDshClientShim: stamps the real bili version into the shim package.jso
         t.skip("needs a built dist (npm run build first)");
         return;
     }
+    if (!supportsFileSymlink()) {
+        t.skip("the shim contract requires file symlinks for live bundle updates");
+        return;
+    }
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-shimver-"));
     try {
         const home = path.join(dir, ".dsh");
@@ -3628,7 +3730,8 @@ test("prepareCodexHome: no real config → overlay holds only the bili MCP block
         assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify(cid)}`));
         // the command value must be a quoted TOML basic string — only then does a spaced/quoted Windows path survive being read from the file
         assert.match(txt, /^command = ".+"$/m);
-        assert.ok(fs.lstatSync(path.join(overlay, "auth.json")).isSymbolicLink());
+        const authStat = fs.lstatSync(path.join(overlay, "auth.json"));
+        assert.ok(authStat.isSymbolicLink() || authStat.nlink > 1);
         assert.ok(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink());
         assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authOriginal);
         assert.ok(!fs.existsSync(path.join(dir, "config.toml")));
@@ -3735,7 +3838,11 @@ test("prepareCodexMcpInjection: routing-only launch (no MCP) still builds the ov
     }
 });
 
-test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the overlay (#535 phase 4)", async () => {
+test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the overlay (#535 phase 4)", async (t) => {
+    if (!supportsFileSymlink()) {
+        t.skip("the dsh live shim contract requires file symlinks for live bundle updates");
+        return;
+    }
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
     const prevBin = process.env.BILI_CLIENT_BIN;
     const prevDshHome = process.env.DSH_HOME;
@@ -4383,10 +4490,12 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-budget-"));
     const prevHome = process.env.HOME;
     const prevUserProfile = process.env.USERPROFILE;
+    const prevCodexHome = process.env.CODEX_HOME;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
     const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
     process.env.HOME = home;
+    process.env.CODEX_HOME = path.join(home, ".codex");
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
@@ -4454,6 +4563,8 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
+        if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = prevCodexHome;
         if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
         else process.env.BILI_CLIENT_BIN = prevClientBin;
         if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
@@ -4520,10 +4631,12 @@ test("runLaunch codex: --no-daemon pinned when supported, escape hatches honored
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-nodaemon-run-"));
     const prevHome = process.env.HOME;
     const prevUserProfile = process.env.USERPROFILE;
+    const prevCodexHome = process.env.CODEX_HOME;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
     const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
     process.env.HOME = home;
+    process.env.CODEX_HOME = path.join(home, ".codex");
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
@@ -4609,6 +4722,8 @@ test("runLaunch codex: --no-daemon pinned when supported, escape hatches honored
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
+        if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = prevCodexHome;
         if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
         else process.env.BILI_CLIENT_BIN = prevClientBin;
         if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
@@ -6325,6 +6440,53 @@ test("resolveClientCommand: mcode resolves `mcode` on PATH, falls back to <insta
         else process.env.USERPROFILE = prevUserProfile;
         rmrf(dir);
         rmrf(home);
+    }
+});
+
+test("resolveClientCommand: antigravity/mcode honor the injectable platform param (#2260)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-home-"));
+    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "bili-agy-lad-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    try {
+        process.env.HOME = home;
+        // os.homedir() reads USERPROFILE on win32, not HOME — seal it so the
+        // non-win32 expectations below hold on every host (CI runs on Windows).
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = home;
+        // Before #2260 these branches read process.platform directly, so the
+        // win32 layout was unreachable from tests (and wrong under any future
+        // platform-injection use). Pin both layouts via EXPLICIT platform args
+        // so the test stays host-independent (a bare default-platform call
+        // resolves through the real host's os.homedir() and cannot hold one
+        // literal on both Windows and POSIX runners).
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz", LOCALAPPDATA: localAppData }, "win32"),
+            { command: path.join(localAppData, "agy", "bin", "agy"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "linux"),
+            { command: path.join(home, ".local", "bin", "agy"), prefixArgs: [] },
+        );
+        const mdDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-plat-"));
+        fs.mkdirSync(path.join(mdDir, "bin"), { recursive: true });
+        fs.writeFileSync(path.join(mdDir, "bin", "mcode.cmd"), "");
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "win32"),
+            { command: path.join(mdDir, "bin", "mcode.cmd"), prefixArgs: [] },
+        );
+        assert.deepEqual(
+            resolveClientCommand("mcode", { PATH: "/nonexistent-dir-zzz", MCODE_INSTALL_DIR: mdDir }, "linux"),
+            { command: path.join(mdDir, "bin", "mcode"), prefixArgs: [] },
+        );
+        rmrf(mdDir);
+    } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        rmrf(home);
+        rmrf(localAppData);
     }
 });
 

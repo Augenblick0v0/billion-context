@@ -12,9 +12,9 @@ import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingT
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
 
-export type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
+type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
 
-export interface DoctorGlobalInfo {
+interface DoctorGlobalInfo {
     installDir?: string;
     form: "npm" | "checkout" | "host-managed" | "unknown";
     owner?: string;
@@ -65,7 +65,7 @@ export interface DoctorReport {
     processes: DoctorProcess[];
 }
 
-export interface DoctorOpts {
+interface DoctorOpts {
     packageName: string;
     runningVersion: string;
     resolveProxy?: (url: string) => string | undefined;

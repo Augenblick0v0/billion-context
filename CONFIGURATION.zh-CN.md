@@ -95,6 +95,7 @@
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
+| `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | 匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。 |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | 以新会话 id 恢复的已识别客户端继承父会话的引用编号与完整存在的压缩块。 |
 | `chainContentDetection` | boolean | false | BILI_CHAIN_CONTENT | 按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。 |
 | `chainEgressStamp` | boolean | false | BILI_CHAIN_STAMP | 在出口消息上打模型可见的 <bili-chain/> 链完整性标记（默认关：模型会把它当幽灵输入而消耗 token）。 |
@@ -206,10 +207,10 @@
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
-| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留。 |
+| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
-| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。 |
-| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。 |
+| `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
+| `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
 | `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
@@ -498,7 +499,7 @@
 - **状态：** ACTIVE
 - **说明：** #1884 重签臂的配置文件面（body 级签名；今天就是华为 CodeArts APIG 的 `SDK-HMAC-SHA256`）。检测是**形状判定**而非名字白名单（#2090）：任何命名了 HMAC 构造的 `Authorization` 方案 token，或以 `-signature` / `-content-sha256` 结尾的请求头，都把该请求标记为 body 已签名 —— 每个网关都自造一套头（dsh 免费模型插件就是 `x-ofm-signature`），封闭名单会不断漏掉新形状，变成静默的上游 401，并在别的插件界面里显示成「凭据无效」。接下来发生什么取决于 bili 能否重签该方案：
   - **内置方案且能解析出凭据**（dsh codearts 账号池）：零配置重签臂 —— 在 dsh 上它通过 credentials 服务从 `$DSH_HOME/jet-hub/state.json` 发现启用的 `codearts` 账号，并对自己产出的每个出站 body 重签，签名上游上的压缩开箱即用。内置键的默认值**就是**这套行为，所以按方案分键并不把这个字段做成华为特殊设计。
-  - **其他任何被检测到的方案**（SigV4、网关自造头）：bili 内部**既没有凭据来源，也没有重签器实现**，所以 bili **一律拒收**（owner 二元契约拍板，#2090：签名请求要么重签+压缩、要么拒绝，绝不无签名放行）。403 文案指明方案名并明说「目前没有任何配置能让这条链路工作」；每次拒收都会记进 state 目录下的 `resign-pending.json`（`~/.local/state/billion-context/`），此后每次启动 bili 都会打 `[resign] … UNRESOLVED` 横幅列出未解决项（dsh agent lane 在插件装载时也会警告），直到 bili 补上该方案的重签器。这些方案的 `passthrough` 设置**无效**——提醒只在分支被卸载（`enabled: false` / `BILI_RESIGN=0`，恢复 pre-resign 改写处理、上游大概率又 401）时自动清除。
+  - **其他任何被检测到的方案**（SigV4、网关自造头）：bili 内部**既没有凭据来源，也没有重签器实现**，所以 bili **一律拒收**（owner 二元契约拍板，#2090：签名请求要么重签+压缩、要么拒绝，绝不无签名放行）。403 文案指明方案名并明说「目前没有任何配置能让这条链路工作」；每次拒收都会记进 state 目录下的 `resign-pending.json`（`~/.local/state/billion-context/`），此后每次启动 bili 都会打 `[resign] … UNRESOLVED` 横幅列出未解决项（dsh agent lane 在插件装载时也会警告），直到 bili 补上该方案的重签器。这些方案的 `passthrough` 设置**无效**——提醒只在分支被卸载（`enabled: false` / `BILI_RESIGN=0`，恢复 pre-resign 改写处理、上游大概率又 401）时自动清除。自 v0.1.186（#2260）起，这类死键还会在配置加载时被一条 `[acp-config]` 警告点名（同一死键集合只报一次），403 文案不再是唯一信号。
 
   本块只管失败/覆盖路径 —— 每个字段环境变量都优先于文件：
   - `enabled: boolean` —— 该方案的开关；`false` 整体卸载重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。环境变量 `BILI_RESIGN=0` 优先。
@@ -515,7 +516,7 @@
   {
     "resign": {
       "sdk-hmac-sha256": { "passthrough": true },
-      "aws4-hmac-sha256": { "passthrough": true }
+      "aws4-hmac-sha256": { "passthrough": true } // 非内置方案无效（#2090）——配置加载时会被点名
     }
   }
   ```
@@ -635,6 +636,13 @@
 - **默认值：** `false`
 - **状态：** ACTIVE
 - **说明：** 匿名（前缀亲和）客户端的 fork 块继承（#629）：此类客户端在会话中途 fork 自己的历史（编辑重发 / 重新生成更早的回合）时，新会话继承父会话中源内容完整存在于 fork 请求里的压缩块，而不是从零压缩状态起步、把共享前缀从头重新折叠。已识别的 resume-fork 不受此开关管辖 —— 它们随 `resumeInheritance` 一起继承块（#1834）。即使开关关闭，每次匿名 fork 也会记录可继承清单，便于启用前评估收益。`BILI_FORK_ADOPTION=1` 开启。
+
+### `affinitySimhash`
+
+- **类型：** `boolean`
+- **默认：** `true`
+- **状态：** ACTIVE
+- **说明：** 匿名（前缀亲和）客户端的 simhash 链对齐收养（#2265）：当客户端侧大面积装饰性改写（Trae 切换模型后给每条 assistant 消息重打模型标签）打断精确哈希链时，若不处理，每个请求都会新铸一个 pfa-* 会话并从零重折全部历史。本开关在精确前缀匹配与新铸之间增加一级：逐位置比较每条消息的 simhash 指纹 —— 覆盖率 ≥90%（Hamming ≤10）且变异位置 ≥20%（大面积改写而非单点编辑）且至少一条字节相同的 USER 消息（所有权锚点 —— 用户原话不会跨对话重复，机具内容会）时，重新挂回既有会话并保留压缩状态；随后存储链按改写后的字节重锚，下一个请求即回到精确快路径。编辑重发 fork 仍然新铸会话（#629 契约不变）；已识别会话永不收养；双候选歧义时拒绝猜测。`BILI_AFFINITY_SIMHASH=0` 关闭。
 
 ### `resumeInheritance`
 
@@ -1048,6 +1056,42 @@
 
 压缩行为由 `compress` 块控制，它可以出现在三个层级。它们按**逐字段、最深层胜出**的方式合并：在更深层设置的字段会覆盖上层同名字段，但更深层*未设置*的字段**永远不会**清除上层已设置的值。换言之，子级按字段覆盖父级 —— 它绝不是整体替换对象。
 
+### 共享外部摘要服务
+
+可选的 `compress.externalSummary` 会把压缩摘要交给一个或多个独立配置的模型。它与其余 `compress` 字段一样存在于全部三个层级，采用整链替换语义：在更深层级（provider 或 model）设置的链会**整体替换**上层链，不做按目标或按预算的子字段合并，与 `tiers` 完全一致。只有 `enabled` 为 `true` 时才启用；启用后按顺序调用目标，目标失败或返回不可用摘要时继续使用下一个目标。摘要请求不会复用主请求的 provider、模型或认证信息。启用该功能后，压缩工具中的 `summary` 变为可选的、非权威提示；代理仍保留原文可恢复，只提交通过校验的外部摘要。
+
+目标是**对 `providers` 表的引用**：每个条目是字符串 `"provider/model"`，其中 `provider` 是一张*具名拨号配方*（`providers` 表中带拨号字段的非 URL 条目），`model` 是其 `models` 表中的一个键。端点、协议与凭据均由配方推导，不需要在每个目标里重复 URL：
+
+```json
+{
+  "providers": {
+    "glm": {
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "api": "openai",
+      "apiKeyEnv": "GLM_API_KEY",
+      "models": { "glm-4.9-flash": { "outputTokens": 4096 } }
+    },
+    "claude": {
+      "baseUrl": "https://api.anthropic.com",
+      "api": "anthropic",
+      "credentialRef": "primary",
+      "models": { "claude-haiku-4.5": {} }
+    }
+  },
+  "compress": {
+    "externalSummary": {
+      "enabled": true,
+      "targets": ["glm/glm-4.9-flash", "claude/claude-haiku-4.5"],
+      "budget": { "totalTimeoutMs": 50000, "targetTimeoutMs": 25000, "maxSummaryBytes": 65536 }
+    }
+  }
+}
+```
+
+配方包含：`baseUrl`（必须 HTTPS，本地开发可用回环 HTTP；拒绝内嵌凭据、代理递归路径与任意 query 参数）；`api`（`openai` | `anthropic` | `responses` | `google` 四选一，决定线上协议并从 `baseUrl` 推导请求路径）；恰好一个凭据引用 —— `apiKeyEnv: "变量名"`（调用时读环境变量）或 `credentialRef: "名字"`（通过 Web UI 存储的值）；以及 `models` 表，每个模型可设 `contextWindow`（默认 128000）、`outputTokens`（默认 `min(8192, 窗口/4)`）、`stream`（默认 false）。配方也可以像 URL 条目一样拆成 `recipe`/`bind` 路由形态；具名条目未绑定时对路由不生效（routing-inert）。
+
+每条链最多 16 个目标。通过 Web API 保存启用的链时会校验每个引用可解析（未知 provider 或 model → HTTP 400）。运行时遇到不可解析的引用会记录一次警告并禁用整条链直至修复 —— 绝不会回退用主模型写摘要。`secret:` 值单独存储在私有的 `billion-context.json.summary-credentials.json` 文件中，不随主 JSON 配置下发，配置 API 也不会返回。Windows 上请用仅管理员的 ACL 保护该文件及其父目录；确认没有代理进程在写存储后，残留的 `.lock` 文件需手工删除。总预算由全部目标与压缩入口共享；取消或会话状态变化会丢弃已生成但未落盘的结果。
+
 三个层级，从最宽泛到最具体：
 
 1. **全局（Global）** —— 顶层 `"compress": { … }` 键。应用于每个请求。这是唯一会生效 `injectTool` / `injectNudge` 开关的层级。
@@ -1132,16 +1176,16 @@
 - **类型：** `string[]`（工具名模式，如 `["todo_list"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"todo_list"`、`"TodoWrite"`、`"todo*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "TodoWrite"] } }`。
+- **说明：** 工具名模式列表：匹配工具的**最新**一次 tool-call 及其配对 result 永远不会被压缩（内核 `protectedLatestTools`，需 `acp-kernel` >= 0.0.80）。为累积快照型工具而设 —— 例如 agent 的 todo/任务清单，每条新 result 都取代旧的：只有最新实例是事实源，若用 `protectedTools` 保护**全部**实例会使该工具的历史无限膨胀，而只保护**最新**一条既让活跃快照留在上下文里，又让所有被取代的旧实例照常折叠。这解决了“压缩后 agent 忘掉任务清单”的故障（#639）。保护是硬排除：最新实例不可寻址（其 ref 渲染为 `BLOCKED`），推荐范围与显式范围都无法覆盖它；在两种压缩模式、所有 wire 上一致生效。模式匹配为精确工具名或 `*` 通配（如 `"todo_list"`、`"todo*"`）。含 `/` 的模式改按规范 skill 路径匹配，且按路径分组各保最新（#1947）：skill 装载在所有客户端投影为 `skill/<name>` —— opencode `skill({name})`、Claude Code/ZCode `Skill({skill})`、任意工具读 `<dir>/<name>/SKILL.md` —— 因此 `"skill/*"` 保住**每个** skill 的最新一次装载（每个名字一个受保实例），而无斜杠的 `"skill"` 维持单一最新实例语义。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedLatestTools": ["todo_list", "skill/*"] } }`。
 
 #### `protectedTools`
 
 - **类型：** `string[]`（工具名模式，如 `["skill"]`）
 - **默认值：** `[]`（无 —— 按客户端自行开启，工具名因客户端而异）
 - **状态：** ACTIVE
-- **说明：** 工具名模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。模式匹配同内核工具模式（精确名或 `*` 通配，如 `"skill"`、`"skill_*"`）。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedTools": ["skill"] } }`。
+- **说明：** 工具名模式列表：匹配工具的 tool-call **及其配对 result，全部实例、完整历史**永远不被压缩（内核 `protectedTools`）。保护是硬排除：所有匹配 ref 渲染为 `BLOCKED`，推荐范围与显式范围都无法覆盖任何实例；在两种压缩模式、所有 wire 上一致生效。模式匹配为精确工具名或 `*` 通配（如 `"skill"`、`"skill_*"`）。含 `/` 的模式可跨客户端按名选定 skill（#1947）：skill 装载投影为规范路径 `skill/<name>` —— opencode `skill({name})`、Claude Code/ZCode `Skill({skill})`、任意工具读 `<dir>/<name>/SKILL.md` —— 因此 `"skill/release-orchestrator"` 只保护该 skill 的每次装载，`"skill/review-*"` 在名字段内通配（`*` 不跨 `/`），`"skill"` ≡ `"skill/*"`（节点含全部后代）。无 `/` 的模式行为不变。跨层级整体替换（最深层胜出）。示例：`{ "compress": { "protectedTools": ["skill/release-orchestrator"] } }`。
 - **⚠ 两个旋钮何时用哪个（配置前必读）：** 按工具的各次结果之间的关系选择：
-  - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。
+  - **独立内容** —— 每个实例携带独特信息，后续结果不会取代它（opencode/pi 的 `skill` 加载、一次性引用资料）：用 `protectedTools`。折叠旧的加载会永久丢失其内容，保护可让每次加载都留在上下文中（#1109）。用 `skill/<name>` 路径模式可只保护某个编排 skill 的全部装载、让轻量 skill 照常折叠（`protectedTools: ["skill/release-orchestrator"]`，#1947）。
   - **累积快照** —— 每条新结果取代旧结果（客户端的 todo/任务清单）：用 `protectedLatestTools`。对这类工具保护**全部**实例会让其历史无限膨胀 —— 正是 #639 通过只保护最新一条来规避的故障。
   - 经验法则：低频高价值工具 → `protectedTools`；高频刷屏工具 → 绝不做全历史保护（上下文无界增长）；累积快照型工具 → `protectedLatestTools`。
 
@@ -1315,14 +1359,14 @@
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** 可选的历史图像载荷移除。设为 `true` 时，除最近 `stripImagesKeepRecent` 条消息外，所有消息在重建 wire 前都会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。最近 N 条的图像逐字转发，且新发送的图像在其到达的那一轮必然落在该窗口内。默认关闭 —— 关闭期间，#488 图像 token 下限及其溢出 `502` 仍是图像密集型载荷的显式信号。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617。
+- **说明：** 可选的历史图像载荷移除。设为 `true` 时，老化消息在重建 wire 前会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。**剥离边界（#1995）：** anthropic 会话存在活跃压缩折叠时，边界为折叠锚定——只剥离被活跃折叠覆盖的 wire 消息，边界仅在压缩事件时移动，被剥离的前缀在两次折叠之间保持字节稳定（prompt cache 不再每轮重复计费），未折叠的图像保持可见。无活跃折叠时（以及其他 wire——其剥离占位符会翻转 kernel 消息 id）沿用经典滑动窗口：除最近 `stripImagesKeepRecent` 条外全部剥离。新发送的图像在其到达的那一轮必然落在未剥离尾部。**恢复：** 被剥离的像素可通过 `decompress({ imageRef })` 恢复——每个被剥离图像按 `mNNNNN` 引用建索引并 spill 到 `<state>/retrieve/img/<session>/`（尽力而为的 7 天 TTL）；preflight 折叠摘要的注释携带引用（`[image: png 1024x768 · m00042]`）。默认关闭 —— 关闭期间，#488 图像 token 下限及其溢出 `502` 仍是图像密集型载荷的显式信号。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617。
 
 #### `stripImagesKeepRecent`
 
 - **类型：** `number`
 - **默认值：** `5`
 - **状态：** ACTIVE
-- **说明：** 在 `stripImages: true` 时，末尾多少条消息保留其图像逐字转发。仅在启用 `stripImages` 时生效。
+- **说明：** 在 `stripImages: true` 时，末尾多少条消息保留其图像逐字转发。仅在启用 `stripImages` 时生效。**回退角色（#1995）：** anthropic 会话存在活跃折叠时剥离边界改为折叠锚定；此窗口在无折叠锚定时（以及所有其他 wire 上）生效。
 
 #### `visibilityMarkers`
 
@@ -1499,6 +1543,7 @@
 | `ACP_UPSTREAM` | `upstream` | https://api.anthropic.com |
 | `BILI_ADVISORY_CHECK` | `advisoryCheck` | true |
 | `BILI_ADVISORY_URL` | `advisoryUrl` | unset (built-in feed) |
+| `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh.allowDshCompaction` | false |
 | `BILI_CCR_RETRIEVAL_TTL_MS` | `ccrRetrievalTtlMs` | 600000 (0 disables retrieval) |
 | `BILI_CHAIN_CONTENT` | `chainContentDetection` | false |
@@ -1618,6 +1663,7 @@
 | `BILI_LOG_MASK_HOSTS` | 设为 `0` 关闭代理日志的 host 脱敏（#897）：非公开目标主机（私有 relay、内网域名）原样记录，而不是 `<private-host>`。默认开启（#255 —— 日志常被整段贴进公开 issue）；凭据头脱敏与之独立、始终开启。真实目标域名不依赖此开关也可查：`GET /__bili/stats` → `blindTunnels`、`GET /__bili/health`（均仅 loopback），以及 `acp_status` 输出。 |
 | `BILI_SUBAGENT_SPLIT` | 设为 `0` 关闭 Claude Code subagent 会话分流（#970）：默认情况下，anthropic 线路上同时携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 头的请求（后台 subagent）会获得独立的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 不再排在主会话的锁后面。默认开启。配置文件中设 `"subagentSplit": false` 效果相同；环境变量优先。 |
 | `BILI_FORK_ADOPTION` | 设为 `1` 开启 fork 块继承（#629）：匿名（prefix-affinity）客户端在会话中途分叉历史（编辑重发 / 从更早轮次重新生成）时，新会话直接继承父会话中"源内容在分叉请求里完整存在"的压缩块 —— 而不是从零开始、把共享前缀重新折叠一遍。默认关闭。带自有 id 的 resume-fork 不受此开关管 —— 它们随 `BILI_RESUME_INHERITANCE` 一并继承压缩块（#1834）。配置文件中设 `"forkAdoption": true` 效果相同；环境变量优先。无论开关如何，匿名 fork 发生时日志都会记录可继承的块清单，便于先评估收益再开启。 |
+| `BILI_AFFINITY_SIMHASH` | 设为 `0` 关闭 simhash 链对齐收养（#2265）：匿名请求的精确哈希链被客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）打断时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。护栏：覆盖率 ≥90%（Hamming ≤10）、变异位置 ≥20%（单点编辑仍走 fork，#629）、至少一条字节相同的用户消息、双候选歧义拒猜。默认开启。配置文件中设 `"affinitySimhash": false` 效果相同；环境变量优先。 |
 | `BILI_RESUME_INHERITANCE` | 设为 `0` 关闭 resume 继承（默认开启）（#1486）：当带自有会话 id 的客户端（如 Claude Code 的 `x-claude-code-session-id`）以**新**会话 id 重放完整历史来续接会话时（`cc --resume` 会 fork 出新 UUID），bili 通过字节级前缀匹配（≥8 条消息、append-only 跟踪）识别出它与该客户端已跟踪历史的父子关系，并在续接会话的首个请求上继承父会话的 ref 分配 —— 模型引用的旧代际 refs 因此命中**原始**消息、而不是错配到重新编号的新消息 —— 同时继承源内容完整存在的压缩块（随本继承一并生效，#1834：resume 丢块会导致被折叠原文重新回到线上、上游请求膨胀；旧的 `forkAdoption` 联动门现仅作用于匿名 fork，#629），并记录 `derivedFrom` 血缘。父会话不受影响；新消息在父会话 ref 空间之上继续编号。resume 必须**严格扩展**父历史 —— 同深度的字节级重放（不同 id）视为重复会话而非 resume。匿名会话不受影响（保留自己的 pfa-* 世界，#309）。配置文件中设 `"resumeInheritance": false` 效果相同；环境变量优先。 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | 设为 `1` 开启稳定 system 锚定（#1085）—— **wire 层兜底（best-effort）**：根治在客户端（会话历史与指令变更的呈现方式由客户端决定），本开关只是阻止代理因头部变化而使整个已缓存前缀失效。**仅限 plain-proxy 模式**：plugin-mode agent（`x-bili-plugin`）自管上下文、永不参与锚定，避免对已自带 cache-friendly 更新注入的客户端（如 claude-code 的 system-reminder）做双重处理。开启后，bili 按会话记住客户端首次发送的头部 system/instructions 块并持续原样重发。**局部变更**（文件式编辑，与当前生效版本共享 ≥70% 行）追加末尾 `[System context update] …` user 注记，内含紧凑行级 diff（`-` 删除 / `+` 新增；每条注记顺序叠加在前一条之上）。**非局部变更**（结构性重排、tool 定义增删、带时间戳的 banner、超 400 行的头部）直接采用新文本 —— 一次有意的缓存失效好过追加会误导模型的噪声 diff。防抖保护：累积超过 8 条注记同样直接替换锚点为最新文本并清空日志。锚点与注记日志随会话持久化，不受压缩/compaction 影响（session metadata 而非 kernel state）。已知残留限制：客户端自放的 `cache_control` 断点在换头后仍可能错位。不参与锚定的请求：标题生成微请求（OpenAI/Google）、Responses compaction-trigger 请求、auto-mode classifier 请求。客户端自身已实现同类机制（稳定 prompt + 历史内更新）时零额外注入 —— 这类更新作为普通历史透传。默认关闭。配置文件中设 `"stableSystemAnchor": true` 效果相同；环境变量优先。 |
 | `BILI_ALLOW_DSH_COMPACTION` | 设为 `1` 放行 dsh 内置自动压缩（#2028）。默认由 wire 级守卫（#1729）**在本地拒绝 dsh 原生压缩调用**（403）：dsh 的 `compaction-basic` 应对上下文压力时会重放会话前缀、并把固定摘要指令作为最后一条 user 消息发出，此类调用一旦落地，其 checkpoint 会永久覆盖原始历史——不可逆，且摧毁代理的压缩基底。本开关解除该拒绝，让 dsh 原生压缩真正执行。作用范围：非 web profile 下随附 bundle patch（`auto: false`）仍抑制**自动**触发，因此那里只有手动 `/compact` 受益；web profile（patch 层够不到 preset 嵌套实例，#1772）下放行后自动触发照常工作。网页配置页提供同一开关；环境变量优先于文件。在配置文件的 `"dsh"` 段下设 `"allowDshCompaction": true` 效果相同（旧文件里裸写在顶层的 `"allowDshCompaction"` 会在加载时自动迁移到该位置）。 |

@@ -38,9 +38,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort } from "./instance.js";
+import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
-import { fetchRegistryVersion } from "./update.js";
+import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
@@ -1004,7 +1004,7 @@ function pluginEntries(data: Record<string, unknown>, key: string): string[] {
 // config.json -> opencode.json -> opencode.jsonc, later wins), else create
 // opencode.json. Never spawn a second file next to an existing config — that
 // splits one logical config across files (#927).
-export function opencodeTargetFile(): string {
+function opencodeTargetFile(): string {
     const raw = process.env.OPENCODE_CONFIG?.trim();
     if (raw && raw.length > 0) return raw;
     const xdg = process.env.XDG_CONFIG_HOME?.trim();
@@ -1502,7 +1502,7 @@ interface KimiInstalledRecord {
 /** installed.json is machine-managed (kimi's own store writes it too) but is
  *  not user-authored prose — a corrupt registry is surfaced loudly instead of
  *  being silently re-created (§7.3). */
-export function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
+function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
     let text: string;
     try {
         text = fs.readFileSync(file, "utf8");
@@ -1526,7 +1526,7 @@ function writeJsonAtomic(file: string, data: unknown): void {
  *  with the bundled-node fallback) requires the v2 engine. A missing binary or
  *  an old one throws with launcher-mode guidance rather than writing a dead
  *  manifest. */
-export function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
+function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
     const candidates: Array<{ cmd: string; viaShell: boolean }> = process.platform === "win32"
         ? [{ cmd: "kimi --version", viaShell: true }]
         : [{ cmd: "kimi", viaShell: false }, { cmd: path.join(resolveKimiHome(env), "bin", "kimi"), viaShell: false }];
@@ -1719,13 +1719,13 @@ function zcodeArgsMatch(args: unknown, re: RegExp): boolean {
     return Array.isArray(args) && args.some((a) => typeof a === "string" && re.test(a));
 }
 
-export function isOursZcodeHookEntry(entry: unknown): boolean {
+function isOursZcodeHookEntry(entry: unknown): boolean {
     const hooks = zcodeAsPlain(entry)?.hooks;
     if (!Array.isArray(hooks)) return false;
     return hooks.some((h) => zcodeArgsMatch(zcodeAsPlain(h)?.args, ZCODE_HOOK_ENTRY_RE));
 }
 
-export function isOursZcodeMcpServer(server: unknown): boolean {
+function isOursZcodeMcpServer(server: unknown): boolean {
     const s = zcodeAsPlain(server);
     return !!s && s.type === "stdio" && zcodeArgsMatch(s.args, ZCODE_MCP_ENTRY_RE);
 }
@@ -1734,7 +1734,7 @@ export function isOursZcodeMcpServer(server: unknown): boolean {
  *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
  *  mcp.servers.bili when it already points at our dist — a user's own "bili"
  *  server throws instead of being clobbered (§7.3). */
-export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
+function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(doc);
     const notes: string[] = [];
     const hooks = zcodeAsPlain(data.hooks) ?? {};
@@ -1761,7 +1761,7 @@ export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { ho
     return { data, notes };
 }
 
-export function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
     const data = structuredClone(doc);
     const removed: string[] = [];
     const hooks = zcodeAsPlain(data.hooks);
@@ -1855,7 +1855,7 @@ function zcodeStatus(): string {
  *  resolvable. Read-only. Multi-face probes degrade to partial info on
  *  malformed config; single-source probes (pi/opencode/zcode) propagate the
  *  parse error so doctor reports a broken probe instead of a false "absent". */
-export interface LanePresence {
+interface LanePresence {
     installed: boolean;
     pointers: string[];
     targets: string[];
@@ -1882,6 +1882,38 @@ function rootFromDistFile(file: string): string {
     return path.dirname(path.dirname(path.dirname(file)));
 }
 
+// #2260(F): cache spec slots are `billion-context@<spec>`; for registry
+// installs <spec> is a dotted version, which lexicographic sort mis-orders
+// ("0.1.9" > "0.1.186" because '9' > '1'). Compare all-numeric specs per
+// segment; anything non-numeric ("latest", file: specs) falls back to plain
+// string order — same relative position as before.
+function compareSpecSlots(a: string, b: string): number {
+    const SPEC_PREFIX = "billion-context@";
+    const av = a.startsWith(SPEC_PREFIX) ? a.slice(SPEC_PREFIX.length) : a;
+    const bv = b.startsWith(SPEC_PREFIX) ? b.slice(SPEC_PREFIX.length) : b;
+    const segments = (s: string): number[] | null => {
+        const parts = s.split(".");
+        if (parts.length === 0) return null;
+        const out: number[] = [];
+        for (const p of parts) {
+            if (!/^\d+$/.test(p)) return null;
+            out.push(Number(p));
+        }
+        return out;
+    };
+    const an = segments(av);
+    const bn = segments(bv);
+    if (an !== null && bn !== null) {
+        const len = Math.max(an.length, bn.length);
+        for (let i = 0; i < len; i++) {
+            const d = (an[i] ?? 0) - (bn[i] ?? 0);
+            if (d !== 0) return d;
+        }
+        return 0;
+    }
+    return av.localeCompare(bv);
+}
+
 /** #1234/#2199: on-disk root of the OpenCode v2 cache copy of billion-context —
  *  $XDG_CACHE_HOME/opencode/npm/billion-context@<spec>/<ts>/node_modules/billion-
  *  context (newest spec slot, newest timestamp wins). Read-only; undefined when
@@ -1899,7 +1931,7 @@ export function opencodeCacheCopyRoot(env: NodeJS.ProcessEnv = process.env): str
     } catch {
         return undefined;
     }
-    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort().reverse()) {
+    for (const slot of slots.filter((s) => s.startsWith("billion-context@")).sort(compareSpecSlots).reverse()) {
         let stamps: string[];
         try {
             stamps = fs.readdirSync(path.join(npm, slot));
@@ -2167,6 +2199,34 @@ export function pluginRemove(agent: PluginAgent): string {
     return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : agent === "kimi" ? kimiRemove() : agent === "hermes" ? hermesRemove() : agent === "zcode" ? zcodeRemove() : opencodeRemove();
 }
 
+/** #2155 uninstall guardrail (advisory half): `bili plugin remove <agent>`
+ * should tell the user that already-open client windows keep talking to the
+ * proxy as zombie plugin sessions (their MCP subprocess died with the remove,
+ * but the session binding is sticky). The proxy side self-heals those sessions
+ * (degrade to proxy mode); this note closes the loop for the human. Best-effort:
+ * any failure (no proxy, endpoint down, odd shape) stays silent. */
+export async function warnActivePluginSessions(agent: PluginAgent): Promise<string> {
+    try {
+        const inst = readProxyInstanceFile();
+        if (inst === undefined) return "";
+        const res = await fetch(inst.origin.replace(/\/$/, "") + "/__bili/sessions", { signal: AbortSignal.timeout(2500), headers: { accept: "application/json" } });
+        if (!res.ok) return "";
+        const data = (await res.json()) as { sessions?: Array<Record<string, unknown>> };
+        const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        let live = 0;
+        for (const s of sessions) {
+            const hint = typeof s["clientHint"] === "string" ? s["clientHint"] : "";
+            const seen = typeof s["lastSeen"] === "string" ? Date.parse(s["lastSeen"]) : Number.NaN;
+            if (hint === agent && Number.isFinite(seen) && seen >= cutoff) live += 1;
+        }
+        if (live === 0) return "";
+        return `note: ${live} active ${agent} session(s) seen in the last 10 minutes — already-open client windows keep running; their plugin lane is gone and the proxy self-heals them to proxy mode (#2155). Reload/restart the client to fully detach.`;
+    } catch {
+        return "";
+    }
+}
+
 export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
     const checks: Array<[PluginAgent, () => string]> = [
         ["pi", piStatus],
@@ -2208,7 +2268,7 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     zcode: "the global bili install (hook/MCP point at its dist)",
 };
 
-export interface PluginUpdateOpts {
+interface PluginUpdateOpts {
     packageName: string;
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;
@@ -2291,8 +2351,14 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const latest = await fetchRegistryVersion(opts, opts.packageName);
         if (!latest) return ["dsh: could not resolve the latest version from npm — leaving profile bundles alone"];
         const before = targets.length;
-        const refreshed = await refreshDshProfileBundles(latest, log);
-        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel (see log for per-profile results)`];
+        const { refreshed, failed } = await refreshDshProfileBundles(latest, log);
+        if (failed === 0) {
+            // #2192: a clean manual run is evidence the lane works — disarm
+            // its cooldown immediately instead of letting the automatic channel
+            // wait out the window (up to 6 h).
+            await clearOwnerLaneBackoff("dsh-profile", latest);
+        }
+        return [`dsh: ${refreshed}/${before} profile bundle(s) refreshed to ${latest} through dsh's plugin channel${failed > 0 ? ` (${failed} failed)` : ""} (see log for per-profile results)`];
     }
     if (agent === "hermes") {
         if (hermesStatus() !== "installed") return ["hermes: not installed — nothing to update"];

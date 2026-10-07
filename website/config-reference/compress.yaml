@@ -119,8 +119,8 @@ entries:
     group: compress
     id: cw.sikr
     render: compress-row
-    desc_en: "With stripImages on, images inside the N newest messages are kept."
-    desc_zh: "开启剥离图片时，最新 N 条消息内的图片保留。"
+    desc_en: "With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary)."
+    desc_zh: "开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。"
     site_en: "With stripImages on, images inside the N newest messages (default 5) are kept."
     site_zh: "开启剥离图片时，最新 N 条消息（默认 5）内的图片保留。"
   - key: compress.tiers
@@ -139,8 +139,8 @@ entries:
     group: compress
     id: ct.pt
     render: compress-row
-    desc_en: "Hard exclusion across all history: results of listed tools never fold."
-    desc_zh: "全历史硬排除：列出工具的结果永不折叠。"
+    desc_en: "Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947)."
+    desc_zh: "全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。"
     site_en: "Hard exclusion across all history: results of listed tools never fold (use with care)."
     site_zh: "全历史硬排除：列出工具的结果永不折叠（慎用）。"
   - key: compress.protectedLatestTools
@@ -149,8 +149,8 @@ entries:
     group: compress
     id: ct.plt
     render: compress-row
-    desc_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
-    desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
+    desc_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947)."
+    desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。"
     site_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
     site_zh: "只保护累积快照类工具的「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
   - key: compress.neverPreserveRecentTools

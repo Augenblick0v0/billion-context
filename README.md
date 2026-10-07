@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-<code>npm install -g billion-context</code>
+<code>npm install -g billion-context --prefix=~/.local</code>
 </p>
 
 <p align="center">
@@ -129,11 +129,23 @@ Pick by your client:
 
 ## Install
 
+Linux / macOS — install with a user-level prefix (no `sudo`, no npm config
+changes, and `bili`'s self-update never hits permission errors):
+
 ```bash
-npm install -g billion-context
+npm install -g billion-context --prefix=~/.local
 ```
 
-This installs the `bili` command (`bili-proxy` is kept as an alias).
+The `bili` command lands in `~/.local/bin` — already on PATH in most distros;
+if not, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or
+`~/.zshrc`. On nvm or Homebrew Node the default prefix is already user-owned —
+a plain `npm install -g billion-context` works as-is. On Windows the default
+prefix (`%APPDATA%\npm`) is also user-writable — plain `npm install -g billion-context`.
+
+This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
+`EACCES` with an old root-owned prefix? Reinstall with `--prefix=~/.local`
+(pass the flag again on any future npm reinstall of `bili`) — that is the
+permanent fix; avoid `sudo`.
 
 ## Quickstart
 
@@ -193,6 +205,13 @@ skipping bili commands entirely:
   for you too: set `"compaction": { "auto": false }` in the same config
   (otherwise OpenCode's native auto-compaction double-compresses) and keep a
   manual backup of the file first.
+- **claude:** this repository doubles as a Claude Code plugin marketplace —
+  `/plugin marketplace add ranxianglei/billion-context`, then
+  `/plugin install billion-context@billion-context`, then run
+  `/billion-context:bili-setup` (it drives `bili plugin install claude` for
+  you and tells you to restart). Same end state as the bili installer; the
+  plugin ships no hooks or MCP entries of its own, so nothing
+  double-registers.
 
 For pi / omp / kimi / claude there is no client-side channel — `bili plugin
 install <client>` writes their config entries for you (kimi's declarative
@@ -407,6 +426,8 @@ In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs 
 **Update visibility is silent by default since v0.1.183 (#1977):** routine/recommended releases no longer render an update line on the `/acp` panel footer or in `acp_status` — only a `critical`-tier release surfaces there (`CRITICAL UPDATE READY/AVAILABLE`). The standing ways to check an installed-but-not-restarted release are the stale cues above: web UI banner, the `/acp` one-line warning, and `GET /__bili/status`. Deliberately no always-on nag; the advisory channel (#1481) remains the only auto-visible critical path.
 
 When an install keeps failing (unwritable or host-managed dir, network error, …), auto-update no longer re-downloads and retries on every 3-minute cycle forever. After three consecutive failures it backs off exponentially (5 min → 10 → 20 …, capped at 6 h), logs a one-time actionable hint (fix permissions / npm prefix, reinstall user-level, or disable via `"autoUpdate": false` / `ACP_AUTO_UPDATE=0`), and logs nothing further about the failure while cooling down (no download, no retry line); it resumes as soon as the failure clears or a different version is targeted (#1603).
+
+The same bounded retry now covers the **owner-managed lanes** the global self-update drives instead of writing the copy itself — the dsh desktop in-place copy, the dsh profile bundles, and pi's npm copy (#2192). Each lane keeps its own failure streak keyed by lane + target version, so a persistently broken desktop layout no longer re-downloads the full tarball every cycle (up to ~480 downloads/day per affected machine before the fix); three strikes arms the same exponential cooldown, and the one-time hint names the failing lane and its manual fix (`dsh plugin --profile <name> add …`, `pi update --extension …`, or recreate the desktop profile). Host-managed instances additionally check on their own slower cadence — 30 minutes plus up to 15 minutes of jitter, tracked under a separate throttle marker — instead of consuming the global 3-minute budget. Failure streaks are shared across every bili process on the machine through a small state file in the cache dir (`.install-backoff.json`), so several running instances don't each burn their own retry budget; a clean `bili plugin update` disarms the dsh profile lane immediately. The file is written atomically (tmp+rename) and every writer merges with what is already on disk, so concurrent instances cooperate instead of overwriting each other's streaks; long-lived processes re-read it when it changes, so a manual disarm by one copy is visible to the others on their next check. It is fail-safe in the retry direction — a corrupt file or jumped clock is dropped, never allowed to silence a lane for long. `bili plugin update` clears the dsh-profile lane's key; a repaired desktop lane clears its own key on its next successful in-place refresh.
 
 ### Critical-defect advisories (forced updates)
 

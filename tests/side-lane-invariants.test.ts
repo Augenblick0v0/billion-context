@@ -48,7 +48,9 @@ async function harness() {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify(req.url?.endsWith("/chat/completions")
                     ? { id: "chat_test", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 10000, completion_tokens: 10, total_tokens: 10010 } }
-                    : { id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
+                    : req.url?.endsWith("/v1/responses")
+                      ? { id: "resp_test", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: 10000, output_tokens: 10, total_tokens: 10010 } }
+                      : { id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
             });
         });
         server.listen(0, "127.0.0.1", () => resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.close(); } }));
@@ -67,7 +69,13 @@ async function harness() {
         const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: maxTokens, stream: false, system, messages: msgs }) });
         assert.equal(response.status, 200, await response.text());
     };
-    return { request, forwarded, dshSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
+    // dsh-shaped request sender (responses wire: instructions is the system carrier)
+    const dshRespSend = async (conversationId: string, input: unknown[], instructions: string, maxTokens = 1024) => {
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId };
+        const response = await fetch(`${origin}/bili/${upstream.url}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_output_tokens: maxTokens, instructions, input }) });
+        assert.equal(response.status, 200, await response.text());
+    };
+    return { request, forwarded, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
 }
 
 const mainMsg = (n: number) => ({ role: "user", content: `main turn ${n} `.repeat(120) });
@@ -197,7 +205,11 @@ test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary
         // REVIEW_POLICY system, full-budget model turn (NOT a side request —
         // budget 300, no tools, no side agent) → keyed by design onto
         // `|sub:<fp>` (#1916/#1307/#1314) and rides the main pipeline there.
-        await h.dshSend(conv, [mainMsg(0), { role: "user", content: "REVIEW: tool call risk assessment" }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        // #2241: the blob is the FLATTENED transcript as a single fresh user
+        // message — it does NOT byte-exactly continue the raw key's chain, so
+        // the continuity-aware anchor still forks it (a replay that DID
+        // continue the chain is the same conversation evolving, not a persona).
+        await h.dshSend(conv, [{ role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nassistant: ok\nProposed tool call: bash rm -rf /tmp/x. Decide SAFE or UNSAFE." }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
         const all = listSessions();
         const kids = all.filter((s) => s.id.startsWith(conv + "|") || s.id.includes(conv + "|sub:"));
         assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
@@ -206,6 +218,35 @@ test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary
         assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
         const status = (await h.request("/__bili/status")).body as { splitSessions?: unknown[] };
         assert.deepEqual(status.splitSessions, [], "/__bili/status stays clean for design persona forks");
+    } finally {
+        await h.close();
+    }
+});
+
+test("(E) side requests never claim the persona anchor on the responses wire (#2203 parity)", async () => {
+    const h = await harness();
+    try {
+        const conv = "persona-resp";
+        // main turn anchors the raw key (instructions is the system carrier here)
+        await h.dshRespSend(conv, [mainMsg(0)], "MAIN OPERATING SYSTEM", 256);
+        const main = resolveConversation(conv).session!;
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 1, "main refs under the raw key");
+        // side shape: tiny budget, no tools, own utility instructions —
+        // sideRequestLike suppresses the persona split (#2203: the responses
+        // wire gained the same `!sideRequestLike` gate as openai/anthropic):
+        // rides the raw key verbatim, mints no |sub:<fp> session, touches no state.
+        await h.dshRespSend(conv, [{ role: "user", content: "Generate a title." }], "You generate short titles.", 100);
+        let all = listSessions();
+        let kids = all.filter((s) => s.id.startsWith(conv + "|"));
+        assert.equal(kids.length, 0, `side request must not mint a persona fork, got ${all.map((s) => s.id).join(", ")}`);
+        assert.equal(main.stats.requests, 1, "side request counts nowhere");
+        // full-budget review shape still forks (the #2203 fix itself) and stays canary-clean
+        await h.dshRespSend(conv, [{ role: "user", content: "REVIEW: tool call risk assessment" }], "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        all = listSessions();
+        kids = all.filter((s) => s.id.startsWith(conv + "|"));
+        assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
+        assert.equal(kids[0].metadata.personaNamespace, true, "fork stamped as a designed split");
+        assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
     } finally {
         await h.close();
     }

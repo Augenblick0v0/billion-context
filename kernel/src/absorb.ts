@@ -3,8 +3,9 @@ import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME } from "./compress-tools.js";
 import { isStoredPlaceholderText } from "./ccr.js";
 import {
   collectLatestProtected,
+  collectProtectedToolCallIds,
   isMessageLatestProtected,
-  isMessageProtected,
+  isMessageProtectedWithPairing,
   matchToolPattern,
   type LatestProtected,
 } from "./protected.js";
@@ -81,18 +82,28 @@ function isAcpOrConfiguredTool(
   return ACP_TOOL_NAMES.has(toolName);
 }
 
+const NO_PROTECTED_CALLS = new Set<string>();
+
 /** True when a tool-result message is in scope for absorption prompting:
  *  a tool-result of a non-ACP, non-excluded, non-protected tool. */
 export function isAbsorbCandidate(
   msg: CoreMessage,
   config: Config,
   latest?: LatestProtected,
+  protectedCallIds?: Set<string>,
 ): boolean {
   if (msg.contentType !== "tool-result" || !msg.toolCallId) return false;
   if (isStoredPlaceholderText(msg.text ?? "")) return false;
   const cfg = resolveAbsorbConfig(config);
   if (isAcpOrConfiguredTool(msg.toolName, cfg)) return false;
-  if (isMessageProtected(msg, config)) return false;
+  if (
+    isMessageProtectedWithPairing(
+      msg,
+      config,
+      protectedCallIds ?? NO_PROTECTED_CALLS,
+    )
+  )
+    return false;
   if (latest && isMessageLatestProtected(msg, latest)) return false;
   for (const pattern of cfg.excludeTools) {
     if (msg.toolName && matchToolPattern(msg.toolName, pattern)) return false;
@@ -152,8 +163,9 @@ export function appendAbsorbPrompts(
 
   let promptedCount = 0;
   const latest = collectLatestProtected(messages, config);
+  const protectedCallIds = collectProtectedToolCallIds(messages, config);
   const out = messages.map((msg) => {
-    if (!isAbsorbCandidate(msg, config, latest)) return msg;
+    if (!isAbsorbCandidate(msg, config, latest, protectedCallIds)) return msg;
     if (absorbedIds.has(msg.id)) return msg;
     const text = msg.text ?? "";
     if (text.includes(ABSORB_PROMPT_MARKER)) return msg;
@@ -301,7 +313,11 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
     };
   }
   if (
-    isMessageProtected(target, input.config) ||
+    isMessageProtectedWithPairing(
+      target,
+      input.config,
+      collectProtectedToolCallIds(input.messages, input.config),
+    ) ||
     isMessageLatestProtected(
       target,
       collectLatestProtected(input.messages, input.config),

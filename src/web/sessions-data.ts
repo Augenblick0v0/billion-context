@@ -5,10 +5,11 @@ import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../p
 import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
-import { statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 
@@ -21,7 +22,7 @@ import * as path from "node:path";
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
  *  total corpus bytes; a single admin request's peak is one decoded file. */
 
-export interface WebSessionSummary {
+interface WebSessionSummary {
     id: string;
     title?: string;
     label?: string;
@@ -91,9 +92,16 @@ export interface WebSessionSummary {
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
     summaryCost?: number;
+    /** #2202: folds whose covered ids were verified on the wire and have since
+     *  vanished (host shadowing / native compaction outside bili's knowledge) —
+     *  their avoided-token accrual is frozen; count + frozen share below. */
+    coverageLostFolds?: number;
+    /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
+     *  grossSaved that is frozen rather than accruing. */
+    coverageLostFrozenTokens?: number;
 }
 
-export interface WebOverview {
+interface WebOverview {
     sessions: number;
     live: number;
     requests: number;
@@ -114,6 +122,12 @@ export interface WebOverview {
     repayTotal: number;
     /** Σ summary generation cost (output tokens) across ledger sessions. */
     summaryCostTotal: number;
+    /** #2202: Σ coverage-lost fold count across sessions (0 when none). */
+    coverageLostFoldTotal: number;
+    /** #2202: Σ frozen avoided tokens over coverage-lost folds — a subset of
+     *  grossSavedTotal whose accrual has stopped (host shadowed the covered
+     *  bytes outside bili's knowledge, #2193/#2202). 0 when none. */
+    coverageLostFrozenTotal: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
     /** Σ compression re-read missed tokens across ledger sessions. */
@@ -130,7 +144,7 @@ export interface WebOverview {
     recent: WebSessionSummary[];
 }
 
-export interface WebSessionDetail extends WebSessionSummary {
+interface WebSessionDetail extends WebSessionSummary {
     lastInputTokens: number;
     compressCreditTokens: number;
     retrieveCalls: number;
@@ -271,21 +285,30 @@ function liveCoveredPaths(dir: string): Set<string> {
     return out;
 }
 
-/** #2180: a top-level ENOENT means "pristine" — a fresh install where the data
- *  root was never created, so no session file can exist anywhere — only when
- *  the DEFAULT layout is in effect: BILI_SESSIONS_DIR unset AND the XDG data
- *  root itself absent. An explicit override pointing nowhere, or a data root
- *  that exists without its sessions subdir, stays loud (#1937): silence there
- *  would hide a moved/misconfigured path while real sessions sit elsewhere. */
+// #2260(F)/#2180 follow-up: bili's own infra dirs created under the data root
+// BEFORE any session exists (ensureRootCA() makes <data>/ca at proxy start) —
+// their presence alone must not read as "misconfigured". The set is closed by
+// construction: paths.ts writes only `sessions` and `ca` directly under it.
+const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
+
+/** #2180: a top-level ENOENT means "pristine" — no session file can exist
+ *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
+ *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  dirs (a fresh install where ensureRootCA() already ran). An explicit
+ *  override pointing nowhere, or a data root containing anything else, stays
+ *  loud (#1937): silence there would hide a moved/misconfigured path while
+ *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
     if (process.env.BILI_SESSIONS_DIR) return false;
+    let entries: string[];
     try {
         statSync(dataDir());
-        return false;
+        entries = readdirSync(dataDir());
     } catch (e) {
         return (e as NodeJS.ErrnoException).code === "ENOENT";
     }
+    return entries.every((entry) => DATA_DIR_INFRA_ENTRIES.has(entry));
 }
 
 /** Single-flight index refresh. Steady-state cost is one stat per file; only
@@ -479,8 +502,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // getCacheLedger() would bootstrap/mutate session.metadata instead.
     const led = s.metadata["cacheLedger"] as {
         agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number; switches?: number; switchMissed?: number; keySwitches?: number; keySwitchMissed?: number };
-        folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }>;
+        folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number; bid?: string }>;
     } | undefined;
+    // #2202: per-block coverage evidence (reconcileFoldCoverage's record) — a
+    // fold is coverage-lost iff it was VERIFIED present at least once and its
+    // covered ids are now entirely off the wire. Live state: self-heals when
+    // the host resends the originals again.
+    const covAll = s.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
     const agg = led;
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
@@ -491,6 +519,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // mirrors acp-kernel summarizeFoldEconomics() so the dashboard can split
     // "compressed away" (gross) from "net saving after re-pay & summary cost".
     let hasFolds = false, grossSaved = 0, netSaved = 0, repayCost = 0, summaryCost = 0, foldCount = 0;
+    let coverageLostFolds = 0, coverageLostFrozenTokens = 0;
     for (const f of led?.folds ?? []) {
         hasFolds = true;
         foldCount += 1;
@@ -500,6 +529,11 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         netSaved += avoided - rep - sig;
         repayCost += rep;
         summaryCost += sig;
+        const cov = f.bid !== undefined ? covAll?.[f.bid] : undefined;
+        if (cov !== undefined && cov.e === 1 && (cov.p ?? 0) + (cov.r ?? 0) === 0) {
+            coverageLostFolds += 1;
+            coverageLostFrozenTokens += Math.max(0, avoided);
+        }
     }
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
@@ -510,6 +544,15 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     }
     // #1426: which client this session came from (plugin stamp wins, then sniff/UA hint).
     const metaRec = s.metadata as Record<string, unknown>;
+    // #2155: active self-heal state (zombie plugin degrade / nudge
+    // suppression) — surface it so the web list can badge the session.
+    const shRaw = metaRec["selfHeal"];
+    const selfHeal = shRaw !== null && typeof shRaw === "object"
+        && typeof (shRaw as Record<string, unknown>)["detected"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["action"] === "string"
+        && typeof (shRaw as Record<string, unknown>)["since"] === "number"
+        ? { detected: (shRaw as Record<string, unknown>)["detected"] as string, action: (shRaw as Record<string, unknown>)["action"] as string, since: (shRaw as Record<string, unknown>)["since"] as number }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -534,11 +577,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         cacheHitPct: hitPct(inputTokens, cachedTokens),
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
+        ...(selfHeal ? { selfHeal } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
         ...(s.restored ? { restored: true } : {}),
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
+        ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
             ? {
@@ -584,9 +629,9 @@ export async function buildSessionList(): Promise<WebSessionSummary[]> {
     return vis;
 }
 
-export interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+interface SessionPageQuery { q?: string; page?: number; pageSize: number }
 
-export interface SessionPageResult {
+interface SessionPageResult {
     sessions: WebSessionSummary[];
     total: number;
     page: number;
@@ -622,6 +667,7 @@ export async function buildOverview(): Promise<WebOverview> {
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
+    let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
     for (const s of all) {
@@ -662,6 +708,8 @@ export async function buildOverview(): Promise<WebOverview> {
             netSavedTotal += s.netSaved ?? 0;
             repayTotal += s.repayCost ?? 0;
             summaryCostTotal += s.summaryCost ?? 0;
+            coverageLostFoldTotal += s.coverageLostFolds ?? 0;
+            coverageLostFrozenTotal += s.coverageLostFrozenTokens ?? 0;
         } else if (s.tokensSaved > 0) {
             // Pre-tagging sessions: their local estimate counts toward the compressed side only.
             grossSavedTotal += s.tokensSaved;
@@ -681,6 +729,8 @@ export async function buildOverview(): Promise<WebOverview> {
         hasFoldData,
         repayTotal,
         summaryCostTotal,
+        coverageLostFoldTotal,
+        coverageLostFrozenTotal,
         missNewTotal,
         missCompTotal,
         missTtlTotal,
