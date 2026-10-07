@@ -5,7 +5,6 @@ import net from "node:net";
 import tls from "node:tls";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { withOneCallPayload } from "./one-call-payload.js";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
@@ -3965,7 +3964,7 @@ async function prepareAnthropic(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = withOneCallPayload(rendered.text, turn.nudge, config);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
                 }
@@ -4215,7 +4214,7 @@ async function prepareOpenai(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = withOneCallPayload(rendered.text, turn.nudge, config);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) }];
                 }
@@ -4467,7 +4466,7 @@ async function prepareGoogle(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = withOneCallPayload(rendered.text, turn.nudge, config);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
                     rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(renderedWithPayload), visibilityMarkers));
                 }
@@ -4796,7 +4795,7 @@ async function prepareResponses(
         if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = withOneCallPayload(rendered.text, turn.nudge, config);
+                const renderedWithPayload = rendered.text;
                 if (rendered.text) {
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]

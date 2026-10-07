@@ -380,3 +380,51 @@ test("no user-msg annotation when count is zero or absent", () => {
     "makeRanges fixtures carry no userMsgs",
   );
 });
+
+// #2302: the one-call skeleton (line form) rides both gentle and emergency
+// nudges — the model gets ready-to-fill compress arguments, not a batch
+// hint it will ignore. T2/T3 nudges fold block refs and never see it.
+test("#2302: gentle nudge carries the one-call line-form skeleton", () => {
+  const result = renderNudgeText(makeDecision({ contextUsage: 0.5 }));
+  assert.ok(result.text.includes("ONE CALL, ONE STRING"), "skeleton framing");
+  assert.ok(
+    result.text.includes("m00001–m00003 <topic>"),
+    "refs header from the recommended ranges",
+  );
+  assert.ok(
+    result.text.includes("<write your summary of this range>"),
+    "summary slot left to the model",
+  );
+  // the old batch hint stays — the skeleton extends it, not replaces it
+  assert.ok(result.text.includes("fold the ranges you keep in ONE call"));
+});
+
+test("#2302: emergency nudge keeps the skeleton but stays unconditional (#1198)", () => {
+  const emergency = renderNudgeText(
+    makeDecision({ contextUsage: 0.99, breakdown: { emergencyOverride: 1 } }),
+  );
+  assert.ok(emergency.text.includes("ONE CALL, ONE STRING"), "skeleton rides");
+  assert.ok(
+    !emergency.text.includes("If you compress"),
+    "emergency stays unconditional",
+  );
+  assert.ok(
+    emergency.text.includes("When you compress"),
+    "unconditional framing for the skeleton",
+  );
+});
+
+test("#2302: tier-2/tier-3 nudges carry no message-ref skeleton (block refs)", () => {
+  const t2 = renderNudgeText(
+    makeDecision({ contextUsage: 0.5, tier: 2, tierTargetBlocks: [] }),
+  );
+  assert.ok(!t2.text.includes("ONE CALL, ONE STRING"), "T2 folds blocks");
+  assert.ok(!t2.text.includes("<write your summary of this range>"));
+});
+
+test("#2302: fewer than two ranges → no skeleton (nothing to batch)", () => {
+  const single = renderNudgeText(
+    makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(1) }),
+  );
+  assert.ok(!single.text.includes("ONE CALL, ONE STRING"));
+});

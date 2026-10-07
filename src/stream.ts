@@ -6,7 +6,7 @@ import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from 
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
-import { withOneCallPayload } from "./one-call-payload.js";
+import { oneCallTail } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
@@ -365,7 +365,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
     const remaining = viableRanges(nudge.compressibleRanges)
         .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
     if (remaining.length > 0) {
-        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}` + withOneCallPayload("", { ...nudge, compressibleRanges: remaining }, ctx.config);
+        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}` + oneCallTail(remaining);
     }
     // A tier-distillation nudge means block-boundary compress calls (bN..bM)
     // are still actionable — a stop signal there would contradict the tier

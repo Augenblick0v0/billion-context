@@ -53,11 +53,12 @@ export {
   countMessageTokens,
 } from "./tokenize.js";
 export type { TokenCountFn } from "./tokenize.js";
-export { renderNudgeText, formatRanges } from "./nudge-text.js";
+export { renderNudgeText, formatRanges, oneCallPayload, oneCallTail } from "./nudge-text.js";
 export type {
   NudgeVoice,
   RenderedNudge,
   NudgePromptSections,
+  OneCallTailOptions,
 } from "./nudge-text.js";
 export {
   resolveBlockSpan,

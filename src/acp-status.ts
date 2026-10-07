@@ -11,7 +11,7 @@ import { conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
-import { withOneCallPayload } from "./one-call-payload.js";
+import { oneCallTail } from "acp-kernel";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -78,7 +78,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const protectedRanges = nudge.protectedRanges ?? [];
             if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
-                extra.push(withOneCallPayload(formatRanges(ranges, protectedRanges), { ...nudge, compressibleRanges: ranges }, ctx.config));
+                extra.push(formatRanges(ranges, protectedRanges) + oneCallTail(ranges));
             }
         }
     } catch {
