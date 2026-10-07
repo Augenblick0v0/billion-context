@@ -7253,9 +7253,8 @@ async function forward(
         } else {
             await pipeThrough(responseBody, res);
         }
-        // #2347: finish the dump before the turn closes — its value is the full
-        // upstream tail, which the client may have stopped reading early.
-        if (dumpRaw) await dumpRaw;
+        // #2347: the raw-SSE dump is finished in the safety-net finally below —
+        // an inline await here would be skipped when a pipe rejects.
         return;
     }
     const ctx: RewriteCtx = {
@@ -7487,6 +7486,11 @@ async function forward(
         // this one must sit at the very end so clearing never happens while a
         // live stream still needs the external-abort listener.
         clearUpstreamTimer();
+        // #2347: finish the raw-SSE dump before the turn closes — its value is
+        // the full upstream tail, which the client may have stopped reading
+        // early. Idempotent where the rewriter lane already awaited it in its
+        // own finally; this covers the non-rewriter branch's throw paths too.
+        if (dumpRaw) await dumpRaw;
     }
 }
 
