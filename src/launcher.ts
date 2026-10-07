@@ -897,30 +897,46 @@ export function buildPiEnv(
     };
 }
 
-export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+// --- #1440 P3: one preset table + one builder behind the per-client
+// buildXxxEnv wrappers. Every client shares the same core —
+// `{ ...baseEnv, HTTPS_PROXY=<origin>, <CA var(s)>=<caPath>,
+// BILLION_CONTEXT_PROXY=<origin> }` — plus optional static extras (NO_PROXY
+// loopback pairs), an aider-only conditional HTTP_PROXY, and/or the single
+// base-URL override env resolved from discovered rewrites (http upstreams →
+// /bili/-wrapped value, https upstreams → raw value; when both exist the
+// https entry wins, matching the historical sequential assignment). buildPiEnv
+// (JSON manifest + host list envs) and buildClaudePluginEnv (direct-URL mode,
+// returns baseEnv untouched) stay bespoke above/below this table. ---
+type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity";
+
+interface EnvClientPreset {
+    /** CA path is written to every listed env var. */
+    caKeys: readonly string[];
+    /** emit HTTPS_PROXY=<origin>; false for gateway/base-URL routing clients (no proxy env at all). */
+    proxy: boolean;
+    /** emit HTTP_PROXY=<origin> only when the wrapper's routeHttp param is true (aider). */
+    httpProxyOnRouteHttp: boolean;
+    /** extra static key/value pairs appended after BILLION_CONTEXT_PROXY, in order. */
+    extras?: readonly (readonly [string, string])[];
+    /** base-URL override env(s) filled from rewrites — first entry is the rewrite lookup key, the rest are mirrors set to the same value. */
+    baseUrlKeys?: readonly string[];
 }
 
-export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
+
+const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
+    codex: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
     // combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
-}
-
-export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    trae: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // jcode is Rust reqwest: CA rides SSL_CERT_FILE (combined bundle).
     // NO_PROXY keeps loopback legs (local model endpoints, MCP) direct.
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        SSL_CERT_FILE: caPath,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
-}
-
-export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    jcode: {
+        caKeys: ["SSL_CERT_FILE"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
     // #1048: aider's Python stack trusts the CA through two different readers
     // — httpx (litellm's HTTP layer) honors SSL_CERT_FILE with REPLACE
     // semantics (hence the combined bundle carrying system roots so
@@ -928,27 +944,90 @@ export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.
     // REQUESTS_CA_BUNDLE. HTTP_PROXY is only set when a plaintext-http
     // upstream actually routes through it (absolute-form forward-proxy).
     // NO_PROXY keeps loopback legs (local ollama/vllm servers) direct.
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        ...(routeHttp ? { HTTP_PROXY: origin } : {}),
-        SSL_CERT_FILE: caBundle,
-        REQUESTS_CA_BUNDLE: caBundle,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
+    aider: {
+        caKeys: ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"],
+        proxy: true,
+        httpProxyOnRouteHttp: true,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
+    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
+    // (the combined bundle, since it replaces Go's system trust store).
+    copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
+    amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"] },
+    codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
+    /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
+     *  override env), so the launcher can only route it via cert MITM: its
+     *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
+     *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
+     *  No base-URL rewrite of any kind. */
+    qoder: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false },
+    // No proxy/CA env: model traffic goes straight to the loopback proxy via
+    // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
+    gemini: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["GOOGLE_GEMINI_BASE_URL"] },
+    // iFlow accepts case variants of the base-URL env; set both documented
+    // forms so whichever the client reads first wins.
+    iflow: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["IFLOW_BASE_URL", "IFLOW_baseUrl"] },
+    /** #1047: qwen-code honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS (undici,
+     *  additive CA semantics like qoder); NO_PROXY keeps loopback legs direct. */
+    qwen: {
+        caKeys: ["NODE_EXTRA_CA_CERTS"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
+    /** #2115: CLOUD_CODE_URL points language_server straight at the loopback
+     *  proxy; no proxy/CA env needed (the override IS the route). */
+    antigravity: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["CLOUD_CODE_URL"] },
+};
+
+function buildClientEnv(
+    preset: EnvClientPreset,
+    origin: string,
+    caPath: string,
+    baseEnv: NodeJS.ProcessEnv,
+    rewrites?: { httpRewrites: HttpRewrite[]; httpsRewrites: HttpRewrite[] },
+    routeHttp?: boolean,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    if (preset.proxy) env.HTTPS_PROXY = origin;
+    if (preset.httpProxyOnRouteHttp && routeHttp === true) env.HTTP_PROXY = origin;
+    for (const k of preset.caKeys) env[k] = caPath;
+    env.BILLION_CONTEXT_PROXY = origin;
+    for (const [k, v] of preset.extras ?? []) env[k] = v;
+    const baseUrlKeys = preset.baseUrlKeys ?? [];
+    if (baseUrlKeys.length > 0 && rewrites !== undefined) {
+        const r = rewrites.httpRewrites.find((rw) => rw.key === baseUrlKeys[0]);
+        if (r) for (const k of baseUrlKeys) env[k] = wrapUpstream(origin, r.realUpstream);
+        const hr = rewrites.httpsRewrites.find((rw) => rw.key === baseUrlKeys[0]);
+        if (hr) for (const k of baseUrlKeys) env[k] = hr.realUpstream;
+    }
+    return env;
+}
+
+export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.codex, origin, caPath, baseEnv);
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.trae, origin, caPath, baseEnv);
+}
+
+export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.jcode, origin, caPath, baseEnv);
+}
+
+export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.aider, origin, caBundle, baseEnv, undefined, routeHttp);
 }
 
 export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
-    // (the combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv(ENV_CLIENTS.copilot, origin, caPath, baseEnv);
 }
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv(ENV_CLIENTS.amp, origin, caPath, baseEnv);
 }
 
 export function buildCodexArgs(
@@ -1139,12 +1218,7 @@ export function buildClaudeEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
-    if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
-    if (hr) env.ANTHROPIC_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.claude, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 /** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
@@ -1174,21 +1248,11 @@ export function buildCodebuddyEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
-    if (r) env.CODEBUDDY_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
-    if (hr) env.CODEBUDDY_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.codebuddy, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
-/** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
- *  override env), so the launcher can only route it via cert MITM: its
- *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
- *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
- *  No base-URL rewrite of any kind. */
 export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv(ENV_CLIENTS.qoder, origin, caPath, baseEnv);
 }
 
 export function buildGeminiEnv(
@@ -1198,14 +1262,7 @@ export function buildGeminiEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    // No proxy/CA env: model traffic goes straight to the loopback proxy via
-    // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
-    if (r) env.GOOGLE_GEMINI_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
-    if (hr) env.GOOGLE_GEMINI_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.gemini, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 export function buildIflowEnv(
@@ -1215,37 +1272,13 @@ export function buildIflowEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    // iFlow accepts case variants of the base-URL env; set both documented
-    // forms so whichever the client reads first wins.
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
-    if (r) {
-        env.IFLOW_BASE_URL = wrapUpstream(origin, r.realUpstream);
-        env.IFLOW_baseUrl = env.IFLOW_BASE_URL;
-    }
-    const hr = httpsRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
-    if (hr) {
-        env.IFLOW_BASE_URL = hr.realUpstream;
-        env.IFLOW_baseUrl = hr.realUpstream;
-    }
-    return env;
+    return buildClientEnv(ENV_CLIENTS.iflow, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
-/** #1047: qwen-code honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS (undici,
- *  additive CA semantics like qoder); NO_PROXY keeps loopback legs direct. */
 export function buildQwenEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        NODE_EXTRA_CA_CERTS: caPath,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
+    return buildClientEnv(ENV_CLIENTS.qwen, origin, caPath, baseEnv);
 }
 
-/** #2115: CLOUD_CODE_URL points language_server straight at the loopback
- *  proxy; no proxy/CA env needed (the override IS the route). */
 export function buildAntigravityEnv(
     origin: string,
     caPath: string,
@@ -1253,12 +1286,7 @@ export function buildAntigravityEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
-    if (r) env.CLOUD_CODE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
-    if (hr) env.CLOUD_CODE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.antigravity, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 /**
