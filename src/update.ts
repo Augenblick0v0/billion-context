@@ -397,7 +397,10 @@ export function backoffMs(count: number): number {
 
 function remediationHint(error: string): string {
     if (/not writable/i.test(error)) {
-        return "the install dir is not writable by this user. Fix its ownership/permissions, point npm at a user-writable prefix and reinstall (npm install -g billion-context), or disable auto-update (config autoUpdate:false / env ACP_AUTO_UPDATE=0)";
+        if (process.platform === "win32") {
+            return "the install dir is not writable by this user. On Windows the default npm prefix (%APPDATA%\\npm) is user-writable \u2014 repair that dir's ownership/permissions and reinstall (npm install -g billion-context), or disable auto-update (config autoUpdate:false / env ACP_AUTO_UPDATE=0)";
+        }
+        return "the install dir is not writable by this user. Fix its ownership/permissions, or move to a user-level prefix \u2014 npm config set prefix \"$HOME/.local\" (then put \"$HOME/.local/bin\" on PATH) and npm install -g billion-context \u2014 or disable auto-update (config autoUpdate:false / env ACP_AUTO_UPDATE=0)";
     }
     if (/git working tree/i.test(error)) {
         return "this copy runs from a source checkout. Install globally instead (npm install -g billion-context) so auto-update has a writable target";
