@@ -131,11 +131,17 @@ QQ群:
 
 ## 安装
 
+Linux / macOS —— 一次性配置用户级 npm prefix(全程不需要 `sudo`，`bili` 自更新也不会再遇到权限问题)：
+
 ```bash
+npm config set prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"   # 这行也请写进 ~/.bashrc 或 ~/.zshrc
 npm install -g billion-context
 ```
 
-这会安装 `bili` 命令(`bili-proxy` 保留为别名)。
+用 nvm 或 Homebrew Node 的，默认 prefix 本来就属于当前用户，直接 `npm install -g billion-context` 即可；Windows 的默认 prefix(`%APPDATA%\npm`)同样用户可写，直接 `npm install -g billion-context`。
+
+这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?执行上面两行 prefix 命令后重装即可根治——不要用 `sudo`。
 
 ## 快速上手
 
