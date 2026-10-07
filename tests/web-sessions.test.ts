@@ -166,6 +166,23 @@ withSessionsDir("buildSessionList merges the live pool with the disk store", asy
     assert.equal(lv2.requests, 9);
 });
 
+withSessionsDir("hostTitle round-trips through persistence and wins display precedence (#2322)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("ht-2322", { protocol: "openai", title: "derived first message", hostTitle: "Named by host" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    setSavedAt(dir, "ht-2322", Date.now() - 60_000);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const row = (await buildSessionList()).find((s) => s.id === "ht-2322");
+    assert.equal(row?.title, "Named by host", "disk-scanned record restores hostTitle from the file");
+
+    await store.writeNow(makeSession("plain-2322", { protocol: "openai", title: "derived only" }, { requests: 1, inputTokens: 5, contextTokens: 4 }));
+    setSavedAt(dir, "plain-2322", Date.now() - 120_000);
+    _resetDiskCacheForTest();
+    const plain = (await buildSessionList()).find((s) => s.id === "plain-2322");
+    assert.equal(plain?.title, "derived only", "no hostTitle → derived title unchanged");
+});
+
 withSessionsDir("buildOverview aggregates totals, hit rate and per-protocol rows", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     await store.writeNow(makeSession("disk-a", { protocol: "openai" }, { requests: 3, inputTokens: 1000, cachedTokens: 400, tokensSaved: 55, contextTokens: 777 }));

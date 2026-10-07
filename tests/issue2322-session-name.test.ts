@@ -150,6 +150,8 @@ test("plugin session-name endpoint: validation, set/rename/clear, display preced
         assert.equal(session.meta.title, derived, "derived title untouched");
         let row = (await webSessions(rig)).sessions.find((s) => s.id === session.id);
         assert.equal(row?.title, "Fix auth bug", "web list prefers hostTitle (#2322)");
+        const stats = await (await fetch(rig.proxyUrl("/__bili/stats"))).json() as { sessions?: Array<{ id: string; title?: string }> };
+        assert.equal(stats.sessions?.find((x) => x.id === session.id)?.title, "Fix auth bug", "/__bili/stats prefers hostTitle (#2322 follow-up)");
 
         // Rename: latest-wins.
         await post(JSON.stringify({ conversationId: "name-conv", name: "renamed" }));
