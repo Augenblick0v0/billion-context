@@ -1027,7 +1027,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // for the whole loop — lastInputTokens mutates mid-loop and must not flip it.
     const baselineKnown = deps.unknownBaseline !== true;
     const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
-    let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    // #2313: provenance-gate the entry meter exactly like the per-round
+    // baselineFloor below (#1492): an estimate-sourced lastInputTokens is a
+    // one-way ratchet written by failed turns and post-rebuild anchors, not
+    // upstream evidence — trusting it here pins the round-0 kernel view at
+    // phantom scale while the folded view the gate actually judges drains
+    // underneath (incident #2313: entry stuck ~10.3M for 12 h). The
+    // empty-input exception mirrors the floor: a transform-failed outbound IS raw.
+    const baselineTrusted = deps.session.stats.lastInputTokensSource === "usage" || deps.session.stats.lastInputTokensSource === "overflow-arm";
+    const entryBaseline = baselineTrusted || messages.length === 0 ? deps.session.stats.lastInputTokens : 0;
+    let currentTokens = baselineKnown ? entryBaseline : estimateCoreMessagesUpper(messages);
     let decisionTokens = 0;
     let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
@@ -1057,18 +1066,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
     let rangesRemaining = 0;
-    // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
-    // note atop the file). A raised budget is only a ceiling — well-behaved
-    // payloads exit early exactly as before; only genuinely huge payloads burn
-    // toward it before the fail-fast reports how far it ran out.
-    const entryLocal = (baselineKnown ? estimateCoreMessages(messages) : estimateCoreMessagesUpper(messages)) + imageReserve + wireOverhead;
-    const entryTokens = Math.max(baselineKnown ? deps.session.stats.lastInputTokens : 0, entryLocal);
-    const overshootRatio = limit > 0 && entryTokens > 0 ? entryTokens / limit : 1;
-    const summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
-    const roundBudget = Math.min(MAX_PREFLIGHT_ROUNDS * 2, Math.max(MAX_PREFLIGHT_ROUNDS, Math.ceil(MAX_PREFLIGHT_ROUNDS * overshootRatio)));
-    if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
-        deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
-    }
+    // #1933 F3 + #2313: scale the depth budgets with the entry overshoot
+    // (coverage-bound note atop the file), measured on the FOLDED view after
+    // the first pipeline pass — not on the raw inbound list, which stays at
+    // full-history scale forever because prior server-side folds hide content
+    // behind blocks (incident #2313: the entry reading and the raised budgets
+    // stayed pinned at full-history scale for 12 h while the real payload
+    // drained). A raised budget is only a ceiling — well-behaved payloads exit
+    // early exactly as before; only genuinely huge payloads burn toward it
+    // before the fail-fast reports how far it ran out.
+    let summaryBudget = MAX_SUMMARY_CALLS_PER_PREFLIGHT;
+    let roundBudget = MAX_PREFLIGHT_ROUNDS;
+    let budgetsDecided = false;
     for (let round = 0; round < roundBudget; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -1104,7 +1113,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // currentTokens at millions and burn rounds folding ranges the window
         // never needed.
         const baselineFloor = messages.length > 0
-            ? ((deps.session.stats.lastInputTokensSource === "usage" || deps.session.stats.lastInputTokensSource === "overflow-arm") ? deps.session.stats.lastInputTokens : 0)
+            ? (baselineTrusted ? deps.session.stats.lastInputTokens : 0)
             : deps.session.stats.lastInputTokens;
         const rawRoundText = estimateCoreMessages(turn.messages) + wireOverhead;
         // #1933 F1: same calibrated caliber as the gate's trigger/fit checks —
@@ -1128,6 +1137,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
+        // #2313: first measurement of this invocation — decide the depth
+        // budgets on the view being folded (see the note above); a payload
+        // that already fits never pays for the decision.
+        if (!budgetsDecided) {
+            budgetsDecided = true;
+            if (decisionTokens >= textTarget) {
+                const entryTokens = Math.max(baselineKnown ? entryBaseline : 0, baselineKnown ? result.payloadEstimate : finalUpper);
+                const overshootRatio = limit > 0 && entryTokens > 0 ? entryTokens / limit : 1;
+                summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
+                roundBudget = Math.min(MAX_PREFLIGHT_ROUNDS * 2, Math.max(MAX_PREFLIGHT_ROUNDS, Math.ceil(MAX_PREFLIGHT_ROUNDS * overshootRatio)));
+                if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+                    deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
+                }
+            }
+        }
         if (decisionTokens < textTarget) break;
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
