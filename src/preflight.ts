@@ -607,7 +607,7 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
     return out || terminalText;
 }
 
-function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
+export function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
     if (protocol === "anthropic") {
         const content = json.content;
         if (!Array.isArray(content)) return "";
@@ -636,11 +636,28 @@ function extractSummaryText(protocol: PreflightProtocol, json: Record<string, un
     if (typeof json.output_text === "string") return json.output_text;
     const output = json.output;
     if (!Array.isArray(output)) return "";
+    // #2308: an explicit type declares what the bytes are — only assistant
+    // message items and their output_text parts are summary body; reasoning
+    // items/parts (reasoning_text, summary_text, ...) must not leak into the
+    // saved summary. Typeless shapes stay accepted for gateways that omit
+    // `type`; top-level output_text compat above is untouched.
     return output
-        .map((o) => (o && typeof o === "object" ? (o as Record<string, unknown>).content : undefined))
+        .map((o) => {
+            if (!o || typeof o !== "object") return undefined;
+            const item = o as Record<string, unknown>;
+            const itemType = typeof item.type === "string" ? item.type : "";
+            if (itemType !== "" && itemType !== "message") return undefined;
+            return item.content;
+        })
         .filter((c): c is unknown[] => Array.isArray(c))
         .flatMap((c) => c)
-        .map((p) => (p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string" ? (p as Record<string, string>).text : ""))
+        .map((p) => {
+            if (!p || typeof p !== "object") return "";
+            const part = p as Record<string, unknown>;
+            const partType = typeof part.type === "string" ? part.type : "";
+            if (partType !== "" && partType !== "output_text") return "";
+            return typeof part.text === "string" ? part.text : "";
+        })
         .join("");
 }
 
