@@ -36,6 +36,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
+import { endsWithDraftClose } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -779,6 +780,64 @@ export async function* runCompressLoop(
                             ctx.log(`[acp-loop] round ${round}: degenerate retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
                         }
                         loggerLog("warn", `[acp-loop] degenerate-turn auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+
+                // #2303: a terminal turn that DID deliver visible prose but ends with a
+                // compression-draft closing tag (summary/analysis close forms) and no
+                // tool call — the model wrote a handoff/compression draft in prose
+                // instead of issuing the action it described, most often after the
+                // upstream cut the final tool call out of the step (149 silent stops /
+                // 70 sessions, DSH native). Same non-convergence as the zero-visible
+                // shape above, so the same one-shot continuation nudge applies. The
+                // retry's output APPENDS to what the client already has, like the
+                // truncation-continuation path: openai/anthropic wires only (same
+                // framing-dedup boundary as #413-follow-up). Reuses degenerateRetried
+                // as its budget: a draft-tail retry that degenerates again falls
+                // through to the plain completion, exactly like the #732 twin.
+                if (
+                    !degenerateRetried &&
+                    sawDone &&
+                    !truncatedDone &&
+                    !suppressCompletion &&
+                    typeof finishReason === "string" &&
+                    finishReason !== "failed" &&
+                    finishReason !== "incomplete" &&
+                    finishReason !== "error" &&
+                    (ctx.protocol === "openai" || ctx.protocol === "anthropic") &&
+                    !ctx.textProtocol &&
+                    assistantText.length > 0 &&
+                    calls.length === 0 &&
+                    endsWithDraftClose(assistantText) &&
+                    !signal?.aborted
+                ) {
+                    degenerateRetried = true;
+                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    const nudge: CoreMessage = {
+                        id: `acp_draft_tail_retry_r${round}`,
+                        role: "user",
+                        contentType: "text",
+                        text: DEGENERATE_RETRY_NUDGE,
+                    };
+                    try {
+                        const retryBody = withStrictEchoRepair(adapter.buildRequest([...coreMessages, nudge], systemPrompt, requestBody));
+                        const respResult = await fetchUpstream(retryBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = adoptUpstream(respResult);
+                        roundBody = retryBody;
+                        settleAttemptUsage();
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
+                        }
+                        loggerLog("warn", `[acp-loop] draft-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
                 break;

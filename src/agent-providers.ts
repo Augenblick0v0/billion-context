@@ -16,7 +16,7 @@ import { validSummaryCredentialName } from "./external-summary-settings.js";
  * structurally before it can influence an outbound summary request.
  */
 
-export type AgentProviderRecipe = NamedProviderRecipe & { apiKey: string };
+type AgentProviderRecipe = NamedProviderRecipe & { apiKey: string };
 
 const byAgent = new Map<string, Record<string, AgentProviderRecipe>>();
 
