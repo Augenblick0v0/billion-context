@@ -173,6 +173,15 @@ test("plugin session-name endpoint: validation, set/rename/clear, display preced
 
 test("pi plugin wiring: session_info_changed reports rename and clear end-to-end (#2322)", async () => {
     const rig = await startRig();
+    // Intercept fetch to count session-name POSTs — the dedupe below must
+    // hold at the source, not merely be idempotent on the server side.
+    let namePosts = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (init?.method === "POST" && url.endsWith("/__bili/plugin/session-name")) namePosts += 1;
+        return realFetch(input, init);
+    }) as typeof fetch;
     try {
         process.env.BILLION_CONTEXT_PROXY = rig.proxyUrl("");
         const host = makeFakePi();
@@ -198,18 +207,22 @@ test("pi plugin wiring: session_info_changed reports rename and clear end-to-end
         await fire({ type: "session_info_changed", name: "My named session" });
         await onceTick();
         assert.equal(session.meta.hostTitle, "My named session", "rename reported through the real endpoint");
+        assert.equal(namePosts, 1, "rename POSTed exactly once");
 
         // Dedupe: an identical event must not re-POST (the map suppresses).
         await fire({ type: "session_info_changed", name: "My named session" });
         await onceTick();
         assert.equal(session.meta.hostTitle, "My named session");
+        assert.equal(namePosts, 1, "identical event suppressed — no re-POST");
 
         // Clear: name: undefined → empty string → hostTitle removed.
         await fire({ type: "session_info_changed", name: undefined });
         await onceTick();
         assert.equal(session.meta.hostTitle, undefined, "clear reported (undefined name → empty string)");
+        assert.equal(namePosts, 2, "clear POSTed once");
     } finally {
         delete process.env.BILLION_CONTEXT_PROXY;
+        globalThis.fetch = realFetch;
         await rig.closeAll();
     }
 });
