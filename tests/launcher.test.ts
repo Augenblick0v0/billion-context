@@ -2780,6 +2780,65 @@ test("buildCodexArgs: #2260(D) last-wins holds across `--` — a user -c before 
     ]);
 });
 
+test("buildCodexArgs: #2281 resume — rewrites insert BEFORE the `resume` subcommand so the user's -c model=… survives codex's exec-resume parsing", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["exec", "--skip-git-repo-check", "-c", "model=gpt-5-codex", "resume", "--last", "turn two prompt"],
+    );
+    // rewrites sit ahead of `resume` — a -c AFTER the resume subcommand makes
+    // codex-cli 0.147.0 drop the earlier `-c model=…` on exec resume (bisected
+    // against the real binary: [-c model=B, resume, --last, -c provider…, prompt]
+    // still loses model=B; see issue #2281).
+    assert.deepEqual(out, [
+        "exec", "--skip-git-repo-check", "-c", "model=gpt-5-codex",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+        "resume", "--last", "turn two prompt",
+    ]);
+});
+
+test("buildCodexArgs: #2281 never splits a value-taking flag from its value — trailing `-c <value>` keeps the legacy append", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    const out = buildCodexArgs(
+        "http://h:p",
+        rewrites,
+        [],
+        ["exec", "-c", "model=gpt-5-codex"],
+    );
+    assert.deepEqual(out, [
+        "exec", "-c", "model=gpt-5-codex",
+        "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+    ]);
+});
+
+test("buildCodexArgs: #2281 flags-only tail and unknown-flag tails keep the append behavior", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    assert.deepEqual(
+        buildCodexArgs("http://h:p", rewrites, [], ["exec", "--some-unknown-flag", "maybe-a-value"]).slice(-2),
+        ["-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`],
+    );
+});
+
+test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the rewrites before it", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "http://up.local/v1" },
+    ];
+    assert.deepEqual(
+        buildCodexArgs("http://h:p", rewrites, [], ["exec", "resume", "--last"]),
+        ["exec",
+            "-c", `model_providers.x.base_url=${wrapUpstream("http://h:p", "http://up.local/v1")}`,
+            "resume", "--last"],
+    );
+});
+
 test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
