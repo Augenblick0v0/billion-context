@@ -3035,7 +3035,7 @@ async function handle(
                     evaluateSelfHealRound(session, {
                         pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
                         biliToolsDeclared: biliToolsDeclaredOnWire(parsed, protocol),
-                        nudgeActive: opts.compress.injectNudge && !nudgeSuppressed(session) && (prepared.nudge.shouldInject || emergencyNudge(prepared.nudge)),
+                        nudgeActive: opts.compress.injectNudge && !nudgeSuppressed(session) && (prepared.nudge.shouldInject || emergencyNudge(prepared.nudge, undefined, config.compress.minCompressRange)),
                         biliToolUses: countBiliToolUses(prepared.processedMessages),
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
@@ -3881,7 +3881,7 @@ async function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
         // stops nagging — including the emergency path, per session.
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4126,7 +4126,7 @@ async function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -4401,7 +4401,7 @@ async function prepareGoogle(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
@@ -4708,7 +4708,7 @@ async function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
