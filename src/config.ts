@@ -599,21 +599,29 @@ export function resolveContextLimit(
     return resolveConfiguredContextLimit(routes, upstreamUrl, model) ?? lookupContextLimit(model);
 }
 
-/** Longest-URL-prefix match over the providers map. Returns the most specific
- *  ProviderRoute whose key is a prefix of `upstreamUrl`, or undefined. Shared
- *  by context-limit / compress-protocol / compress-settings resolution. */
-export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefined): ProviderRoute | undefined {
+/** #2317: the matched providers key itself (longest-URL-prefix, same rule as
+ *  findRoute) — or undefined when no key matches. Diagnostics need the KEY a
+ *  request resolved against (or proof of a route-miss), which findRoute's
+ *  route-object return cannot express. A key matches if upstreamUrl === key OR
+ *  upstreamUrl starts with key + "/" (boundary-safe: "https://x.com" does not
+ *  match "https://x.com.evil"); longest (most specific) key wins. */
+export function findRouteKey(routes: ProviderRoutes, upstreamUrl: string | undefined): string | undefined {
     if (!upstreamUrl) return undefined;
-    // A key matches if upstreamUrl === key OR upstreamUrl starts with key + "/".
-    // The boundary check ("/" or end-of-string) avoids "https://x.com" matching
-    // "https://x.com.evil". Longest (most specific) key wins.
     let bestKey = "";
     for (const key of Object.keys(routes)) {
         if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
             if (key.length > bestKey.length) bestKey = key;
         }
     }
-    return bestKey ? routes[bestKey] : undefined;
+    return bestKey || undefined;
+}
+
+/** Longest-URL-prefix match over the providers map. Returns the most specific
+ *  ProviderRoute whose key is a prefix of `upstreamUrl`, or undefined. Shared by
+ *  context-limit / compress-protocol / compress-settings resolution. */
+export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefined): ProviderRoute | undefined {
+    const key = findRouteKey(routes, upstreamUrl);
+    return key ? routes[key] : undefined;
 }
 
 export function resolveConfiguredContextLimit(

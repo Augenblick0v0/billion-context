@@ -12,13 +12,13 @@ import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js
 export type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveResignSettings } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, fetchWithTransportRetry, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, recordUpstreamAlert } from "./upstream-alerts.js";
-import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
+import { CREDENTIAL_HEADER_RE, hostIdForLog, maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
 // "acp-kernel/wire" (kernel #215).
@@ -1668,6 +1668,20 @@ async function handle(
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
+            // #2317: the providers key this request resolved against (or proof of a
+            // route-miss) plus the origin/host the match ran on — surfaced by the
+            // [window]/clamp lines, the once-per-upstream route-miss WARN, and the
+            // preflight fail-fast note, because a silent miss drops every per-provider
+            // override while the registry value happens to look plausible.
+            const routeKey = findRouteKey(opts.routes, embeddedUrl);
+            const providerKeys = Object.keys(opts.routes);
+            const routeLabel = routeKey !== undefined
+                ? hostIdForLog(routeKey)
+                : (providerKeys.length > 0 ? "miss" : "none");
+            let diagOrigin: string | undefined;
+            if (embeddedUrl) {
+                try { diagOrigin = new URL(embeddedUrl).origin; } catch {}
+            }
             const peekWindow = capRegistryWindowByStandard(model, peekRegistryContext(model, host), hasTierEvidence);
             let native = betaWindow
                 ?? suffixWindow
@@ -1697,7 +1711,7 @@ async function handle(
                     // The output-headroom reservation below shrinks
                     // reqConfig.modelContextLimit per request; its result gets
                     // its own [headroom] line so one label can't carry two values.
-                    log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} base=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
+                    log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} base=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback} upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
                     // #1569: a cooperating plugin is present but its configured
                     // window never arrived — the host's own limit.context is not
                     // reaching us, and nudge bands / emergency depth are being
@@ -1708,6 +1722,7 @@ async function handle(
                     }
                 }
             }
+            if (routeKey === undefined && providerKeys.length > 0) warnRouteMissIfNew(diagOrigin, model, providerKeys, log);
             resolvedNativeWindow = native;
             // #321 PR-E1: a codex client carries its OWN window perception
             // (bundled model table + 272K unknown-model fallback) and
@@ -1727,7 +1742,7 @@ async function handle(
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
-                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
@@ -5595,6 +5610,62 @@ export function outboundContextEstimate(
     return outboundContextEstimates(prepared, wireBody, opts, upstream, parsed).upperBound;
 }
 
+// #2317 — route-miss diagnostics. A providers table that exists but matches NONE
+// of a request's upstream silently drops every per-provider override (context,
+// compress.*, …) for that request while the registry value looks plausible, and
+// the preflight 502 then points at the one knob the operator already set under a
+// DIFFERENT key. Make the miss loud (once per upstream+model) and make the 502
+// advice name the real cause instead of the misleading "set modelContextLimit".
+const routeMissWarned = new Set<string>();
+
+export function _resetRouteMissWarnedForTest(): void {
+    routeMissWarned.clear();
+}
+
+/** #2317: warn at most once per (upstream-origin, model). Origin (scheme+host+port)
+ *  keys the dedupe so two relays on one host with different ports each warn — a
+ *  hostname-only key would collide across them. */
+export function warnRouteMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    knownKeys: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || knownKeys.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (routeMissWarned.has(key)) return false;
+    routeMissWarned.add(key);
+    const hosts = knownKeys.map((k) => hostIdForLog(k));
+    log("warn", `[route] no provider route matched ${hostIdForLog(origin)} (model=${model}) — its per-provider settings (context/compress/…) are IGNORED; known providers keys: ${hosts.join(", ")}. Add a matching key to the providers block in ~/.config/billion-context/billion-context.json.`);
+    return true;
+}
+
+/** #736 / #2317: the preflight fail-fast "effective window below native" note. The
+ *  operator and codex-route-hit texts are preserved byte-for-byte; the new
+ *  codex-route-miss branch fires when the shrink is codex-driven AND the request's
+ *  upstream matched NO configured providers key (so the operator's pinned window was
+ *  never consulted — advising "set modelContextLimit" would be wrong). */
+export function buildWindowShrinkNote(args: {
+    reason: "operator" | "codex" | undefined;
+    limit: number;
+    nativeWindow?: number;
+    routeMissedConfigured?: boolean;
+    upstreamEndpoint?: string;
+    knownKeys?: string[];
+}): string {
+    if (args.reason === undefined || args.nativeWindow === undefined || args.limit >= args.nativeWindow) return "";
+    const head = ` Note: bili's effective window ${args.limit} is below the model's full window ${args.nativeWindow} — `;
+    if (args.reason === "operator") {
+        return head + `your compress.modelContextLimit setting overrides it; if the upstream actually serves the larger window, raise or remove that setting (hot-reloaded, no session restart needed).`;
+    }
+    if (args.routeMissedConfigured) {
+        const up = args.upstreamEndpoint ? hostIdForLog(args.upstreamEndpoint) : "this upstream";
+        const keys = (args.knownKeys ?? []).map((k) => hostIdForLog(k)).join(", ");
+        return head + `it was aligned down to codex's own window perception, and your upstream (${up}) matched NO configured providers key${keys ? ` — your pinned context/modelContextLimit sit under: ${keys}` : ""}. Add a providers entry for this upstream so the pinned window applies here.`;
+    }
+    return head + `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`;
+}
+
 async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -5761,12 +5832,16 @@ async function preflightCompressIfNeeded(
         // reqConfig.modelContextLimit below native for every non-Anthropic turn
         // with a max_tokens, so comparing alone would emit this note for a
         // setting the operator never touched (#737 review).
-        const shrinkNote = windowShrinkReason !== undefined && resolvedNativeWindow !== undefined && limit < resolvedNativeWindow
-            ? ` Note: bili's effective window ${limit} is below the model's full window ${resolvedNativeWindow} — ` +
-                (windowShrinkReason === "codex"
-                    ? `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`
-                    : `your compress.modelContextLimit setting overrides it; if the upstream actually serves the larger window, raise or remove that setting (hot-reloaded, no session restart needed).`)
-            : "";
+        const ffEmbeddedUrl = route?.rewrittenUrl;
+        const ffProviderKeys = Object.keys(opts.routes);
+        const shrinkNote = buildWindowShrinkNote({
+            reason: windowShrinkReason,
+            limit,
+            nativeWindow: resolvedNativeWindow,
+            routeMissedConfigured: ffProviderKeys.length > 0 && findRouteKey(opts.routes, ffEmbeddedUrl) === undefined,
+            upstreamEndpoint: ffEmbeddedUrl,
+            knownKeys: ffProviderKeys,
+        });
         const message =
             `${sizeClause} (model=${model})${rangesClause} ` +
             `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
