@@ -6961,6 +6961,7 @@ async function forward(
     // endpoint; the outer upstreamOrigin is the configured route target).
     let targetOrigin: string | undefined;
     try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
+    let dumpRaw: Promise<void> | undefined;
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -7004,6 +7005,13 @@ async function forward(
                     log,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
+            }
+            // #2347: raw-dump twin of the tee below — this branch returns
+            // before reaching it, so plugin-mode turns need their own.
+            if (opts.dumpSse && prepared.stream && pluginBody) {
+                const [a, b] = pluginBody.tee();
+                pluginBody = a;
+                dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
             }
             if (prepared.stream) {
                 if (prepared.protocol === "responses") {
@@ -7062,6 +7070,9 @@ async function forward(
             }
         } finally {
             clearUpstreamTimer();
+            // #2347: finish the dump before the turn closes — its value is the
+            // full upstream tail, which the client may have stopped reading early.
+            if (dumpRaw) await dumpRaw;
         }
         return;
     }
@@ -7120,6 +7131,17 @@ async function forward(
             });
             responseBody = bufferToStream(resolvedBuf);
         }
+    // #2347: dump the FINAL upstream body for every prepared streaming turn,
+    // regardless of rewriter branch — the previous tee sat INSIDE the useRewriter
+    // branch, so non-injected turns never dumped (the plugin lane above has its
+    // own twin tee before its early return). Must stay AFTER resolveFakeCompletion
+    // (it replaces responseBody wholesale; teeing earlier dumps the discarded
+    // stream) and BEFORE the branch split.
+    if (opts.dumpSse && prepared !== null && prepared.stream && responseBody) {
+        const [a, b] = responseBody.tee();
+        responseBody = a;
+        dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
+    }
     // We only rewrite when THIS request actually had the compress tool
     // injected (per-request). Non-injected requests (OpenAI title-gen
     // exclusion, ACP_NO_INJECT_TOOL, auto-mode classifier bypass) must NOT
@@ -7231,6 +7253,9 @@ async function forward(
         } else {
             await pipeThrough(responseBody, res);
         }
+        // #2347: finish the dump before the turn closes — its value is the full
+        // upstream tail, which the client may have stopped reading early.
+        if (dumpRaw) await dumpRaw;
         return;
     }
     const ctx: RewriteCtx = {
@@ -7242,13 +7267,6 @@ async function forward(
         debug: opts.debug,
     };
     if (prepared.stream) {
-        let streamToRead = responseBody;
-        let dumpRaw: Promise<void> | undefined;
-        if (opts.dumpSse) {
-            const [a, b] = responseBody.tee();
-            streamToRead = a;
-            dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
-        }
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
         // (decompress/search edge case, JSON.parse failure, fetch abort),
         // emitStreamError sends a protocol-appropriate error + finish so the
@@ -7344,7 +7362,7 @@ async function forward(
             // upstream expression as outboundPayloadBreakdown.
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
-                streamToRead,
+                responseBody,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
