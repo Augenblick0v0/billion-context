@@ -22,6 +22,7 @@ import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
+import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
@@ -266,6 +267,15 @@ export interface CompressLoopAdapter {
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
     emitError(message: string): Buffer;
     extractTextTriggers?(text: string): ExtractedTextTriggers;
+}
+
+export async function executeProxyToolAsync(
+    toolName: string, args: Record<string, unknown>, ctx: LoopCtx,
+    callId?: string, rawArguments?: string, signal?: AbortSignal,
+): Promise<ProxyToolResult> {
+    if (toolName !== "compress") return executeProxyTool(toolName, args, ctx, callId, rawArguments);
+    const input = typeof rawArguments === "string" && rawArguments.length > 0 ? rawArguments : args;
+    return applyConfiguredCompression(input, ctx, callId, signal);
 }
 
 export function executeProxyTool(
@@ -826,7 +836,7 @@ export async function* runCompressLoop(
                         rawArgs = call.arguments;
                         parsedArgs = {};
                     }
-                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId, rawArgs));
+                    const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
                     proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, signature: call.signature });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;

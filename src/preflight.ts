@@ -19,6 +19,8 @@ import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import type { ResolvedKernelConfig } from "./compress-settings.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -100,7 +102,7 @@ const FUTILITY_SLACK = 1.2;
 // removes CHUNK_FRACTION x window); larger entry overshoots scale both
 // budgets proportionally, capped at 2x the base (see preflightCompress).
 
-type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
+export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
 // #2189: subscription-OAuth credentials (Claude Code login) accept only
 // requests whose system carries the client's billing-attribution block; every
@@ -172,6 +174,8 @@ export interface PreflightDeps {
     upstreamOrigin?: string;
     /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
     forceStreamSummary?: boolean;
+    /** One external-summary deadline shared by every range/chunk in this invocation. */
+    externalSummary?: ConfiguredSummaryPlan;
     /** #2155: compress.streamSummary resolved FALSE for this request (explicit operator opt-out anywhere in the cascade). Neither learn path (400 "stream required" nor the 524/504 gateway-timeout first-hit learn) may arm, and an already-armed session flag is ignored — the operator said this upstream must never stream summaries. */
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
@@ -408,7 +412,7 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         // #2189: carry the client's billing-attribution block as system[0] with
@@ -607,7 +611,7 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
     return out || terminalText;
 }
 
-function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
+export function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
     if (protocol === "anthropic") {
         const content = json.content;
         if (!Array.isArray(content)) return "";
@@ -778,6 +782,13 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
         (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
             ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
             : "");
+    if (deps.externalSummary) {
+        const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
+            maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
+        const result = batch.results[0];
+        return result?.status === "success" ? { summary: result.summary }
+            : { unusable: "configured external summary candidates failed or exceeded their budget", transient: false };
+    }
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
     // the session metadata). #663: likewise, per URL+model, upstreams that
@@ -1012,6 +1023,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
+    if (deps.externalSummary === undefined) {
+        try {
+            // The plan rides the request Config rail: deps.config is this
+            // request's resolved Config (three-level cascade), so the plan
+            // always matches the settings the wire path itself resolved.
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary) };
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
+        }
+    }
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
