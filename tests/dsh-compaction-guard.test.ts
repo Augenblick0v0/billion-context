@@ -106,6 +106,80 @@ test("out-of-scope protocols and missing shapes never intercept", () => {
     assert.equal(isDshCompactionCall("openai", null), false);
 });
 
+// #2360: dsh desktop's compaction rides /v1/responses — the pre-#2360 protocol
+// whitelist returned false for "responses" BEFORE the marker was ever examined
+// (silent pass-through; 576/576 sessions with dshCompactionRefused=None). The
+// responses lane must be marker-decisive like openai/anthropic: last role=user
+// item of parsed.input starts with the prefix.
+
+function responsesBody(input: unknown[]) {
+    return { model: "qwen-3.8-27b", input, stream: true };
+}
+
+test("#2360 regression: rc.2 full-shadowed-region replay on the responses wire IS intercepted", () => {
+    // system item + replayed region as individual items (message items plus
+    // function_call/function_call_output noise) + the directive as the FINAL
+    // user message item — the observed production shape (1017 msgs).
+    const input = [
+        { type: "message", role: "system", content: "you are dsh" },
+        ...Array.from({ length: 1118 }, (_, i) => {
+            if (i % 4 === 0) return { type: "function_call", name: "bash", arguments: "{}" };
+            if (i % 4 === 1) return { type: "function_call_output", call_id: `c${i}`, output: "ok" };
+            return { type: "message", role: i % 2 ? "assistant" : "user", content: `history ${i}` };
+        }),
+        { type: "message", role: "user", content: INSTRUCTION },
+    ];
+    const body = responsesBody(input);
+    assert.ok(input.length > DSH_COMPACTION_SHAPE_MSGS);
+    assert.equal(isDshCompactionCall("responses", body), true);
+});
+
+test("responses: directive as content-parts array still matches", () => {
+    const body = responsesBody([
+        { type: "message", role: "system", content: "you are dsh" },
+        { type: "message", role: "user", content: giantPrefix },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "  " + INSTRUCTION }] },
+    ]);
+    assert.equal(isDshCompactionCall("responses", body), true);
+});
+
+test("responses: item without a type field still counts as a user message", () => {
+    const body = responsesBody([
+        { role: "user", content: "please continue" },
+        { role: "user", content: INSTRUCTION },
+    ]);
+    assert.equal(isDshCompactionCall("responses", body), true);
+});
+
+test("responses: assistant-role item carrying the directive does NOT match", () => {
+    const body = responsesBody([
+        { type: "message", role: "user", content: "please continue" },
+        { type: "message", role: "assistant", content: INSTRUCTION },
+    ]);
+    assert.equal(isDshCompactionCall("responses", body), false);
+});
+
+test("responses: quoting the template mid-history is NOT intercepted", () => {
+    const input = Array.from({ length: 107 }, (_, i) => ({ type: "message", role: i % 2 ? "assistant" : "user", content: `msg ${i}` }));
+    input[50] = { type: "message", role: "user", content: INSTRUCTION };
+    input.push({ type: "message", role: "user", content: "what did we just discuss?" });
+    assert.equal(isDshCompactionCall("responses", responsesBody(input)), false);
+});
+
+test("responses: no user item at all never intercepts", () => {
+    const body = responsesBody([
+        { type: "message", role: "system", content: "s" },
+        { type: "function_call", name: "bash", arguments: "{}" },
+        { type: "function_call_output", call_id: "c1", output: "ok" },
+    ]);
+    assert.equal(isDshCompactionCall("responses", body), false);
+});
+
+test("responses: messages-shaped body (no input array) never intercepts", () => {
+    assert.equal(isDshCompactionCall("responses", openaiBody([{ role: "user", content: INSTRUCTION }])), false);
+    assert.equal(isDshCompactionCall("responses", null), false);
+});
+
 test("refusal bodies carry the marker reason and are non-retryable", () => {
     const openai = dshCompactionRefusal("openai") as { status: number; body: { error: { retryable: boolean; message: string } } };
     assert.equal(openai.status, 403);
@@ -114,6 +188,12 @@ test("refusal bodies carry the marker reason and are non-retryable", () => {
     const anthropic = dshCompactionRefusal("anthropic") as { status: number; body: { error: { message: string } } };
     assert.equal(anthropic.status, 403);
     assert.match(anthropic.body.error.message, /durably/);
+    // #2360: the responses lane refuses through the same generic shape.
+    const responses = dshCompactionRefusal("responses") as { status: number; body: { error: { code: string; retryable: boolean; message: string } } };
+    assert.equal(responses.status, 403);
+    assert.equal(responses.body.error.code, "dsh_compaction_refused");
+    assert.equal(responses.body.error.retryable, false);
+    assert.match(responses.body.error.message, /#1729/);
 });
 
 test("the versioned marker prefix matches the live dsh template", () => {

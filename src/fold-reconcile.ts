@@ -51,7 +51,10 @@ const MAX_ANCHORS = 16384;
 const MAX_ORDER = 32768;
 const METADATA_DRIFT_STREAK = "foldDriftStreak";
 const METADATA_DRIFT_SINCE = "foldDriftSince";
-const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
+/** Exported so the compress-failure receipt can sharpen its cause label into
+ *  the substrate-destruction verdict (#2360 §2.4) without hardcoding a second
+ *  copy of the key here. */
+export const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
 /** #2193: total-loss drift (covered ids missing with ZERO reanchoring) across
  *  this many consecutive passes means the fold state can never recover —
  *  escalate once from warn to error and name the suspect cause instead of

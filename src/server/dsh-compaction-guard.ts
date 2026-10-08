@@ -30,6 +30,18 @@
  * the tracked sentence is refreshed per dsh release like MAIN_SYSTEM_PREFIXES
  * tracks Claude Code's system prompts (#970).
  *
+ * PROTOCOL COVERAGE (#2360): the whitelist used to read openai/anthropic ONLY.
+ * dsh's desktop lane speaks Responses (/v1/responses, /responses/compact), so
+ * every compaction call on that wire hit the protocol check and returned
+ * false BEFORE the marker was ever examined — the second AND-condition
+ * failure after #2193's SHAPE fix (marker-decisive but protocol-blind, and
+ * the pass-through stayed completely silent: no warn, no refusal, the exact
+ * failure direction #2193 eliminated). All three lanes are now marker-
+ * decisive with the same final-user-message rule; each wire contributes its
+ * last role=user text (messages[] for openai/anthropic, input[] for
+ * responses). Google's contents/parts shape stays out of scope — dsh speaks
+ * no Google wire.
+ *
  * Deliberately unconditional (auto pressure, context-overflow recovery, and
  * manual /compact all send the same envelope — the traffic layer cannot tell
  * which trigger fired, and a landed checkpoint is equally destructive from
@@ -71,8 +83,7 @@ function textOfContent(content: unknown): string {
 
 /** Text of the LAST role=user message for the messages-shaped protocols
  * (openai chat/completions, anthropic messages). Google's contents/parts
- * shape and the Responses input items are out of scope for v1 — dsh's
- * desktop lane speaks OpenAI-compatible chat. */
+ * shape stays out of scope — dsh speaks no Google wire. */
 function lastUserMessageText(protocol: string, parsed: unknown): string | undefined {
     if (parsed === null || typeof parsed !== "object") return undefined;
     const messages = (parsed as Rec).messages;
@@ -86,13 +97,36 @@ function lastUserMessageText(protocol: string, parsed: unknown): string | undefi
     return undefined;
 }
 
+/** Text of the LAST role=user item on the Responses wire (parsed.input).
+ * Items are typed objects ({type:"message", role, content: string | parts[]});
+ * function_call / function_call_output / reasoning items never carry user
+ * prose, so a role check plus the type guard is enough (#2360). */
+function lastResponsesInputUserText(parsed: unknown): string | undefined {
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const input = (parsed as Rec).input;
+    if (!Array.isArray(input)) return undefined;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const item = input[i];
+        if (item === null || typeof item !== "object") continue;
+        const rec = item as Rec;
+        if (rec.role !== "user") continue;
+        if (rec.type !== undefined && rec.type !== "message") continue;
+        return textOfContent(rec.content);
+    }
+    return undefined;
+}
+
 /** Marker-decisive test (#2193): the final user message starts with the
  * versioned instruction prefix. Message count plays NO part — rc.2 replays
  * the full shadowed region (~1100+ msgs) and the old ≤4 bar made the guard
- * permanently blind while its pass-through stayed silent. */
+ * permanently blind while its pass-through stayed silent. Protocol coverage
+ * (#2360): openai + anthropic read messages[], responses reads input[] — the
+ * pre-#2360 whitelist returned false for the responses lane before the marker
+ * was ever examined. */
 export function isDshCompactionCall(protocol: string | null, parsed: unknown): boolean {
-    if (protocol !== "openai" && protocol !== "anthropic") return false;
-    const finalUser = lastUserMessageText(protocol, parsed);
+    let finalUser: string | undefined;
+    if (protocol === "responses") finalUser = lastResponsesInputUserText(parsed);
+    else if (protocol === "openai" || protocol === "anthropic") finalUser = lastUserMessageText(protocol, parsed);
     if (finalUser === undefined) return false;
     return finalUser.trimStart().startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX);
 }
