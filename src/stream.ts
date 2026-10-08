@@ -220,14 +220,18 @@ const COMPRESS_LOOP_KEY = "compressFailStreak";
 const COMPRESS_LOOP_THRESHOLD = 3;
 const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
 
-type CompressLoopStreak = { n: number; lastAt: number };
+type CompressLoopStreak = { n: number; lastAt: number; cause?: string };
 
 function readCompressLoopStreak(session: Session): CompressLoopStreak | undefined {
     const v = session.metadata[COMPRESS_LOOP_KEY];
     if (!v || typeof v !== "object") return undefined;
     const o = v as Record<string, unknown>;
     if (typeof o["n"] !== "number" || !Number.isFinite(o["n"]) || typeof o["lastAt"] !== "number") return undefined;
-    return { n: Math.max(0, Math.floor(o["n"] as number)), lastAt: o["lastAt"] as number };
+    return {
+        n: Math.max(0, Math.floor(o["n"] as number)),
+        lastAt: o["lastAt"] as number,
+        ...(typeof o["cause"] === "string" && (o["cause"] as string).length > 0 ? { cause: o["cause"] as string } : {}),
+    };
 }
 
 function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undefined): void {
@@ -267,7 +271,14 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: stri
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
-    writeCompressLoopStreak(ctx.session, { n, lastAt: now });
+    // #2432: persist the failure cause on the streak so surfaces OUTSIDE the
+    // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
+    // instead of waiting for the third failure to arm the breaker. A cause
+    // only ever moves forward: an unknown-cause failure keeps the last known
+    // verdict rather than erasing it.
+    const freshCause = errs !== undefined ? compressFailureCause(errs, ctx.session) : "";
+    const cause = freshCause !== "" ? freshCause : streak?.cause;
+    writeCompressLoopStreak(ctx.session, { n, lastAt: now, ...(cause !== undefined ? { cause } : {}) });
     if (n < COMPRESS_LOOP_THRESHOLD) return "";
     const label = specLabel || "unparseable call";
     if (n === COMPRESS_LOOP_THRESHOLD) {
@@ -290,15 +301,26 @@ function clearCompressLoopStreak(session: Session): void {
  *  within the decay window — the same two conditions noteCompressLoopFailure
  *  applies, so a decayed-but-not-yet-overwritten streak reads as disarmed
  *  here even before the next failure rewrites the metadata. */
-export function compressBreakerDetail(session: Session): { n: number; threshold: number; decayMinutes: number } | undefined {
+export function compressBreakerDetail(session: Session): { n: number; threshold: number; decayMinutes: number; cause?: string } | undefined {
     const s = readCompressLoopStreak(session);
     if (!s || s.n < COMPRESS_LOOP_THRESHOLD) return undefined;
     if (Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
-    return { n: s.n, threshold: COMPRESS_LOOP_THRESHOLD, decayMinutes: Math.round(COMPRESS_LOOP_DECAY_MS / 60000) };
+    return { n: s.n, threshold: COMPRESS_LOOP_THRESHOLD, decayMinutes: Math.round(COMPRESS_LOOP_DECAY_MS / 60000), ...(s.cause !== undefined ? { cause: s.cause } : {}) };
 }
 
 export function compressBreakerArmed(session: Session): boolean {
     return compressBreakerDetail(session) !== undefined;
+}
+
+/** #2432: the last recorded compress-failure cause, readable while the breaker
+ *  is NOT yet armed (n < threshold) and within the decay window. acp_status
+ *  uses it to stop advertising ranges the moment a failure is attributed to a
+ *  dead substrate or a foreign ref generation — before the third failure arms
+ *  the breaker and the model has already been pointed at failing ranges twice. */
+export function compressLastFailureCause(session: Session): string | undefined {
+    const s = readCompressLoopStreak(session);
+    if (!s || Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
+    return s.cause;
 }
 
 // #2360 §2: while the breaker is armed, the kernel's per-error retry guidance

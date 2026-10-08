@@ -15,10 +15,11 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { applyRanges, compressBreakerArmed, compressBreakerDetail, type RewriteCtx } from "../src/stream.ts";
+import { applyRanges, compressBreakerArmed, compressBreakerDetail, compressLastFailureCause, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { handleAcpStatus } from "../src/acp-status.ts";
 import { METADATA_DRIFT_ESCALATED } from "../src/fold-reconcile.ts";
+import { conflictEventsOf, formatConflictSection, recordConflict } from "../src/conflict-watch.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
 
@@ -132,4 +133,70 @@ test("#2432: acp_status shows the armed counter and suppresses the Compressible-
     assert.match(armed.text, /Disarms on one successful compress or 10 min/, "disarm condition stated");
     assert.ok(!(armed.text).includes("Compressible ranges ("), "ranges list suppressed while armed — no contradiction with the breaker receipt");
     assert.match(armed.text, /SUPPRESSED while the breaker is armed/, "suppression is explained, not silent");
+});
+
+test("#2432: failure cause persists on the streak and is readable before the breaker arms", () => {
+    const all = Array.from({ length: 10 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(400)));
+    const ctx = makeCtx(all);
+    ctx.messages = all.slice(7);
+    ctx.session.metadata[METADATA_DRIFT_ESCALATED] = true;
+
+    applyRanges(parseCompressInput(compressArgs("m00001", "m00003")), ctx);
+    assert.equal(compressBreakerArmed(ctx.session), false, "one failure does not arm");
+    assert.ok(compressLastFailureCause(ctx.session)?.startsWith("substrate-destruction"), "cause readable at n=1");
+
+    // A later unknown-cause failure (parse failure — no kernel error text to
+    // attribute) must NOT erase the last known verdict.
+    applyRanges(parseCompressInput({ content: [] }), ctx);
+    assert.ok(compressLastFailureCause(ctx.session)?.startsWith("substrate-destruction"), "unknown-cause failure keeps the prior verdict");
+
+    const st = ctx.session.metadata["compressFailStreak"];
+    assert.ok(st && typeof st === "object");
+    (st as { lastAt: number }).lastAt = Date.now() - 11 * 60 * 1000;
+    assert.equal(compressLastFailureCause(ctx.session), undefined, "decayed streak lapses the verdict");
+});
+
+test("#2432: substrate/stale-ref verdicts stop range advertising BEFORE arming; other causes do not", () => {
+    const msgs = Array.from({ length: 6 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "y".repeat(8000)));
+    const session = makeSession();
+    session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    const ctx = { core: createCore(), config: defaultConfig(200000), messages: msgs, session };
+    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "healthy surface advertises");
+
+    session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now(), cause: "substrate-destruction — host-native compaction or bulk client-side history rewrite landed outside bili's knowledge (#1729/#2193); structural, report it" };
+    const sub = handleAcpStatus({}, ctx).text ?? "";
+    assert.match(sub, /FOLD SUBSTRATE INVALID/, "explicit invalid-substrate section at n=1");
+    assert.match(sub, /start a fresh conversation/, "recovery path stated");
+    assert.ok(!sub.includes("Compressible ranges ("), "ranges suppressed at n=1 — no pointing at unanchorable refs");
+    assert.doesNotMatch(sub, /COMPRESS CIRCUIT BREAKER: ARMED/, "no armed section below threshold");
+
+    session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now(), cause: "stale-ref — the refs belong to another session generation (or are typos)" };
+    const stale = handleAcpStatus({}, ctx).text ?? "";
+    assert.match(stale, /FOLD BASE GENERATION MISMATCH/, "stale-ref gets its own section");
+    assert.ok(!stale.includes("Compressible ranges ("), "ranges suppressed for stale-ref too");
+
+    session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now(), cause: "covered-by-block — nothing new to fold in that window" };
+    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "covered-by-block does NOT over-suppress");
+
+    session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now() - 11 * 60 * 1000, cause: "substrate-destruction — structural" };
+    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "decayed verdict lapses suppression");
+});
+
+test("#2432: conflict footer stops presenting host-native landings as a second compressor", () => {
+    const s = makeSession();
+    recordConflict(s, "unannounced-rewrite", "359/1611 incoming message(s) carry pre-turn refs of 2196 known");
+    recordConflict(s, "native-compaction", "dsh native compaction: 12/14 covered id(s) replaced by the compacted history; ACP state rebased (#2432)");
+    const mixed = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.match(mixed, /client's OWN native compaction landing/, "footer names the host-side source");
+    assert.doesNotMatch(mixed, /Keep exactly ONE compressor/, "no second-plugin hunt command when nothing foreign was confirmed");
+
+    const s2 = makeSession();
+    recordConflict(s2, "third-party-plugin", "some-other-compressor plugin detected [confirmed]");
+    assert.match(formatConflictSection(conflictEventsOf(s2)).join("\n"), /Keep exactly ONE compressor/, "foreign confirmed ledger keeps the one-compressor command");
+
+    const s3 = makeSession();
+    recordConflict(s3, "third-party-plugin", "maybe-a-compressor [suspected]");
+    recordConflict(s3, "native-compaction", "dsh native compaction: 3/4 covered id(s) replaced; ACP state rebased (#2432)");
+    const suspectedMixed = formatConflictSection(conflictEventsOf(s3)).join("\n");
+    assert.match(suspectedMixed, /client's OWN native compaction landing/, "suspected-only foreign names do not keep the hunt command either (#1736 tiering)");
 });

@@ -14,7 +14,7 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
-import { compressBreakerDetail } from "./stream.js";
+import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
@@ -129,6 +129,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // wording stays verbatim (#2146 owner decision); this surface gets the
     // armed state instead, with the counter visible (issue expected behavior 4).
     const breaker = compressBreakerDetail(ctx.session);
+    // #2432: react to the failure verdict at n=1, not at arming. A compress
+    // failure attributed to a dead substrate or a foreign ref generation means
+    // every range this surface would advertise cannot anchor — advertising
+    // them anyway is exactly how the model burned 15+ attempts in the incident
+    // (it compressed the ranges this very surface had broadcast moments before).
+    const lastCause = compressLastFailureCause(ctx.session);
+    const substrateInvalid = lastCause !== undefined && (lastCause.startsWith("substrate-destruction") || lastCause.startsWith("stale-ref"));
     try {
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
@@ -155,7 +162,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const minChars = ctx.config.compress.minCompressRange;
             const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
-            if (!breaker && (ranges.length > 0 || protectedRanges.length > 0)) {
+            if (!breaker && !substrateInvalid && (ranges.length > 0 || protectedRanges.length > 0)) {
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
@@ -176,6 +183,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
         extra.push("The Compressible-ranges list is SUPPRESSED while the breaker is armed: recent compress attempts have all failed and re-attempting fails the same way. Do not attempt to compress now; continue the task.");
+    }
+    if (substrateInvalid) {
+        extra.push("");
+        if (lastCause.startsWith("stale-ref")) {
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The Compressible-ranges list is SUPPRESSED: refs from a previous generation cannot anchor in this session. Recovery: run acp_status again after the next request and compress only what it then reports; if refs keep failing, start a fresh conversation.`);
+        } else {
+            extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. Advertised ranges cannot anchor in this session; compression is unavailable here.`);
+            extra.push("Recovery: start a fresh conversation — the folded base no longer matches what the client resends.");
+        }
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
