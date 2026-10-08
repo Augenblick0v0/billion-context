@@ -1131,6 +1131,10 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
             child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            // #2362: inverse of the orphan filter — a dead ref whose message IS
+            // in the forked prefix is visible again in the child; refs outside
+            // it stay dead (their messages are absent from the child too).
+            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
