@@ -1758,12 +1758,20 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // T1; T2/T3 override via either path: (a) COUNT — the number of active
   // lower-tier blocks reached tiers.tier2Trigger/tier3Trigger (the documented
   // block-count trigger; summaries are ~10:1 condensed so a token comparison
-  // against raw pending starves), or (b) TOKEN MASS — crossed the shared 1.5x
+  // against raw pending starves), or (b) TOKEN MASS — crossed the per-tier
   // threshold AND exceeds the effective pending of every lower tier (T2 > T1
-  // effective; T3 > T2 and > T1 effective).
+  // effective; T3 > T2 and > T1 effective). Per-tier thresholds (#2376):
+  // nudge.tierGrowthTokens.{t1,t2,t3} may pin each mass trigger independently;
+  // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
+  // shared multiplier threshold), so absent config decides byte-identically.
   const tier2Threshold = Math.round(
     nudgeGrowthTokens * (config.nudge.tier2GrowthMultiplier ?? 1.5),
   );
+  const tierThresholds: Record<CompressionTier, number> = {
+    1: config.nudge.tierGrowthTokens?.t1 ?? nudgeGrowthTokens,
+    2: config.nudge.tierGrowthTokens?.t2 ?? tier2Threshold,
+    3: config.nudge.tierGrowthTokens?.t3 ?? tier2Threshold,
+  };
   let injectedTier: CompressionTier | null = null;
   let injectedReason = "";
   let bestPending = 0;
@@ -1834,12 +1842,12 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= nudgeGrowthTokens) {
+    if (t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
-      injectedReason = `T1 effective ${t1Eff} >= ${nudgeGrowthTokens}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
+      injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
       config.tiers.enabled &&
-      (t2CountReady || (t2Pen >= tier2Threshold && t2Pen > t1Eff))
+      (t2CountReady || (t2Pen >= tierThresholds[2] && t2Pen > t1Eff))
     ) {
       const lastShown = state.nudge.lastShownByTier[2] ?? 0;
       const cadenceMet =
@@ -1848,12 +1856,12 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         injectedTier = 2;
         injectedReason = t2CountReady
           ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%`
-          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tier2Threshold} (1.5x) and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+          : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
       config.tiers.enabled &&
       (t3CountReady ||
-        (t3Pen >= tier2Threshold && t3Pen > t2Pen && t3Pen > t1Eff))
+        (t3Pen >= tierThresholds[3] && t3Pen > t2Pen && t3Pen > t1Eff))
     ) {
       const lastShown = state.nudge.lastShownByTier[3] ?? 0;
       const cadenceMet =
@@ -1862,7 +1870,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         injectedTier = 3;
         injectedReason = t3CountReady
           ? `T3 condense ready: ${t3Count} tier-2 blocks >= tier3Trigger ${config.tiers.tier3Trigger} (${t3Pen} tokens), usage ${Math.round(usage * 100)}%`
-          : `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tier2Threshold} (1.5x) and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
+          : `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     }
   }
@@ -1891,11 +1899,11 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           ? t3Count >= config.tiers.tier3Trigger
           : false;
     const ready = eligible
-      .filter((t) => (tiers[t]?.pending ?? 0) >= nudgeGrowthTokens)
+      .filter((t) => (tiers[t]?.pending ?? 0) >= tierThresholds[t])
       .map((t) => `T${t} ${tiers[t]!.pending}`);
     const readyCount = eligible
       .filter(
-        (t) => (tiers[t]?.pending ?? 0) < nudgeGrowthTokens && countReady(t),
+        (t) => (tiers[t]?.pending ?? 0) < tierThresholds[t] && countReady(t),
       )
       .map((t) => `T${t} ${t === 2 ? t2Count : t3Count} blocks (count)`);
     const readyAll = [...ready, ...readyCount];
@@ -1904,7 +1912,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     const blocked = eligible
       .filter(
         (t) =>
-          ((tiers[t]?.pending ?? 0) >= nudgeGrowthTokens || countReady(t)) &&
+          ((tiers[t]?.pending ?? 0) >= tierThresholds[t] || countReady(t)) &&
           (state.nudge.lastShownByTier[t] ?? 0) > 0 &&
           tokenCount - (state.nudge.lastShownByTier[t] ?? 0) < growthFloor,
       )
@@ -1915,13 +1923,18 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // can have plenty to compress (pending >= threshold) but still not
     // inject because growth/floor/cadence isn't met — the old fixed
     // "< threshold" string lied in that case.
-    const pendingShort = maxPending < nudgeGrowthTokens;
+    // The floor below which NO tier can fire by mass; with all tiers unset
+    // this is exactly nudgeGrowthTokens (the T1 threshold is the minimum).
+    const minTierThreshold = Math.min(
+      tierThresholds[1],
+      tierThresholds[2],
+      tierThresholds[3],
+    );
+    const pendingShort = maxPending < minTierThreshold;
     const growthShort = growthSinceReference < growthFloor;
     const parts: string[] = [];
     if (pendingShort)
-      parts.push(
-        `max compressible ${maxPending} < threshold ${nudgeGrowthTokens}`,
-      );
+      parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
       parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
     if (parts.length === 0)
