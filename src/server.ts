@@ -118,6 +118,7 @@ import { personaNamespace } from "./persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
+import type { UpstreamMeta } from "./plugin.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
@@ -7047,6 +7048,11 @@ async function forward(
                 dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
             }
             if (prepared.stream) {
+                // #2328: what the pipes know about the upstream HTTP response —
+                // first attempt's status/content-type (a resolveFakeCompletion
+                // re-send is not reflected; the pipes' own diag says which
+                // retry budget was spent instead).
+                const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
                 if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
@@ -7070,6 +7076,7 @@ async function forward(
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
+                        upstreamMeta,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -7096,6 +7103,7 @@ async function forward(
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
+                        upstreamMeta,
                     );
                 }
             } else {
@@ -7186,6 +7194,8 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
+        // #2328: pipes cite the first upstream response's HTTP identity.
+        const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
         if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
@@ -7212,6 +7222,10 @@ async function forward(
                         log,
                         label: prepared.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    upstreamMeta,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -7252,6 +7266,10 @@ async function forward(
                         log,
                         label: p.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    upstreamMeta,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -7271,6 +7289,10 @@ async function forward(
                         log,
                         label: p.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    upstreamMeta,
                 );
             }
         } else if (
