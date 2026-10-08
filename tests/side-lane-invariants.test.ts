@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -249,5 +250,17 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
         assert.equal(splitSessionWarnings(all).length, 0, "healthy persona traffic must not cry wolf");
     } finally {
         await h.close();
+    }
+});
+
+// (#1440 P2 cut 2): the extracted protocol-preparation / tool-injection modules
+// sit on EVERY main-wire turn; they must never reach into the #388 side-lane
+// engine — neither by importing side-request.js nor by its gate symbols. That
+// direction of coupling is exactly how lane behavior leaks into normal turns.
+test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2)", () => {
+    const mod = (name: string) => readFileSync(fileURLToPath(new URL(`../src/server/${name}`, import.meta.url)), "utf8");
+    const laneInternals = /\bfrom\s*["'](?:\.\.?\/)*side-request\.js["']|\bresolveSideLane\b|\bdemoteGate\b|\bSideLaneDecision\b|\bdemotedSide\b|\bsideRequestLike\b|\bSIDE_REQUEST_MAX_TOKENS\b/;
+    for (const f of ["prepare-anthropic.ts", "prepare-openai.ts", "prepare-google.ts", "prepare-responses.ts", "inject.ts"]) {
+        assert.doesNotMatch(mod(f), laneInternals, `${f} must stay decoupled from the side-lane engine`);
     }
 });
