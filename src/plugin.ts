@@ -1842,27 +1842,28 @@ export async function pipePluginChatWithStrip(
     let buf = "";
     const acc: UsageSample = {};
     let sawStrippedEcho = false;
+    // #2405(c): one warn line per event, session-prefixed — the former second
+    // write through the request logger landed in the SAME tee file, doubling
+    // every count taken from bili.log.
+    const who = session ? `[${session.id}] ` : "";
     const onTagDrop = (snippet: string) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
     // already decided by the state machine.
     const onResidueWarn = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        loggerLog("warn", `${who}[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const onMarkerDrop = (snippet: string) => {
         sawStrippedEcho = true;
-        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
+        loggerLog("warn", `${who}[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const onBiliDrop = (snippet: string) => {
         sawStrippedEcho = true;
-        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
+        loggerLog("warn", `${who}[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state. Tool-call arguments
@@ -2191,24 +2192,23 @@ export async function pipePluginChatWithStrip(
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         let inputChars = 0;
+        let dropCount = 0;
         let dropped = false;
         for (const s of streams.values()) {
             const st = s.filter.stats();
             inputChars += st.inputChars;
+            dropCount += st.dropCount;
             dropped = dropped || st.dropped;
         }
         const msg = degenerateTurnWarning({
             reason: finalFinishReason,
             terminalReason: protocol === "anthropic" ? "end_turn" : protocol === "google" ? "STOP" : "stop",
             toolCalls: sawToolUse ? 1 : 0,
-            text: { inputChars, outputChars: visibleTextChars, dropped },
+            text: { inputChars, outputChars: visibleTextChars, dropped, dropCount },
             sawThinking,
             wire: `plugin-passthrough-${protocol}`,
         });
-        if (msg) {
-            loggerLog("warn", msg);
-            log?.(msg);
-        }
+        if (msg) loggerLog("warn", `${who}${msg}`);
     };
     // #1368: parity with the proxy pipe's #361 detector (src/server.ts) — model
     // prose carrying tool-call-shaped XML (a call drafted as literal text) is
@@ -2217,10 +2217,7 @@ export async function pipePluginChatWithStrip(
     // discussing such markup (#295/#361). Off the per-frame hot path by design.
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
-        const who = session ? `[${session.id}] ` : "";
-        const msg = `[tag-echo] ${who}plugin passthrough: response text contains tool-call XML fragment (possible tag echo; not stripped)`;
-        loggerLog("warn", msg);
-        log?.(msg);
+        loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
     };
     // #1501 option C: once-per-response visibility into nameless tool calls on
     // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
@@ -2229,11 +2226,22 @@ export async function pipePluginChatWithStrip(
     const maybeWarnNamelessToolCalls = () => {
         const nameless = [...seenToolCalls.values()].filter((tc) => tc.name.length === 0);
         if (nameless.length === 0) return;
-        const who = session ? `[${session.id}] ` : "";
         const parts = nameless.map((tc) => `${tc.label}${tc.id ? ` id=${tc.id}` : ""} argsLen=${tc.argsLen} frags=${tc.frags}`).join(" | ");
-        const msg = `[plugin] ${who}nameless tool call(s) forwarded verbatim (${protocol}, ${nameless.length}): ${parts} (#1501 observe-only)`;
-        loggerLog("warn", msg);
-        log?.(msg);
+        loggerLog("warn", `${who}[plugin] nameless tool call(s) forwarded verbatim (${protocol}, ${nameless.length}): ${parts} (#1501 observe-only)`);
+    };
+    // #2405(c): per-response strip total. The one-shot detail line above only
+    // proves stripping happened at least once; this makes the full count
+    // observable for coverage acceptance without logging every event. n==1 is
+    // already fully described by its detail line, so stay silent there. The
+    // guard mirrors the adapter twins: the terminal sequence and the catch
+    // path both call this, so a throw between the two must not double-log.
+    let stripSummarized = false;
+    const maybeSummarizeStrips = () => {
+        if (stripSummarized) return;
+        stripSummarized = true;
+        let total = 0;
+        for (const s of streams.values()) total += s.filter.stats().dropCount;
+        if (total > 1) loggerLog("warn", `${who}[tag-echo] stripped ${total} occurrence(s) total in this response`);
     };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
@@ -2740,6 +2748,7 @@ export async function pipePluginChatWithStrip(
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
         maybeWarnNamelessToolCalls();
+        maybeSummarizeStrips();
         settleWitnesses();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"));
@@ -2748,6 +2757,7 @@ export async function pipePluginChatWithStrip(
     } catch (e) {
         settleUsage();
         maybeWarnNamelessToolCalls();
+        maybeSummarizeStrips();
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
@@ -2905,24 +2915,22 @@ export async function pipePluginResponsesWithStrip(
         diagLastTypes.push(label);
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
+    const who = session ? `[${session.id}] ` : "";
     const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        loggerLog("warn", `${who}[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const onBiliDrop = (snippet: string) => {
-        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
+        loggerLog("warn", `${who}[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const tagFilter = composeStreamFilters(
         composeStreamFilters(
             createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText),
             createMarkerLineFilter((snippet) => {
-                loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
+                loggerLog("warn", `${who}[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
             }),
         ),
         createBiliArtifactFilter(onBiliDrop),
@@ -3054,23 +3062,26 @@ export async function pipePluginResponsesWithStrip(
             toolCalls: sawFunctionCall ? 1 : 0,
             // #1778: fast-path prose bypasses the filter, so surface it here —
             // otherwise every clean-prose turn looks like an empty one.
-            text: fastPathChars > 0 ? { inputChars: st.inputChars, outputChars: st.outputChars + fastPathChars, dropped: st.dropped } : st,
+            text: fastPathChars > 0 ? { inputChars: st.inputChars, outputChars: st.outputChars + fastPathChars, dropped: st.dropped, dropCount: st.dropCount } : st,
             sawThinking: sawReasoning,
             wire: "plugin-passthrough-responses",
         });
-        if (msg) {
-            loggerLog("warn", msg);
-            log?.(msg);
-        }
+        if (msg) loggerLog("warn", `${who}${msg}`);
+    };
+    // #2405(c): per-response strip total — see the chat-pipe twin above, incl.
+    // the terminal/catch double-call guard.
+    let stripSummarized = false;
+    const maybeSummarizeStrips = () => {
+        if (stripSummarized) return;
+        stripSummarized = true;
+        const total = tagFilter.stats().dropCount;
+        if (total > 1) loggerLog("warn", `${who}[tag-echo] stripped ${total} occurrence(s) total in this response`);
     };
     // #1368: once-per-request #361 detector for the Responses pipe — see the
     // chat-pipe twin above for the warn-only rationale (#295/#361).
     const maybeWarnProtocolFragment = () => {
         if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
-        const who = session ? `[${session.id}] ` : "";
-        const msg = `[tag-echo] ${who}plugin passthrough: response text contains tool-call XML fragment (possible tag echo; not stripped)`;
-        loggerLog("warn", msg);
-        log?.(msg);
+        loggerLog("warn", `${who}[tag-echo] detected: plugin passthrough response text contains tool-call XML fragment (possible tag echo; left untouched)`);
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -3507,6 +3518,7 @@ export async function pipePluginResponsesWithStrip(
         }
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
         // #721: same as the chat-pipe twin — never close bare on a missing
@@ -3518,6 +3530,7 @@ export async function pipePluginResponsesWithStrip(
         }
     } catch (e) {
         settleUsage();
+        maybeSummarizeStrips();
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");

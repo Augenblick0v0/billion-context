@@ -6100,10 +6100,10 @@ async function forward(
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains \x3cacp tag`);
+                        log("warn", `[${prepared.session.id}] [tag-echo] detected: ${prepared.protocol} response stream contains \x3cacp tag`);
                     } else if (!protocolFragmentWarned && containsToolCallXmlFragment(s)) {
                         protocolFragmentWarned = true;
-                        log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains tool-call XML fragment (possible tag echo; not stripped)`);
+                        log("warn", `[${prepared.session.id}] [tag-echo] detected: ${prepared.protocol} response stream contains tool-call XML fragment (left untouched)`);
                     }
                 }
                 res.write(chunk);
