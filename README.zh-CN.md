@@ -133,6 +133,24 @@ QQ群:
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install …`)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 两者同时生效意味着双重压缩。安装器负责切换:替换旧条目(裸名、`npm:` 别名、带版本号、路径形式都认,数组/对象两种形态都处理),原配置快照到 `.bili-bak`;**项目级**安装不会被碰 —— 需手动移除。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出。pi 一侧该标记需要 `billion-context-pi` **0.1.72+**。
 
 
+### Pi：内置子代理
+
+使用 `bili pi` 或 pi 原生插件（`bili plugin install pi`）时，会自带默认启用的子代理功能：`acp_delegate`、`acp_delegate_wait` 和 `acp_delegate_cancel`。这组额外工具仅在 pi 上提供。
+
+**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。项目级 `pi-subagents` 安装默认会让内置 delegate 自动让位，但仅有用户级安装时不会，因此不能把这项保护当作所有安装方式都适用的保障。
+
+要关闭内置子代理并保留上下文压缩，请将以下配置合并到 `~/.config/billion-context/billion-context.json`（或 `BILI_CONFIG_FILE` 指定的文件），保留已有的其他设置：
+
+```json
+{
+  "pi": {
+    "subagents": false
+  }
+}
+```
+
+重启 pi 并开启新会话后生效。该配置关闭三个 delegate 工具、配套的系统提示词和子代理管理界面的快捷键，上下文压缩仍然启用；单独安装的其他子代理插件不受此开关控制。更多选项见[子代理配置](CONFIGURATION.zh-CN.md#pi)。
+
 ## 安装
 
 Linux / macOS —— 指定用户级 prefix 安装(全程不需要 `sudo`，也不改你的 npm 配置，`bili` 自更新不会再遇到权限问题)：
