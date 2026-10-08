@@ -269,6 +269,7 @@ function clearCompressLoopStreak(session: Session): void {
 const KERNEL_RETRY_GUIDANCE = [
     "Run acp_status, then call the compress tool again using only the refs it reports.",
     "Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.",
+    "Do not retry this range in any form \u2014 run acp_status and target only the live refs it reports.",
 ] as const;
 
 function scrubKernelRetryGuidance(errs: string): string {
