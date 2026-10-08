@@ -6,7 +6,8 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, repairResponsesAssistantOrdering, reapOrphansLogged, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, withReasoningDrop, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, repairResponsesAssistantOrdering, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, withReasoningDrop, type Prepared } from "../server.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, type DecideConfig } from "../nudge-decide.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
@@ -48,6 +49,7 @@ export async function prepareResponses(
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     billingUpstream?: string,
+    decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -289,18 +291,61 @@ export async function prepareResponses(
         // trigger (preflight alone fires only at the hard limit). Ephemeral user
         // message — not persisted, prefix-cache-anchor safe.
         if (willInjectNudge && turn.nudge) {
-            try {
-                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                const renderedWithPayload = rendered.text;
-                if (rendered.text) {
-                    const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
-                        ? [{ type: "message", role: "user", content: rebuiltInput }]
-                        : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
-                    rebuiltInput = inputItems;
-                    log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
+            // #2228: model-decided timing (see prepareAnthropic for the policy):
+            // gentle/over-limit T1 arms ask the model first; EMERGENCY and
+            // tier>=2 keep the legacy advisory.
+            const useDecide = decide !== undefined && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+            if (useDecide && ladderMode(session.metadata) === "fallback") {
+                consumeFallback(session.metadata);
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                            ? [{ type: "message", role: "user", content: rebuiltInput }]
+                            : rebuiltInput;
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
+                        rebuiltInput = inputItems;
+                        log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
+                    }
+                } catch {
                 }
-            } catch {
+            } else if (useDecide) {
+                const ranges = turn.nudge.compressibleRanges ?? [];
+                // Mirror the post-try strict-echo repair on the stable prefix so
+                // the side call's bytes match the main request's cache line.
+                const stableItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                    ? [{ type: "message", role: "user", content: rebuiltInput }]
+                    : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
+                const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
+                if (outcome.kind === "yes") {
+                    const span = resolveDecisionRange(outcome, ranges);
+                    if (span) {
+                        const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                            ? [{ type: "message", role: "user", content: rebuiltInput }]
+                            : [...stableItems];
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(buildDirectiveText(span.startRef, span.endRef, outcome.topic)), externalSummaryEnabled(config)), visibilityMarkers) });
+                        rebuiltInput = inputItems;
+                        log("debug", `[${sessionId}] [inject] compress directive appended as trailing user turn`);
+                    } else {
+                        log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
+                    }
+                }
+            } else {
+                try {
+                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                    const renderedWithPayload = rendered.text;
+                    if (rendered.text) {
+                        const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                            ? [{ type: "message", role: "user", content: rebuiltInput }]
+                            : rebuiltInput;
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
+                        rebuiltInput = inputItems;
+                        log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
+                    }
+                } catch {
+                }
             }
         }
         // [#1095] restore-channel guidance — ephemeral trailing note (see
