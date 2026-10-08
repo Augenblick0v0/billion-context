@@ -18,7 +18,7 @@ const END_MARK = "window.bili_conflictLine = bili_conflictLine;";
 type LatestEntry = { kind: string; detail?: string; at?: number; sessionId?: string };
 type BannerInput = { events?: number; sessions?: number; active?: number; historical?: number; kinds?: Record<string, number>; latest?: LatestEntry[] };
 type SeverityInput = BannerInput & { sibling?: number; suspected?: number };
-interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; what: string; active: number }
+interface Severity { onKey: string; riskKey: string; hasConfirmed: boolean; siblingOnly?: boolean; what: string; active: number }
 
 // Both helpers share the same extracted slice (they sit together in WEB_CLIENT);
 // the slice ends at the first window.* export so no `window` reference runs under Node.
@@ -150,6 +150,7 @@ test("#2324 suspected-only ledger -> soft 'verify first' framing, no confirmed-c
     assert.strictEqual(r.onKey, "conflict.on_suspected");
     assert.strictEqual(r.riskKey, "conflict.risk_suspected");
     assert.strictEqual(r.active, 96);
+    assert.ok(!r.siblingOnly, "#2430: non-sibling ledgers must never set siblingOnly");
 });
 
 test("#2324 confirmed third-party plugin keeps the double-compression warning (active)", () => {
@@ -173,6 +174,8 @@ test("#2324 sibling-only -> stands-down framing, not a confirmed conflict (#2261
     assert.strictEqual(r.hasConfirmed, false);
     assert.strictEqual(r.onKey, "conflict.on");
     assert.strictEqual(r.riskKey, "conflict.risk_sibling");
+    // #2430: pure-sibling ledgers stand down completely — the banner hides on this flag.
+    assert.strictEqual(r.siblingOnly, true);
 });
 
 test("#2324 mixed suspected+confirmed -> strong warning retained while naming both families", () => {
