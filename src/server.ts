@@ -98,7 +98,7 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, isPidAlive, listInstances, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, type ProxyInstanceFile } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
@@ -886,7 +886,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // proxy-origin file only reflects the last writer.
         const registryRecord = { ...instanceRecord };
         delete registryRecord.launchToken;
-        registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
+        const warnedAtRegistration = registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
+        // #2401: registration warns the late starter only — a resident that is
+        // ALREADY serving stays blind to a peer appearing later (the exact
+        // dual-generation shape behind the stale-serving report). Rescan the
+        // liveness registry on a slow unref'd tick; warn once per peer.
+        {
+            const warnedPeers = new Set<string>(warnedAtRegistration);
+            const peerRescanMs = 60_000;
+            const peerTimer = setInterval(() => {
+                for (const id of warnOnNewPeers({ instanceId, lane: launcherLane }, warnedPeers, (msg) => log("warn", `[instances] ${msg}`))) {
+                    warnedPeers.add(id);
+                }
+            }, peerRescanMs);
+            peerTimer.unref?.();
+        }
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
