@@ -267,6 +267,8 @@ function reportSessionName(ctx: Ctx | undefined, name: string): void {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ conversationId: sid, name }),
         signal: AbortSignal.timeout(5000),
+    }).then((res) => {
+        if (!res.ok) lastReportedNames.delete(sid);
     }).catch(() => {
         lastReportedNames.delete(sid);
     });

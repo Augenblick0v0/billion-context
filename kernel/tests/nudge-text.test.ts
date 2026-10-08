@@ -381,50 +381,65 @@ test("no user-msg annotation when count is zero or absent", () => {
   );
 });
 
-// #2302: the one-call skeleton (line form) rides both gentle and emergency
-// nudges — the model gets ready-to-fill compress arguments, not a batch
-// hint it will ignore. T2/T3 nudges fold block refs and never see it.
-test("#2302: gentle nudge carries the one-call line-form skeleton", () => {
+// #2302 as shipped in v0.1.188+: the one-call reminder is a STATIC line —
+// never expanded per range, never range-aware. The expanded skeleton grew
+// linearly with the range count, read like a mandatory to-do list, and leaked
+// onto query-only surfaces (acp_status). T2/T3 nudges fold block refs and
+// never see it.
+test("#2302: gentle nudge carries the static one-call hint, no expanded skeleton", () => {
   const result = renderNudgeText(makeDecision({ contextUsage: 0.5 }));
-  assert.ok(result.text.includes("ONE CALL, ONE STRING"), "skeleton framing");
   assert.ok(
-    result.text.includes("m00001–m00003 <topic>"),
-    "refs header from the recommended ranges",
+    result.text.includes("fold the ranges you keep in ONE call"),
+    "static one-call batch hint",
   );
   assert.ok(
-    result.text.includes("<write your summary of this range>"),
-    "summary slot left to the model",
+    !result.text.includes("<write your summary of this range>"),
+    "no ready-to-fill skeleton",
   );
-  // the old batch hint stays — the skeleton extends it, not replaces it
-  assert.ok(result.text.includes("fold the ranges you keep in ONE call"));
+  assert.ok(
+    !result.text.includes("<topic>"),
+    "no per-range skeleton headers",
+  );
 });
 
-test("#2302: emergency nudge keeps the skeleton but stays unconditional (#1198)", () => {
+test("#2302: emergency nudge carries the static hint, stays unconditional (#1198)", () => {
   const emergency = renderNudgeText(
     makeDecision({ contextUsage: 0.99, breakdown: { emergencyOverride: 1 } }),
   );
-  assert.ok(emergency.text.includes("ONE CALL, ONE STRING"), "skeleton rides");
+  assert.ok(
+    emergency.text.includes("ONE call, ONE string"),
+    "static hint rides emergency too",
+  );
   assert.ok(
     !emergency.text.includes("If you compress"),
     "emergency stays unconditional",
   );
   assert.ok(
-    emergency.text.includes("ONE CALL, ONE STRING"),
-    "skeleton framing has no conditional of its own (the emergency header carries the directive)",
+    !emergency.text.includes("<write your summary of this range>"),
+    "no skeleton even in emergency",
   );
 });
 
-test("#2302: tier-2/tier-3 nudges carry no message-ref skeleton (block refs)", () => {
+test("#2302: hint never grows with the range count", () => {
+  const few = renderNudgeText(
+    makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(2) }),
+  );
+  const many = renderNudgeText(
+    makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(24) }),
+  );
+  const count = (s: string) => (s.match(/ONE call, ONE string/g) ?? []).length;
+  assert.equal(count(few.text), 0, "gentle hint phrased conditionally");
+  assert.equal(count(many.text), 0, "24 ranges — still no expanded skeleton");
+  assert.ok(
+    many.text.length < few.text.length + 200 * 22,
+    "growth stays bounded by the ranges table, not a skeleton",
+  );
+});
+
+test("#2302: tier-2/tier-3 nudges carry no message-ref hint (block refs)", () => {
   const t2 = renderNudgeText(
     makeDecision({ contextUsage: 0.5, tier: 2, tierTargetBlocks: [] }),
   );
-  assert.ok(!t2.text.includes("ONE CALL, ONE STRING"), "T2 folds blocks");
+  assert.ok(!t2.text.includes("ONE call, ONE string"), "T2 folds blocks");
   assert.ok(!t2.text.includes("<write your summary of this range>"));
-});
-
-test("#2302: fewer than two ranges → no skeleton (nothing to batch)", () => {
-  const single = renderNudgeText(
-    makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(1) }),
-  );
-  assert.ok(!single.text.includes("ONE CALL, ONE STRING"));
 });

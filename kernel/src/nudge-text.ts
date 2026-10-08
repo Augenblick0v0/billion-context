@@ -229,51 +229,21 @@ function compact(parts: string[]): string[] {
   return parts;
 }
 
-/** #2302: serialize ranges as a ready-to-fill line-form skeleton — the
- *  compress tool's preferred content shape. ONE string carries the whole
- *  batch: one block per range, first line the refs (en dash, optional
- *  topic slot), remaining lines the model's summary. No JSON shells, no
- *  escaping. Ranges beyond maxEntries collapse into a trailing same-string
- *  note. Refs are ours; the wording is the model's. */
-export function oneCallPayload(
-  ranges: readonly CompressibleRange[],
-  maxEntries = 16,
-): string {
-  const shown = ranges.slice(0, maxEntries);
-  const blocks = shown.map(
-    (r) =>
-      `${r.startRef}–${r.endRef} <topic>\n<write your summary of this range>`,
-  );
-  const more = ranges.length - shown.length;
-  const tailMore =
-    more > 0
-      ? `\n\n(+${more} more range(s) — continue the SAME string with further blocks, one per range: ${ranges
-          .slice(maxEntries)
-          .map((r) => `${r.startRef}–${r.endRef}`)
-          .join(", ")})`
-      : "";
-  return blocks.join("\n\n") + tailMore;
-}
-
-/** #2302 root-cause fix, as a nudge tail. The nudge used to hand the model
- *  a LIST of recommended ranges plus a batching hint — and the model
- *  digests the list in groups, one compress call per group. Each separate
- *  call resets the provider prefix cache from its fold point and re-bills
- *  the whole remaining history; one call carrying every range pays once
- *  (live incident: five single-range calls over 44s on a 555K-token
- *  session re-billed 1.38M tokens; one 9-range call on the same log paid
- *  once). Instructions about batching do not survive contact with the
- *  model — the arguments themselves now do. Empty when fewer than two
- *  ranges (nothing to batch). Keeps #1198 licensing: the gentle tip above
- *  stays conditional, and delete-don't-split semantics mean a model that
- *  still needs a range drops the block, never folds the call in halves. */
-export function oneCallTail(
-  ranges: readonly CompressibleRange[],
-): string {
-  if (ranges.length < 2) return "";
-  return `\n\nONE CALL, ONE STRING — copy, fill each summary, DELETE the blocks you still need (they reappear in later nudges); never split into several calls:\n${oneCallPayload(ranges)}`;
-}
-
+/** #2302 root-cause fix, distilled to a STATIC reminder. The nudge used to
+ *  hand the model a LIST of recommended ranges plus a batching hint — and the
+ *  model digests the list in groups, one compress call per group. Each separate
+ *  call resets the provider prefix cache from its fold point and re-bills the
+ *  whole remaining history; one call carrying every range pays once (live
+ *  incident: five single-range calls over 44s on a 555K-token session
+ *  re-billed 1.38M tokens; one 9-range call on the same log paid once).
+ *  Instructions about batching do not survive contact with the model — but
+ *  the expanded ready-to-fill skeleton had its own failure mode (#2377
+ *  review): it grows linearly with the range count, reads like a mandatory
+ *  to-do list (eroding the model's own judgment on WHAT to fold), and leaked
+ *  onto query-only surfaces (acp_status). So the reminder is now ONE static
+ *  line — never expanded, never range-aware, identical for every nudge. */
+export const ONE_CALL_HINT =
+  "ONE call, ONE string — fold every range you keep into a single compress call: content entries ({startId, endId, summary, topic?}) or one plain string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
 
 export function renderNudgeText(
   decision: NudgeDecision,
@@ -335,7 +305,8 @@ export function renderNudgeText(
         "",
         rangesStr,
         ...(blockMapStr ? ["", blockMapStr] : []),
-        oneCallTail(decision.compressibleRanges),
+        "",
+        ONE_CALL_HINT,
       ]).join("\n"),
     };
   }
@@ -354,7 +325,6 @@ export function renderNudgeText(
       ...(blockMapStr ? ["", blockMapStr] : []),
       "",
       `💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (\`content: [{...}, {...}]\`) or ONE plain string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.`,
-      oneCallTail(decision.compressibleRanges),
     ]).join("\n"),
   };
 }

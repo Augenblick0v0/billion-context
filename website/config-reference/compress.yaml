@@ -62,6 +62,26 @@ entries:
     desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
     site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
     site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
+  - key: compress.nudgeModelDecided
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.nmd
+    render: compress-row
+    desc_en: "Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON \"yes\" injects an explicit directive with a program-finalized span; \"no\", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled."
+    desc_zh: "模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 \"yes\" 会注入带程序最终确定范围的明确压缩指令；\"no\"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。"
+    site_en: "Model-decided nudge timing (off by default): an armed tier-1 nudge first asks the model, over the session's cached prefix, whether compressing now helps the current task; a strict-JSON yes injects a directive with a program-finalized span, anything else injects nothing this round."
+    site_zh: "模型自决的压缩时机（默认关闭）：tier-1 提醒触发时，先通过会话缓存前缀上的短 side call 问模型现在压缩是否划算；严格 JSON 的 yes 注入带程序最终确定范围的指令，其余情况本轮不注入。"
+  - key: compress.nudgeDecisionMaxTokens
+    type: number
+    default: "200"
+    group: compress
+    id: cw.ndmt
+    render: compress-row
+    desc_en: "Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0."
+    desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。"
+    site_en: "Output budget (tokens) of the model-decision side call (default 200). Must be > 0."
+    site_zh: "模型决策 side call 的输出预算（token，默认 200）。必须 > 0。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"

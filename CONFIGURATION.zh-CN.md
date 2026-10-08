@@ -202,6 +202,8 @@
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
+| `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
+| `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 "stream required"，网关超时永远无法触发。 |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
@@ -694,7 +696,7 @@
 - **类型：** `{ subagents?: PiSubagentsFileConfig | boolean }`
 - **默认值：** `{}`（acp_delegate 面按包默认值启用）
 - **状态：** ACTIVE（#2230 配置搬家）
-- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
+- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；仓内组件 `pi-subagents/`（npm 名 `billion-context-pi-subagents`）用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
 
 ```jsonc
 "pi": {
@@ -730,7 +732,7 @@
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` 关闭。 |
 | `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | ≥1 整数；非法值回落到文件值，再回落到无限。 |
 
-修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme)。
+修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](pi-subagents/README.md)。
 
 ### 进程级配置块（#2030）
 
@@ -1170,6 +1172,19 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** *（未设置——每层使用各自的派生值）*
 - **状态：** ACTIVE（需要 acp-kernel >= 0.0.107）
 - **说明：** T1/T2/T3 三条压缩路径的分层 token 质量触发阈值（#2376）。默认三层都从 `nudgeGrowthTokens` 派生（T1 = 步长，T2/T3 = 步长 × 1.5）；此字段可逐层独立钉死——例如长任务保持 T1 激进、让 T2 提前或延后蒸馏。每个**未设置**的子字段回退到该层的派生默认值，因此缺省或空对象与统一值完全向后兼容。只有 token 质量触发比较会变化：数量触发（`tiers.tier2Trigger` / `tiers.tier3Trigger`）、节奏下限、first-sight 质量旁路、压力/紧急路由均保持既有基准不变。跨全局 → provider → model 按**子字段**合并（model 层的 `t2` 不会丢掉 provider 层的 `t1`）。映射到内核字段 `nudge.tierGrowthTokens`。
+#### `nudgeModelDecided`
+
+- **类型：** `boolean`
+- **默认值：** *（关闭，除非显式设置）*
+- **状态：** ACTIVE (#2228)
+- **说明：** 模型自决的压缩时机。开启后，**tier-1**（温和增长或超阈值）提醒触发时不再立即注入 advisory 文本，而是先发一次短 **side call**：复用会话已缓存的前缀（同样的 system/tools/messages 前缀、极小输出预算、15 秒空闲超时），让模型以当前任务为前提判断"现在压缩是否净收益为正"，并可给出建议折叠范围与简短主题。回答必须是严格 JSON（`{"compress": true|false, "range": "mNNNNN-mNNNNN"?, "topic": "?"}`），其余任何输出都按失败处理。有效的 "yes" 会注入一条明确的压缩指令并带程序最终确定的范围——建议范围只有完整落在某个存活可压缩范围内才被采纳，否则取最大的存活范围；"no"、格式错误或超时则本轮不注入任何东西。**连续 3 次硬失败**后，下一次 arm 回退到原有 advisory 一次并把计数清零（自愈阶梯）。**EMERGENCY** 档与 **tier-2/3 蒸馏**永远不经过决策，逐字保留原有 advisory。该字段仅宿主侧使用——不传入内核。默认关闭。
+
+#### `nudgeDecisionMaxTokens`
+
+- **类型：** `number`
+- **默认值：** `200`
+- **状态：** ACTIVE (#2228)
+- **说明：** `nudgeModelDecided` 开启时，模型决策 side call 的输出预算（token）。必须 > 0（非法值在配置加载时被拒绝）。
 
 #### `preserveRecentMessages`
 

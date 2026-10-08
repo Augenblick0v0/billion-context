@@ -85,7 +85,8 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, credentialFingerprint, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { extractBillingAttributionBlock, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals } from "./apig-resign.js";
@@ -104,6 +105,7 @@ import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { wrapStreamWithRunawayGuard } from "./runaway-guard.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
@@ -2948,6 +2950,12 @@ async function handle(
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
+                    // #2228: model-decided nudge timing — resolved through the standard
+                    // three-level compress cascade; presence of the object enables the
+                    // side-call decision path at tier-1 arms (off unless explicitly set).
+                    const decide = cs.nudgeModelDecided === true
+                        ? { maxTokens: typeof cs.nudgeDecisionMaxTokens === "number" && cs.nudgeDecisionMaxTokens > 0 ? Math.floor(cs.nudgeDecisionMaxTokens) : DEFAULT_DECIDE_MAX_TOKENS }
+                        : undefined;
                     // #1279: stamp this request's effective cache-economics price
                     // profile on the session so request-context-free report faces
                     // (acp_cache / /acp-cache / __bili/cache-report) price folds
@@ -3009,19 +3017,19 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     return protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide)
                           : responsesCompact
                             // #618 review nit: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                             // the re-serialized post-strip work instead so dropped images don't
                             // ride along. Unchanged bodies keep the original buffer byte-identical.
                             ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -3927,6 +3935,75 @@ function buildForwardTarget(
     return { upstreamUrl, headers, proxyUrl: decision.proxy };
 }
 
+// #2228: model-decided nudge timing — the side-channel decision call. It
+// reuses the main request's forward target (same URL/headers/proxy/resign
+// arm) so the session's stable prefix lands on the SAME cache line as the
+// main turn; only the tail differs (one neutral question, small output
+// budget). The answer never enters any history — it only decides whether the
+// main request gets a directive or nothing. Timeout-bounded (no client abort
+// handle exists at prepare time): a hung decision degrades to "inject
+// nothing this round", and repeated hard failures fall back to the legacy
+// advisory nudge via the ladder in nudge-decide.ts.
+export async function runNudgeDecision(args: {
+    req: http.IncomingMessage;
+    opts: ProxyOptions;
+    protocol: "anthropic" | "openai" | "google" | "responses";
+    sideBody: Record<string, unknown>;
+    session: Session;
+    log: (level: string, msg: string) => void;
+}): Promise<DecisionOutcome> {
+    const { req, opts, protocol, sideBody, session, log } = args;
+    let outcome: DecisionOutcome;
+    try {
+        const route = resolveUpstream(opts, req.url ?? "", req);
+        const target = buildForwardTarget(req, opts, route);
+        let url = target.upstreamUrl;
+        if (protocol === "google" && url.includes(":streamGenerateContent")) {
+            url = url.replace(":streamGenerateContent", ":generateContent");
+        }
+        const bodyStr = JSON.stringify(sideBody);
+        const headers: Record<string, string> = { "content-type": "application/json", ...target.headers };
+        const fwdResign = resignSettingsFor(opts, target.upstreamUrl);
+        const resignCtx =
+            fwdResign.enabled && String(Array.isArray(req.headers[APIG_RESIGN_HEADER]) ? req.headers[APIG_RESIGN_HEADER][0] ?? "" : req.headers[APIG_RESIGN_HEADER] ?? "") === APIG_RESIGN_SCHEME
+                ? decodeApigCredential(Array.isArray(req.headers[APIG_RESIGN_CREDENTIAL_HEADER]) ? req.headers[APIG_RESIGN_CREDENTIAL_HEADER][0] : req.headers[APIG_RESIGN_CREDENTIAL_HEADER])
+                : undefined;
+        if (resignCtx !== undefined) {
+            try {
+                resignApig(headers, resignCtx, "POST", target.upstreamUrl, bodyStr, findRoute(opts.routes, target.upstreamUrl));
+            } catch (err) {
+                log("warn", `[acp-decide] session=${session.id} re-sign failed; sending the previous signature: ${String(err)}`);
+            }
+        }
+        const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, DECIDE_TIMEOUT_MS);
+        try {
+            if (!response.ok) {
+                outcome = { kind: "failed", detail: `HTTP ${response.status}` };
+            } else {
+                const text = await response.text();
+                let json: Record<string, unknown> | null = null;
+                try {
+                    json = JSON.parse(text) as Record<string, unknown>;
+                } catch {
+                    json = null;
+                }
+                outcome = parseDecision(json !== null ? extractDecisionText(protocol, json) : extractSummaryFromSse(protocol, text));
+            }
+        } finally {
+            clearTimer();
+        }
+    } catch (e) {
+        outcome = { kind: "failed", detail: String(e) };
+    }
+    recordDecision(session.metadata, outcome.kind !== "failed");
+    markDirty(session);
+    log(
+        outcome.kind === "failed" ? "warn" : "info",
+        `[acp-decide] session=${session.id} ${protocol}: ${outcome.kind === "failed" ? outcome.detail : outcome.kind === "yes" ? `yes${outcome.range ? ` (${outcome.range})` : ""}` : "no"}`,
+    );
+    return outcome;
+}
+
 // #247: context exceeds the (new) model's window — usually right after a
 // mid-session model switch. The payload would overflow at forward time and
 // the reactive nudge could never fire (the request itself is rejected before
@@ -4340,11 +4417,11 @@ async function preflightCompressIfNeeded(
     }
     // #1933 F1: scale the local text estimate by the per-route calibration
     // factor k̂ learned from this session's own usage reports (local estimate ÷
-    // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
-    // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
-    // i.e. today's behavior. #2117 B: the model dimension gates too — a factor
-    // learned on another model acts as absent here rather than deciding with a
-    // cross-model billing scale (currentCalibrationFactor).
+    // what upstream actually billed; clamped 0.25–4, two-way since #2366 — see
+    // settleUsageReport). Unknown/mismatched origin → raw estimate, i.e. the
+    // uncalibrated legacy behavior. #2117 B: the model dimension gates too — a
+    // factor learned on another model acts as absent here rather than deciding
+    // with a cross-model billing scale (currentCalibrationFactor).
     const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
@@ -4374,8 +4451,9 @@ async function preflightCompressIfNeeded(
     // upstream's billing scale diverges from the estimator's caliber
     // (incident #2313: a local OpenAI-compatible shim billed ~200 B/token —
     // the trigger read 7.3M-10.3M against a real 305K input, ~24-34x over),
-    // calibration cannot correct it (k̂ is one-way, clamped 0.25-1, and
-    // consistent samples below CALIBRATION_SAMPLE_MIN are discarded), so
+    // calibration cannot correct it (k̂ is two-way since #2366 but clamped
+    // 0.25-4, and a 24-34x shim sits far outside the clamp; consistent
+    // samples below CALIBRATION_SAMPLE_MIN are discarded), so
     // estimate-driven folding demands unreachable targets, cannot finish
     // inside client stream patience (~300s idle abort), and never lets a
     // forward through — 0 successful forwards in 12h while every failed
@@ -5599,6 +5677,15 @@ async function forward(
                 // re-send is not reflected; the pipes' own diag says which
                 // retry budget was spent instead).
                 const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+                // #2346: intrinsic runaway-enumeration terminator for the plugin-streamed
+                // body (the incident lane). Applied after any fake-completion buffering so
+                // both the live and replayed paths are guarded; byte-verbatim otherwise.
+                // Sits AFTER the #2347 plugin-lane tee on purpose: the dump twin must
+                // observe the raw upstream bytes even when the guard aborts them.
+                pluginBody = wrapStreamWithRunawayGuard(pluginBody, (v) => {
+                    log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+                    clientAbort.abort();
+                });
                 if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
@@ -5867,6 +5954,16 @@ async function forward(
         debug: opts.debug,
     };
     if (prepared.stream) {
+        // #2346: intrinsic runaway-enumeration terminator for the streamed response —
+        // aborts the upstream and ends the stream cleanly when one message degenerates
+        // into an unbounded marker flood. Forwards every byte verbatim otherwise.
+        // Master moved the #2347 dump tee ahead of the branch split (it reassigns
+        // responseBody), so the guard wraps the post-tee body: the dump twin still
+        // observes raw upstream bytes even when the guard aborts them.
+        responseBody = wrapStreamWithRunawayGuard(responseBody, (v) => {
+            log("error", `[${prepared.session.id}] runaway enumeration detected (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
+            clientAbort.abort();
+        });
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
         // (decompress/search edge case, JSON.parse failure, fetch abort),
         // emitStreamError sends a protocol-appropriate error + finish so the
