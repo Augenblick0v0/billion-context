@@ -2588,22 +2588,25 @@ export async function preflightCompressIfNeeded(
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
-    // #2391: fixed system+tool-schema overhead (+ verbatim images) lives outside the fold
-    // space, so when this floor alone >= limit no folding can ever fit it (fit gate is
-    // `< limit`). Fail fast with an actionable breakdown instead of the doomed walk + #726
-    // cooldown. Raw overhead (not k̂-deflated) = the conservative reading the no-progress
-    // fit gate below already trusts; !payloadFitsWindow guard keeps a calibrated forward intact.
-    if (!payloadFitsWindow && overheadEstimate + imageTokens >= limit) {
+    // #2391: fixed system+tool-schema overhead lives OUTSIDE the fold space, so when it
+    // alone >= limit no folding can ever fit the payload (fit gate is `< limit`). Fail
+    // fast with an actionable breakdown instead of the doomed walk + #726 cooldown. Raw
+    // overhead (not k̂-deflated) decides window fit: k̂ is a BILLING scale learned from
+    // usage reports (#1933), not a token-count measure — the raw chars/4 text reading is
+    // the conservative one the no-progress fit gate below already trusts; the
+    // !payloadFitsWindow guard keeps a calibrated forward intact. Verbatim images stay
+    // OUT of the trigger deliberately: their byte-based estimate is unreliable
+    // (pixel-tile billing, #1800), so image-dominated floors keep the house
+    // walk/futility/arbitration paths (#1800/#1841/#857) instead of this verdict.
+    if (!payloadFitsWindow && overheadEstimate >= limit) {
         const { systemTokens, toolTokens } = wireOverheadBreakdown(prepared.protocol, prepared.body);
-        const floor = overheadEstimate + imageTokens;
-        const shortfall = Math.max(0, floor - limit);
+        const shortfall = Math.max(0, overheadEstimate - limit);
         const detail =
             `mandatory per-request overhead alone exceeds the budget: instruction/system text ~${Math.round(systemTokens)} tok + tool definitions ~${Math.round(toolTokens)} tok` +
-            (imageTokens > 0 ? ` + verbatim images ~${Math.round(imageTokens)} tok` : "") +
-            ` = ~${Math.round(floor)} tok total, a shortfall of ~${Math.round(shortfall)} tok over the effective budget ${limit}. ` +
+            ` = ~${Math.round(overheadEstimate)} tok total, a shortfall of ~${Math.round(shortfall)} tok over the effective budget ${limit}. ` +
             `This overhead rides outside the foldable conversation history, so conversation compression CANNOT reduce it — no amount of folding will bring this payload under the window. ` +
             `Recovery options: trim the client's instruction/skill content or tool catalog; use a model with a larger context window; or lower the output reservation (compress.outputHeadroomMaxPct) to give input more room.`;
-        log("error", `[${session.id}] mandatory overhead alone (~${Math.round(floor)} tok: sys~${Math.round(systemTokens)} + tools~${Math.round(toolTokens)}) >= effective budget ${limit} — compression cannot reduce it (#2391); failing fast without a summarization walk`);
+        log("error", `[${session.id}] mandatory overhead alone (~${Math.round(overheadEstimate)} tok: sys~${Math.round(systemTokens)} + tools~${Math.round(toolTokens)}) >= effective budget ${limit} — compression cannot reduce it (#2391); failing fast without a summarization walk`);
         return failFast(502, detail, false);
     }
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
