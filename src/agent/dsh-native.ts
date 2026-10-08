@@ -737,10 +737,18 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
         });
         if (result.outcome === "adopted") {
             console.error(`bili-native-dsh: fork child ${child.sid} adopted parent ${child.parent} at branch point ${result.branchPoint}${result.replayed ? " (replayed)" : ""} (#2399)`);
-        } else {
-            console.error(`bili-native-dsh: fork adoption for ${child.sid} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
+            forkDone.add(child.sid);
+            return;
         }
-        forkDone.add(child.sid);
+        console.error(`bili-native-dsh: fork adoption for ${child.sid} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
+        // Only transient failures (network / 5xx / unmappable body) leave the
+        // window open so a later request retries up to FORK_ATTEMPT_CAP; every
+        // other outcome is terminal. Once this sid's stamped request has
+        // landed, a retry can only ever meet CHILD_CONFLICT (the server
+        // registers the child conversation before any later fork POST), which
+        // latches here as a non-transient outcome.
+        const transient = /^(snapshot|fork) (error|http 5\d\d)/.test(result.reason) || result.reason === "body unmappable";
+        if (!transient || (forkAttempts.get(child.sid) ?? 0) >= FORK_ATTEMPT_CAP) forkDone.add(child.sid);
     })().catch((err: unknown) => {
         console.error(`bili-native-dsh: fork adoption for ${child.sid} failed unexpectedly (${err instanceof Error ? err.message : String(err)}) (#2399)`);
     });
