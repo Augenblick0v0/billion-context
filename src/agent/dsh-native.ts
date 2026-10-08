@@ -704,6 +704,19 @@ function bodyJsonOf(init: RequestInit | undefined): unknown {
     return undefined;
 }
 
+// #2399 spec gate ④: side-shaped request = no tools AND a small output budget
+// (dsh title-gen / auto-review sidecars). They carry no replayed parent prefix,
+// so matching one would N=0-degrade the sid and permanently block the real
+// first stamped request from adopting. The server-side side heuristic uses the
+// same budget bound (#388: maxTokens <= 200). Exported for tests.
+export function sideShapedBody(body: unknown): boolean {
+    if (body === null || typeof body !== "object") return false;
+    const rec = body as Record<string, unknown>;
+    if (Array.isArray(rec.tools) && rec.tools.length > 0) return false;
+    const budget = typeof rec.max_tokens === "number" ? rec.max_tokens : typeof rec.max_completion_tokens === "number" ? rec.max_completion_tokens : undefined;
+    return budget !== undefined && budget <= 200;
+}
+
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     if (!register.toolsReady) return;
     const child = forkChildOf(ctx);
@@ -711,6 +724,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
     if (forkDone.has(child.sid)) return;
     const body = bodyJsonOf(init);
     if (body === undefined) return;
+    if (sideShapedBody(body)) return;
     const base = register.base;
     if (base === undefined) return;
     if ((forkAttempts.get(child.sid) ?? 0) >= FORK_ATTEMPT_CAP) return;

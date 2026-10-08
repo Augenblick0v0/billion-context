@@ -15,6 +15,7 @@ import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-dsh-fork-"));
@@ -110,6 +111,24 @@ test("matchForkPrefix returns the longest hash-equal prefix", () => {
     const unrelated: CoreMessage[] = [{ id: "q", role: "user", contentType: "text", text: "unrelated" }];
     assert.equal(matchForkPrefix(unrelated, identities), 0);
     assert.equal(matchForkPrefix([], identities), 0);
+});
+
+// ---------------------------------------------------------------------------
+// sideShapedBody (#2399 spec gate ④): an early sidecar must not consume the
+// per-sid adoption budget, or it N=0-degrades the sid before the real replay
+// can adopt.
+// ---------------------------------------------------------------------------
+
+test("sideShapedBody: no tools + small budget is side-shaped; tools or big budget are not (#2399)", () => {
+    assert.equal(sideShapedBody({ messages: [{ role: "user", content: "t" }], max_tokens: 100 }), true);
+    assert.equal(sideShapedBody({ messages: [], max_tokens: 200 }), true);
+    assert.equal(sideShapedBody({ messages: [], max_completion_tokens: 150 }), true);
+    assert.equal(sideShapedBody({ messages: [], max_completion_tokens: 201 }), false);
+    assert.equal(sideShapedBody({ messages: [], tools: [{ type: "function", function: { name: "x" } }], max_tokens: 100 }), false);
+    assert.equal(sideShapedBody({ messages: [], tools: [], max_tokens: 4096 }), false);
+    assert.equal(sideShapedBody({ messages: [] }), false);
+    assert.equal(sideShapedBody(null), false);
+    assert.equal(sideShapedBody("not-an-object"), false);
 });
 
 // ---------------------------------------------------------------------------
