@@ -5822,6 +5822,33 @@ async function preflightCompressIfNeeded(
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
     if (limit <= 0 || !model || !triggerFires) return prepared;
+    // #2313: an estimate may not block the forward. The trigger above can
+    // fire on the calibrated chars/4 estimate alone; when the current
+    // upstream's billing scale diverges from the estimator's caliber
+    // (incident #2313: a local OpenAI-compatible shim billed ~200 B/token —
+    // the trigger read 7.3M-10.3M against a real 305K input, ~24-34x over),
+    // calibration cannot correct it (k̂ is one-way, clamped 0.25-1, and
+    // consistent samples below CALIBRATION_SAMPLE_MIN are discarded), so
+    // estimate-driven folding demands unreachable targets, cannot finish
+    // inside client stream patience (~300s idle abort), and never lets a
+    // forward through — 0 successful forwards in 12h while every failed
+    // turn ratchets the estimate-sourced meter higher: the livelock. Rule:
+    // when the session carries a nonzero baseline NONE of which is upstream
+    // evidence for THIS route (estimate-sourced, or usage/overflow-arm
+    // demoted by #1933 F2 — in both cases baselineFloor === 0), forward once
+    // and let the upstream arbitrate size instead of folding first: success
+    // settles a usage baseline, a 4xx overflow arms one (armOverflowShrink
+    // stamps the evidence origin so the arm survives F2 on this route).
+    // Either outcome re-arms honest metering and fail-fast semantics resume
+    // from the next request. Generalizes the #496/#1800 forward-once image
+    // arbitration to the estimate channel. Fresh sessions
+    // (lastInputTokens <= 0 / unknownBaseline #553) keep the fold-first
+    // judgment — they hold no known-wrong meter to replace.
+    const probeForEvidence = !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    if (probeForEvidence) {
+        log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
+        return prepared;
+    }
     const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
@@ -6678,6 +6705,11 @@ async function forward(
             // overwrites it.
             s.stats.lastInputTokens = info.window;
             s.stats.lastInputTokensSource = "overflow-arm";
+            // #2313: the rejection came from THIS upstream — stamp the
+            // evidence origin so the #1933 F2 route gate (and the #2313
+            // probe-forward gate) treat the arm as current-route evidence
+            // instead of demoting it against a stale settle origin.
+            s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline.
             s.stats.overflowArmTokens = info.window;
@@ -6707,6 +6739,7 @@ async function forward(
                 // (still accepted by effectiveTokenCount + the #496 gate).
                 s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
+                s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
         }
