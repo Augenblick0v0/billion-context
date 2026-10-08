@@ -940,7 +940,7 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
-function forkMessageIdentityHash(message: CoreMessage): string {
+export function forkMessageIdentityHash(message: CoreMessage): string {
     return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
 }
 
@@ -1062,6 +1062,19 @@ function parseForkRequest(payload: string): ForkRequest {
     return { protocolVersion: 1, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
 }
 
+/** [#2399 stage 2] omp/pi identity-register their session ids at session_start
+ *  — BEFORE a fork child's first model request can trigger the extension-side
+ *  adoption — so a fork POST for such a child arrives with the id already in
+ *  registeredIds. That register carries the SAME parent the fork request
+ *  declares, so it is a compatible lineage claim by the same host, not a rival
+ *  child: allow the fork through and drop the register entry on success (the
+ *  fork-created conversation then binds by the conversations map, exactly like
+ *  a dsh-style child that never registered). A registered id WITHOUT a parent
+ *  declaration, or with a different parent, stays a conflict. */
+function forkChildHeldBySameParent(child: string, parent: string): boolean {
+    return registeredIds.get(child)?.parentConversationId === parent;
+}
+
 export async function handlePluginFork(payload: string, res: ServerResponse): Promise<void> {
     let request: ForkRequest;
     try { request = parseForkRequest(payload); }
@@ -1076,14 +1089,14 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         return true;
     };
     if (replay()) return;
-    if (conversations.has(request.childConversationId) || registeredIds.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId)) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+    if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
         await withSessionLock(parent, () => {
             if (replay()) return;
-            if (conversations.has(request.childConversationId) || registeredIds.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId)) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
+            if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
@@ -1149,6 +1162,12 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
+            // [#2399 stage 2] the host's session_start identity register claimed
+            // this id with the same parent (see forkChildHeldBySameParent) — the
+            // fork-created conversation supersedes it; a lingering entry would
+            // re-bind plugin mode on the child's next request, which the map
+            // binding already does without dragging the derived-parent path in.
+            registeredIds.delete(request.childConversationId);
             remembered.set(child.id, { processed: structuredClone(child.pluginSnapshot), original: structuredClone(child.pluginSnapshot) });
             // #2077: the parent snapshot is now an external contract — this child
             // was cut from it, and later forks/replays depend on its continuity.
