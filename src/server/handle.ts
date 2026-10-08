@@ -15,7 +15,7 @@ import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock } from "../session.js";
+import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -30,10 +30,11 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexClient, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
+import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaNamespace } from "../persona-anchor.js";
 import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume } from "../fork-adoption.js";
+import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
@@ -1199,16 +1200,41 @@ export async function handle(
         // lands on the SAME first request (pi RLM children: no replay, link
         // as before — no deferral, no timing change).
         if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
-            const resume = derivedParent !== undefined
-                ? prefixAffinity.findResumeParentWithin(derivedParent, affinityMessageList(), sessionId)
-                : prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
+            const loadParent = (id: string): Session | undefined => peekSession(id) ?? getStore().loadSync(id, { protocol, upstreamOrigin }) ?? undefined;
+            // Claude Code records its fork parent in the transcript
+            // (forkedFrom) — authoritative where the byte-exact prefix match
+            // below fails: equal-length resumes and re-decorated tails (a
+            // resume-time reminder appended to the last messages) made it
+            // fall back to a far older ancestor, dropping every block folded
+            // since. Main lane only (a `|sub:` split is not the transcript's
+            // session), loopback only (the transcript is a local file).
+            let resume: { sessionId: string; sharedDepth: number; via: string } | null = null;
+            const claudeHeader = conversationHeaderSource(req.headers);
+            if (protocol === "anthropic" && claudeHeader?.name === "x-claude-code-session-id" && claudeHeader.value === sessionId && isLoopbackAddress(req.socket.remoteAddress)) {
+                try {
+                    const lineage = resolveClaudeTranscriptLineage(sessionId, (id) => id !== sessionId && loadParent(id) !== undefined);
+                    if (lineage.parentId !== undefined) {
+                        resume = { sessionId: lineage.parentId, sharedDepth: 0, via: `transcript forkedFrom (${lineage.hops} hop${lineage.hops === 1 ? "" : "s"})` };
+                    } else if (lineage.reason !== "no-transcript" && lineage.reason !== "no-fork-marker" && lineage.reason !== "invalid-id") {
+                        log("info", `[${sessionId}] [resume-inheritance] transcript lineage unusable (${lineage.reason}); falling back to prefix match (#1486)`);
+                    }
+                } catch (err) {
+                    log("warn", `[${sessionId}] [resume-inheritance] transcript lineage lookup failed (${String(err)}); falling back to prefix match (#1486)`);
+                }
+            }
+            if (!resume) {
+                const matched = derivedParent !== undefined
+                    ? prefixAffinity.findResumeParentWithin(derivedParent, affinityMessageList(), sessionId)
+                    : prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
+                if (matched) resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+            }
             if (resume) {
-                const resumeParent = peekSession(resume.sessionId) ?? getStore().loadSync(resume.sessionId, { protocol, upstreamOrigin }) ?? undefined;
+                const resumeParent = loadParent(resume.sessionId);
                 if (resumeParent && resumeParent !== session) {
                     session.metadata.derivedFrom = resumeParent.id;
                     session.metadata.derivedFromSessionId = resumeParent.id;
                     markDirty(session);
-                    log("info", `[${sessionId}] [resume-inheritance] ${resume.sharedDepth} msg(s) byte-exact prefix of ${resumeParent.id} — inheriting refs/blocks/lineage (#1486)`);
+                    log("info", `[${sessionId}] [resume-inheritance] ${resume.via} of ${resumeParent.id} — inheriting refs/blocks/lineage (#1486)`);
                     try {
                         maybeAdoptResume({
                             session,
