@@ -693,7 +693,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `{ subagents?: PiSubagentsFileConfig | boolean }`
 - **Default:** `{}` (acp_delegate surface enabled with package defaults)
 - **Status:** ACTIVE (#2230 config-home)
-- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the standalone `billion-context-pi-subagents` package reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
+- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the in-repo `pi-subagents/` component (npm name `billion-context-pi-subagents`) reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
 
 ```jsonc
 "pi": {
@@ -729,7 +729,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` disables. |
 | `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | Integer ≥ 1; invalid falls through to the file value, then unlimited. |
 
-Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme).
+Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](pi-subagents/README.md).
 
 ### Process-level blocks (#2030)
 

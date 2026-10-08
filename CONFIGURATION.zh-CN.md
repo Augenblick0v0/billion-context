@@ -693,7 +693,7 @@
 - **类型：** `{ subagents?: PiSubagentsFileConfig | boolean }`
 - **默认值：** `{}`（acp_delegate 面按包默认值启用）
 - **状态：** ACTIVE（#2230 配置搬家）
-- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；独立包 `billion-context-pi-subagents` 用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
+- **说明：** 内置 **pi lane 子代理**（`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`，`bili pi` 装入内嵌扩展时注册）的配置。`pi.subagents` 段是该功能的配置家；仓内组件 `pi-subagents/`（npm 名 `billion-context-pi-subagents`）用自己的 loader 读同一段（契约是文件格式，不是共享代码）。此前这些旋钮在 pi 的 `~/.pi/acp.json`（`delegate` / `delegatePrompt` / `displayUsage` / `debug` 四键）——这四键是**已废弃的回退源**：段缺失时仍读取（宿主进程 stderr 打印一次性弃用警告），**段存在后完全忽略**，未来版本移除。改名：`delegatePrompt` → `prompt`；`debug` 限定子代理子系统，**不**与顶层代理 `debug` 冲突。
 
 ```jsonc
 "pi": {
@@ -729,7 +729,7 @@
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` 关闭。 |
 | `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | ≥1 整数；非法值回落到文件值，再回落到无限。 |
 
-修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme)。
+修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](pi-subagents/README.md)。
 
 ### 进程级配置块（#2030）
 

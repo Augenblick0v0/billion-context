@@ -39,7 +39,10 @@ defineConfig({
     // published artifact is self-contained (zero runtime deps). Without
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
-    // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
+    // "dist/index.js is self-contained" contract (AGENTS.md §2.1). Same for
+    // billion-context-pi-subagents (#2384): vendored under pi-subagents/,
+    // consumed via file:, and its own build already inlines its typebox peer,
+    // so its dist is self-contained too.
     noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     // sharp is an OPTIONAL runtime dependency (native module): it must stay
     // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves

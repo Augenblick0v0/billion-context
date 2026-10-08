@@ -34,11 +34,11 @@ The full file-by-file map lives in [reference/architecture.md](reference/archite
 
 ### Key Design Decisions
 
-1. **The in-repo kernel is bundled inline** — `kernel/` (the acp-kernel source, consumed as a `file:` devDependency, #2092) is NOT listed in tsup `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing.
+1. **The in-repo kernel is bundled inline** — `kernel/` (the acp-kernel source, consumed as a `file:` devDependency, #2092) is NOT listed in tsup `external`, so `dist/index.js` is self-contained. Exception: `zod` (exact `4.1.8`, matching the opencode host's own zod so V1 plugin-tool shapes interoperate) is a real dependency and stays external — only `dist/agent/opencode-native.js` imports it (lazily, at plugin-tool registration); `dist/index.js` and every other entry remain zod-free. When zod cannot be resolved at runtime the V1 plugin degrades to plain proxy mode instead of failing. Same for `pi-subagents/` (the billion-context-pi-subagents source, #2384): consumed via a `file:` devDependency and inlined into the pi-lane entries; its own build inlines the `typebox` peer, so those bundles stay self-contained too.
 2. **Tags use XML format** — messages carry ACP tags like `<acp tokens="2" type="text">m00001</acp>` (an opening element with `tokens=`/`type=` attributes wrapping a ref id, closed by its end element). In **source files** these angle brackets MUST be written as hex escapes (`\x3c`, `\x3e`) to avoid tooling that strips well-formed tags.
 3. **Auto-update**: checks npm registry every 3 min by default (`CHECK_INTERVAL_MS = 3*60*1000`, overridable via `update.checkIntervalMs` / `BILI_UPDATE_CHECK_INTERVAL_MS`, #2030); first check per process ignores throttle.
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
-5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092).** The acp-kernel source is vendored under `kernel/` and consumed via `"acp-kernel": "file:./kernel"` (devDependency; inlined into `dist` at build time). A commit IS the pin — there is no registry range left to drift. The kernel keeps its OWN version in `kernel/package.json`: any kernel source change MUST bump it (CI-enforced — see Kernel Boundary below), so accumulated changes can later ship as an independent npm release of `acp-kernel`. `package-lock.json` records the file link and stays committed.
+5. **The kernel lives in-repo; determinism comes from git, not a registry pin (#2092).** The acp-kernel source is vendored under `kernel/` and consumed via `"acp-kernel": "file:./kernel"` (devDependency; inlined into `dist` at build time). A commit IS the pin — there is no registry range left to drift. The kernel keeps its OWN version in `kernel/package.json`: any kernel source change MUST bump it (CI-enforced — see Kernel Boundary below), so accumulated changes can later ship as an independent npm release of `acp-kernel`. `package-lock.json` records the file link and stays committed. Same pattern for `pi-subagents/` (#2384): vendored under `pi-subagents/`, consumed via `"billion-context-pi-subagents": "file:./pi-subagents"`, own version in `pi-subagents/package.json` (CI-enforced — see Pi-Subagents Boundary below).
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly ONE writer; mixing writers is what the guard forbids. The canonical statement is the Install-Lane & Update-Ownership Contract below.
 7. **Two compression modes with different summary carriers** (CRITICAL — reason in BOTH, see §6):
    - **pluginMode** (the `x-bili-plugin` header / registered agent, e.g. `bili pi`): the ACP-native agent OWNS compression — it executes `compress` locally, the call+result live in its own re-sent history, and the wire summary carrier is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`).
@@ -83,14 +83,23 @@ The compression kernel lives IN THIS REPO under `kernel/` (migrated verbatim fro
 5. **Two test layers, both must pass.** The kernel's own unit suite (`npm --prefix kernel test` — runs against TS source) plus the bili suite/e2e as the integration layer. A kernel change is done only when BOTH are green on the rebased head.
 6. **Structural invariants stay human-gated** (carried over from the kernel's own spec): zero runtime deps (no new dependency without owner sign-off), platform-agnostic core (no host API / file I/O / network), message-id immutability, wire-artifact format, lossless round-trip, protected-tool hard exclusion, canonical pipeline node ordering.
 
+## Pi-Subagents Boundary (in-repo pi-lane component, #2384)
+
+The pi sub-agent surface (`acp_delegate` tools) lives IN THIS REPO under `pi-subagents/` (migrated verbatim from ranxianglei/billion-context-pi-subagents @ master `d19481e` on 2026-10-08, INCLUDING the merged-but-unreleased settle-gate notification fix for #2301; initial in-repo version `0.1.2`; the old repo stays frozen until the move has settled — see `pi-subagents/PROVENANCE.md`). It keeps its own identity — npm name `billion-context-pi-subagents`, own `version`, own unit suite (`pi-subagents/tests/`), own build chain (tsup → `pi-subagents/dist` + d.ts) — and the host consumes it through `"billion-context-pi-subagents": "file:./pi-subagents"` exactly like `kernel/`. Enforced rules:
+
+1. **Version discipline (CI-enforced).** Any change under `pi-subagents/src/**` (or `pi-subagents/tsup.config.ts` / `pi-subagents/tsconfig.json`) MUST bump `version` in `pi-subagents/package.json`; a bump without such a change also fails (CI job `pi-subagents-guard`). Normal changes ride along with billion-context releases; when enough accumulates, a dedicated release can publish `billion-context-pi-subagents` standalone.
+2. **Two test layers, both must pass.** The component's own unit suite (`npm --prefix pi-subagents test` — runs against TS source) plus the bili suite/e2e as the integration layer. A component change is done only when BOTH are green on the rebased head.
+3. **Lighter gating than `kernel/` (deliberate).** No PR-body declaration and no human-only review tier: this is a fast-moving pi-lane extension surface, not load-bearing core compression — the point of #2384 is ending the cross-repo npm round-trip. If that assessment changes, tighten HERE first (add the gate, don't improvise it).
+4. **Zero-runtime-dep contract preserved.** The component's only runtime host import (`@earendil-works/pi-coding-agent`, namespace-imported by its config-dir module for `CONFIG_DIR_NAME`) stays external and is aliased to `src/agent/pi-host-stub.ts` in the bili bundle (#2186); its `typebox` peer is inlined by the component's OWN tsup build, so no new runtime dependency ever reaches `dist/`.
+
 ## 3. Development Standards
 
 ### Build Commands
 
 ```bash
-npm run build          # builds kernel/ first, then tsup bundle (kernel inlined)
-npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests; pre-hooks build kernel/)
-npm test               # node --import tsx --test tests/*.test.ts (bili suite; kernel suite: npm --prefix kernel test)
+npm run build          # builds kernel/ + pi-subagents/ first, then tsup bundle (both inlined)
+npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests; pre-hooks build kernel/ + pi-subagents/)
+npm test               # node --import tsx --test tests/*.test.ts (bili suite; kernel suite: npm --prefix kernel test; pi-subagents suite: npm --prefix pi-subagents test)
 ```
 
 ### Local Testing & Install
@@ -179,7 +188,7 @@ Releases are fully automated via CI (`.github/workflows/release.yml`): the Agent
 
 ## 6. Contributing
 
-Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) understand the module dependency graph, (4) **consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned in BOTH plugin mode and proxy mode; correct-in-one-mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`. (5) **Kernel changes follow the Kernel Boundary** — declaration marker, owner approval, version discipline, two-layer tests; the kernel is relatively stable by design, touch it only when necessary.
+Before changes: (1) `npm run typecheck` clean, (2) `npm test` green, (3) understand the module dependency graph, (4) **consider BOTH compression modes** — any change touching the wire (message rebuild, system/developer handling, tool injection, `acp_summary` stripping, preflight, nudge) must be reasoned in BOTH plugin mode and proxy mode; correct-in-one-mode can break the other (#377 only manifested in proxy mode). See TECHNICAL-NOTES.md "Two compression modes" and the `pluginMode` comment in `src/server.ts`. (5) **Kernel changes follow the Kernel Boundary** — declaration marker, owner approval, version discipline, two-layer tests; the kernel is relatively stable by design, touch it only when necessary. (6) **`pi-subagents/` changes follow the Pi-Subagents Boundary** — version discipline + two-layer tests, lighter gating than `kernel/` (see that section).
 
 Commit convention: `feat:` / `fix:` / `refactor:` / `test:` / `docs:` / `release:`.
 
