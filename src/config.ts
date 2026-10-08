@@ -12,6 +12,7 @@ import { parseCompatDropFields } from "./compat-drop.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
+import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -105,6 +106,20 @@ export type ProviderRoute = {
      *  both). The model-level knob lives one level deeper —
      *  `models.<name>.benefit` on this same provider key (#1884 level 3). */
     resign?: ResignSchemeMap;
+    /** #2336 lane credential override (forward path): name of the environment
+     *  variable holding the key bili sends upstream INSTEAD of the client's
+     *  own credential for this lane. Exactly one of apiKeyEnv/credentialRef;
+     *  replacement rules — `authorization` is replaced only when the client's
+     *  value is a Bearer token (other schemes are signature-owned and kept),
+     *  `x-api-key`/`x-goog-api-key` are replaced outright, and a request with
+     *  none of the three gains `authorization: Bearer <key>`. Never applied
+     *  when the #1884 re-sign arm owns the signature. Invalid values THROW
+     *  (#1909 discipline). */
+    apiKeyEnv?: string;
+    /** #2336 lane credential override: NAME in the private summary-credential
+     *  store (`billion-context.json.summary-credentials.json`) — same
+     *  semantics as apiKeyEnv, for keys kept out of the environment. */
+    credentialRef?: string;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -131,6 +146,11 @@ export type ModelEntry = {
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
 export type CompressSettings = {
+    /** External summary chain — three-level like every other compress field
+     *  (whole-chain replace at provider/model level, no sub-merge). File shape:
+     *  references into the named providers table ("glm/glm-4.9-flash"),
+     *  expanded at request-config time (see NamedProviderRecipe). */
+    externalSummary?: ExternalSummaryChain;
     /** Effective context window used by the compression engine — this is the
      *  model's context size. It is the **denominator** the kernel uses for its
      *  usage ratio (`usage = tokens / modelContextLimit`); it is NOT a
@@ -608,21 +628,29 @@ export function resolveContextLimit(
     return resolveConfiguredContextLimit(routes, upstreamUrl, model) ?? lookupContextLimit(model);
 }
 
-/** Longest-URL-prefix match over the providers map. Returns the most specific
- *  ProviderRoute whose key is a prefix of `upstreamUrl`, or undefined. Shared
- *  by context-limit / compress-protocol / compress-settings resolution. */
-export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefined): ProviderRoute | undefined {
+/** #2317: the matched providers key itself (longest-URL-prefix, same rule as
+ *  findRoute) — or undefined when no key matches. Diagnostics need the KEY a
+ *  request resolved against (or proof of a route-miss), which findRoute's
+ *  route-object return cannot express. A key matches if upstreamUrl === key OR
+ *  upstreamUrl starts with key + "/" (boundary-safe: "https://x.com" does not
+ *  match "https://x.com.evil"); longest (most specific) key wins. */
+export function findRouteKey(routes: ProviderRoutes, upstreamUrl: string | undefined): string | undefined {
     if (!upstreamUrl) return undefined;
-    // A key matches if upstreamUrl === key OR upstreamUrl starts with key + "/".
-    // The boundary check ("/" or end-of-string) avoids "https://x.com" matching
-    // "https://x.com.evil". Longest (most specific) key wins.
     let bestKey = "";
     for (const key of Object.keys(routes)) {
         if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
             if (key.length > bestKey.length) bestKey = key;
         }
     }
-    return bestKey ? routes[bestKey] : undefined;
+    return bestKey || undefined;
+}
+
+/** Longest-URL-prefix match over the providers map. Returns the most specific
+ *  ProviderRoute whose key is a prefix of `upstreamUrl`, or undefined. Shared by
+ *  context-limit / compress-protocol / compress-settings resolution. */
+export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefined): ProviderRoute | undefined {
+    const key = findRouteKey(routes, upstreamUrl);
+    return key ? routes[key] : undefined;
 }
 
 export function resolveConfiguredContextLimit(
@@ -687,6 +715,12 @@ export type ProxyOptions = {
     host: string;
     upstream: string;
     routes: ProviderRoutes;
+    /** Named dialing recipes from the providers table (pi/opencode idiom) —
+     *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
+     *  Populated by loadOptions; optional so inline test fixtures (which
+     *  never reference chains) stay terse. Refreshed together with `routes`
+     *  on web Apply. */
+    namedProviders?: Record<string, NamedProviderRecipe>;
     /** Global default upstream HTTP proxy. Per-URL `proxy` overrides this.
      *  Empty string explicitly disables environment/system proxy fallback. */
     proxy?: string;
@@ -880,7 +914,11 @@ function warnNamedProviderOnce(signature: string, message: string): void {
 
 function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null): void {
     if (!obj) return;
-    const inert = NAMED_PROVIDER_ROUTING_FIELDS.filter((f) => f in obj && obj[f] !== undefined);
+    // A dialing recipe (baseUrl/api/...) re-scopes "models": on a recipe entry
+    // it is the model REGISTRY the summary chain references, not routing — so
+    // only warn for fields that are genuinely dead routing config there.
+    const recipe = obj.baseUrl !== undefined || obj.api !== undefined;
+    const inert = NAMED_PROVIDER_ROUTING_FIELDS.filter((f) => f in obj && obj[f] !== undefined && !(recipe && f === "models"));
     if (inert.length === 0) return;
     warnNamedProviderOnce(
         `inert:${key}:${inert.join(",")}`,
@@ -957,6 +995,105 @@ function fillRouteGaps(winner: unknown, filler: unknown): unknown {
  *  `compactionOptIn` only); if it nevertheless carries routing fields, a
  *  startup warning names the key and the inert fields instead of failing
  *  silently. */
+/** Per-model knobs a named recipe exposes to referencing chains. These are
+ *  the same fields an inline external-summary target carried; defaults come
+ *  from the chain expansion, not from here. */
+interface NamedProviderModel {
+    contextWindow?: number;
+    outputTokens?: number;
+    stream?: boolean;
+}
+
+/** Dialing recipe on a NAMED providers-table key (pi/opencode idiom): the
+ *  name maps to {baseUrl, api, credential, models}. Routing-inert by itself
+ *  — same as every named entry without `bind` — and referenced by
+ *  `compress.externalSummary.targets` ("glm/glm-4.9-flash"). Credentials are
+ *  references only (env var name or secret-store name); a plaintext key in
+ *  the config file is rejected by the unknown-key check, keeping the file
+ *  non-secret (web GET echoes it verbatim). */
+export interface NamedProviderRecipe {
+    baseUrl: string;
+    api: "anthropic" | "openai" | "responses" | "google";
+    apiKeyEnv?: string;
+    credentialRef?: string;
+    models: Record<string, NamedProviderModel>;
+}
+
+const NAMED_PROVIDER_RECIPE_FIELDS = ["baseUrl", "api", "apiKeyEnv", "credentialRef", "models"] as const;
+
+/** Parse one named-entry recipe. THROWS on an invalid shape — the web save
+ *  path surfaces it as a 400; loadNamedProviders catches and warns instead
+ *  (a broken recipe disables its chain references loudly, never the proxy). */
+export function parseNamedProviderRecipe(value: unknown): NamedProviderRecipe {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("a named provider recipe must be an object");
+    const obj = value as Record<string, unknown>;
+    const unknownKeys = Object.keys(obj).filter((key) => ![...NAMED_PROVIDER_RECIPE_FIELDS, "bind", "compactionOptIn"].includes(key));
+    if (unknownKeys.length > 0) throw new Error(`unknown recipe fields on named provider entry [${unknownKeys.join(", ")}] — routing fields need "bind"; credentials must use apiKeyEnv/credentialRef`);
+    if (typeof obj.baseUrl !== "string" || !obj.baseUrl.trim() || obj.baseUrl.length > 2048) throw new Error("recipe baseUrl must be a non-empty string");
+    if (obj.api !== "anthropic" && obj.api !== "openai" && obj.api !== "responses" && obj.api !== "google") throw new Error(`recipe api must be one of: anthropic, openai, responses, google (got ${JSON.stringify(obj.api)})`);
+    if (obj.apiKeyEnv !== undefined && (typeof obj.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(obj.apiKeyEnv))) throw new Error("recipe apiKeyEnv must be an environment variable name");
+    if (obj.credentialRef !== undefined && (typeof obj.credentialRef !== "string" || !validSummaryCredentialName(obj.credentialRef))) throw new Error("recipe credentialRef must be a secret-store credential name");
+    if (obj.apiKeyEnv !== undefined && obj.credentialRef !== undefined) throw new Error("recipe carries both apiKeyEnv and credentialRef — pick one");
+    if (obj.apiKeyEnv === undefined && obj.credentialRef === undefined) throw new Error("recipe needs a credential reference (apiKeyEnv or credentialRef)");
+    if (!obj.models || typeof obj.models !== "object" || Array.isArray(obj.models) || Object.keys(obj.models).length === 0) throw new Error("recipe models must be a non-empty object of model entries");
+    const models: Record<string, NamedProviderModel> = {};
+    for (const [id, raw] of Object.entries(obj.models)) {
+        const knobs = (raw && typeof raw === "object" && !Array.isArray(raw)) ? raw as Record<string, unknown> : {};
+        const unknown = Object.keys(knobs).filter((key) => !["contextWindow", "outputTokens", "stream"].includes(key));
+        if (unknown.length > 0) throw new Error(`unknown fields on recipe model "${id}" [${unknown.join(", ")}]`);
+        if (knobs.contextWindow !== undefined && (typeof knobs.contextWindow !== "number" || !Number.isSafeInteger(knobs.contextWindow) || knobs.contextWindow < 2048 || knobs.contextWindow > 10_000_000)) throw new Error(`recipe model "${id}" contextWindow must be an integer in [2048, 10000000]`);
+        if (knobs.outputTokens !== undefined && (typeof knobs.outputTokens !== "number" || !Number.isSafeInteger(knobs.outputTokens) || knobs.outputTokens < 128)) throw new Error(`recipe model "${id}" outputTokens must be an integer >= 128`);
+        if (knobs.stream !== undefined && typeof knobs.stream !== "boolean") throw new Error(`recipe model "${id}" stream must be a boolean`);
+        models[id] = { ...(knobs.contextWindow !== undefined ? { contextWindow: knobs.contextWindow } : {}), ...(knobs.outputTokens !== undefined ? { outputTokens: knobs.outputTokens } : {}), ...(knobs.stream !== undefined ? { stream: knobs.stream } : {}) };
+    }
+    return { baseUrl: obj.baseUrl.trim().replace(/\/+$/, ""), api: obj.api, ...(obj.apiKeyEnv !== undefined ? { apiKeyEnv: obj.apiKeyEnv } : {}), ...(obj.credentialRef !== undefined ? { credentialRef: obj.credentialRef } : {}), models };
+}
+
+/** True when the entry carries recipe fields (used to re-scope the inert
+ *  warning: on a recipe entry `models` is a registry, not routing). */
+function isNamedProviderRecipeShape(value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const obj = value as Record<string, unknown>;
+    return obj.baseUrl !== undefined || obj.api !== undefined;
+}
+
+export function collectNamedProviders(providers: Record<string, unknown>): Record<string, NamedProviderRecipe> {
+    const out: Record<string, NamedProviderRecipe> = {};
+    for (const [key, value] of Object.entries(providers)) {
+        if (isUrlLikeKey(key) || value === null || typeof value !== "object" || Array.isArray(value)) continue;
+        if (!isNamedProviderRecipeShape(value)) continue;
+        if (!validSummaryCredentialName(key)) {
+            warnNamedProviderOnce(`recipe-name:${key}`, `providers."${key}" is not a valid recipe name ([A-Za-z0-9][A-Za-z0-9_-]{0,63}) — the entry is ignored`);
+            continue;
+        }
+        try {
+            out[key] = parseNamedProviderRecipe(value);
+        } catch (error) {
+            warnNamedProviderOnce(`recipe:${key}`, `providers."${key}" has an invalid recipe (${error instanceof Error ? error.message : String(error)}) — chains referencing it are disabled`);
+        }
+    }
+    return out;
+}
+
+/** Named dialing recipes from the same sources `loadRoutes` reads (external
+ *  ACP_PROVIDERS file entries replace inline ones wholesale). Re-read per
+ *  call like every other config-file consumer; the server snapshots it next
+ *  to routes and refreshes both on web Apply. */
+export function loadNamedProviders(env: NodeJS.ProcessEnv = process.env): Record<string, NamedProviderRecipe> {
+    const fileConfig = loadConfigFile();
+    const out: Record<string, NamedProviderRecipe> = {};
+    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
+    if (routesPath) {
+        const parsed = safeReadJson(routesPath);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(out, collectNamedProviders(parsed as Record<string, unknown>));
+    }
+    if (fileConfig.providers) {
+        const inline = collectNamedProviders(fileConfig.providers as unknown as Record<string, unknown>);
+        for (const [name, recipe] of Object.entries(inline)) if (out[name] === undefined) out[name] = recipe;
+    }
+    return out;
+}
+
 export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes {
     const fileConfig = loadConfigFile();
     const routes: ProviderRoutes = {};
@@ -1134,6 +1271,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
+    const namedProviders = loadNamedProviders(env);
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
@@ -1212,6 +1350,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         upstream,
         auxProxyFallback,
         routes,
+        namedProviders,
         proxy,
         proxyMode,
         proxySource,
@@ -1940,7 +2079,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -1959,6 +2098,27 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageBilling) route.imageBilling = imageBilling;
         const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
+        // #2336 lane credential override. Only parsed for NON-recipe-shaped
+        // entries: a dialing recipe (baseUrl/api present) validates its own
+        // credential fields in parseNamedProviderRecipe, and letting this
+        // parser run first would surface recipe errors with route-flavored
+        // wording. A named non-recipe entry carrying `bind` folds these onto
+        // the bound lane via fillRouteGaps (generic field copy) — free.
+        if (obj.baseUrl === undefined && obj.api === undefined) {
+            if (obj.apiKeyEnv !== undefined || obj.credentialRef !== undefined) {
+                if (obj.apiKeyEnv !== undefined && obj.credentialRef !== undefined)
+                    throw new Error("[acp-config] providers entry carries both apiKeyEnv and credentialRef — exactly one lane credential is allowed");
+                if (obj.apiKeyEnv !== undefined) {
+                    if (typeof obj.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(obj.apiKeyEnv))
+                        throw new Error(`[acp-config] providers entry apiKeyEnv must be an environment variable name (got ${JSON.stringify(obj.apiKeyEnv)})`);
+                    route.apiKeyEnv = obj.apiKeyEnv;
+                } else {
+                    if (typeof obj.credentialRef !== "string" || !validSummaryCredentialName(obj.credentialRef))
+                        throw new Error(`[acp-config] providers entry credentialRef must be a name in the summary-credential store (got ${JSON.stringify(obj.credentialRef)})`);
+                    route.credentialRef = obj.credentialRef;
+                }
+            }
+        }
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
@@ -2002,6 +2162,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
+    if (obj.externalSummary !== undefined) {
+        try { out.externalSummary = parseExternalSummaryChain(obj.externalSummary); }
+        catch (error) {
+            // Keep the "unparseable values reject the whole compress block"
+            // contract, but make the rejection VISIBLE with the specific
+            // reason — silently dropping the block also reverts custom
+            // prompts/knobs to defaults, which must never pass unnoticed.
+            loggerLog("warn", `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`);
+            return undefined;
+        }
+    }
     const numberOrPercent = (value: unknown): value is number | string =>
         typeof value === "number" && Number.isFinite(value)
         || (typeof value === "string" && /^\d+(\.\d+)?%$/.test(value.trim()));

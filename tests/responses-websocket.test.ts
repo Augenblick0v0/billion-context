@@ -12,7 +12,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { Agent } from "undici";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import { ResponsesWsHistory, ResponsesWsUpstream } from "../src/responses-ws.ts";
+import { ResponsesWsHistory, ResponsesWsUpstream, finalizeResponsesWsUpstreamHeaders } from "../src/responses-ws.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { proxyDispatcher } from "../src/upstream-proxy.ts";
 import { ensureRootCA, mintHostCert, rootCaPath } from "../src/ca.ts";
@@ -64,6 +64,56 @@ test("V2 handshake: routes OAuth/API Responses sockets and stamps native identit
             assert.equal(event.headers?.["x-bili-plugin"], "opencode");
             assert.equal(event.headers?.["x-bili-plugin-conversation"], "ses_ws");
         }
+    } finally { cleanup(); }
+});
+
+test("Responses WS egress headers: azure strips consumed x-bili-* under the custom-header cap; other hosts unchanged", () => {
+    const raw = {
+        host: "westus2.openai.azure.com",
+        connection: "Upgrade",
+        "content-length": "128",
+        "content-type": "application/json",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+        "api-key": "sk-azure-test-credential",
+        "x-openai-organization": "org-test",
+        "x-stainless-runtime": "node",
+        "x-bili-plugin": "opencode",
+        "x-bili-plugin-conversation": "ses_az",
+        "x-bili-plugin-model": "gpt-5.2",
+        "x-bili-plugin-context-window": "200000",
+    };
+    const azure = finalizeResponsesWsUpstreamHeaders("https://westus2.openai.azure.com/openai/v1/responses?api-version=2024-08-01-preview", raw);
+    assert.equal(azure["api-key"], "sk-azure-test-credential");
+    assert.equal(azure["x-openai-organization"], "org-test");
+    assert.equal(azure["content-type"], "application/json");
+    for (const dropped of ["host", "connection", "content-length", "sec-websocket-key", "sec-websocket-version", "x-bili-plugin", "x-bili-plugin-conversation", "x-bili-plugin-model", "x-bili-plugin-context-window"]) assert.ok(!(dropped in azure), `azure egress must not carry ${dropped}`);
+    const openai = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", raw);
+    assert.equal(openai["x-bili-plugin"], "opencode");
+    assert.equal(openai["x-bili-plugin-conversation"], "ses_az");
+    assert.equal(openai["x-bili-plugin-model"], "gpt-5.2");
+    assert.equal(openai["api-key"], "sk-azure-test-credential");
+    for (const dropped of ["host", "connection", "content-length", "sec-websocket-key"]) assert.ok(!(dropped in openai), `non-azure egress must still drop hop marker ${dropped}`);
+});
+
+test("V2 handshake: azure Responses sockets are intercepted; uncovered providers stay unintercepted", async () => {
+    const hooks = new Map<string, (event: V2HttpRequestEvent) => void | Promise<void>>();
+    const origin = "http://127.0.0.1:8787";
+    const cleanup = await createOpencodeV2Setup({ route: createNativeRoute({ origin, ready: Promise.resolve(origin) }, { probe: async () => true }) })({
+        session: { hook: async (name, cb) => { hooks.set(name, cb); return {}; } },
+    });
+    try {
+        const azureUrl = "wss://myres.openai.azure.com/openai/v1/responses?api-version=2024-08-01-preview";
+        const azureEvent: V2HttpRequestEvent = { url: azureUrl, headers: { "api-key": "sk-azure-test" }, sessionID: "ses_az", agent: "build", model: { providerID: "azure", id: "gpt-5.2" } };
+        await hooks.get("experimental.ws.handshake")!(azureEvent);
+        assert.equal(azureEvent.url, `ws://127.0.0.1:8787/bili/responses/${azureUrl.replace(/^ws/, "http")}`);
+        assert.equal(azureEvent.headers?.["x-bili-plugin"], "opencode");
+        assert.equal(azureEvent.headers?.["x-bili-plugin-conversation"], "ses_az");
+        const otherUrl = "wss://api.anthropic.com/v1/messages";
+        const otherEvent: V2HttpRequestEvent = { url: otherUrl, headers: {}, sessionID: "ses_other", agent: "build", model: { providerID: "anthropic", id: "claude-x" } };
+        await hooks.get("experimental.ws.handshake")!(otherEvent);
+        assert.equal(otherEvent.url, otherUrl);
+        assert.ok(otherEvent.headers?.["x-bili-plugin"] === undefined);
     } finally { cleanup(); }
 });
 
@@ -134,7 +184,7 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
     await once(upstream, "listening");
     const config = defaultConfig(200000);
     config.preserveRecentTokens = 0;
-    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
+    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, proxy: "", proxyMode: "direct", proxySource: "direct", proxyFallback: { explicitDirect: true, globalSource: "direct" }, auxProxyFallback: { explicitDirect: true, globalSource: "direct" }, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
     const proxy = await startServer(opts);
     await once(proxy, "listening");
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
@@ -216,6 +266,8 @@ test("Responses WS: both ends use sockets; incremental tool continuation reaches
         assert.equal((f.rows[1].request.input as Item[]).length, 2);
         assert.ok(JSON.stringify(f.rows[1].full).includes("first-round-sentinel"));
         assert.equal(f.rows[0].headers.authorization, "Bearer fake-credential");
+        // #2359 control: a non-azure upstream still receives the consumed x-bili-* metadata verbatim — only *.openai.azure.com egress strips it.
+        assert.equal(f.rows[0].headers["x-bili-plugin"], "opencode");
         assert.equal(second.status, "completed");
         const session = peekSession(f.sid);
         assert.ok(session);

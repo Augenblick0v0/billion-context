@@ -587,21 +587,59 @@ HTTP transports; WS row documented from #2073, no live cell):
 
 Caveats worth knowing:
 
-- **Restrictive `tools:` allowlists filter ACP tools.** An agent definition
-  whose frontmatter `tools:` list omits the ACP tool names (e.g. the builtin
-  `scout` lists only `read`/`bash`/…) will not expose them in the child, even
-  though the session is named and compressed. Pre-fix foreground children
-  happened to have the tools via proxy wire injection regardless of the
-  allowlist — so such agents see fewer tools after the upgrade. Restore them
-  by omitting the `tools:` field or adding
-  `compress,decompress,search_context,acp_status,acp_cache`. The filtering is
-  pi-subagents' pre-existing behavior, not a regression of this fix.
+- **Roles with restrictive `tools:` allowlists get the ACP channel back
+  automatically (#2268).** An agent definition whose frontmatter `tools:` list
+  omits the ACP tool names — all seven builtin roles ship like this (e.g.
+  `delegate` lists `read,grep,find,ls,bash,edit,write,contact_supervisor`) —
+  no longer loses interactive compression after the #2185 named-plugin fix.
+  bili detects such children per request (pi-subagents stamps every child
+  session's system prompt with an `<active_agent name="…">` marker; the gate
+  also requires the request's tools array to expose none of the names bili
+  would inject) and serves them through the **proxy-style compression
+  channel**: wire-injected ACP tools + nudge, server-side execution,
+  `acp_summary` carrier — while keeping the named plugin-session identity
+  from #2185. No configuration change required; the role's original allowlist
+  stays intact on the wire, and a mid-session whitelist change self-heals on
+  the next request. Scoped to nicobailon/pi-subagents children only (the
+  marker is theirs); every other plugin host is unaffected. If upstream ever
+  drops the marker, these roles degrade to pre-#2268 behavior (named session,
+  no local ACP tools).
+  - A role exposing **any** ACP/bili-injectable name stays in pure plugin
+    mode (duplicate tool declarations are rejected by providers), so
+    **partial grants are unsupported** — grant none, or grant all
+    (`compress,decompress,search_context,acp_status[,acp_cache]`).
+  - Want locally registered (plugin-carrier) tools for a specific role? Keep
+    the manual grant: omit the `tools:` field or add the ACP names to it.
 - **One-request registration race in background children** (ACP tools present
   from the second request on) is pre-existing in all modes.
 - **Behavior change disclosure:** foreground children move from anonymous
   proxy mode (`pfa-*`) to named plugin mode (child session id + parent
   lineage). Strictly more information, but anything keyed on `pfa-*`
   identities will observe different ids.
+
+## Adopting unlisted clients (any client with a configurable model base URL) (#2340)
+
+Every client that lets you **edit its model endpoint and carries an API key** (rather than a login) can ride compression today with a one-line change — no launcher, no code: prepend the proxy origin + `/bili/` to the base URL (`http://127.0.0.1:8787/bili/https://api.example.com/v1`), keep the API key as-is, and run the daemon (`bili start`). What you get is the full pure-proxy treatment: compression + wire-level tool injection. Details and examples: [CONFIGURATION.md → `/bili/` prefix](CONFIGURATION.md#bili-prefix-api-key-clients).
+
+Verified entry points (community-maintained list — the mechanism is generic):
+
+| Client | Where the base URL lives |
+|---|---|
+| **Cline / Roo Code / Kilo Code** (VS Code) | provider settings — "OpenAI Compatible" Base URL, or the Anthropic provider's base URL |
+| **Continue** | `~/.continue/config.yaml` — per-model `apiBase` |
+| **OpenHands** | `llm.base_url` (config or env) |
+| **Zed** | `settings.json` — `language_models.openai_compatible.api_url` |
+| **Void** | custom OpenAI-compatible endpoint setting |
+| **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
+| **Warp** | custom-model base URL setting |
+
+Notes:
+
+- **Crush** is a launcher lane now — prefer `bili crush` (config untouched, HTTPS domains MITM'd automatically).
+- **Zed** is a launcher lane too — prefer `bili zed` (Linux; config untouched, model domains MITM'd automatically, loopback providers stay direct). The settings.json `api_url` path above remains the cross-platform alternative.
+- Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
+- Plain **web apps** (browser-only products) have no local traffic to intercept.
+- VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.
 
 ## Client uses `http.proxy` (CONNECT) but nothing compresses
 

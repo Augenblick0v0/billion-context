@@ -15,7 +15,7 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
-type Ctx = {
+export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; api?: string; [key: string]: unknown } | undefined;
     // #2186: acp_delegate surface notifies stand-downs through the host toast
@@ -25,7 +25,15 @@ type Ctx = {
     // optional because older hosts lack it. The real ModelRegistry surface is
     // find(provider, modelId) — there is no getModel (verified against pi
     // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
-    modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
+    modelRegistry?: {
+        find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined;
+        // #2336 agent-registry fallback: the fuller surface (verified against
+        // pi v0.99.1 model-registry.d.ts) — all optional, older hosts lack them.
+        getAll?: () => Array<{ id: string; provider: string; api?: unknown; contextWindow?: unknown; maxTokens?: unknown }>;
+        getProvider?: (provider: string) => { baseUrl?: unknown; auth?: { oauth?: unknown; apiKey?: unknown } | undefined } | undefined;
+        getProviderAuthStatus?: (provider: string) => { configured?: unknown; source?: unknown } | undefined;
+        getApiKeyForProvider?: (provider: string) => Promise<string | undefined> | undefined;
+    } | undefined;
     cwd?: string;
 };
 
@@ -76,6 +84,9 @@ type ExtensionAPI = {
     // pi-web); notify() is a transient toast — only the fallback for hosts
     // without sendMessage (issue #359).
     sendMessage?: (message: { customType: string; content: string; display: boolean }) => void;
+    // #2322: current session name (pi /name); optional because older hosts
+    // lack it (the session_info_changed event is the primary channel).
+    getSessionName?: () => string | undefined;
 };
 
 function agentName(override: string | undefined): string {
@@ -112,6 +123,94 @@ function latestPhysicalResponse(branchEntries: unknown): { provider: string; mod
     return undefined;
 }
 
+/** pi KnownApi → summary protocol (#2336). Unmappable apis (bedrock, vertex,
+ *  mistral, pi-messages) are skipped — the summary chain only speaks the four
+ *  wire protocols bili knows how to dial. */
+const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | "google"> = {
+    "anthropic-messages": "anthropic",
+    "openai-completions": "openai",
+    "openai-responses": "responses",
+    "azure-openai-responses": "responses",
+    "openai-codex-responses": "responses",
+    "google-generative-ai": "google",
+};
+
+/** #2336: report the host's own provider dialing recipes — baseUrl + api +
+ *  the RESOLVED api key, in memory only — so summary chains can reference
+ *  them ("glm/glm-5") without duplicating the dialing config in bili's
+ *  file. Skips OAuth providers, auth.json credentials ("stored" — never
+ *  collected by design), unmappable apis and baseUrls that point back at
+ *  this proxy. Returns true when done (or permanently unavailable) so the
+ *  caller can stop retrying; throws on transient failures. */
+export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
+    const proxyBase = proxyBaseForCtx(ctx);
+    if (proxyBase === undefined) return false;
+    const registry = ctx.modelRegistry;
+    if (registry?.getAll === undefined || registry.getProvider === undefined || registry.getProviderAuthStatus === undefined || registry.getApiKeyForProvider === undefined) return true;
+    type ProviderAcc = { api: "anthropic" | "openai" | "responses" | "google"; models: Array<{ id: string; contextWindow?: number; outputTokens?: number }> };
+    const byProvider = new Map<string, ProviderAcc>();
+    for (const model of registry.getAll()) {
+        const api = typeof model.api === "string" ? AGENT_PROVIDER_API[model.api] : undefined;
+        if (api === undefined || typeof model.provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(model.provider) || model.provider.length === 0 || typeof model.id !== "string" || model.id.length === 0 || model.id.length > 200) continue;
+        let entry = byProvider.get(model.provider);
+        if (entry === undefined) {
+            entry = { api, models: [] };
+            byProvider.set(model.provider, entry);
+        }
+        // A provider speaking two wire apis dials them differently; the
+        // recipe carries ONE api, so keep only the first one's models.
+        if (entry.api !== api || entry.models.length >= 16) continue;
+        entry.models.push({
+            id: model.id,
+            ...(typeof model.contextWindow === "number" && Number.isSafeInteger(model.contextWindow) && model.contextWindow >= 2048 && model.contextWindow <= 10_000_000 ? { contextWindow: model.contextWindow } : {}),
+            ...(typeof model.maxTokens === "number" && Number.isSafeInteger(model.maxTokens) && model.maxTokens >= 128 ? { outputTokens: model.maxTokens } : {}),
+        });
+    }
+    const providers: Record<string, { baseUrl: string; api: "anthropic" | "openai" | "responses" | "google"; apiKey: string; models: Record<string, { contextWindow?: number; outputTokens?: number }> }> = {};
+    for (const [id, entry] of byProvider) {
+        if (entry.models.length === 0) continue;
+        const provider = registry.getProvider(id);
+        const baseUrl = provider?.baseUrl;
+        if (typeof baseUrl !== "string" || !(baseUrl.startsWith("https://") || baseUrl.startsWith("http://"))) continue;
+        // Self-loop guard: skip providers whose endpoint IS this proxy — in
+        // the /bili/<upstream> prefix form the baseUrl embeds the proxy
+        // origin, and in MITM form detectProxyBase(baseUrl) resolves EVERY
+        // url through the env base, so compare origins instead of just
+        // testing detectProxyBase() !== undefined (which would skip the
+        // whole table whenever BILLION_CONTEXT_PROXY is set).
+        let selfLoop = true;
+        try { selfLoop = new URL(baseUrl).origin === new URL(proxyBase).origin; } catch { selfLoop = true; }
+        if (selfLoop) continue;
+        const status = registry.getProviderAuthStatus(id);
+        if (status?.configured !== true || status.source === "stored") continue;
+        if (provider?.auth?.oauth !== undefined) continue;
+        let apiKey: string | undefined;
+        try {
+            apiKey = await registry.getApiKeyForProvider(id);
+        } catch {
+            continue;
+        }
+        if (typeof apiKey !== "string" || apiKey.length === 0) continue;
+        const models: Record<string, { contextWindow?: number; outputTokens?: number }> = {};
+        for (const model of entry.models) {
+            models[model.id] = {
+                ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+                ...(model.outputTokens !== undefined ? { outputTokens: model.outputTokens } : {}),
+            };
+        }
+        providers[id] = { baseUrl, api: entry.api, apiKey, models };
+    }
+    if (Object.keys(providers).length === 0) return true;
+    const res = await fetch(`${proxyBase}/__bili/agent-providers`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent, providers }),
+        signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`agent-providers HTTP ${res.status}`);
+    return true;
+}
+
 function virtualModelProxyBase(ctx: Ctx, branchEntries: unknown): string | undefined {
     try {
         const last = latestPhysicalResponse(Array.isArray(branchEntries) ? branchEntries : ctx.sessionManager?.getBranch?.());
@@ -145,6 +244,32 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     } catch {
         return undefined;
     }
+}
+
+// #2322: report the host session name (pi /name) so the proxy's web UI labels
+// the conversation with it instead of staying pinned to the truncated first
+// user message. B-channel: a dedicated POST per change (set/rename/clear —
+// empty string clears) rather than piggybacking a header on model requests,
+// which could never express "cleared" and would only land on the next
+// request. Deduped per sid; a failed POST re-arms so the next event retries.
+const lastReportedNames = new Map<string, string>();
+
+function reportSessionName(ctx: Ctx | undefined, name: string): void {
+    const proxyBase = proxyBaseForCtx(ctx);
+    if (proxyBase === undefined) return;
+    const sid = ctx !== undefined ? sessionIdOf(ctx) : undefined;
+    if (sid === undefined || sid.length === 0) return;
+    const prev = lastReportedNames.get(sid);
+    if (prev === name || (name === "" && prev === undefined)) return;
+    lastReportedNames.set(sid, name);
+    fetch(`${proxyBase}/__bili/plugin/session-name`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId: sid, name }),
+        signal: AbortSignal.timeout(5000),
+    }).catch(() => {
+        lastReportedNames.delete(sid);
+    });
 }
 
 /** [#1333/#1362] Session files declare derivation in their header: the header
@@ -431,6 +556,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #2336: one successful agent-providers report per plugin instance;
+        // retried on later session_starts while the proxy base is unknown
+        // (native mode resolves it asynchronously).
+        let agentProvidersDone = false;
         // #2185 方案 A: this bundle's own file path, registered per session so
         // pi-subagents children load it deterministically (see module header).
         const subagentReg: SubagentSelfRegState = {};
@@ -889,6 +1018,17 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
+            if (!agentProvidersDone) {
+                agentProvidersDone = true;
+                reportAgentProviders(ctx, agent).then((done) => {
+                    if (done) return;
+                    // Proxy base not resolvable yet — retry on the next session.
+                    agentProvidersDone = false;
+                }).catch((err: unknown) => {
+                    agentProvidersDone = false;
+                    console.warn(`bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
+                });
+            }
             if (agent === "pi") {
                 const regReason = selfRegisterForSession(subagentReg, {
                     env: process.env,
@@ -911,6 +1051,17 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
             void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            // #2322: a resumed session may carry a name without ever firing
+            // session_info_changed (nothing changed) — stamp the current
+            // value once per session start so the proxy label follows it.
+            if (typeof pi.getSessionName === "function") {
+                try {
+                    const n = pi.getSessionName();
+                    if (typeof n === "string" && n.length > 0) reportSessionName(ctx, n);
+                } catch {
+                    // optional host API — ignore
+                }
+            }
         });
         // #2185: drop our required-child-extension entry when this session's
         // extension runtime tears down (quit/reload/new/resume/fork).
@@ -932,6 +1083,13 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 body: JSON.stringify({ conversationId: sid }),
                 signal: AbortSignal.timeout(5000),
             }).catch(() => {});
+        });
+        // #2322: follow the host session name. The event carries the
+        // authoritative value (name: undefined = cleared) and fires on
+        // rename — no need to wait for the next model request.
+        pi.on("session_info_changed", (event, ctx) => {
+            const name = (event as { name?: unknown }).name;
+            reportSessionName(ctx, typeof name === "string" ? name : "");
         });
         // #2186: acp_delegate surface for the pi lane, inlined from
         // billion-context-pi-subagents. omp never reaches the wiring (the

@@ -32,6 +32,8 @@
 <a href="https://www.minimax.io" title="MiniMax Code (mcode)"><img src="https://cdn.simpleicons.org/minimax/E73562" height="26" alt="MiniMax Code"></a>&nbsp;
 <a href="https://www.deepseek.com" title="deepseek-harness (dsh)"><img src="https://cdn.simpleicons.org/deepseek/5786FE" height="26" alt="deepseek-harness"></a>&nbsp;
 <a href="https://ampcode.com" title="Amp"><img src="https://icons.duckduckgo.com/ip3/ampcode.com.ico" height="26" alt="Amp"></a>&nbsp;
+<a href="https://charm.land/crush" title="Crush"><img src="https://icons.duckduckgo.com/ip3/charm.land.ico" height="26" alt="Crush"></a>&nbsp;
+<a href="https://zed.dev" title="Zed"><img src="https://icons.duckduckgo.com/ip3/zed.dev.ico" height="26" alt="Zed"></a>&nbsp;
 <a href="https://aider.chat" title="aider"><img src="https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/assets/icons/favicon-32x32.png" height="26" alt="aider"></a>&nbsp;
 <a href="https://github.com/aaif-goose/goose" title="goose"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_dark.png"><img src="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_light.png" height="26" alt="goose"></picture></a>&nbsp;
 <a href="https://github.com/NousResearch/hermes-agent" title="hermes"><img src="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/apps/bootstrap-installer/src-tauri/icons/128x128.png" height="26" alt="hermes"></a>&nbsp;
@@ -123,6 +125,8 @@ QQ群:
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili aider`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(仅 shell 命令钩子,无工具注入接缝,[#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot**(GitHub Copilot CLI) | `bili copilot`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
 | **amp**(Amp CLI) | `bili amp`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
+| **crush**(Charm Crush) | `bili crush`(启动器,cert-MITM)—— 开源 Go 二进制、无插件接缝;内置 provider 域加白,crush.json 自定义 `base_url` 自动发现(#2340) |
+| **zed**(Zed 编辑器) | `bili zed`(启动器,cert-MITM)—— 开源 Rust 编辑器、无插件接缝;reqwest 吃 HTTPS_PROXY,CA 走 SSL_CERT_FILE(Linux TLS env 探测);内置 provider 域加白,settings.json 自定义 `api_url` 自动发现;环回 provider(ollama/lmstudio)经 NO_PROXY 保持直连(#2340) |
 | **goose**(Goose CLI) | `bili goose`(启动器)—— rustls 不信任任何 CA 文件,无法 cert-MITM:openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST`,自定义 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay(#1049) |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
@@ -172,6 +176,7 @@ bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照�
 
 - **dsh:** `dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令 —— 两种走法终态一致(pnpm 装进 profile、patch 层由 dsh 自己挂载);经同一通道卸载。见下文 dsh 段。
 - **opencode:** 把裸 npm 包名直接写进你真实配置的插件列表 —— `"plugin": ["billion-context"]`(仅 npm 形态;git checkout 没有已发布入口)。包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载,插件自拉起的行为与 bili 安装的形态完全一致。另外要做两件 bili 安装器会替你做的事:在同一份配置里设 `"compaction": { "auto": false }`(否则 OpenCode 的原生自动压缩会双重压缩),并先手工备份该配置文件。
+- **claude:** 本仓库同时是一个 Claude Code 插件市场 —— `/plugin marketplace add ranxianglei/billion-context`,再 `/plugin install billion-context@billion-context`,然后运行 `/billion-context:bili-setup`(它会替你驱动 `bili plugin install claude` 并提示重启)。终态与 bili 安装器一致;插件自身不携带 hooks 或 MCP 条目,不会双重注册。
 
 pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。
 
@@ -181,13 +186,13 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与 CLI 侧「CC 的 undici 忽略 proxy env」的既有结论一致(这正是 `bili claude` 改用 `/bili/` base-URL 改写的原因)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
 - `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
-- `copilot`、`amp`、`goose` 仅启动器模式(#1049);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
+- `copilot`、`amp`、`crush`、`zed`、`goose` 仅启动器模式(#1049/#2340);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
 
-### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili goose`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -212,6 +217,8 @@ bili mcode                            # MiniMax Code CLI:与 kimi 同构(代理�
 bili aider                            # Aider(Python pair programmer):HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE 证书 MITM;端点取自 OPENAI_API_BASE / ANTHROPIC_BASE_URL / --openai-api-base / .aider.conf.yml(#1048)
 bili copilot                          # Copilot CLI(GitHub,闭源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.githubcopilot.com + 各套餐子域加白(#1049)
 bili amp                              # Amp CLI(Sourcegraph,闭源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),ampcode.com 加白(#1049)
+bili crush                            # Crush(Charm,开源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.anthropic.com/api.openai.com/openrouter.ai + crush.json 自定义 base_url 加白(#2340)
+bili zed                              # Zed 编辑器(开源 Rust)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE,Linux TLS env 探测),内置 provider 域 + settings.json 自定义 api_url 加白,环回 provider 保持直连(#2340)
 bili goose                            # Goose(Block,Rust/reqwest):rustls 发布构建不信任任何 CA 文件 —— openai/anthropic 腿经 OPENAI_HOST/ANTHROPIC_HOST,自定义 provider 经重新生成的 GOOSE_PATH_ROOT overlay(/bili/ 改写,真实配置不动)(#1049)
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```

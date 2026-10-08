@@ -11,17 +11,49 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
+import { externalSummaryEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
-import { executeProxyTool } from "./loop/core.js";
+import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
-import { degenerateTurnWarning } from "./degenerate-turn.js";
+import type { TruncationDiag } from "./stream-error.js";
+
+/** #2328 Q2: what the pipes know about the upstream HTTP response whose body
+ *  they are piping — threaded in by server.ts so the truncation diag can cite
+ *  status/content-type without the pipes holding the Response object. */
+export interface UpstreamMeta {
+    status?: number;
+    contentType?: string;
+}
+
+/** #2328 Q4: does the dangling partial event left at a cut carry the opening
+ *  bytes of the wire's own terminal? Factual byte evidence only — this never
+ *  guesses about frames that parsed but were classified otherwise. */
+function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): boolean {
+    // [DONE] torn anywhere past `data: [DO` is still recognizable as the
+    // terminal byte arriving.
+    if (/^data: \[DO/.test(tail)) return true;
+    if (protocol === "anthropic") return /event: message_stop/.test(tail.slice(0, 64)) || /"type"\s*:\s*"message_stop"/.test(tail);
+    if (protocol === "openai") {
+        // `"finish_reason":null` rides EVERY chat chunk — only a quoted
+        // (non-null) value counts, which is the final chunk's signature.
+        return /"finish_reason"\s*:\s*"/.test(tail);
+    }
+    if (protocol === "google") {
+        // finishReason only ever appears on Gemini's terminal chunk.
+        return /"finishReason"\s*:\s*"/.test(tail);
+    }
+    // responses: the completion-family event is the terminal.
+    return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
+        /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
+}
+import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -706,6 +738,53 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
     res.end(JSON.stringify({ ok: true, conversationId }));
 }
 
+// #2322: the host named the conversation (pi /name) — remember it as the
+// session's display title. B-channel design: a dedicated endpoint (instead
+// of a request header) so set/rename/CLEAR are all expressible (empty name =
+// clear, falling display back to the derived first-message title) and the
+// name lands immediately, not on the next model request.
+const HOST_TITLE_MAX = 200;
+
+export function handlePluginSessionName(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: { conversationId?: unknown; name?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown; name?: unknown };
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
+        return;
+    }
+    if (typeof parsed.name !== "string") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "name must be a string (empty clears)" }));
+        return;
+    }
+    const { session, entry } = resolveConversation(conversationId);
+    if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+            ok: false,
+            error: entry
+                ? `unknown plugin conversation id "${conversationId}" (id registered but session not resident)`
+                : `unknown plugin conversation id "${conversationId}" (no model request has arrived with this conversation id yet)`,
+        }));
+        return;
+    }
+    let name = parsed.name.replace(/\s+/g, " ").trim();
+    if (name.length > HOST_TITLE_MAX) name = name.slice(0, HOST_TITLE_MAX);
+    if (name) session.meta.hostTitle = name;
+    else delete session.meta.hostTitle;
+    markDirty(session);
+    if (entry) entry.lastSeen = Date.now();
+    res.end(JSON.stringify({ ok: true, conversationId }));
+}
+
 // #1685: the conversation_id tool parameter is GONE from the manifest — the
 // model must never see or echo a conversation id (zero-injection identity:
 // the proxy routes by outbound tool_use witness / body id / single-active
@@ -738,13 +817,14 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
     // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
     // a registered agent never sees range fields execution would refuse.
-    const acpAnthropic = ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE;
-    const acpOpenai = ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE;
+    const externalSummary = externalSummaryEnabled(config);
+    const acpAnthropic = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, externalSummary);
+    const acpOpenai = withExternalSummaryTools(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, externalSummary);
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = BILI_ACP_TOOLS_RESPONSES_NO_RANGE;
+    const acpResponses = withExternalSummaryTools(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, externalSummary);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -761,7 +841,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
-        capabilities: { fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint" } } : {}), fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
     }));
 }
 
@@ -772,6 +852,7 @@ export type PluginToolDeps = {
     // Browser-reachable origin of THIS proxy (http://host:port) for the human-facing
     // Web UI deep links inside panels/reports; absent in test harnesses/embeds.
     webOrigin?: string;
+    signal?: AbortSignal;
 };
 
 /** Reverse-lookup the conversation id bound to a session id. #656: the
@@ -1490,7 +1571,7 @@ export async function handlePluginTool(
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
             const pendingBefore = new Set(session.pendingRetrievals.map((p) => p.ref));
-            const toolResult = executeProxyTool(tool, args, {
+            const toolResult = await executeProxyToolAsync(tool, args, {
                 core: deps.core,
                 // #833: run proxy tools under the session's last resolved Config
                 // (same values the wire path used), not the base kernelConfig.
@@ -1498,7 +1579,7 @@ export async function handlePluginTool(
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
-            }, callId);
+            }, callId, undefined, deps.signal);
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -1727,6 +1808,11 @@ export async function pipePluginChatWithStrip(
     // The shipped request text: an emission-shaped span the user asked to
     // output verbatim is echoed, not dropped (m00885).
     requestText?: string,
+    // #2328 Q2: upstream HTTP status/content-type of the response this stream
+    // came from, for the truncation diag. Optional so existing callers/tests
+    // stay source-compatible; the plugin lane's resolveFakeCompletion refetch
+    // swallows the original response object, hence optional.
+    upstreamMeta?: UpstreamMeta,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -1823,6 +1909,16 @@ export async function pipePluginChatWithStrip(
      *  the text that survives such a frame is the tag's own interior. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
+    // #2328 Q2/Q4: termination diagnostics — every truncation emit below
+    // carries these on the in-band error frame (meta) and the log line.
+    let diagEvents = 0;
+    let diagBytes = 0;
+    let diagUnparseable = 0;
+    const diagLastTypes: string[] = [];
+    const diagPushType = (label: string) => {
+        diagLastTypes.push(label);
+        if (diagLastTypes.length > 5) diagLastTypes.shift();
+    };
     // #1501 option C: tool-call observations on this verbatim lane, keyed per
     // protocol (openai: choice:toolIndex, anthropic: block:N, google:
     // candidate/part). Bytes are forwarded untouched (#1039); the tracker only
@@ -1860,9 +1956,16 @@ export async function pipePluginChatWithStrip(
      *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (refetch === undefined || truncationRetried) return false;
+        // #2303: a terminal turn whose visible prose ends with a compression-draft
+        // closing tag and no tool call is non-converged even though it has visible
+        // text — the model wrote a handoff/compression draft in prose instead of
+        // issuing the action it described (149 silent stops / 70 sessions, DSH
+        // native). Treat it like the empty-turn shape below so at worst the client
+        // gets one extra continuation instead of losing the whole turn.
+        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
-        if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
+        if (!draftTail && (visibleTextChars > releasedMarkupChars || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
         if (degenerateRetried) {
@@ -1877,10 +1980,13 @@ export async function pipePluginChatWithStrip(
         // A turn the model left genuinely bare — no thought, no stripped echo,
         // no released markup — is the upstream's own empty answer, not a stall:
         // re-issuing it double-bills an empty completion (#732/#821 keep the
-        // same boundary in the compress loop).
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
+        // same boundary in the compress loop). A draft-tail turn is NOT bare:
+        // it delivered a full handoff draft, which is precisely the stall signal.
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -1955,6 +2061,27 @@ export async function pipePluginChatWithStrip(
         buf = "";
         return true;
     };
+    // #2328 Q2/Q4: the diag snapshot riding every truncation emit below. Built
+    // at emit time so the counters reflect the final (possibly retried)
+    // attempt; `buf` is whatever partial SSE event the cut left dangling.
+    const buildTruncationDiag = (cause: "eof" | "read-error"): TruncationDiag => ({
+        cause,
+        classification: buf.length > 0 && tailLooksTerminal(buf, protocol) ? "terminal-bytes-unrecognized" : "no-terminal-seen",
+        protocol,
+        events: diagEvents,
+        unparseableForwarded: diagUnparseable,
+        bytes: diagBytes,
+        lastEventTypes: [...diagLastTypes],
+        eofBufferBytes: buf.length,
+        ...(buf.length > 0 ? { eofBufferHead: buf.slice(0, 80).replace(/[\r\n]+/g, "\\n") } : {}),
+        ...(finalFinishReason !== undefined ? { finishReason: finalFinishReason } : {}),
+        visibleChars: visibleTextChars,
+        sawStrippedEcho,
+        retryZeroByteCutSpent: truncationRetried,
+        retryDegenerateSpent: degenerateRetried,
+        ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
+        ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+    });
     /** While the retry stream feeds the client, the message the FIRST attempt
      *  opened is still open: nothing may re-open it. Returns true when the event
      *  was consumed. */
@@ -2458,16 +2585,26 @@ export async function pipePluginChatWithStrip(
         return rawEvent + "\n\n";
     };
     try {
+        let pendingFinal: string | null = null;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
                 if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
-                break;
+                // #2323: a CRLF/lone-CR whose final byte arrived last is held back
+                // by the streaming normalizer; resolve it and re-drive the completed
+                // event through the same path below before deciding truncation.
+                const resolved = finalizeSseLineEndings(buf);
+                if (resolved === buf) break;
+                buf = "";
+                pendingFinal = resolved;
+            } else {
+                if (value && value.length > 0) diagBytes += value.byteLength;
+                pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
-            if (value && value.length > 0) {
-                buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
+            if (pendingFinal !== null) {
+                buf = normalizeSseLineEndings(buf + pendingFinal);
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
                     const rawEvent = buf.slice(0, idx);
@@ -2477,6 +2614,8 @@ export async function pipePluginChatWithStrip(
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr) continue;
                     if (jsonStr === "[DONE]") {
+                        diagEvents++;
+                        diagPushType("[DONE]");
                         sawTerminal = true;
                         await write(flushTails() + rawEvent + "\n\n");
                         continue;
@@ -2485,11 +2624,28 @@ export async function pipePluginChatWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        diagEvents++;
+                        diagUnparseable++;
+                        diagPushType("unparseable");
                         // #2190: unparseable frames bypass every filter — audit them.
                         auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
+                    diagEvents++;
+                    // #2328: wire-native label where one exists; the chat wires
+                    // without a `type` get a synthesized one so the last-events
+                    // trail is readable in the diag.
+                    if (protocol === "anthropic") diagPushType(typeof ev["type"] === "string" ? ev["type"] as string : "frame");
+                    else if (protocol === "openai") {
+                        const c0 = Array.isArray(ev["choices"]) ? (ev["choices"] as unknown[])[0] : undefined;
+                        const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finish_reason"] : undefined;
+                        diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
+                    } else if (protocol === "google") {
+                        const c0 = Array.isArray(ev["candidates"]) ? (ev["candidates"] as unknown[])[0] : undefined;
+                        const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finishReason"] : undefined;
+                        diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
+                    } else diagPushType("frame");
                     if (retryFraming(ev)) continue;
                     if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
                     if (ev["type"] === "message_stop") sawTerminal = true;
@@ -2532,6 +2688,7 @@ export async function pipePluginChatWithStrip(
                     if (out.length > 0) await write(offsetRetryIndices(out));
                 }
             }
+            if (done) break;
             if (res.destroyed || res.writableEnded) break;
         }
         // #721: upstream EOF without a terminal event must not close the
@@ -2557,7 +2714,7 @@ export async function pipePluginChatWithStrip(
         maybeWarnNamelessToolCalls();
         settleWitnesses();
         if (truncated) {
-            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"));
             return;
         }
     } catch (e) {
@@ -2581,7 +2738,7 @@ export async function pipePluginChatWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
-        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error"));
         return;
     } finally {
         reader.releaseLock();
@@ -2702,11 +2859,22 @@ export async function pipePluginResponsesWithStrip(
     absorbInstructed?: boolean,
     // m00885: echoed (user-requested verbatim) emission spans survive.
     requestText?: string,
+    // #2328 Q2 — see pipePluginChatWithStrip.
+    upstreamMeta?: UpstreamMeta,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    // #2328 Q2/Q4 — see the chat-pipe twin.
+    let diagEvents = 0;
+    let diagBytes = 0;
+    let diagUnparseable = 0;
+    const diagLastTypes: string[] = [];
+    const diagPushType = (label: string) => {
+        diagLastTypes.push(label);
+        if (diagLastTypes.length > 5) diagLastTypes.shift();
+    };
     const onTagDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
@@ -2921,6 +3089,29 @@ export async function pipePluginResponsesWithStrip(
         if (typeof type === "string" && type.startsWith("response.reasoning_summary_")) return true;
         return type === "response.created" || type === "response.output_item.added" || type === "response.content_part.added";
     };
+    // #2328 Q2/Q4 — see the chat-pipe twin. Responses-specific extras: the
+    // last completion-family status observed (a failed/incomplete status on a
+    // "truncated" stream changes the diagnosis) and how many done-family
+    // frames were still held for the degenerate-turn retry when the cut hit.
+    const buildTruncationDiag = (cause: "eof" | "read-error"): TruncationDiag => ({
+        cause,
+        classification: buf.length > 0 && tailLooksTerminal(buf, "responses") ? "terminal-bytes-unrecognized" : "no-terminal-seen",
+        protocol: "responses",
+        events: diagEvents,
+        unparseableForwarded: diagUnparseable,
+        bytes: diagBytes,
+        lastEventTypes: [...diagLastTypes],
+        eofBufferBytes: buf.length,
+        ...(buf.length > 0 ? { eofBufferHead: buf.slice(0, 80).replace(/[\r\n]+/g, "\\n") } : {}),
+        ...(responseStatus !== undefined ? { responseStatus } : {}),
+        visibleChars: visibleTextChars,
+        sawStrippedEcho,
+        retryZeroByteCutSpent: truncationRetried,
+        retryDegenerateSpent: degenerateRetried,
+        heldEvents: heldEvents.length,
+        ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
+        ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+    });
     /** Every id the retry carries is rewritten onto the first attempt's, so the
      *  client's assembled item stays the one it already holds. */
     const rewriteRetryIds = (ev: Record<string, unknown>): void => {
@@ -2953,16 +3144,22 @@ export async function pipePluginResponsesWithStrip(
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
-        if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
+        // #2303: same shape as the chat-pipe twin — visible prose ending in a
+        // compression-draft closing tag with no function call is non-converged.
+        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
         // A turn the model left genuinely bare — no reasoning, no stripped
         // echo — is the upstream's own empty answer, not a stall: re-issuing it
         // double-bills an empty completion (#732/#821 keep the same boundary in
-        // the compress loop).
-        if (!sawReasoning && !sawStrippedEcho) return false;
+        // the compress loop). A draft-tail turn delivered a full handoff draft:
+        // precisely the stall signal.
+        if (!sawReasoning && !sawStrippedEcho && !draftTail) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.(draftTail
+            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+            : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -3028,16 +3225,26 @@ export async function pipePluginResponsesWithStrip(
         return out;
     };
     try {
+        let pendingFinal: string | null = null;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
                 if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
-                break;
+                // #2323: a CRLF/lone-CR whose final byte arrived last is held back
+                // by the streaming normalizer; resolve it and re-drive the completed
+                // event through the same path below before deciding truncation.
+                const resolved = finalizeSseLineEndings(buf);
+                if (resolved === buf) break;
+                buf = "";
+                pendingFinal = resolved;
+            } else {
+                if (value && value.length > 0) diagBytes += value.byteLength;
+                pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
-            if (value && value.length > 0) {
-                buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
+            if (pendingFinal !== null) {
+                buf = normalizeSseLineEndings(buf + pendingFinal);
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
                     const rawEvent = buf.slice(0, idx);
@@ -3046,7 +3253,11 @@ export async function pipePluginResponsesWithStrip(
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr || jsonStr === "[DONE]") {
-                        if (jsonStr === "[DONE]") sawTerminal = true;
+                        if (jsonStr === "[DONE]") {
+                            diagEvents++;
+                            diagPushType("[DONE]");
+                            sawTerminal = true;
+                        }
                         await write(rawEvent + "\n\n");
                         continue;
                     }
@@ -3054,11 +3265,16 @@ export async function pipePluginResponsesWithStrip(
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
                     } catch {
+                        diagEvents++;
+                        diagUnparseable++;
+                        diagPushType("unparseable");
                         // #2190: unparseable frames bypass every filter — audit them.
                         auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
                     }
+                    diagEvents++;
+                    if (typeof ev["type"] === "string") diagPushType(ev["type"] as string);
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
                     const type = ev["type"];
@@ -3250,6 +3466,7 @@ export async function pipePluginResponsesWithStrip(
                     await write(rawEvent + "\n\n");
                 }
             }
+            if (done) break;
             if (res.destroyed || res.writableEnded) break;
         }
         // Stream cut without a done-family event: flush whatever the tag
@@ -3266,7 +3483,7 @@ export async function pipePluginResponsesWithStrip(
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
-            emitUpstreamTruncation(res, "responses", false, log);
+            emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("eof"));
             return;
         }
     } catch (e) {
@@ -3287,7 +3504,7 @@ export async function pipePluginResponsesWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
-        emitUpstreamTruncation(res, "responses", false, log);
+        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error"));
         return;
     } finally {
         reader.releaseLock();

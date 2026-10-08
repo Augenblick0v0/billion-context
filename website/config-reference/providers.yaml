@@ -146,6 +146,26 @@ entries:
     desc_zh: "把具名（非 URL）条目深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。"
     site_en: "Named (non-URL) entry: deep-merged onto the bound URL lane at config load as an alias. Without bind a named entry stays routing-inert."
     site_zh: "具名（非 URL）条目：加载配置时深合并到所绑定的 URL 通道作为别名；无 bind 的具名条目不参与路由。"
+  - key: apiKeyEnv
+    type: "string (env var name)"
+    default: "unset"
+    group: providers
+    id: cr.lanekey
+    render: route-row
+    desc_en: "Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref)."
+    desc_zh: "通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。"
+    site_en: "Lane credential override (#2336): requests forwarded through this lane carry this env variable's value instead of the client's own credential — x-api-key / x-goog-api-key replaced outright, Bearer authorization replaced, injected when absent. Exactly one of apiKeyEnv / credentialRef per entry."
+    site_zh: "通道凭据覆盖（#2336）：经该通道转发的请求使用此环境变量的值取代客户端自带凭据——x-api-key / x-goog-api-key 直接替换、Bearer authorization 替换、缺失时注入。每个条目与 credentialRef 二选一。"
+  - key: credentialRef
+    type: "string (store name)"
+    default: "unset"
+    group: providers
+    id: cr.lanecred
+    render: route-row
+    desc_en: "Lane credential override via the private summary-credential store (secret:NAME semantics)."
+    desc_zh: "经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。"
+    site_en: "Lane credential override via the private summary-credential store (`secret:NAME` semantics); exactly one of apiKeyEnv / credentialRef per entry."
+    site_zh: "经私有摘要凭据存储的通道凭据覆盖（`secret:NAME` 语义）；每个条目与 apiKeyEnv 二选一。"
   - key: compactionOptIn
     type: boolean
     default: "false"

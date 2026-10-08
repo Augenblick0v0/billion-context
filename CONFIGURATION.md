@@ -106,7 +106,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compat.streamErrorShape` | "protocol" \| "completion" | protocol | BILI_STREAM_ERROR_SHAPE | How upstream stream failures are presented after the 200 is committed: protocol-native error frames (default) or the legacy synthesized-completion shape. |
 | `compat.noCacheControl` | boolean | false | BILI_NO_CACHE_CONTROL | Stop stamping Anthropic-lane cache_control breakpoints entirely (escape hatch for upstreams/relays with their own breakpoint policy). |
 | `compat.keepResponseId` | boolean | false | ACP_KEEP_RESPONSE_ID | Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued). |
-| `dsh.allowDshCompaction` | boolean | false | BILI_ALLOW_DSH_COMPACTION | Lift bili's local 403 refusal of dsh native compaction calls (#1729/#2028): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in. |
+| `dsh.allowDshCompaction` | boolean | false | BILI_ALLOW_DSH_COMPACTION | Lift bili's local 403 refusal of dsh native compaction calls on EVERY wire lane bili serves — openai, anthropic, and responses (#1729/#2028; responses added by #2360, the lane dsh desktop's compaction actually rides): when true, dsh's compaction-basic may execute through bili; its checkpoint durably shadows raw history, so this is an explicit irreversible opt-in. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding. |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | auto | ACP_PROMPT_CACHE_ROUTING | Prompt-cache routing posture for cache-aware lane selection. |
 | `native.attachExternal` | boolean | false | BILI_NATIVE_ATTACH_EXTERNAL | Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own. |
@@ -285,6 +285,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `imageTokenCap` | number | unset (uncapped) | — | Per-image token cost cap for this route. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | Per-route overrides of the global resign map (level 2, deepest wins). |
 | `bind` | string (named entries only) | unset | — | Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert. |
+| `apiKeyEnv` | string (env var name) | unset | — | Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref). |
+| `credentialRef` | string (store name) | unset | — | Lane credential override via the private summary-credential store (secret:NAME semantics). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
 
 **Environment-only variables**
@@ -867,7 +869,7 @@ Three more #2030 keys extend existing blocks: [`mitm.handshakeTimeoutMs`](#clien
 
 ## Providers
 
-The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
+The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, a client-side direct exemption, and a lane credential override ([`apiKeyEnv`](#lane-credentials-apikeyenv--credentialref)). Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).
 ```jsonc
 {
   "providers": {
@@ -891,6 +893,8 @@ The `providers` block maps **upstream URLs** to per-provider configuration. Each
 Keys are matched against the request's upstream URL by **longest-prefix wins**. A key matches if the request URL equals the key, or starts with `key + "/"`. This makes matching boundary-safe: a key `https://api.example.com` matches `https://api.example.com/v1/chat` but does **not** match `https://api.example.com.evil` (an attacker-controlled lookalike host).
 
 A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A deep key (`https://open.bigmodel.cn/api/anthropic`) matches only that endpoint. When two keys both match, the longest (most specific) one wins. Trailing slashes on keys are stripped automatically.
+
+**A request whose upstream matches no key applies NO per-provider override.** If the request URL matches none of the keys above, that request runs on registry/global defaults only — its `models.<m>.context`, `compress.modelContextLimit`, proxy, protocol, etc. are all silently ignored. The usual trap is switching your client to a *different relay host* while your pins live under the old host's key: the new host is a route-miss, so nothing you set under the old key ever reaches it. Since #2317 this is loud instead of silent — bili logs a once-per-(upstream, model) `[route]` warning naming the known keys, stamps `upstream=<…> route=miss` on the `[window]` / codex-clamp lines, and a preflight 502 for an over-window payload points at the missing key rather than telling you to re-set `compress.modelContextLimit`. Add a `providers` entry for the new host (or URL prefix) to make your overrides apply there. Endpoints in these lines are fingerprinted (`<host:xxxxxxxx>`) rather than printed verbatim, consistent with log host-masking (`BILI_LOG_MASK_HOSTS`).
 
 ### MITM vs `/bili/` key schemes
 
@@ -934,6 +938,24 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
   }
 }
 ```
+
+### Lane credentials (`apiKeyEnv` / `credentialRef`)
+
+A URL-keyed lane (or a named entry with `bind`) can send **its own** credential upstream instead of the client's — the lane owner's key replaces whatever the agent client put on the wire (#2336). Typical case: a shared machine proxy where the owner's `deepseek` lane authenticates with the owner's key no matter which client (and whose personal key) is talking through it.
+
+```jsonc
+{
+  "providers": {
+    "https://api.deepseek.com": { "apiKeyEnv": "DEEPSEEK_LANE_KEY" }
+  }
+}
+```
+
+- **Type:** `string` — `apiKeyEnv` is an environment-variable NAME (`env:VAR` semantics), `credentialRef` is a NAME in the private [summary-credential store](#shared-external-summary-service) (`secret:NAME` semantics). Exactly one of the two per entry; invalid values reject the config (#1909 discipline — startup failure / web-UI 400).
+- **Replacement rules:** `x-api-key` and `x-goog-api-key` are replaced outright. `authorization` is replaced **only** when the client's value is a Bearer token — any other scheme (SDK-HMAC signatures, mTLS fingerprints…) is signature-owned and left untouched, with a warning. A request carrying none of the three gains `authorization: Bearer <key>`.
+- **#1884 interplay:** skipped whenever the CodeArts re-sign arm is active on the request — the re-signer owns `Authorization` there.
+- **Failure posture:** if the env var is unset or the secret is absent, bili keeps the client's own headers and warns once per lane+reference (visible, never silently degrading to a guaranteed 401). The warning re-arms after a successful resolution.
+- Applied once to the shared forward-header set, so every egress of the request — initial send, role-ladder retry, overflow refold, compress-loop rounds, continuation refetch — carries the lane credential.
 
 ### `models`
 
@@ -1053,6 +1075,46 @@ A key that is not a URL (e.g. `"claude-bridge"`) is a **named** entry. On its ow
 ## Compression Tuning
 
 Compression behaviour is controlled by the `compress` block, which can appear at three levels. They merge **per-field, deepest wins**: a field set at a deeper level overrides the same field higher up, but an *unset* field at a deeper level never clears a value set higher up. In other words, the child covers the parent field-by-field — it never replaces the whole object.
+
+### Shared external summary service
+
+The optional `compress.externalSummary` block sends compression summaries to one or more separately configured models. It lives at all three `compress` levels like every other field, with whole-chain semantics: a chain set at a deeper level (provider or model) **replaces** the entire chain above it — there is no per-target or per-budget sub-merge, exactly like `tiers`. It is disabled unless `enabled` is `true`; when enabled, targets are tried in order and a failed or unusable target falls through to the next one. The main request provider, model, and authorization are never reused for these calls. This feature changes the compression tool contract so `summary` is an optional non-authoritative hint; the proxy keeps the original messages recoverable and commits only a validated returned summary.
+
+Targets are **references into the `providers` table**: each entry is the string `"provider/model"`, where `provider` is a *named provider recipe* (a non-URL `providers` entry carrying dial fields) and `model` is a key of its `models` map. The endpoint, protocol, and credential are derived from the recipe — no URLs are repeated per target:
+
+```json
+{
+  "providers": {
+    "glm": {
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "api": "openai",
+      "apiKeyEnv": "GLM_API_KEY",
+      "models": { "glm-4.9-flash": { "outputTokens": 4096 } }
+    },
+    "claude": {
+      "baseUrl": "https://api.anthropic.com",
+      "api": "anthropic",
+      "credentialRef": "primary",
+      "models": { "claude-haiku-4.5": {} }
+    }
+  },
+  "compress": {
+    "externalSummary": {
+      "enabled": true,
+      "targets": ["glm/glm-4.9-flash", "claude/claude-haiku-4.5"],
+      "budget": { "totalTimeoutMs": 50000, "targetTimeoutMs": 25000, "maxSummaryBytes": 65536 }
+    }
+  }
+}
+```
+
+A recipe carries: `baseUrl` (HTTPS; loopback HTTP allowed for local development; no embedded credentials, proxy-recursion paths, or arbitrary query parameters), `api` (one of `openai` | `anthropic` | `responses` | `google`; selects the wire protocol and derives the request path from `baseUrl`), exactly one credential reference — `apiKeyEnv: "VAR_NAME"` (an environment variable read at call time) or `credentialRef: "NAME"` (a value stored via the Web UI) — and a `models` map whose per-model fields are `contextWindow` (default 128000), `outputTokens` (default `min(8192, window/4)`), and `stream` (default false). Recipes can also be split into `recipe`/`bind` routing form like URL entries; a named entry is routing-inert unless bound.
+
+Up to 16 targets per chain are supported. Saving an enabled chain through the Web API validates that every reference resolves (unknown provider or model → HTTP 400). At runtime an unresolvable reference is logged once and disables the chain until fixed — it never falls back to summarizing with the main model. `secret:` values are stored separately from the main JSON configuration in the private `billion-context.json.summary-credentials.json` file and are never returned by the configuration API. On Windows, protect this file and its parent directory with an administrator-only ACL; stale `.lock` files require manual removal after confirming no proxy process is writing the store. The total budget is shared across all targets and compression entry points, and cancellation or session-state changes discard generated results without folding.
+
+#### Agent-reported providers (fallback layer)
+
+An ACP-native agent (currently the `pi` extension) reports its own configured providers to the proxy once per process (`POST /__bili/agent-providers`): provider name, base URL, wire protocol, resolved API key, and model list. These recipes form a **fallback layer** — a chain may reference `"zhipu/glm-5"` without the dial fields being duplicated in the file, so a provider configured once in the agent's own config is directly usable as a summary target. Merge order is **file wins**: a file recipe with the same name shadows the agent's contribution for that provider entirely (including its models). The agent layer never persists to disk: keys live only in proxy process memory, are never returned by the configuration API, and never appear in logs. Skip rules on the reporting side: OAuth-authenticated providers, `auth.json` ("stored") credentials, providers whose endpoint points back at the proxy itself, and wire protocols without a summary dial (`bedrock`, `vertex`, `mistral`, `pi-messages`) are not reported. The Web UI marks agent-reported models with an `(agent)` badge in the target dropdown.
 
 The three levels, from broadest to most specific:
 
@@ -1642,7 +1704,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_AFFINITY_SIMHASH` | Set `0` to turn OFF simhash chain-alignment adoption (#2265): anonymous requests whose exact hash chain was broken by a client-side pervasive decorative rewrite (e.g. Trae re-stamping model tags on every assistant message) re-attach the existing session with its compression state instead of minting fresh and re-folding from zero. Guards: ≥90% coverage within Hamming 10, ≥20% mutated-but-similar positions (point edits still fork, #629), ≥1 byte-identical user message, unique candidate only. Default ON. `"affinitySimhash": false` in the config file does the same; the env var wins. |
 | `BILI_RESUME_INHERITANCE` | Set `0` to turn OFF resume inheritance (ON by default) (#1486): when an identified client (sends its own session id, e.g. Claude Code's `x-claude-code-session-id`) resumes a conversation under a NEW session id while replaying the full transcript (`cc --resume` forks a fresh UUID), bili matches the incoming history byte-exactly against that client's tracked chains (≥8 messages, append-only tracking) and, on the resumed session's first request, inherits the parent's ref assignments — stale model citations then resolve to their ORIGINAL messages instead of mis-hitting renumbered ones — adopts the fully-present compression blocks (together with this inheritance, #1834: losing them on resume meant the folded originals came back on the wire and the upstream request ballooned; the old `forkAdoption` co-gate now applies only to anonymous forks, #629), and records the `derivedFrom` lineage. The parent is never modified and fresh messages number above the parent's ref space. A resume must strictly EXTEND the parent's history — an equal-depth byte-exact replay under another id is a duplicate, not a resume. Anonymous sessions are unaffected (they keep their own pfa-* world, #309). `"resumeInheritance": false` in the config file does the same; the env var wins. |
 | `BILI_STABLE_SYSTEM_ANCHOR` | Set `1` to enable stable-system anchoring (#1085) — a **best-effort wire-layer fallback** for prefix caching: the root fix belongs client-side (the client owns its history and decides how to present instruction changes), this only stops the proxy from letting a changed head invalidate the whole cached prefix. **Plain-proxy mode only**: plugin-mode agents (`x-bili-plugin`) own their context management and are never anchored, so clients that already inject cache-friendly updates (e.g. claude-code-style system reminders) are not double-processed. When enabled, bili remembers each session's first-seen head system/instructions block and keeps re-sending those exact bytes even when the client's system prompt later changes. A **localized** change (a file-style edit sharing ≥70% of lines with the version in effect so far) appends a trailing `[System context update] …` user note carrying a compact line diff (`-` removed / `+` added; each note composes sequentially onto the previous one). A **non-localized** change (structural reshuffle, tool-def churn, timestamped banners, heads over 400 lines) is adopted outright — one deliberate cache miss beats appending noise that would mislead the model about its instructions. Churn guard: more than 8 accumulated notes likewise replace the anchor with the newest text and clear the log. The anchor and note log persist with the session and survive compression/compaction (session metadata, not kernel state). Known residual limitation: client-placed `cache_control` breakpoints may still misalign after a head swap. Excluded from anchoring: title-gen micro-requests (OpenAI/Google), Responses compaction-trigger requests, auto-mode classifier requests. Clients implementing their own variant (stable prompt + in-history updates) get zero extra injection — such updates pass through as ordinary history. Default is OFF. `"stableSystemAnchor": true` in the config file does the same; the env var wins. |
-| `BILI_ALLOW_DSH_COMPACTION` | Set `1` to let dsh's built-in auto-compaction run through bili (#2028). By default the wire-level guard (#1729) **refuses dsh native compaction calls locally** (403): dsh's `compaction-basic` answers context pressure by replaying the conversation prefix plus a fixed summarization directive as the final user message, and when such a call LANDS its checkpoint durably shadows the raw history — irreversible, and it destroys the proxy's compression substrate. This switch lifts the refusal so dsh-native compaction can actually execute. Scope note: on non-web profiles the shipped bundle patch (`auto: false`) still suppresses AUTO-triggering, so only manual `/compact` benefits there; on web profiles (where no patch layer reaches the preset-nested instance, #1772) auto-triggering works as-is once allowed. The web config page exposes the same switch; the env var wins over the file. Set `"dsh": { "allowDshCompaction": true }` in the config file to the same effect (a bare top-level `"allowDshCompaction"` in an older file is auto-relocated there on load). |
+| `BILI_ALLOW_DSH_COMPACTION` | Set `1` to let dsh's built-in auto-compaction run through bili (#2028). By default the wire-level guard (#1729) **refuses dsh native compaction calls locally** (403) on every lane bili serves — openai, anthropic, and responses (responses added by #2360; it was the lane the pre-#2360 whitelist short-circuited before the marker was ever examined, so dsh desktop's compaction calls passed silently): dsh's `compaction-basic` answers context pressure by replaying the conversation prefix plus a fixed summarization directive as the final user message, and when such a call LANDS its checkpoint durably shadows the raw history — irreversible, and it destroys the proxy's compression substrate. This switch lifts the refusal so dsh-native compaction can actually execute. Scope note: on non-web profiles the shipped bundle patch (`auto: false`) still suppresses AUTO-triggering, so only manual `/compact` benefits there; on web profiles (where no patch layer reaches the preset-nested instance, #1772) auto-triggering works as-is once allowed. The web config page exposes the same switch; the env var wins over the file. Set `"dsh": { "allowDshCompaction": true }` in the config file to the same effect (a bare top-level `"allowDshCompaction"` in an older file is auto-relocated there on load). |
 | `BILI_NO_CACHE_CONTROL` | Set `1` to disable bili's Anthropic-lane `cache_control` breakpoint stamping (#1637, shipped in #1639). On by default: Anthropic-style upstreams cache only what is explicitly breakpointed (max 4 per request, counted across system + tools + message blocks combined), so bili marks the system block plus up to 3 cumulative message marks — a marked message stays marked (byte-stable prefix), marks die only by folding, and the last 3 stable messages carry the advancing frontier. Any client-set `cache_control` (message blocks, tools entries) suppresses bili's stamps entirely — client-managed caching wins. Marks persist with the session. This switch is the escape hatch for upstreams that reject the field or relays with their own breakpoint policy. Plain-proxy Anthropic lane only; OpenAI/Responses lanes cache implicitly and are never stamped. Config-file twin: [`compat.noCacheControl`](#compat) — the env var wins. |
 | `BILI_CHAIN_CONTENT` | Set `1` to turn ON the ACP-artifact / `<bili-chain …/>` checkpoint **body-content** detection of bili→bili chain awareness (#1086/#1421): when an inbound request carries compression artifacts (render tags / historical `acp_status`+`search_context` tool calls) or a digest-bearing checkpoint in its BODY but neither the `x-bili-hop` header nor local compression state for its session, bili records an advisory observation and/or applies first-processor-wins passthrough. **Default is OFF** (#1683 follow-up): by default ONLY the `x-bili-hop` header drives chain recognition, because scanning the request BODY can false-positive on CCR/file-introduced text and model-echoed tags that look like real markers. Enable it only for the narrow multi-bili relay case where an intermediate box strips `x-bili-hop` and you accept that false-positive risk. `"chainContentDetection": true` in the config file does the same; the env var wins. The `x-bili-hop` signal itself is unaffected by this switch. |
 | `BILI_CHAIN_STAMP` | Set `1` to turn ON egress emission of the **model-visible** `<bili-chain …/>` chain-integrity checkpoint carrier (#1683, default OFF): when enabled, every request THIS instance actually processes leaves with a digest-bearing stamp so a downstream bili applies first-processor-wins even when the `x-bili-hop` header was stripped in transit (#1421). The carrier lands in a slot the terminal model also reads (a trailing `user` message on OpenAI/Responses, a trailing text part on Anthropic/Google), so models treat it as phantom user input and burn tokens commenting on it — which is why it is off by default. Enable it only for the narrow multi-bili relay case where `x-bili-hop` is stripped by an intermediate box and the digest-verified body-stamp is the sole guard against double-processing. Independent of `BILI_CHAIN_CONTENT` (inbound body-detection is also default OFF) and of the `x-bili-hop` passthrough, which works either way. `"chainEgressStamp": true` in the config file does the same; the env var wins. |
@@ -1773,6 +1835,7 @@ Clients you configure with an **API key** (not a login) let you change the upstr
 
 **OpenCode note.** This is the **no-plugin** path for OpenCode. If the native plugin is also installed over such a config, the runtime warns once per session with a fix-it guide (remove the prefix or remove the plugin); the requests themselves keep riding the plain-proxy path. The three mutually exclusive OpenCode access paths are documented in [CLIENTS.md](CLIENTS.md#opencode).
 
+**Other clients.** The same one-line prefix works for any client whose model base URL you can edit (Cline / Roo Code / Kilo Code, Continue, OpenHands, Zed, Void, Cursor single-model override, …) — verified entry points are listed in [CLIENTS.md → Adopting unlisted clients](CLIENTS.md#adopting-unlisted-clients-any-client-with-a-configurable-model-base-url-2340).
 **Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
 
 ```toml

@@ -69,6 +69,43 @@ export const WEB_CLIENT = `(function () {
         return line;
     }
     window.bili_conflictLine = bili_conflictLine;
+    // #2219: per-client remediation block for the conflict surfaces — one
+    // actionable i18n line per resolved client (capped so the banner stays a
+    // summary), unknown clients fall back to the generic hint, and every block
+    // ends at the docs pointer instead of duplicating the full matrix.
+    // Explicit branches keep every key a literal t("…") reference so the #1024
+    // liveness gate sees them (dynamic "conflict.hint." + cl reads as dead);
+    // the whitelist mirrors the server map (conflictRemediation), unknown → generic.
+    function conflictHintLine(cl) {
+        switch (cl) {
+            case "opencode": return t("conflict.hint.opencode");
+            case "claude": return t("conflict.hint.claude");
+            case "codex": return t("conflict.hint.codex");
+            case "pi": return t("conflict.hint.pi");
+            case "omp": return t("conflict.hint.omp");
+            default: return t("conflict.hint.generic");
+        }
+    }
+    function conflictHintBlock(clients) {
+        const uniq = [];
+        for (const x of Array.isArray(clients) ? clients : []) {
+            if (typeof x !== "string" || !x || uniq.indexOf(x) >= 0) continue;
+            uniq.push(x);
+        }
+        const MAX_HINTS = 3;
+        let html = '<div style="margin-top:6px">' + t("conflict.hint_label");
+        if (uniq.length === 0) {
+            html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(t("conflict.hint.generic")) + "</div>";
+        } else {
+            for (const cl of uniq.slice(0, MAX_HINTS)) {
+                html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(conflictHintLine(cl)) + "</div>";
+            }
+            if (uniq.length > MAX_HINTS) html += '<div class="dim small">' + t("conflict.hint_more", { n: uniq.length - MAX_HINTS }) + "</div>";
+        }
+        html += '<div class="dim small">' + escapeHtml(t("conflict.docs")) + "</div></div>";
+        return html;
+    }
+    window.bili_conflictHintBlock = conflictHintBlock;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -270,8 +307,12 @@ export const WEB_CLIENT = `(function () {
         const keyPart = s.keySwitches
             ? '<span title="' + escapeHtml(t("ses.th_keyswitches_tip")) + '">🔑' + s.keySwitches + (!s.keySwitchMissedTokens ? "" : " · " + fmtW(s.keySwitchMissedTokens)) + "</span>"
             : "";
-        if (!modelPart && !keyPart) return '<td class="num dim">' + t("common.none") + "</td>";
-        const parts = [modelPart, keyPart].filter(Boolean);
+        // #2350: ✍️ = host system-prompt rewrites (fingerprint changed between requests).
+        const promptPart = s.promptSwitches
+            ? '<span title="' + escapeHtml(t("ses.th_promptswitches_tip")) + '">✍️' + s.promptSwitches + (!s.promptSwitchMissedTokens ? "" : " · " + fmtW(s.promptSwitchMissedTokens)) + "</span>"
+            : "";
+        if (!modelPart && !keyPart && !promptPart) return '<td class="num dim">' + t("common.none") + "</td>";
+        const parts = [modelPart, keyPart, promptPart].filter(Boolean);
         return '<td class="num" title="' + escapeHtml(t("ses.th_switches_tip")) + '">' + parts.join(" ") + "</td>";
     }
 
@@ -332,7 +373,7 @@ export const WEB_CLIENT = `(function () {
                 tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + '</td>' + hitTd({ cacheHitPct: r.hitPct, missDropNew: r.missDropNew, missDropComp: r.missDropComp, missDropTtl: r.missDropTtl }) + '<td class="' + (r.savedNet > 0 ? "num good-num" : "num") + '"' + (r.savedNet < 0 ? ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"' : "") + '">' + (r.savedNet ? fmtW(r.savedNet) : t("common.none")) + '</td><td class="num">' + (r.folds ? fmtW(r.folds) : t("common.none")) + "</td>";
                 pb.appendChild(tr);
             });
-            $("sys-version").textContent = d.version || "?";
+            $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -390,7 +431,10 @@ export const WEB_CLIENT = `(function () {
                 const what = [tpN > 0 ? t("conflict.what_plugin") : "", siblingN > 0 ? t("conflict.what_sibling") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
                 const active = typeof c.active === "number" ? c.active : c.events;
                 const risk = tpN === 0 && nativeN === 0 ? t("conflict.risk_sibling") : (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical"));
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                // #2219: per-client remediation block between the summary line and the
+                // details pointer — clients[] comes from summarizeConflicts (server-side
+                // resolution); payloads without it degrade to the generic hint only.
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 cb.classList.toggle("info", active === 0);
                 cb.classList.toggle("warn", active > 0);
                 const btn = $("conflicts-clear-btn");
@@ -907,6 +951,13 @@ export const WEB_CLIENT = `(function () {
             const abN = Number(lsRaw.abortCorrelated) || 0;
             if (abN > 0) attrChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + " ×" + abN + "</span>");
         }
+        // #2350: host system-prompt rewrites are a named partition of the same
+        // residual (cause=prompt), not part of ledger.seam — read them directly.
+        const pswRaw = d.ledger && typeof d.ledger.promptSwitches === "object" ? d.ledger.promptSwitches : null;
+        if (pswRaw) {
+            const pM = Number(pswRaw.missedTokens) || 0, pN = Number(pswRaw.count) || 0;
+            if (pM > 0 || pN > 0) attrChips.push('<span style="color:#0969da" title="' + escapeHtml(t("det.attr_prompt_tip")) + '">' + escapeHtml(t("det.attr_prompt")) + " " + fmtW(pM) + (pN > 0 ? " ×" + pN : "") + "</span>");
+        }
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
@@ -998,6 +1049,18 @@ export const WEB_CLIENT = `(function () {
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
                 + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
             keySw.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
+        // #2350: host system-prompt rewrite events — fingerprints only, raw
+        // prompt text never leaves the ledger.
+        const promptSw = ledger.promptSwitches;
+        if (promptSw && promptSw.count > 0 && promptSw.events && promptSw.events.length > 0) {
+            const pHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.prompt_fp") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
+            promptSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
             parts.push("</tbody></table></div></details>");
@@ -1094,6 +1157,9 @@ export const WEB_CLIENT = `(function () {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
             parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.conflicts_title") + '</span><span class="hint">' + t("det.conflicts_hint") + '</span></div><div class="card-b">');
+            // #2219: per-client remediation for THIS session — conflictClient is
+            // resolved server-side (sessions-data), unknown/absent → generic hint.
+            parts.push('<div class="mono small dim" style="margin-bottom:8px">' + escapeHtml(conflictHintLine(d.conflictClient)) + "</div>");
             for (const ev of d.conflicts.slice(-10).reverse()) {
                 parts.push('<div class="alert-row"><span class="mono">' + escapeHtml(fmtDT(ev.at)) + ' · ' + escapeHtml(ev.kind) + "</span><span>" + escapeHtml(ev.detail) + "</span></div>");
             }
@@ -1366,9 +1432,10 @@ export const WEB_CLIENT = `(function () {
             }
             if (fe) cfgSavedSnap = fe.value;
             hydrateQuickConfig(cfg);
+            hydrateSummaryConfig(cfg);
             refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -1772,6 +1839,145 @@ export const WEB_CLIENT = `(function () {
         if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); refreshDirtyFlag(); });
         syncAll();
     }
+    function hydrateSummaryConfig(cfg) {
+        const box = $("summary-fields"), fe = $("cfg-file-edit");
+        if (!box || !fe) return;
+        const status = Object.assign({}, cfg.externalSummaryCredentials || {});
+        function read() {
+            const draft = JSON.parse(fe.value || "{}");
+            if (!draft || typeof draft !== "object" || Array.isArray(draft)) throw new Error(t("cfg.invalid_json"));
+            return draft;
+        }
+        function mutate(fn, repaint) {
+            try {
+                const draft = read();
+                if (!draft.compress) draft.compress = {};
+                if (!draft.compress.externalSummary) draft.compress.externalSummary = { enabled: false, targets: [] };
+                fn(draft.compress.externalSummary);
+                fe.value = JSON.stringify(draft, null, 2);
+                refreshDirtyFlag();
+                if (repaint) render();
+            } catch (e) { toast(e.message, "err"); }
+        }
+        function button(parent, label, action, symbol) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.title = label;
+            btn.setAttribute("aria-label", label);
+            if (symbol) btn.innerHTML = symbol; else btn.textContent = label;
+            btn.addEventListener("click", action);
+            parent.appendChild(btn);
+            return btn;
+        }
+        function field(parent, id, label, value, change, type, options) {
+            const lab = document.createElement("label");
+            lab.htmlFor = id;
+            const title = document.createElement("span"); title.textContent = label;
+            lab.appendChild(title);
+            const inp = document.createElement(options ? "select" : "input");
+            inp.id = id; inp.className = "field-input";
+            if (options) options.forEach((v) => { const opt = document.createElement("option"); opt.value = typeof v === "object" ? v.value : v; opt.textContent = typeof v === "object" ? v.label : v; inp.appendChild(opt); });
+            else { inp.type = type || "text"; if (type === "number") { inp.min = "1"; inp.step = "1"; } }
+            inp.value = value === undefined ? "" : String(value);
+            inp.addEventListener("change", () => change(type === "number" ? Number(inp.value) : inp.value));
+            lab.appendChild(inp); parent.appendChild(lab);
+            return inp;
+        }
+        function render() {
+            box.replaceChildren();
+            let draft;
+            try { draft = read(); } catch (e) { box.textContent = t("cfg.invalid_json"); return; }
+            const s = (draft.compress && draft.compress.externalSummary) || { enabled: false, targets: [] };
+            if (s.invalid || !Array.isArray(s.targets || [])) { box.textContent = t("summary.invalid"); return; }
+            // Recipes = named (non-URL) providers entries carrying dial fields;
+            // the raw editor below owns their bodies, this panel only wires the
+            // chain (references + budget) and the credential keys they cite.
+            const providers = draft.providers && typeof draft.providers === "object" && !Array.isArray(draft.providers) ? draft.providers : {};
+            const recipes = Object.keys(providers).filter((name) => name.indexOf("http://") !== 0 && name.indexOf("https://") !== 0 && providers[name] && typeof providers[name] === "object" && !Array.isArray(providers[name]) && (providers[name].baseUrl !== undefined || providers[name].api !== undefined)).map((name) => ({ name, recipe: providers[name] }));
+            const options = [];
+            recipes.forEach(({ name, recipe }) => { Object.keys(recipe.models && typeof recipe.models === "object" ? recipe.models : {}).forEach((model) => options.push(name + "/" + model)); });
+            // #2336: agent-registry fallback — providers the host agent
+            // reported live (dialing lives in its memory, not in this file).
+            // Offered with an agent marker so the operator knows editing them
+            // here is not possible; the ref itself saves as provider/model.
+            (Array.isArray(cfg.agentProviders) ? cfg.agentProviders : []).forEach((group) => {
+                (group.providers || []).forEach((p) => {
+                    (p.models || []).forEach((model) => {
+                        const ref = p.name + "/" + model;
+                        if (options.some((o) => (typeof o === "object" ? o.value : o) === ref)) return;
+                        options.push({ value: ref, label: ref + " (" + (group.agent || "agent") + ")" });
+                    });
+                });
+            });
+            const head = document.createElement("div"); head.className = "summary-actions";
+            const plain = (v) => typeof v === "object" ? v.value : v;
+            const enabled = document.createElement("label");
+            const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.id = "summary-enabled"; toggle.checked = s.enabled === true;
+            toggle.disabled = !!cfg.parseError;
+            toggle.addEventListener("change", () => mutate((v) => { v.enabled = toggle.checked; }));
+            enabled.append(toggle, document.createTextNode(" " + t("summary.enabled"))); head.appendChild(enabled);
+            const add = button(head, t("summary.add"), () => mutate((v) => {
+                if (!v.targets) v.targets = [];
+                v.targets.push(plain(options.find((option) => v.targets.indexOf(plain(option)) === -1)) || "");
+            }, true));
+            add.disabled = !!cfg.parseError || (s.targets || []).length >= 16 || (options.length === 0 && (s.targets || []).length > 0);
+            box.appendChild(head);
+            if (options.length === 0) {
+                const hint = document.createElement("p"); hint.textContent = t("summary.no_recipes"); box.appendChild(hint);
+            }
+            (s.targets || []).forEach((ref, i) => {
+                const item = document.createElement("fieldset"); item.className = "summary-target";
+                const legend = document.createElement("legend"); legend.textContent = String(i + 1) + ". " + (ref || "—"); item.appendChild(legend);
+                const fields = document.createElement("div"); fields.className = "summary-grid";
+                const refOptions = options.slice();
+                if (ref && refOptions.map(plain).indexOf(ref) === -1) refOptions.unshift(ref);
+                const set = (value) => mutate((v) => { v.targets[i] = String(value).trim(); }, true);
+                field(fields, "summary-" + i + "-ref", t("summary.ref"), ref, set, refOptions.length ? null : "text", refOptions.length ? refOptions : undefined);
+                item.appendChild(fields);
+                const actions = document.createElement("div"); actions.className = "summary-actions";
+                button(actions, t("summary.up"), () => mutate((v) => { const prev = v.targets[i - 1]; v.targets[i - 1] = v.targets[i]; v.targets[i] = prev; }, true), "&#8593;").disabled = i === 0;
+                button(actions, t("summary.down"), () => mutate((v) => { const next = v.targets[i + 1]; v.targets[i + 1] = v.targets[i]; v.targets[i] = next; }, true), "&#8595;").disabled = i === s.targets.length - 1;
+                button(actions, t("summary.remove"), () => mutate((v) => { v.targets.splice(i, 1); }, true), "&#215;");
+                item.appendChild(actions); item.disabled = !!cfg.parseError; box.appendChild(item);
+            });
+            if (recipes.length) {
+                const creds = document.createElement("div"); creds.className = "summary-creds";
+                const title = document.createElement("h4"); title.textContent = t("summary.credentials"); creds.appendChild(title);
+                recipes.forEach(({ name, recipe }) => {
+                    const row = document.createElement("div"); row.className = "summary-actions";
+                    const ref = typeof recipe.credentialRef === "string" ? "secret:" + recipe.credentialRef : typeof recipe.apiKeyEnv === "string" ? "env:" + recipe.apiKeyEnv : null;
+                    const label = document.createElement("span"); label.textContent = name + " · " + (ref || "—"); row.appendChild(label);
+                    const badge = document.createElement("span"); badge.className = "badge " + (ref && status[ref] ? "ok" : "disk"); badge.textContent = ref && status[ref] ? t("summary.key_set") : t("summary.key_missing"); row.appendChild(badge);
+                    if (ref && ref.indexOf("secret:") === 0) {
+                        const key = field(row, "summary-key-" + name, t("summary.key"), "", () => {}, "password");
+                        key.autocomplete = "new-password"; key.disabled = !!cfg.parseError;
+                        async function saveKey(btn, value) {
+                            busy(btn, true);
+                            try {
+                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                key.value = ""; status[ref] = result.configured;
+                                render();
+                                toast(t("summary.key_saved"), "ok");
+                            } catch (e) { toast(e.message, "err"); } finally { busy(btn, false); }
+                        }
+                        const save = button(row, t("summary.key_save"), () => saveKey(save, key.value));
+                        const del = button(row, t("summary.key_delete"), () => { if (confirm(t("summary.key_delete") + "?")) saveKey(del, null); });
+                        save.disabled = del.disabled = !!cfg.parseError;
+                    }
+                    creds.appendChild(row);
+                });
+                box.appendChild(creds);
+            }
+            const budget = document.createElement("div"); budget.className = "summary-grid";
+            [["totalTimeoutMs", t("summary.total"), 50000], ["targetTimeoutMs", t("summary.timeout"), 25000], ["maxSummaryBytes", t("summary.bytes"), 65536]].forEach(([key, label, fallback]) => {
+                field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;
+            });
+            box.appendChild(budget);
+        }
+        render();
+        fe.onchange = render;
+    }
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
@@ -1969,6 +2175,8 @@ export const WEB_CLIENT = `(function () {
         });
         // #1426: single raw config-file editor — the server validates every known field
         const sf = $("save-file");
+        const ss = $("save-summary");
+        if (ss) ss.addEventListener("click", () => putCfg(ss, { file: $("cfg-file-edit").value }));
         if (sf) sf.addEventListener("click", async () => {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";

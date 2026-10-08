@@ -120,3 +120,18 @@ test("section absent without active blocks; inactive blocks excluded", () => {
     inactive.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
     assert.doesNotMatch(renderHandoff(inactive, false), /## Compressed block summaries/);
 });
+
+test("host-named sessions export under the host name, not the derived title (#2322)", () => {
+    const named = makeSession("named1");
+    named.meta.hostTitle = "Fix login flow";
+    named.lastMessagesFolded = true;
+    named.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
+    const md = renderHandoff(named, false);
+    assert.match(md, /- title: Fix login flow/, "handoff prefers hostTitle over the derived title");
+    assert.doesNotMatch(md, /auth debugging/, "derived title must not replace it");
+
+    const plain = makeSession("plain1");
+    plain.lastMessagesFolded = true;
+    plain.lastMessages = [{ id: "m9", role: "user", contentType: "text", text: "later question" }];
+    assert.match(renderHandoff(plain, false), /- title: auth debugging/, "no hostTitle → derived title unchanged");
+});

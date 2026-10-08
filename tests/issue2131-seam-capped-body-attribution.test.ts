@@ -102,8 +102,9 @@ test("visible break inside the recorded region stays a suspect, with EXACT count
     assert.equal(line.seam, 1);
     const ev = led.seamEvents?.[0];
     assert.ok(ev, "seam event recorded");
-    // Both sides clipped: per-message forensics is blind (msgIndex 0), but the
-    // byte LCP still proves the break sits INSIDE the recorded region...
+    // Both sides clipped: per-message forensics is blind (msgIndex null — position
+    // unknowable, #2339), but the byte LCP still proves the break sits INSIDE the
+    // recorded region...
     assert.ok(ev!.lcpBytes > 0 && ev!.lcpBytes < CAP, "byte LCP lands inside the recorded head");
     // ...and the send-time counts replace the parse-blind zeros.
     assert.equal(ev!.prevMsgs, 32, "exact prior count, not the parse-blind zero");

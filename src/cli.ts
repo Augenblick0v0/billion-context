@@ -31,12 +31,12 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
-import { VERSION, PACKAGE_NAME } from "./version.js";
+import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -63,6 +63,8 @@ Usage:
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
   bili amp [opts --] [args]        start a proxy + launch Amp against it (cert-MITM)
+  bili crush [opts --] [args]      start a proxy + launch Crush against it (cert-MITM)
+  bili zed [opts --] [args]        start a proxy + launch the Zed editor against it (cert-MITM)
   bili goose [opts --] [args]      start a proxy + launch Goose against it (base-URL redirect)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
@@ -86,19 +88,19 @@ Usage:
                                     global install, dsh bundles refresh through
                                     dsh's channel, host-owned copies are pointed
                                     at their host's updater — never overwritten
-  bili plugin list                 show install status for every host
+   bili plugin list                 show install status + installed (on-disk) version for every host
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili goose):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp via SSL_CERT_FILE
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE
   (aider also REQUESTS_CA_BUNDLE). Goose trusts neither (rustls), so it is redirected per-endpoint instead. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
@@ -123,6 +125,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
     bili amp                              # launch Amp through the proxy (cert-MITM; ampcode.com whitelisted by default)
+    bili crush                            # launch Crush through the proxy (cert-MITM; api.anthropic.com/api.openai.com/openrouter.ai + crush.json base_urls whitelisted)
+    bili zed                              # launch the Zed editor through the proxy (cert-MITM; built-in provider hosts + settings.json api_urls whitelisted; Linux TLS env)
     bili goose                            # launch Goose through the proxy (openai/anthropic legs via *_HOST envs, custom providers via a regenerated config overlay — real config untouched)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
@@ -389,7 +393,9 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "version") {
-        process.stdout.write(VERSION + "\n");
+        // "0.1.187 (8f9faf9e)" — the commit identifies the exact build for
+        // locally-installed test trees whose semver matches a released version.
+        process.stdout.write(`${VERSION} (${BUILD_COMMIT})\n`);
         return;
     }
     if (command === "acp-cache") {
@@ -437,10 +443,7 @@ export async function main(): Promise<void> {
         // proxy-origin discovery file would silently win over the flag.
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
-            for (const row of pluginStatusAll()) {
-                const channel = row.status === "not installed" || row.status.startsWith("error") ? "" : ` | updates via ${row.channel}`;
-                console.log(`${row.agent.padEnd(10)} ${row.status}${channel}`);
-            }
+            process.stdout.write(renderPluginList(pluginStatusAll()));
             return;
         }
         if (pluginAction === "update") {

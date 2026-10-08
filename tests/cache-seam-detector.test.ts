@@ -267,3 +267,70 @@ test("seam detector: pre-upgrade ledger shape normalizes attribution counters (n
         assert.ok(Number.isFinite(v), `report value finite: ${v}`);
     }
 });
+
+// #2339: msgsOf read only `.messages`, so every Responses (`input`) / Google
+// (`contents`) pair parsed to zero messages — the fallback msgIndex 0 rendered
+// as a real "message[0]", and the #2059 tail-append arm went dead on those wires.
+const respBody = (items: string[], stream: boolean, tools: Array<Record<string, unknown>>): string =>
+    JSON.stringify({ model: "m", input: items.map((c) => ({ type: "message", role: "user", content: [{ type: "input_text", text: c }] })), stream, tools });
+
+test("seam detector: Responses-wire tail-append with trailing fields attributes provider-side (#2339)", () => {
+    const s = makeSession();
+    const tools = [{ name: "read_file" }];
+    noteForwardedBody(s, respBody(["a", "b"], false, tools));
+    settle(s, T0, 100_000, 99_000);
+    // Pure tail append; trailing fields after `input` put the byte-divergence
+    // point beyond the 4-byte closing-region tolerance, so only the parsed
+    // element walk can prove the prior list survived. Pre-fix it fell through
+    // to suspect = a false seam event.
+    noteForwardedBody(s, respBody(["a", "b", "c"], true, tools));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.providerSideMisses, 1, "Responses-wire tail-append miss is provider-side");
+    assert.equal(led.agg.seamSuspects, 0, "must not cry a false seam");
+    assert.notEqual(led.lines[led.lines.length - 1]!.seam, 1);
+});
+
+test("seam detector: Responses-wire mid-history break localizes the divergent input element (#2339)", () => {
+    const s = makeSession();
+    const tools = [{ name: "read_file" }];
+    noteForwardedBody(s, respBody(["a", "b", "c"], true, tools));
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, respBody(["a", "B2", "c"], true, tools));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.seamSuspects, 1, "mid-history break stays a seam-suspect");
+    assert.equal(led.agg.providerSideMisses, 0, "must not be swallowed into provider-side");
+    assert.equal(led.seamEvents?.[0]?.msgIndex, 1, "element walk works on the `input` array");
+});
+
+test("seam detector: Google-native tail-append attributes provider-side (#2339)", () => {
+    const s = makeSession();
+    const googBody = (items: string[]): string =>
+        JSON.stringify({ model: "m", contents: items.map((c) => ({ role: "user", parts: [{ text: c }] })), generationConfig: { temperature: 0 } });
+    noteForwardedBody(s, googBody(["a", "b"]));
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, googBody(["a", "b", "c"]));
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.providerSideMisses, 1, "contents-wire tail-append miss is provider-side");
+    assert.equal(led.agg.seamSuspects, 0, "must not cry a false seam");
+});
+
+test("seam detector: capped pair reports msgIndex null (unknown position), never fallback 0 (#2339)", () => {
+    const s = makeSession();
+    noteForwardedBody(s, JSON.stringify({ model: "m", messages: [{ role: "user", content: "x".repeat(600 * 1024) }] }), 148);
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, body(["q", "r"]), 151);
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const led = getCacheLedger(s);
+    assert.equal(led.agg.seamSuspects, 1, "truncated-pair miss stays a seam-suspect");
+    const ev = led.seamEvents?.[0];
+    assert.ok(ev, "seam event recorded");
+    assert.equal(ev!.msgIndex, null, "position unknowable when a side parses to no list — never the fallback 0");
+    assert.equal(ev!.prevMsgs, 148, "send-time exact counts still reported");
+    assert.equal(ev!.curMsgs, 151);
+    const text = handleAcpCache(s).text;
+    assert.match(text, /divergence ≥.*at message\[\?\] of 148→151/, "report renders the unknown-position token, not message[0]");
+    assert.equal(buildSessionCacheReport(s).seam.events[0]?.msgIndex, null, "UI data carries null, rendered as '?' by the client guard");
+});

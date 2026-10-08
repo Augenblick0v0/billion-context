@@ -159,17 +159,36 @@ test("describeRestorable: one line per image, sorted, capped", () => {
 
 test("writeRestoredImage: writes decoded bytes 0600 under retrieve/img, idempotent", () => {
     const p = writeRestoredImage("m00042", 0, pngImg, "sess-A");
-    assert.ok(p && p.endsWith(join("retrieve", "img", "sess-A", "m00042.png")), `path ${p}`);
+    assert.ok(p && /m00042-[0-9a-f]{8}\.png$/.test(p.replace(/\\/g, "/")), `path ${p}`);
     assert.ok(existsSync(p!));
     assert.deepEqual(readFileSync(p!), Buffer.from(PNG, "base64"), "decoded bytes round-trip");
     if (process.platform !== "win32") assert.equal(statSync(p!).mode & 0o777, 0o600, "not world-readable");
     // Multi-image suffix + extension mapping.
     const p2 = writeRestoredImage("m00042", 1, pngImg, "sess-A");
-    assert.ok(p2!.endsWith("m00042-1.png"));
+    assert.ok(/m00042-1-[0-9a-f]{8}\.png$/.test(p2!.replace(/\\/g, "/")));
     const jpg = writeRestoredImage("m00042", 0, { ...pngImg, mediaType: "image/jpeg" }, "sess-B");
-    assert.ok(jpg!.endsWith("m00042.jpg"));
+    assert.ok(/m00042-[0-9a-f]{8}\.jpg$/.test(jpg!.replace(/\\/g, "/")));
     // Idempotent rewrite of identical bytes.
     assert.equal(writeRestoredImage("m00042", 0, pngImg, "sess-A"), p);
+});
+
+test("writeRestoredImage: a rebase that restarts refs never restores the previous generation's pixels (#1995)", () => {
+    // resetSessionCompression clears the in-memory index/caches when refs are
+    // renumbered from m00001, but old spill files survive on disk — a ref-only
+    // filename plus skip-if-exists would hand the NEW image's ref back the OLD
+    // generation's file. The content salt must discriminate the two generations
+    // (same session id, same ref, same media type, different bytes).
+    const PNG2 = PNG.slice(0, -8) + "YPhfDw" + PNG.slice(-2); // distinct bytes, same 1x1 PNG shape
+    const png2: RestorableImage = { mediaType: "image/png", b64: PNG2, bytes: Buffer.byteLength(PNG2, "base64") };
+    const gen1 = writeRestoredImage("m00001", 0, pngImg, "sess-rebase")!;
+    const gen2 = writeRestoredImage("m00001", 0, png2, "sess-rebase")!;
+    assert.notEqual(gen1, gen2, "different bytes must land in different files");
+    assert.deepEqual(readFileSync(gen1), Buffer.from(PNG, "base64"), "old generation keeps its own bytes");
+    assert.deepEqual(readFileSync(gen2), Buffer.from(PNG2, "base64"), "new generation is not served stale pixels");
+    // Idempotency is preserved per content: re-spilling the SAME image returns
+    // the same file, whichever generation it belongs to.
+    assert.equal(writeRestoredImage("m00001", 0, png2, "sess-rebase"), gen2);
+    assert.equal(writeRestoredImage("m00001", 0, pngImg, "sess-rebase"), gen1);
 });
 
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {

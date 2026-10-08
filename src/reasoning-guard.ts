@@ -1,5 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { awaitDrain } from "./server/stream-io.js";
 
 /** Minimal server-response surface the guard writes SSE frames to. Kept apart
@@ -344,22 +344,30 @@ async function consumeRound(
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    const drainOnce = (): { terminal: Record<string, unknown> } | null => {
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const ev = parseFrame(frame);
+            if (ev === null || ev === DONE_SENTINEL) continue;
+            const term = processEvent(ev, st, res);
+            if (term) return { terminal: term };
+        }
+        return null;
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
             buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-                const frame = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
-                const ev = parseFrame(frame);
-                if (ev === null || ev === DONE_SENTINEL) continue;
-                const term = processEvent(ev, st, res);
-                if (term) return { terminal: term };
-            }
+            const term = drainOnce();
+            if (term) return term;
         }
+        buf = finalizeSseLineEndings(buf);
+        const finalTerm = drainOnce();
+        if (finalTerm) return finalTerm;
         return { error: "upstream_eof" };
     } catch (e) {
         return { error: e instanceof Error ? e.message : String(e) };

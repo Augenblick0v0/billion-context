@@ -4,7 +4,7 @@ import WebSocket from "ws";
 import { MAX_REQUEST_BYTES, type FetchOptions } from "./fetch-util.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import { connectionNamedHeaders, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
 type JsonObject = Record<string, unknown>;
@@ -22,6 +22,32 @@ function describeEventType(frame: unknown): string {
     if (frame === null) return "null";
     if (!object(frame)) return Array.isArray(frame) ? "array" : String(typeof frame);
     return typeof frame.type === "string" ? frame.type : "<missing type>";
+}
+
+// #2359: Azure OpenAI caps custom request headers on the WS upgrade (documented
+// 10). Bili's forwarded x-bili-* metadata (already consumed at ingress) plus
+// OpenCode's own x-* headers push a typical handshake past it, so the gateway
+// closes with 1011 before any event. Strip bili-internal headers at final egress
+// to *.openai.azure.com ONLY — auth + OpenCode headers stay intact, and every
+// other host keeps its existing forwarding/chaining behavior byte-for-byte.
+function isAzureOpenAiHost(url: string): boolean {
+    try {
+        return new URL(url).hostname.toLowerCase().endsWith(".openai.azure.com");
+    } catch {
+        return false;
+    }
+}
+
+/** Final wire header set for an upstream Responses WebSocket upgrade: drop
+ *  hop-by-hop + sec-websocket- markers, then (azure only) the consumed x-bili-*
+ *  metadata. Exported so the exact egress decision — including the #2359 azure
+ *  custom-header-cap strip — is asserted directly rather than via a permissive
+ *  round-trip mock. */
+export function finalizeResponsesWsUpstreamHeaders(url: string, rawHeaders: FetchOptions["headers"]): Record<string, string> {
+    const headers = Object.fromEntries(new Headers(rawHeaders).entries());
+    for (const key of Object.keys(headers)) if (UPSTREAM_HOP_HEADERS.has(key) || key.startsWith("sec-websocket-")) delete headers[key];
+    if (isAzureOpenAiHost(url)) for (const key of Object.keys(headers)) if (key.startsWith("x-bili-")) delete headers[key];
+    return headers;
 }
 
 // Transport options the WebSocket lane cannot honor. The lane forces stream:true
@@ -168,8 +194,7 @@ export class ResponsesWsUpstream {
     }
 
     private async connect(url: string, options: FetchOptions): Promise<InstanceType<typeof UpstreamWebSocket>> {
-        const headers = Object.fromEntries(new Headers(options.headers).entries());
-        for (const key of Object.keys(headers)) if (UPSTREAM_HOP_HEADERS.has(key) || key.startsWith("sec-websocket-")) delete headers[key];
+        const headers = finalizeResponsesWsUpstreamHeaders(url, options.headers);
         const wsUrl = url.replace(/^http/, "ws");
         const key = `${wsUrl}:${canonical(headers)}`;
         if (this.key === key && this.socket?.readyState === UpstreamWebSocket.OPEN) return this.socket;
@@ -358,6 +383,16 @@ class ResponsesWsResponse extends http.ServerResponse {
         this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
         if (this.buffer.length > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket output buffer limit exceeded");
         this.buffer = normalizeSseLineEndings(this.buffer);
+        this.drainSse();
+        cb?.();
+        if (this.peer.bufferedAmount > MAX_REQUEST_BYTES) {
+            this.peer.close(1013, "Output buffer limit exceeded");
+            this.destroy();
+        }
+        return true;
+    }
+
+    private drainSse(): void {
         let index: number;
         while ((index = this.buffer.indexOf("\n\n")) >= 0) {
             const block = this.buffer.slice(0, index);
@@ -376,12 +411,6 @@ class ResponsesWsResponse extends http.ServerResponse {
             }
             if (this.peer.readyState === WebSocket.OPEN) this.peer.send(data, { binary: false });
         }
-        cb?.();
-        if (this.peer.bufferedAmount > MAX_REQUEST_BYTES) {
-            this.peer.close(1013, "Output buffer limit exceeded");
-            this.destroy();
-        }
-        return true;
     }
 
     override end(callback?: () => void): this;
@@ -390,6 +419,10 @@ class ResponsesWsResponse extends http.ServerResponse {
     override end(chunk?: unknown, encoding?: BufferEncoding | (() => void), callback?: () => void): this {
         if (this.ended) return this;
         if (typeof chunk === "string" || chunk instanceof Uint8Array) this.write(chunk);
+        // #2323: resolve a CRLF/lone-CR whose final byte arrived last (held back by
+        // the streaming normalizer) so a complete terminal frame isn't lost.
+        this.buffer = finalizeSseLineEndings(this.buffer);
+        this.drainSse();
         if (!this.terminal && this.peer.readyState === WebSocket.OPEN) {
             let details: unknown;
             try { details = JSON.parse(this.buffer); } catch { details = undefined; }

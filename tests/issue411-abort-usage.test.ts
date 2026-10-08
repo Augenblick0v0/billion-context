@@ -81,6 +81,9 @@ async function startRig(mode: UpstreamMode = "drip"): Promise<Rig> {
 
     const opts: ProxyOptions = {
         port: 0,
+        proxy: "",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "i411-model": { context: 100_000 } } } },
@@ -153,6 +156,10 @@ test("#411 plugin stream: client abort keeps sniffed usage, logs info (not error
         ac.abort();
         await waitFor(() => listSessions().some((s) => s.stats.lastInputTokens === 1234));
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
+        // #2305 review: the info abort log is a SEPARATE async side effect
+        // that can land after the timer clears — waiting avoids the
+        // synchronous-assert flake seen on a loaded windows-latest runner.
+        await waitFor(() => captured.some((l) => l.level === "info" && l.msg.includes("client aborted mid-stream")));
         assert.ok(captured.some((l) => l.level === "info" && l.msg.includes("client aborted mid-stream")), `expected info abort log, got: ${JSON.stringify(captured)}`);
         assert.ok(!captured.some((l) => l.level === "error" && l.msg.includes("AbortError")), `no bare AbortError error log, got: ${JSON.stringify(captured.filter((l) => l.level === "error"))}`);
     } finally {

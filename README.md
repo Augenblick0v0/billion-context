@@ -32,6 +32,8 @@
 <a href="https://www.minimax.io" title="MiniMax Code (mcode)"><img src="https://cdn.simpleicons.org/minimax/E73562" height="26" alt="MiniMax Code"></a>&nbsp;
 <a href="https://www.deepseek.com" title="deepseek-harness (dsh)"><img src="https://cdn.simpleicons.org/deepseek/5786FE" height="26" alt="deepseek-harness"></a>&nbsp;
 <a href="https://ampcode.com" title="Amp"><img src="https://icons.duckduckgo.com/ip3/ampcode.com.ico" height="26" alt="Amp"></a>&nbsp;
+<a href="https://charm.land/crush" title="Crush"><img src="https://icons.duckduckgo.com/ip3/charm.land.ico" height="26" alt="Crush"></a>&nbsp;
+<a href="https://zed.dev" title="Zed"><img src="https://icons.duckduckgo.com/ip3/zed.dev.ico" height="26" alt="Zed"></a>&nbsp;
 <a href="https://aider.chat" title="aider"><img src="https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/assets/icons/favicon-32x32.png" height="26" alt="aider"></a>&nbsp;
 <a href="https://github.com/aaif-goose/goose" title="goose"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_dark.png"><img src="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_light.png" height="26" alt="goose"></picture></a>&nbsp;
 <a href="https://github.com/NousResearch/hermes-agent" title="hermes"><img src="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/apps/bootstrap-installer/src-tauri/icons/128x128.png" height="26" alt="hermes"></a>&nbsp;
@@ -121,6 +123,8 @@ Pick by your client:
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili aider` (cert-MITM) or `/bili/` prefix — no native mode (shell-command-only hooks, no tool-injection seam, [#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot** (GitHub Copilot CLI) | `bili copilot` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
 | **amp** (Amp CLI) | `bili amp` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
+| **crush** (Charm Crush) | `bili crush` (launcher, cert-MITM) — open-source Go binary, no plugin seam; built-in provider hosts whitelisted, custom `base_url`s auto-discovered from crush.json (#2340) |
+| **zed** (Zed editor) | `bili zed` (launcher, cert-MITM) — open-source Rust editor, no plugin seam; reqwest honors HTTPS_PROXY, CA via SSL_CERT_FILE (Linux env probing); built-in provider hosts whitelisted, custom `api_url`s auto-discovered from settings.json; loopback providers (ollama/lmstudio) stay direct via NO_PROXY (#2340) |
 | **goose** (Goose CLI) | `bili goose` (launcher) — rustls trusts no CA file, so no cert-MITM: openai/anthropic legs via `OPENAI_HOST`/`ANTHROPIC_HOST`, custom providers via a regenerated `GOOSE_PATH_ROOT` overlay (#1049) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
@@ -205,6 +209,13 @@ skipping bili commands entirely:
   for you too: set `"compaction": { "auto": false }` in the same config
   (otherwise OpenCode's native auto-compaction double-compresses) and keep a
   manual backup of the file first.
+- **claude:** this repository doubles as a Claude Code plugin marketplace —
+  `/plugin marketplace add ranxianglei/billion-context`, then
+  `/plugin install billion-context@billion-context`, then run
+  `/billion-context:bili-setup` (it drives `bili plugin install claude` for
+  you and tells you to restart). Same end state as the bili installer; the
+  plugin ships no hooks or MCP entries of its own, so nothing
+  double-registers.
 
 For pi / omp / kimi / claude there is no client-side channel — `bili plugin
 install <client>` writes their config entries for you (kimi's declarative
@@ -217,7 +228,7 @@ Notes:
 - `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
 - `codex` is the one client a plugin install cannot make self-sufficient: codex routes model traffic via env only (no config-file routing seam for the default ChatGPT-login provider — a managed `model_providers` block would force API-key auth and drop subscription login), and an MCP server cannot inject env into its parent. `bili plugin install codex` writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml` (command = node, args = dist/mcp.js) exposing the four ACP tools; at session start the shell resolves a proxy — env `BILI_MCP_PROXY` > the live-instance record (any lane's proxy or a `bili start` daemon) > the 8787 user-zone default (#1660 removed the install-time origin bake, #403) — nothing reachable → `tools/list` fails with -32003. So: start bili first (`bili start` or any client's lane proxy), export HTTPS_PROXY yourself if you also want compression, or use `bili codex` for the zero-config full posture. Mechanics: [CLIENTS.md](CLIENTS.md#codex-openai-codex-cli).
-- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md). **Known limitation (#2290):** the Claude Desktop app's Code tab (`CLAUDE_CODE_ENTRYPOINT=claude-desktop`) sets its own `ANTHROPIC_BASE_URL` on its embedded Claude Code, overriding the managed one — desktop sessions bypass the proxy entirely while the managed block's `DISABLE_AUTO_COMPACT=1` still applies, so they get neither bili compression nor native auto-compaction. The hook warns loudly at session start (and records it for `bili doctor`, which also flags machines where Claude Desktop is installed alongside the native lane); terminal sessions are unaffected. **Field-tested 2026-10-06 (#2290):** putting `HTTPS_PROXY` in the settings `env` block produced zero CONNECT traffic to a live MITM-enabled proxy on Claude Desktop 2.19675.1 / embedded CC 2.1.288 (Windows 11) — the variable reaches no network stack there, consistent with the CLI finding that CC's undici ignores proxy env vars (why `bili claude` uses the `/bili/` base-URL rewrite instead). As of that version there is no usable routing seam on the desktop Code tab; the lane stays tracked in [#2290](https://github.com/ranxianglei/billion-context/issues/2290) in case upstream changes behavior. Desktop-only users can restore native auto-compact with `bili plugin remove claude`.
 - `zcode` has a native posture (#1145): managed `~/.zcode/cli/config.json` block + per-session provider `baseURL` rewrite. Full mechanics: [CLIENTS.md](CLIENTS.md).
 - `jcode` and `aider` have no native mode (no plugin/MCP/tool-injection seam: #962, #1048) — use `bili jcode` / `bili aider`.
 - `copilot`, `amp` and `goose` are launcher-only (#1049); goose cannot be cert-MITMed (rustls trusts no CA file) and rides plain-HTTP base-URL redirects instead.

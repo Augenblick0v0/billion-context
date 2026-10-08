@@ -38,7 +38,10 @@ type FoldReconcileMode = "off" | "warn" | "repair";
 
 const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
-const METADATA_SYSTEM_FP = "systemFp";
+/** #1921: last-noted system-prompt fingerprint ({fp, size}), consumed by both
+ *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
+ *  attribution (#2350). */
+export const METADATA_SYSTEM_FP = "systemFp";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
@@ -48,7 +51,10 @@ const MAX_ANCHORS = 16384;
 const MAX_ORDER = 32768;
 const METADATA_DRIFT_STREAK = "foldDriftStreak";
 const METADATA_DRIFT_SINCE = "foldDriftSince";
-const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
+/** Exported so the compress-failure receipt can sharpen its cause label into
+ *  the substrate-destruction verdict (#2360 §2.4) without hardcoding a second
+ *  copy of the key here. */
+export const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
 /** #2193: total-loss drift (covered ids missing with ZERO reanchoring) across
  *  this many consecutive passes means the fold state can never recover —
  *  escalate once from warn to error and name the suspect cause instead of
@@ -100,8 +106,9 @@ interface ReconciliationPlan {
     claims: Map<string, string>;
     byTool: number;
     byNorm: number;
-    /** Covered ids missing from the resent history with no match — their
-     *  originals re-enter the wire unfolded (honest, unchanged behavior). */
+    /** Covered ids missing from the resent history with no match — either
+     *  mutation (originals re-enter the wire unfolded) or benign client-side
+     *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
     unmatched: string[];
 }
 
@@ -177,13 +184,21 @@ function anchorFrom(message: CoreMessage): FoldAnchor {
 
 interface BlockLike {
     blockId?: string;
+    active?: boolean;
     effectiveMessageIds?: string[];
     directMessageIds?: string[];
 }
 
+/** #2297: only LIVE blocks count as covered. The kernel deactivates a block
+ *  (consumed into a newer fold, host-expanded, or drifted out of the resent
+ *  history) by setting active=false while KEEPING its effectiveMessageIds —
+ *  those dead-lineage ids can never re-anchor and would sit in `missing`
+ *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
+ *  #1195 pre-turn snapshot. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
     const covered = new Set<string>();
     for (const block of blocks) {
+        if (!block.active) continue;
         for (const id of block.effectiveMessageIds ?? []) covered.add(id);
     }
     return covered;
@@ -489,9 +504,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
-        } else {
+        } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
+            // #2297: once the episode escalated, the single error line IS the
+            // report — repeating this warn per pass contradicts the #2193
+            // contract ("one error line per episode ... instead of letting the
+            // identical warn print hundreds of times"). Recovery resets the
+            // latch, so a later episode reports fresh; the persisted latch also
+            // keeps a restarted process silent mid-episode (#2293 terminal state).
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — originals re-enter the wire unfolded (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire) (#1921)`);
         }
     }
     return {

@@ -221,7 +221,7 @@ test("#1891: streaming /bili/ lane captures outbound bodies at the main chokepoi
         assert.equal(led2.agg.seamSuspects, 1);
         assert.ok(led2.seamEvents?.length, "body-pair forensics now available on the streaming lane");
         assert.ok(led2.seamEvents![0]!.lcpBytes > 0, "LCP computed from captured bodies");
-        assert.ok(led2.seamEvents![0]!.msgIndex >= 1, "divergence located past the stable head");
+        assert.ok(led2.seamEvents![0]!.msgIndex !== null && led2.seamEvents![0]!.msgIndex >= 1, "divergence located past the stable head");
     } finally {
         await close(proxy);
         await close(upstream);

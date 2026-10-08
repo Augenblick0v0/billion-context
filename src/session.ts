@@ -79,12 +79,20 @@ export type Session = {
          *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
          *  Set once on the first request that has a user message. */
         title?: string;
+        /** #2322: session name set by the host itself (pi /name). Sent by the
+         *  plugin over POST /__bili/plugin/session-name; latest-wins and a
+         *  clear (empty) removes it. Kept separate from `title` so the four
+         *  first-message derivation sites never touch it; display precedence
+         *  is hostTitle || title. */
+        hostTitle?: string;
         /** Effective compress prompt pack for the most recent request
          *  ("default" when none). Route/model can change it mid-session, so
          *  this is stamped per request (latest wins) — persisted so post-hoc
          *  forensics can tell which surface served the session without config
          *  archaeology. */
         activePack?: string;
+        /** Resolved request prompt for external summaries, including pack sections. */
+        summaryInstructions?: string;
     };
     /** Cumulative usage stats, summed across all requests. Each sample =
      *  one upstream usage report. Persisted; survives restart. */

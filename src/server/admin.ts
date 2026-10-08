@@ -3,16 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
@@ -22,7 +23,7 @@ import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
-import { PACKAGE_NAME, VERSION } from "../version.js";
+import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { queryLogLines } from "../web/logs-query.js";
 
@@ -170,7 +171,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -209,6 +210,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
+            opts.namedProviders ??= {};
+            for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+            Object.assign(opts.namedProviders, loadNamedProviders());
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
@@ -278,7 +282,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress));
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }));
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -355,6 +359,24 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/agent-providers") {
+        // #2336 agent-registry fallback: a plugin host reports its dialing
+        // recipes (key bytes resolved in the agent's memory). Names only in
+        // the response — the key never crosses a log or GET surface.
+        try {
+            const body = await readBody(req);
+            const report = parseAgentProviderReport(JSON.parse(body.toString("utf8")));
+            recordAgentProviders(report.agent, report.providers);
+            log("info", `[agent-providers] ${report.agent} registered: ${Object.keys(report.providers).sort().join(", ")} (#2336)`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, agent: report.agent, providers: Object.keys(report.providers) }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+            return;
+        }
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/runtime-info") {
         try {
             const body = await readBody(req);
@@ -370,6 +392,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginCompact(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/session-name") {
+        // #2322: host-provided conversation name (pi /name) — becomes the
+        // session's display title in the web UI (clear = empty string).
+        try {
+            const body = await readBody(req);
+            handlePluginSessionName(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
@@ -398,6 +433,9 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
+    opts.namedProviders ??= {};
+    for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+    Object.assign(opts.namedProviders, loadNamedProviders());
     const reloaded = loadOptions();
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;
@@ -455,12 +493,13 @@ function sendStats(res: http.ServerResponse): void {
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
+        const ps = readPromptSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
             upstream: s.meta.upstreamOrigin,
             label: s.meta.label,
-            title: s.meta.title,
+            title: s.meta.hostTitle ?? s.meta.title,
             requests: s.stats.requests,
             contextTokens: s.stats.contextTokens,
             contextTokensSource: s.stats.contextTokensSource,
@@ -474,6 +513,8 @@ function sendStats(res: http.ServerResponse): void {
             switchMissedTokens: sw?.missedTokens ?? 0,
             keySwitches: ks?.count ?? 0,
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
+            promptSwitches: ps?.count ?? 0,
+            promptSwitchMissedTokens: ps?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
@@ -515,7 +556,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -560,6 +601,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
     res.end(JSON.stringify({
         overview,
         version: VERSION,
+        commit: BUILD_COMMIT,
         diskVersion,
         stale,
         autoRestartOnUpdate: opts.autoRestartOnUpdate,

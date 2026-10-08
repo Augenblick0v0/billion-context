@@ -7,15 +7,16 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
+import { oneCallTail } from "acp-kernel";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
-import { VERSION } from "./version.js";
+import { VERSION, BUILD_COMMIT } from "./version.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -51,7 +52,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         limit,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
-            host: `billion-context ${VERSION}`,
+            host: `billion-context ${VERSION} (${BUILD_COMMIT})`,
         },
     });
     if (scope) return toolOk(base);
@@ -77,7 +78,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const protectedRanges = nudge.protectedRanges ?? [];
             if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
-                extra.push(formatRanges(ranges, protectedRanges));
+                extra.push(formatRanges(ranges, protectedRanges) + oneCallTail(ranges));
             }
         }
     } catch {
@@ -137,8 +138,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // user sees it while the session is still recoverable.
     const cevents = conflictEventsOf(ctx.session);
     if (cevents.length > 0) {
+        // #2219: key the remediation hint on THIS session's resolved client so
+        // the model can relay per-client steps without digging out the docs.
         extra.push("");
-        extra.push(...formatConflictSection(cevents));
+        extra.push(...formatConflictSection(cevents, Date.now(), conflictClientOf(ctx.session)));
     }
     const adv = getAdvisoryState();
     if (adv.active) {

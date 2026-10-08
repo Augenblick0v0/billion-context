@@ -18,7 +18,12 @@ billion-context/
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
+│   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
+│   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
+│   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
+│   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
+│   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
@@ -97,6 +102,14 @@ billion-context/
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
+│   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
+│   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs
+│   ├── external-summary-settings.ts # Global external-summary target and budget validation
+│   ├── external-summary-config.ts # Strict external-summary config loading
+│   ├── external-summary-credentials.ts # Separate atomic credential store
+│   ├── external-summary-runtime.ts # Configured candidate plan and shared executor
+│   ├── external-summary-compress.ts # External summary fold coordinator and state checks
+│   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)

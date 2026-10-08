@@ -485,6 +485,28 @@ export function isBiliClaudeBaseUrl(value: unknown): boolean {
     return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/https?:\/\//.test(value);
 }
 
+/** Disk evidence that the Claude Desktop app is installed — the host whose
+ *  Code tab overrides ANTHROPIC_BASE_URL for its embedded Claude Code
+ *  (#2290), silently voiding the managed block's routing while its
+ *  DISABLE_AUTO_COMPACT still applies. Conservative by design: well-known
+ *  install locations only (portable installs exist), so callers treat a hit
+ *  as an advisory input and a miss as absence-of-evidence, never an error.
+ *  Injectable for tests. */
+export function claudeDesktopPresent(opts: { platform?: string; localAppData?: string; home?: string; appRoots?: string[] } = {}): boolean {
+    const platform = opts.platform ?? process.platform;
+    const home = opts.home ?? os.homedir();
+    if (platform === "win32") {
+        const lad = opts.localAppData ?? process.env.LOCALAPPDATA;
+        if (lad === undefined || lad.length === 0) return false;
+        return fs.existsSync(path.join(lad, "Programs", "Claude"));
+    }
+    if (platform === "darwin") {
+        const roots = opts.appRoots ?? ["/Applications"];
+        return [...roots, path.join(home, "Applications")].some((r) => fs.existsSync(path.join(r, "Claude.app")));
+    }
+    return false;
+}
+
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
     const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
     return claudeNativeBaseUrlForOrigin(origin, undefined, env);
@@ -2205,7 +2227,29 @@ export async function warnActivePluginSessions(agent: PluginAgent): Promise<stri
     }
 }
 
-export function pluginStatusAll(): Array<{ agent: string; status: string; channel: string }> {
+export interface PluginStatusRow {
+    agent: string;
+    status: string;
+    channel: string;
+    /** On-disk version of the billion-context copy this lane loads (#2325);
+     *  undefined when not resolvable from disk. */
+    copyVersion?: string;
+}
+
+/** The billion-context version(s) a lane's on-disk copy actually loads
+ *  (#2325). Single-face lanes → that copy's version; dsh (one row, N profiles)
+ *  → the distinct per-profile versions joined with "," so cross-profile drift
+ *  stays visible. undefined when nothing is resolvable. */
+function laneCopyVersion(presence: LanePresence): string | undefined {
+    if (!presence.installed) return undefined;
+    if (presence.profiles !== undefined) {
+        const set = [...new Set(presence.profiles.map((p) => p.copyVersion).filter((v): v is string => v !== undefined))];
+        return set.length > 0 ? set.join(",") : undefined;
+    }
+    return presence.copyVersion;
+}
+
+export function pluginStatusAll(): PluginStatusRow[] {
     const checks: Array<[PluginAgent, () => string]> = [
         ["pi", piStatus],
         ["omp", ompStatus],
@@ -2218,10 +2262,16 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
         ["zcode", zcodeStatus],
     ];
     return checks.map(([agent, check]) => {
+        let copyVersion: string | undefined;
         try {
-            return { agent, status: check(), channel: UPDATE_CHANNEL[agent] };
+            copyVersion = laneCopyVersion(inspectLanePresence(agent));
+        } catch {
+            copyVersion = undefined;
+        }
+        try {
+            return { agent, status: check(), channel: UPDATE_CHANNEL[agent], copyVersion };
         } catch (err) {
-            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, channel: UPDATE_CHANNEL[agent] };
+            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, channel: UPDATE_CHANNEL[agent], copyVersion };
         }
     });
 }
@@ -2245,6 +2295,40 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
     zcode: "the global bili install (hook/MCP point at its dist)",
 };
+
+/** Render `bili plugin list` as an aligned table with a version column (#2325).
+ *  Version cell = on-disk copy version this lane loads: "—" when not installed
+ *  / probe errored, "unknown" when installed but unresolvable from disk, else
+ *  the resolved version. It NEVER falls back to the running CLI version; the
+ *  on-disk copy may lag a still-running session until reload/restart. */
+export function renderPluginList(rows: PluginStatusRow[]): string {
+    const cells = rows.map((r) => {
+        const hidden = r.status === "not installed" || r.status.startsWith("error");
+        return {
+            agent: r.agent,
+            status: r.status,
+            version: hidden ? "—" : (r.copyVersion ?? "unknown"),
+            channel: hidden ? "" : r.channel,
+        };
+    });
+    const wAgent = Math.max("agent".length, ...cells.map((c) => c.agent.length));
+    const wVersion = Math.max("version".length, ...cells.map((c) => c.version.length));
+    // Status is unbounded free text (multi-profile summaries, probe errors that
+    // carry file paths) — cap the padded width so one long row cannot stretch
+    // every other row out; an over-long status simply overflows its own row
+    // rather than being truncated.
+    const STATUS_CAP = 52;
+    const wStatus = Math.min(STATUS_CAP, Math.max("status".length, ...cells.map((c) => c.status.length)));
+    const padTo = (s: string, w: number): string => s.padEnd(w);
+    const lines: string[] = [];
+    lines.push(`${padTo("agent", wAgent)}  ${padTo("status", wStatus)}  ${padTo("version", wVersion)}  updates via`);
+    for (const c of cells) {
+        const statusCell = c.status.length > wStatus ? c.status : padTo(c.status, wStatus);
+        const body = `${padTo(c.agent, wAgent)}  ${statusCell}  ${padTo(c.version, wVersion)}`;
+        lines.push((c.channel === "" ? body : `${body}  ${c.channel}`).replace(/\s+$/, ""));
+    }
+    return `${lines.join("\n")}\n`;
+}
 
 interface PluginUpdateOpts {
     packageName: string;

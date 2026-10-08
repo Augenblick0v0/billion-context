@@ -478,10 +478,10 @@ test("host-managed instances throttle on their own marker with the owner-lane ca
     }
 });
 
-test("ownerLaneIntervalMs: 30 min floor, 15 min jitter ceiling (#2192)", () => {
-    assert.equal(ownerLaneIntervalMs(() => 0), 30 * 60_000);
-    assert.equal(ownerLaneIntervalMs(() => 1), 45 * 60_000);
-    assert.equal(ownerLaneIntervalMs(() => 0.5), 37 * 60_000 + 30_000);
+test("ownerLaneIntervalMs: 10 min floor, 5 min jitter ceiling (#2192, owner cadence call 2026-10-07)", () => {
+    assert.equal(ownerLaneIntervalMs(() => 0), 10 * 60_000);
+    assert.equal(ownerLaneIntervalMs(() => 1), 15 * 60_000);
+    assert.equal(ownerLaneIntervalMs(() => 0.5), 12 * 60_000 + 30_000);
 });
 
 // — (e) cross-process streak sharing + manual-repair disarm (#2192 follow-up) —

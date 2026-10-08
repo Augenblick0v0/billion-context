@@ -101,6 +101,7 @@ interface PersistedSession {
         label?: string;
         title?: string;
         activePack?: string;
+        hostTitle?: string;
     };
     /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
      *  fallbacks below. */
@@ -322,6 +323,13 @@ export class SessionStore {
             // before the kernel extraction (and every v1/v2 file before it).
             legacy: (parsed) => (isValidRecord(parsed) ? { id: parsed.id, payload: parsed, version: parsed.version, savedAt: parsed.savedAt } : null),
             validate: (envelope) => isValidRecord(envelope.payload),
+            // #2298: CCR content-store envelopes (#1097) co-reside in the SAME
+            // namespace by design (<proto>/<host>_<hash>.content-store.json) but
+            // are not session records — declaring them foreign keeps the boot
+            // scan from parsing each one and warning "skipping invalid record"
+            // per file (hundreds of warns per start at multi-relay scale). Same
+            // suffix predicate the GC (#1180) and web walkers already use.
+            foreignFile: (file) => path.basename(file).endsWith(".content-store.json"),
         });
     }
 
@@ -829,6 +837,8 @@ function buildSession(parsed: PersistedSession): Session {
             title: meta.title,
             // #1724: buildRecord persists activePack via spread but this reader dropped it
             activePack: typeof meta.activePack === "string" ? meta.activePack : undefined,
+            // #2322: same as activePack above — buildRecord persists hostTitle via the spread; restore so the name survives restart
+            hostTitle: typeof meta.hostTitle === "string" ? meta.hostTitle : undefined,
         },
         stats: {
             requests: stats.requests ?? parsed.requests ?? 0,

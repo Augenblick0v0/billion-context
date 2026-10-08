@@ -14,6 +14,7 @@
  *   bili claude [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili kimi   [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS (cert-MITM)
  *   bili aider  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE (cert-MITM)
+ *   bili crush  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE (cert-MITM)
  *   bili test pi                      non-polluting pi smoke test
  *
  * The real upstream hosts are DISCOVERED by reading (never editing) the
@@ -63,8 +64,8 @@ import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -139,17 +140,22 @@ export {
     type AiderConfig,
     COPILOT_DEFAULT_MODEL_HOSTS,
     AMP_DEFAULT_MODEL_HOSTS,
+    CRUSH_DEFAULT_MODEL_HOSTS,
+    readCrushConfig,
+    ZED_DEFAULT_MODEL_HOSTS,
+    readZedConfig,
     resolveGooseDirs,
     readGooseConfig,
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "antigravity", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -821,6 +827,54 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 httpsDomains.push(host);
             }
         }
+    } else if (client === "crush") {
+        // #2340: open-source Go binary — cert-MITM like amp/copilot (net/http
+        // honors HTTPS_PROXY; CA rides SSL_CERT_FILE). Whitelist the built-in
+        // provider hosts plus custom provider base_urls discovered from
+        // crush.json (readCrushConfig, https only); exotic relays ride
+        // --mitm-domain.
+        for (const h of CRUSH_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+        for (const raw of config.crush?.baseUrls ?? []) {
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+                const host = new URL(raw).hostname.toLowerCase();
+                if (host && !httpsSeen.has(host)) {
+                    httpsSeen.add(host);
+                    httpsDomains.push(host);
+                }
+            } catch {}
+        }
+    } else if (client === "zed") {
+        // #2340: open-source Rust editor — cert-MITM like jcode (reqwest
+        // honors HTTPS_PROXY; CA rides SSL_CERT_FILE via openssl-probe env
+        // probing on Linux). Whitelist the built-in provider hosts plus
+        // custom provider api_urls discovered from settings.json
+        // (readZedConfig, https only); exotic relays ride --mitm-domain.
+        for (const h of ZED_DEFAULT_MODEL_HOSTS) {
+            const host = h.split(":", 2)[0]!.toLowerCase();
+            if (host && !httpsSeen.has(host)) {
+                httpsSeen.add(host);
+                httpsDomains.push(host);
+            }
+        }
+        for (const raw of config.zed?.baseUrls ?? []) {
+            try {
+                if (new URL(raw).protocol !== "https:") continue;
+                const host = new URL(raw).hostname.toLowerCase();
+                if (host && !httpsSeen.has(host)) {
+                    httpsSeen.add(host);
+                    httpsDomains.push(host);
+                }
+            } catch {
+                continue;
+            }
+        }
     } else if (client === "goose") {
         // #1049: release builds wire reqwest with rustls (webpki roots), so the
         // proxy's CA is untrusted and cert-MITM cannot reach goose at all — every
@@ -897,30 +951,46 @@ export function buildPiEnv(
     };
 }
 
-export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+// --- #1440 P3: one preset table + one builder behind the per-client
+// buildXxxEnv wrappers. Every client shares the same core —
+// `{ ...baseEnv, HTTPS_PROXY=<origin>, <CA var(s)>=<caPath>,
+// BILLION_CONTEXT_PROXY=<origin> }` — plus optional static extras (NO_PROXY
+// loopback pairs), an aider-only conditional HTTP_PROXY, and/or the single
+// base-URL override env resolved from discovered rewrites (http upstreams →
+// /bili/-wrapped value, https upstreams → raw value; when both exist the
+// https entry wins, matching the historical sequential assignment). buildPiEnv
+// (JSON manifest + host list envs) and buildClaudePluginEnv (direct-URL mode,
+// returns baseEnv untouched) stay bespoke above/below this table. ---
+type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed";
+
+interface EnvClientPreset {
+    /** CA path is written to every listed env var. */
+    caKeys: readonly string[];
+    /** emit HTTPS_PROXY=<origin>; false for gateway/base-URL routing clients (no proxy env at all). */
+    proxy: boolean;
+    /** emit HTTP_PROXY=<origin> only when the wrapper's routeHttp param is true (aider). */
+    httpProxyOnRouteHttp: boolean;
+    /** extra static key/value pairs appended after BILLION_CONTEXT_PROXY, in order. */
+    extras?: readonly (readonly [string, string])[];
+    /** base-URL override env(s) filled from rewrites — first entry is the rewrite lookup key, the rest are mirrors set to the same value. */
+    baseUrlKeys?: readonly string[];
 }
 
-export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
+
+const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
+    codex: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
     // combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
-}
-
-export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    trae: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // jcode is Rust reqwest: CA rides SSL_CERT_FILE (combined bundle).
     // NO_PROXY keeps loopback legs (local model endpoints, MCP) direct.
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        SSL_CERT_FILE: caPath,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
-}
-
-export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    jcode: {
+        caKeys: ["SSL_CERT_FILE"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
     // #1048: aider's Python stack trusts the CA through two different readers
     // — httpx (litellm's HTTP layer) honors SSL_CERT_FILE with REPLACE
     // semantics (hence the combined bundle carrying system roots so
@@ -928,27 +998,116 @@ export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.
     // REQUESTS_CA_BUNDLE. HTTP_PROXY is only set when a plaintext-http
     // upstream actually routes through it (absolute-form forward-proxy).
     // NO_PROXY keeps loopback legs (local ollama/vllm servers) direct.
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        ...(routeHttp ? { HTTP_PROXY: origin } : {}),
-        SSL_CERT_FILE: caBundle,
-        REQUESTS_CA_BUNDLE: caBundle,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
+    aider: {
+        caKeys: ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"],
+        proxy: true,
+        httpProxyOnRouteHttp: true,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
+    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
+    // (the combined bundle, since it replaces Go's system trust store).
+    copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
+    amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"] },
+    codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
+    /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
+     *  override env), so the launcher can only route it via cert MITM: its
+     *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
+     *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
+     *  No base-URL rewrite of any kind. */
+    qoder: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false },
+    // #2340: Zed is a Rust reqwest client — same env contract as jcode. The
+    // CA rides SSL_CERT_FILE: Zed's rustls resolves roots through
+    // rustls-platform-verifier -> rustls-native-certs -> openssl-probe, which
+    // reads SSL_CERT_FILE/SSL_CERT_DIR first (Linux; macOS/Windows platform
+    // verifiers ignore env files — system trust store there). NO_PROXY keeps
+    // loopback providers (ollama/lmstudio) and MCP legs direct.
+    zed: {
+        caKeys: ["SSL_CERT_FILE"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
+    // No proxy/CA env: model traffic goes straight to the loopback proxy via
+    // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
+    gemini: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["GOOGLE_GEMINI_BASE_URL"] },
+    // iFlow accepts case variants of the base-URL env; set both documented
+    // forms so whichever the client reads first wins.
+    iflow: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["IFLOW_BASE_URL", "IFLOW_baseUrl"] },
+    /** #1047: qwen-code honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS (undici,
+     *  additive CA semantics like qoder); NO_PROXY keeps loopback legs direct. */
+    qwen: {
+        caKeys: ["NODE_EXTRA_CA_CERTS"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
+    /** #2115: CLOUD_CODE_URL points language_server straight at the loopback
+     *  proxy; no proxy/CA env needed (the override IS the route). */
+    antigravity: { caKeys: [], proxy: false, httpProxyOnRouteHttp: false, baseUrlKeys: ["CLOUD_CODE_URL"] },
+};
+
+function buildClientEnv(
+    preset: EnvClientPreset,
+    origin: string,
+    caPath: string,
+    baseEnv: NodeJS.ProcessEnv,
+    rewrites?: { httpRewrites: HttpRewrite[]; httpsRewrites: HttpRewrite[] },
+    routeHttp?: boolean,
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...baseEnv };
+    if (preset.proxy) env.HTTPS_PROXY = origin;
+    if (preset.httpProxyOnRouteHttp && routeHttp === true) env.HTTP_PROXY = origin;
+    for (const k of preset.caKeys) env[k] = caPath;
+    env.BILLION_CONTEXT_PROXY = origin;
+    for (const [k, v] of preset.extras ?? []) env[k] = v;
+    const baseUrlKeys = preset.baseUrlKeys ?? [];
+    if (baseUrlKeys.length > 0 && rewrites !== undefined) {
+        const r = rewrites.httpRewrites.find((rw) => rw.key === baseUrlKeys[0]);
+        if (r) for (const k of baseUrlKeys) env[k] = wrapUpstream(origin, r.realUpstream);
+        const hr = rewrites.httpsRewrites.find((rw) => rw.key === baseUrlKeys[0]);
+        if (hr) for (const k of baseUrlKeys) env[k] = hr.realUpstream;
+    }
+    return env;
+}
+
+export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.codex, origin, caPath, baseEnv);
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.trae, origin, caPath, baseEnv);
+}
+
+export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.jcode, origin, caPath, baseEnv);
+}
+
+export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.aider, origin, caBundle, baseEnv, undefined, routeHttp);
 }
 
 export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
-    // (the combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv(ENV_CLIENTS.copilot, origin, caPath, baseEnv);
 }
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
+    return buildClientEnv(ENV_CLIENTS.amp, origin, caPath, baseEnv);
+}
+
+export function buildCrushEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #2340: crush is a Go binary like amp/copilot — same cert-MITM contract
+    // (net/http honors HTTPS_PROXY; the combined CA bundle replaces Go's
+    // system trust store via SSL_CERT_FILE).
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+export function buildZedEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    // #2340: Rust reqwest + rustls (roots via openssl-probe read
+    // SSL_CERT_FILE first on Linux) — the jcode env contract; NO_PROXY keeps
+    // loopback providers direct.
+    return buildClientEnv(ENV_CLIENTS.zed, origin, caPath, baseEnv);
 }
 
 export function buildCodexArgs(
@@ -1017,7 +1176,7 @@ const CODEX_BOOLEAN_FLAGS = new Set([
  * flag or itself a positional) — never between a value-taking flag and its
  * value, and never into flags we do not recognise (those keep the legacy
  * append, which is at worst today's behavior). */
-export function codexRewriteInsertionIndex(extra: readonly string[]): number {
+function codexRewriteInsertionIndex(extra: readonly string[]): number {
     const sep = extra.indexOf("--");
     if (sep !== -1) return sep;
     const resume = extra.indexOf("resume");
@@ -1139,12 +1298,7 @@ export function buildClaudeEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
-    if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
-    if (hr) env.ANTHROPIC_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.claude, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 /** codebuddy budget alignment (#321 pattern, mirrors resolveClaudeBudgetEnv):
@@ -1174,21 +1328,11 @@ export function buildCodebuddyEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
-    if (r) env.CODEBUDDY_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "CODEBUDDY_BASE_URL");
-    if (hr) env.CODEBUDDY_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.codebuddy, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
-/** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
- *  override env), so the launcher can only route it via cert MITM: its
- *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
- *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
- *  No base-URL rewrite of any kind. */
 export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv(ENV_CLIENTS.qoder, origin, caPath, baseEnv);
 }
 
 export function buildGeminiEnv(
@@ -1198,14 +1342,7 @@ export function buildGeminiEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    // No proxy/CA env: model traffic goes straight to the loopback proxy via
-    // GOOGLE_GEMINI_BASE_URL (GATEWAY mode), never through HTTPS_PROXY.
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
-    if (r) env.GOOGLE_GEMINI_BASE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "GOOGLE_GEMINI_BASE_URL");
-    if (hr) env.GOOGLE_GEMINI_BASE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.gemini, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 export function buildIflowEnv(
@@ -1215,37 +1352,13 @@ export function buildIflowEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    // iFlow accepts case variants of the base-URL env; set both documented
-    // forms so whichever the client reads first wins.
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
-    if (r) {
-        env.IFLOW_BASE_URL = wrapUpstream(origin, r.realUpstream);
-        env.IFLOW_baseUrl = env.IFLOW_BASE_URL;
-    }
-    const hr = httpsRewrites.find((rw) => rw.key === "IFLOW_BASE_URL");
-    if (hr) {
-        env.IFLOW_BASE_URL = hr.realUpstream;
-        env.IFLOW_baseUrl = hr.realUpstream;
-    }
-    return env;
+    return buildClientEnv(ENV_CLIENTS.iflow, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
-/** #1047: qwen-code honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS (undici,
- *  additive CA semantics like qoder); NO_PROXY keeps loopback legs direct. */
 export function buildQwenEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        NODE_EXTRA_CA_CERTS: caPath,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
+    return buildClientEnv(ENV_CLIENTS.qwen, origin, caPath, baseEnv);
 }
 
-/** #2115: CLOUD_CODE_URL points language_server straight at the loopback
- *  proxy; no proxy/CA env needed (the override IS the route). */
 export function buildAntigravityEnv(
     origin: string,
     caPath: string,
@@ -1253,12 +1366,7 @@ export function buildAntigravityEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, BILLION_CONTEXT_PROXY: origin };
-    const r = httpRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
-    if (r) env.CLOUD_CODE_URL = wrapUpstream(origin, r.realUpstream);
-    const hr = httpsRewrites.find((rw) => rw.key === "CLOUD_CODE_URL");
-    if (hr) env.CLOUD_CODE_URL = hr.realUpstream;
-    return env;
+    return buildClientEnv(ENV_CLIENTS.antigravity, origin, caPath, baseEnv, { httpRewrites, httpsRewrites });
 }
 
 /**
@@ -1367,12 +1475,12 @@ function isPrivateIPv4(host: string): boolean {
  *  mcp.json path is hardcoded in the binary with no ephemeral-config flag,
  *  so v1 runs pure wire mode (#757). gemini/iflow/qwen (#1047) are excluded
  *  like codebuddy: their MCP-injection flags are unverified, v1 is pure wire.
- *  copilot/amp/goose are excluded likewise: closed or unverified MCP
- *  surfaces, v1 runs pure wire mode (#1049). antigravity is excluded too
+ *  copilot/amp/crush/goose are excluded likewise: closed or unverified MCP
+ *  surfaces, v1 runs pure wire mode (#1049 / #2340). antigravity is excluded too
  *  (#2115): its model channel is a closed Go binary with no MCP-injection
  *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -2538,14 +2646,14 @@ export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrite
             if (st.isSymbolicLink()) {
                 if (fs.readlinkSync(link) !== target) {
                     fs.rmSync(link);
-                    fs.symlinkSync(target, link);
+                    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
                 }
             } else {
                 return undefined;
             }
         } catch {
             try {
-                fs.symlinkSync(target, link);
+                fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
             } catch {
                 return undefined;
             }
@@ -2831,6 +2939,11 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
             try {
                 fs.rmSync(p, { recursive: true, force: true });
             } catch {}
+            // Cold-start thread records keep absolute rollout paths in the overlay.
+            if (st.isDirectory() && !linkOverlayEntry(realHome, overlay, entry)) {
+                ok = false;
+                console.error(`bili: could not relink ${p} after exit-time write-back — data is in ${realHome}, but recorded overlay paths may not resolve.`);
+            }
         } else {
             ok = false;
             console.error(`bili: could not merge ${p} into ${realHome} at exit — kept in the overlay, resolve manually.`);
@@ -4523,6 +4636,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     ? "It is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs."
                     : "Its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs.";
                 console.error(`bili: WARNING: co-resident compression plugin on ${base}: ${f.entry} (${f.source}). ${risk} (#1206) — disable the other plugin, or don't route this client through bili.`);
+                // #2219: actionable follow-up — how to stop THIS client's own
+                // compaction (same per-client map as acp_status / web banner).
+                console.error(`bili:   fix (${base}): ${conflictRemediation(base)}`);
             }
         } catch {
             // The scan is diagnostic only — never block client startup on it.
@@ -4821,6 +4937,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         let dshAcpPatch: string | undefined;
         if (!dshNativeInstalled()) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+        } else if (allowDshCompactionState(process.env).enabled !== true) {
+            // #2360 §3: native install owns the plugin chain — the overlay patch
+            // above would insert a SECOND bili-native entry and hard-fail dsh
+            // boot, and DSH mounts compaction in the agent preset's group where
+            // a profile-level dsh.bundle.patch.yml cannot reach it either
+            // (#1772/#2360) — so compaction-basic auto:false is NOT in force and
+            // dsh native compaction stays armed. Say so at launch instead of
+            // leaving the user to discover a landed checkpoint through
+            // destroyed-substrate errors; the live protection is the proxy's
+            // wire-level refusal on every lane (openai/anthropic/responses).
+            console.error(
+                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in the agent preset where profile patches cannot reach it (#1772/#2360): dsh native compaction stays ARMED. Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'compression substrate appears destroyed' or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
+            );
         }
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "kimi") {
@@ -4989,6 +5118,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #1049: cert-MITM like copilot; ampcode.com carries both the model
         // leg and the control plane, so the single whitelist entry covers both.
         env = buildAmpEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "crush") {
+        // #2340: cert-MITM like amp/copilot — Go net/http honors HTTPS_PROXY
+        // and the combined CA bundle via SSL_CERT_FILE. Whitelist = built-in
+        // provider hosts + crush.json custom base_urls (discoverRoutes).
+        env = buildCrushEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "zed") {
+        // #2340: cert-MITM like jcode — Rust reqwest honors HTTPS_PROXY; the
+        // combined CA bundle rides SSL_CERT_FILE (openssl-probe reads it first
+        // on Linux). Whitelist = built-in provider hosts + settings.json
+        // custom api_urls (discoverRoutes). Loopback legs stay direct
+        // (NO_PROXY).
+        env = buildZedEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "goose") {
         // #1049: rustls release builds won't trust bili's CA, so no proxy envs
         // at all — every model leg is redirected straight at the proxy as
