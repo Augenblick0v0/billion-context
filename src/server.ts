@@ -3989,6 +3989,7 @@ export async function forward(
         session: prepared.session,
         log: (msg: string) => log("info", `[${prepared.session.id}] ${msg}`),
         debug: opts.debug,
+        lastNudge: prepared.nudge,
     };
     if (prepared.stream) {
         // #2346: intrinsic runaway-enumeration terminator for the streamed response —

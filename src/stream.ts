@@ -29,6 +29,13 @@ export type RewriteCtx = {
     session: Session;
     log: (msg: string) => void;
     debug?: boolean;
+    /** #2404: this request's prepare-time nudge — the pre-fold offer the model
+     *  acted on. postCompressTail bases "remaining ranges" on it (minus the
+     *  just-folded spans) instead of a post-fold recompute, which would advance
+     *  the protection window and leak newly-de-protected ranges into the receipt
+     *  (zero-growth chained folds + prefix-cache thrash). Absent on internal
+     *  lanes (preflight) → they fall back to the live recompute. */
+    lastNudge?: NudgeDecision;
 };
 
 // Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
@@ -377,40 +384,82 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
 // verbatim pi-side so both hosts speak the same contract.
 const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
 
-function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
-    // Same source as handleAcpStatus (#389): recompute the nudge from live
-    // state instead of trusting any prepare-time snapshot — a successful
-    // compress mutates state mid-turn, so stale snapshots list already-folded
-    // refs as compressible. processTurn is pure (nodes return new objects);
-    // the returned state is deliberately NOT adopted.
-    let nudge: NudgeDecision | undefined;
-    try {
-        const turn = ctx.core.processTurn({
-            messages: ctx.messages,
-            state: ctx.session.state,
-            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
-            tokenCount: statusInputBaseline(ctx.session),
-            renderTags: "none",
-            contentStore: contentStoreOf(ctx.session),
-        });
-        nudge = turn.nudge;
-    } catch {
-        return "";
-    }
-    if (!nudge) return "";
-    // Same gates as handleAcpStatus: viability floor + the submit gate's raw
-    // char count — never advertise a range the kernel would reject (#847).
+// #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
+// set the model acted on) minus the just-folded spans — NOT a fresh post-fold
+// recompute. Recomputing from live state advances the protection window, so a
+// range still protected at nudge time becomes eligible only AFTER the fold and
+// leaks into the receipt; the model then folds it at ZERO conversation growth,
+// each fold rewriting the history prefix and invalidating the upstream prefix
+// cache (fold #1's uncached re-read is paid again by fold #2). Pinning the list
+// to the pre-fold offer keeps a not-yet-offered (still-protected) range out of
+// the receipt, so the protection holds. Wording unchanged (KDD #8: prompt text
+// is kernel-owned) — this is pure bili-side gating.
+type CompressibleRangeItem = NonNullable<NudgeDecision["compressibleRanges"]>[number];
+
+// Refs are zero-padded mNNNNN, stable across folds (kernel id-never-reused
+// contract); compare numeric parts. Two [start,end] spans overlap iff neither
+// ends before the other starts.
+function spanNum(ref: string): number {
+    const n = Number(ref.replace(/\D/g, ""));
+    return Number.isFinite(n) ? n : 0;
+}
+function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
+    const aLo = Math.min(spanNum(aStart), spanNum(aEnd));
+    const aHi = Math.max(spanNum(aStart), spanNum(aEnd));
+    const bLo = Math.min(spanNum(bStart), spanNum(bEnd));
+    const bHi = Math.max(spanNum(bStart), spanNum(bEnd));
+    return aLo <= bHi && bLo <= aHi;
+}
+
+function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
+    // Same gates as handleAcpStatus: viability floor + the submit gate's raw char
+    // count — never advertise a range the kernel would reject (#847).
     const minChars = ctx.config.compress.minCompressRange;
-    const remaining = viableRanges(nudge.compressibleRanges)
-        .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+    const submitGate = (r: CompressibleRangeItem): boolean =>
+        minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars;
+    let base: CompressibleRangeItem[];
+    let tier: number | null;
+    if (ctx.lastNudge) {
+        // Baseline = this request's prepare-time offer (already viable-filtered
+        // by the prepare step), NOT a post-fold recompute (#2404).
+        base = viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate);
+        tier = ctx.lastNudge.tier ?? null;
+    } else {
+        // Internal lanes (preflight overflow-compress) capture no prepare-time
+        // nudge → fall back to the live recompute (same source as #389).
+        // processTurn is pure; the returned state is deliberately NOT adopted.
+        let nudge: NudgeDecision | undefined;
+        try {
+            const turn = ctx.core.processTurn({
+                messages: ctx.messages,
+                state: ctx.session.state,
+                config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+                tokenCount: statusInputBaseline(ctx.session),
+                renderTags: "none",
+                contentStore: contentStoreOf(ctx.session),
+            });
+            nudge = turn.nudge;
+        } catch {
+            return "";
+        }
+        if (!nudge) return "";
+        base = viableRanges(nudge.compressibleRanges).filter(submitGate);
+        tier = nudge.tier ?? null;
+    }
+    // Drop the offers this call just folded; everything else stays advertised
+    // ("compressed 2 of 3 -> show the 1"). Only when ALL offered folded does the
+    // stop signal fire below. Ranges not in the pre-fold offer never appear here.
+    const remaining = ctx.lastNudge
+        ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
+        : base;
     if (remaining.length > 0) {
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
     }
-    // A tier-distillation nudge means block-boundary compress calls (bN..bM)
-    // are still actionable — a stop signal there would contradict the tier
-    // trigger. Partial failures stay silent too: the model still owes the
-    // errors an answer before any "you are done" verdict (pi #521 gate).
-    if (!cleanSuccess || nudge.tier !== null) return "";
+    // A tier-distillation nudge means block-boundary compress calls (bN..bM) are
+    // still actionable — a stop signal there would contradict the tier trigger.
+    // Partial failures stay silent too: the model still owes the errors an answer
+    // before any "you are done" verdict (pi #521 gate).
+    if (!cleanSuccess || tier !== null) return "";
     return `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 
@@ -785,7 +834,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.session.stats.lastInputTokens = Math.max(0, ctx.session.stats.lastInputTokens - r.tokensCompressed);
         // #1387: post-compress snapshot / stop signal ride on the netted
         // (post-compress) token count, matching what the next turn sees.
-        const tail = postCompressTail(ctx, r.errors.length === 0);
+        // #2404: base the "remaining ranges" on this request's pre-fold offer
+        // (ctx.lastNudge) minus the submitted spans — a partial fold still shows
+        // what was offered but not folded; recovery for rejected refs rides the
+        // error note above (#1495/#847), not the range list.
+        const tail = postCompressTail(ctx, r.errors.length === 0, ranges);
         msg += tail;
         logMsg += tail;
         ctx.log(`[acp-proxy: ${logMsg}]`);

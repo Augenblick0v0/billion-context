@@ -83,7 +83,8 @@ export const WEB_CLIENT = `(function () {
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
-        if (siblingN > 0) whatParts.push(t("conflict.what_sibling"));
+        // #2430: siblings are family, never a warning — they no longer appear in the
+        // "what" enumeration even in mixed ledgers (pure-sibling banners are hidden outright).
         if (nativeN > 0) whatParts.push(t("conflict.what_native"));
         const active = typeof c.active === "number" ? c.active : c.events;
         const hasConfirmed = confirmedTpN > 0 || nativeN > 0;
@@ -102,7 +103,10 @@ export const WEB_CLIENT = `(function () {
             onKey = "conflict.on"; onText = t("conflict.on");
             riskKey = "conflict.risk_sibling"; riskText = t("conflict.risk_sibling");
         }
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, what: whatParts.join(t("conflict.what_join")), active: active };
+        // #2430: a ledger that is ONLY bili's own siblings stands down completely — they are
+        // compatible family, not conflicts; the web banner must stay hidden for them.
+        const siblingOnly = !hasConfirmed && suspectedN === 0 && siblingN > 0;
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, what: whatParts.join(t("conflict.what_join")), active: active };
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
@@ -289,7 +293,7 @@ export const WEB_CLIENT = `(function () {
     function refreshDirtyFlag() {
         const el = $("cfg-file-edit");
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
-        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
     }
 
@@ -457,7 +461,11 @@ export const WEB_CLIENT = `(function () {
         const cb = $("conflicts-banner");
         if (cb) {
             const c = d.conflicts;
-            if (c && c.events > 0) {
+            // #2430: siblings-only ledgers stand down — bili's own family (billion-context-pi /
+            // opencode-acp) is compatible, so a pure-sibling ledger is not a warning. The events
+            // stay recorded (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
+            if (c && c.events > 0 && !(sev0 && sev0.siblingOnly)) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
