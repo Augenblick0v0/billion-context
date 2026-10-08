@@ -87,6 +87,8 @@
   "files": [
     "LICENSE",
     "README.md",
+    "CONFIGURATION.md",
+    "CONFIGURATION.zh-CN.md",
     "dist",
     "dsh.bundle.patch.yml",
     "hermes-plugin",
