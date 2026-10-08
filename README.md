@@ -131,24 +131,6 @@ Pick by your client:
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install …`) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive** — both active means double compression. The installer makes the switch: it replaces the legacy entries (bare name, `npm:` alias, versioned, path form; array or object shape) and snapshots the original config to `.bili-bak` once; a **project-local** install is not touched — remove that one by hand. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time. On the pi side the marker needs `billion-context-pi` **0.1.72+**, and the pi-native entry scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
 
 
-### Pi: built-in subagents
-
-Using `bili pi` or the native pi plugin (`bili plugin install pi`) includes built-in subagent support, enabled by default: `acp_delegate`, `acp_delegate_wait`, and `acp_delegate_cancel`. This additional tool surface is specific to pi.
-
-**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A project-scope `pi-subagents` install makes the built-in delegate stand down by default, but a user-scope-only install does not; do not rely on that guard for every installation.
-
-To disable the built-in subagents while keeping context compression, merge this into `~/.config/billion-context/billion-context.json` (or the file selected by `BILI_CONFIG_FILE`), preserving your other settings:
-
-```json
-{
-  "pi": {
-    "subagents": false
-  }
-}
-```
-
-Restart pi and start a new session for the change to take effect. This disables the three delegate tools, their system-prompt section, and the fleet keyboard shortcut; context compression remains enabled. It does not disable independently installed subagent plugins. More options: [subagent configuration](CONFIGURATION.md#pi).
-
 ## Install
 
 Linux / macOS — install with a user-level prefix (no `sudo`, no npm config
@@ -242,6 +224,7 @@ install <client>` writes their config entries for you (kimi's declarative
 Notes:
 
 - Native mode is **mutually exclusive** with the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) — the installer swaps the entries and snapshots the original config (`.bili-bak`).
+- **pi:** native installs wire in built-in subagents by default (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`) — how to disable them while keeping context compression: [Pi built-in subagents](#pi-built-in-subagents).
 - OpenCode legacy sessions, V1/V2 shapes and caveats: [OpenCode](CLIENTS.md#opencode).
 - `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
@@ -488,6 +471,24 @@ Knobs people look for first:
 - **Upstream proxy (firewall/GFW)** — routing the proxy's own outbound traffic through v2rayA/clash: full resolution order, empty-string = explicit direct, SOCKS5 rejection, both egress paths, and the `mitm://` vs `https://` key schemes live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `proxy`; Providers → key schemes).
 - **Wire-compat role rewrite (`compat.roles`)** — an upstream that rejects the `developer` role? Covered by [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `compat`) — including the learn-on-failure auto-fix that needs no configuration at all.
 - **Signed upstreams (body-covering signatures)** — a gateway whose requests carry a body-covering signature (CodeArts APIG's `SDK-HMAC-SHA256`, or gateway-invented headers like `x-ofm-signature`): the built-in scheme re-signs transparently on dsh; every other detected scheme is ALWAYS refused locally — signed requests are either re-signed+compressed or refused, never passed through unsigned — and bili keeps reminding at startup and in the web UI until it ships the scheme's re-signer (#1884/#2090). Detection rules, per-scheme overrides, and `BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` live in [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `resign`).
+
+### Pi built-in subagents
+
+Using `bili pi` or the native pi plugin (`bili plugin install pi`) includes built-in subagent support, enabled by default: `acp_delegate`, `acp_delegate_wait`, and `acp_delegate_cancel`. This additional tool surface is specific to pi.
+
+**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A project-scope `pi-subagents` install makes the built-in delegate stand down by default, but a user-scope-only install does not; do not rely on that guard for every installation.
+
+To disable the built-in subagents while keeping context compression, merge this into `~/.config/billion-context/billion-context.json` (or the file selected by `BILI_CONFIG_FILE`), preserving your other settings:
+
+```json
+{
+  "pi": {
+    "subagents": false
+  }
+}
+```
+
+Restart pi and start a new session for the change to take effect. This disables the three delegate tools, their system-prompt section, and the fleet keyboard shortcut; context compression remains enabled. It does not disable independently installed subagent plugins. More options: [subagent configuration](CONFIGURATION.md#pi).
 
 ## How sessions work
 
