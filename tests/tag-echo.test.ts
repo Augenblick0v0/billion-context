@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -938,4 +939,61 @@ test("streaming filter swallows a wrapped-turn imitation push by push, never emi
     visible += f.flush();
     assert.equal(visible, "", "nothing of the wrapped turn reaches the client");
     assert.ok(f.stats().dropped, "the span is accounted as dropped");
+});
+
+// #2348 pain-point corpus: real per-message leak samples from the issue's
+// evidence zip (05-degenerate-tags: paired attr-drift forms embedded in CJK
+// prose; instance-c-message: fullwidth-corrupt close; healthy-control: one
+// canonical pair). Invariant: ZERO markup bytes reach the client in either
+// mode, and streaming agrees with whole-text at every chunk size.
+const PAINPOINT_DIR = new URL("./fixtures/painpoint-2348/", import.meta.url);
+const PAINPOINT_FILES = [
+    "sample-01-seq409-turn4.txt",
+    "sample-02-seq424-turn4.txt",
+    "sample-03-seq429-turn4.txt",
+    "sample-04-seq454-turn4.txt",
+    "sample-05-seq464-turn4.txt",
+    "sample-06-seq469-turn4.txt",
+    "sample-07-seq474-turn4.txt",
+    "sample-08-seq522-turn8.txt",
+    "instance-c-message.txt",
+    "healthy-control-message.txt",
+];
+
+test("#2348 pain-point corpus: zero markup reaches the client; stream == whole-text at every chunk size", () => {
+    for (const name of PAINPOINT_FILES) {
+        const input = readFileSync(new URL(name, PAINPOINT_DIR), "utf8");
+        const wt = stripAcpTags(input);
+        assert.ok(!wt.includes(LT), `${name}: whole-text output leaves markup bytes`);
+        for (const chunk of [1, 7, 32]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, wt, `${name} chunk=${chunk}: streaming diverges from whole-text`);
+        }
+    }
+});
+
+// #2348: pre-fix, an attr-self-closing render tag was read as an unclosed
+// opening whose swallow state ate everything after it — the H-class shape
+// below lost the model's ENTIRE visible reply before the fix. Pin the loss
+// mode, not just the strip: output must equal the clean truth byte-for-byte.
+test("#2348 self-closing forms keep all following prose byte-for-byte (pre-fix swallow-loss mode)", () => {
+    const cases: Array<[string, string]> = [
+        ["attr-selfclose mid-prose", `先说结论：缓存层没问题。\n\n${LT}acp tokens="12" type="text"/\x3e\n\n真正的原因在序列化那一环，下面展开。`],
+        ["bare selfclose line-head", `${LT}acp/\x3e\n第二点，重试风暴来自上游限流而不是本地。`],
+        ["mixed shapes one message", `核对完毕。\n${LT}acp tokens="38" string="true"\x3em00282${LT}/acp\x3e \n中间还夹了一个 ${LT}acp tokens="0" type="text"/\x3e 之类的残留。\n总之结论不变：先修序列化。`],
+        ["H-class attr drift", `${LT}acp test="m00430"/\x3e\n收到，继续执行。`],
+    ];
+    for (const [label, input] of cases) {
+        const truth = stripAcpTags(input);
+        const f = createTagEchoFilter();
+        let out = "";
+        for (let i = 0; i < input.length; i += 7) out += f.push(input.slice(i, i + 7));
+        out += f.flush();
+        assert.equal(out, truth, `${label}: prose after the self-close was lost`);
+        assert.ok(!out.includes(LT), `${label}: markup leaked`);
+        assert.ok(f.stats().dropped, `${label}: drop accounting (warn path)`);
+    }
 });
