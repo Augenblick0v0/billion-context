@@ -236,7 +236,8 @@ export type Session = {
          calibrationRing?: { origin: string; model?: string; values: number[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
-         *  system/tools overhead + image reserve, defaultCountTokens rate),
+         *  system/tools overhead + image reserve, defaultCountTokens rate;
+         *  includes host-projected thinking mass since #2407),
          *  recorded in prepare*. settleUsageReport pairs it with the NEXT
          *  usage report's billed total (same request) to sample k̂, then
          *  overwrites it with the current turn's value. In-memory only — a

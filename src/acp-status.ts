@@ -1,5 +1,6 @@
 import {
     buildStatusReport,
+    countMessageTokens,
     defaultCountTokens,
     formatRanges,
     viableRanges,
@@ -70,7 +71,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const billed = statusInputBaseline(ctx.session);
     if (billed > 0) {
         let estTotal = 0;
-        for (const m of ctx.messages) estTotal += defaultCountTokens(m.text ?? "");
+        // #2407: count host-projected thinking mass (countMessageTokens) so the
+        // ratio stays honest on thinking routes — same caliber as the per-message
+        // breakdown the kernel renders above.
+        for (const m of ctx.messages) estTotal += countMessageTokens(m, defaultCountTokens);
         // Billed input covers system+tools too (and images); the est view must
         // carry the same overhead — every prepare site keeps
         // metadata.systemPromptTokens current — or every system-heavy session

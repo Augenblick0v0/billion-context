@@ -1,4 +1,5 @@
 import {
+    countMessageTokens,
     defaultCountTokens,
     viableRanges,
     type CompressionCore,
@@ -247,9 +248,16 @@ function refNum(ref: string): number {
 // CJK-aware: the fast chars/4 estimator undercounts CJK ~4× (CJK is ~1
 // token/char), which made the fit check believe an oversized CJK payload
 // already fit and skip compression. defaultCountTokens counts CJK per-char.
+// #2407: host-projected thinking mass (CoreMessage.thinkingTokens, #1320) is
+// billed by upstream but invisible in m.text — count it via the kernel's
+// countMessageTokens so every consumer of this estimator (the k̂ calibration
+// denominator at the prepare sites, preflight fit/round budgets, the output
+// clamp, the image-cost textSide) carries billed-caliber mass. Without it the
+// k̂ sample divides a bill that includes thinking by an estimate that
+// excludes it, and thinking-heavy routes learn an inflated factor.
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += defaultCountTokens(m.text ?? "");
+    for (const m of messages) tokens += countMessageTokens(m, defaultCountTokens);
     return tokens;
 }
 

@@ -20,6 +20,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge } from "./budget.js";
+import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 
@@ -235,6 +236,18 @@ export async function prepareGoogle(
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
+    }
+    // #1933 F1 + #2407: billed-caliber denominator of the k̂ learning pair.
+    // The Google lane was the only one of the four never recording it, so
+    // Gemini-native routes could never learn the calibration factor and
+    // stayed raw-estimate caliber forever. Mirrors the anthropic/openai/
+    // responses lanes (same estimateCoreMessages caliber, projected thinking
+    // mass included); title-gen side requests skip like the rows above.
+    if (!isTitleGen) {
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(googleOutboundSystem ?? "", toolsOut)
+            + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin);
+        if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
