@@ -507,13 +507,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         );
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -604,6 +604,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
+            // #2362: machine-readable failure class for the [plugin] execution
+            // line — outcome=refused alone never says why in the logs.
+            const gateReason = /cannot be anchored/.test(errs) ? "gate:cannot-anchor"
+                : /already compressed/.test(errs) ? "gate:already-compressed"
+                : /requested range\(s\) resolved/.test(errs) ? "gate:none-resolved"
+                : /too small/.test(errs) ? "gate:too-small"
+                : "gate:other";
             const revNote = revs.length > 0
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
                 : "";
@@ -661,7 +668,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     }
                 }
             }
-            return compressResult(receipt, "refused", 0);
+            return compressResult(receipt, "refused", 0, gateReason);
         }
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);
@@ -817,7 +824,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
         const specKey = normalizedSpecKey(ranges);
-        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0);
+        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0, "exception");
     }
 }
 

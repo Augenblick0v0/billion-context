@@ -1632,7 +1632,7 @@ export async function handlePluginTool(
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
-    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"})`);
+    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"}${result.reason ? `, reason=${result.reason}` : ""})`);
     // Same deep link on the /acp-cache display surfaces: clients wrap this text in
     // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
     // (src/acp-panel.ts). The MCP acp_cache path shares this endpoint — one extra line
