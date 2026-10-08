@@ -31,7 +31,7 @@
 //   "warn"   — compute + log only, no rewrite.
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
-import type { CoreMessage } from "acp-kernel";
+import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
@@ -110,6 +110,14 @@ interface ReconciliationPlan {
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
     unmatched: string[];
+    /** #2283: sum of defaultCountTokens over every churn-region candidate — the
+     *  raw mass riding unfolded in the drift zone this pass. Undefined when there
+     *  is no drift (the missing.length === 0 early return skips this). */
+    churnTokens?: number;
+    /** #2283: subset of churnTokens whose candidate was re-covered by a claim.
+     *  In repair mode rewriteBlocks applies the claims so those are covered again;
+     *  in warn mode nothing is rewritten, so all churnTokens unfold. */
+    claimedChurnTokens?: number;
 }
 
 interface FoldReconcileResult {
@@ -343,6 +351,17 @@ export function planReconciliation(
     for (const id of missing) {
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
+    // #2283: token estimate of the re-entering unfolded mass (drift-only path, post
+    // missing.length===0 early return — stays near-free on large steady-state histories).
+    let churnTokens = 0;
+    for (const c of candidates) churnTokens += defaultCountTokens(c.message.text ?? "");
+    let claimedChurnTokens = 0;
+    for (const cid of claimedCandidates) {
+        const m = byId.get(cid);
+        if (m !== undefined) claimedChurnTokens += defaultCountTokens(m.text ?? "");
+    }
+    plan.churnTokens = churnTokens;
+    plan.claimedChurnTokens = claimedChurnTokens;
     return plan;
 }
 
@@ -506,6 +525,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // letting the identical warn print hundreds of times.
     const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
     const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0;
+    const unfoldedDrift = mode === "repair"
+        ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
+        : (plan.churnTokens ?? 0);
+    const driftTok = unfoldedDrift > 0 ? ` (~${unfoldedDrift} tok unfolded in churn region)` : "";
     const prevStreak = (session.metadata[METADATA_DRIFT_STREAK] as number | undefined) ?? 0;
     if (!totalDrift) {
         if (prevStreak !== 0) resetFoldDriftState(session);
@@ -519,7 +542,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             const since = session.metadata[METADATA_DRIFT_SINCE] as number | undefined;
             const span = typeof since === "number" ? `, ${Math.max(1, Math.round((Date.now() - since) / 60000))} min so far` : "";
             if (opts.log !== undefined) {
-                opts.log("error", `${tag}[fold-reconcile] compression substrate appears destroyed: ${plan.unmatched.length} covered id(s) missing with NO anchor match for ${streak} consecutive passes${span} — consistent with a host-native compaction landing outside bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-side history rewrite; bili folds can no longer cover the resent history (#1921)`);
+                opts.log("error", `${tag}[fold-reconcile] compression substrate appears destroyed: ${plan.unmatched.length} covered id(s) missing with NO anchor match for ${streak} consecutive passes${span} — consistent with a host-native compaction landing outside bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-side history rewrite; bili folds can no longer cover the resent history (#1921)${driftTok}`);
             }
         }
     }
@@ -530,10 +553,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
@@ -542,7 +565,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // latch, so a later episode reports fresh; the persisted latch also
             // keeps a restarted process silent mid-episode (#2293 terminal state).
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire) (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire) (#1921)${driftTok}`);
         }
     }
     return {

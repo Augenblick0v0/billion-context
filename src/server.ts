@@ -2888,6 +2888,17 @@ async function handle(
                     }
                 }
             }
+            // #2283 sub-defect 1: emit [window-change] when the per-session resolution
+            // triple (model/source/base) moves mid-session. Placed pre output-headroom so
+            // #2096's per-request max_tokens reservation can't read as a base change.
+            {
+                const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
+                const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
+                if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
+                    log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
+                }
+                if (session.metadata) session.metadata.lastWindowResolution = curRes;
+            }
             let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
             // Fallback-derived windows are optimistic guesses: never let the
             // output-headroom reservation push the effective window below the
@@ -4454,6 +4465,13 @@ async function preflightCompressIfNeeded(
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
+    // EVERY request (not only when preflight triggers) — the offline data source for the
+    // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
+    if (opts.debug) {
+        const billed = session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : "none";
+        log("debug", `[${session.id}] [usage-vs-est] upstream-billed=${billed} est=${Math.round(textEstimate)} k̂=${kFactor !== undefined ? kFactor.toFixed(2) : "n/a"} route=${currentOrigin ?? "?"} model=${model ?? "?"} baseline-grade=${session.stats.lastInputTokensSource ?? "none"} (#2283)`);
+    }
     if (limit <= 0 || !model || !triggerFires) return prepared;
     // #2313: an estimate may not block the forward. The trigger above can
     // fire on the calibrated chars/4 estimate alone; when the current
