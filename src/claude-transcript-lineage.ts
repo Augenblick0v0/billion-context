@@ -35,13 +35,13 @@ const MAX_HEAD_BYTES = 256 * 1024;
 /** Bound on the projects/* fan-out (one existsSync per directory). */
 const MAX_PROJECT_DIRS = 2000;
 
-export function isClaudeSessionUuid(id: string): boolean {
+function isClaudeSessionUuid(id: string): boolean {
     return UUID_RE.test(id);
 }
 
 /** Candidate Claude config roots: CLAUDE_CONFIG_DIR (Claude Code's own
  *  override), then ~/.claude. */
-export function claudeConfigDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+function claudeConfigDirs(env: NodeJS.ProcessEnv = process.env): string[] {
     const dirs: string[] = [];
     for (const v of [env.CLAUDE_CONFIG_DIR, path.join(os.homedir(), ".claude")]) {
         if (typeof v !== "string" || v.trim().length === 0) continue;
@@ -119,7 +119,7 @@ function readForkedFrom(file: string, selfId: string): string | undefined {
     return undefined;
 }
 
-export type TranscriptParentLookup =
+type TranscriptParentLookup =
     | { kind: "parent"; parentId: string; transcript: string }
     | { kind: "none"; reason: "invalid-id" | "no-transcript" | "no-fork-marker" | "ambiguous" };
 
