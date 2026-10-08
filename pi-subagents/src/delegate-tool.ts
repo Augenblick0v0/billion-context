@@ -848,18 +848,42 @@ interface HostNotificationState {
 
 const hostNotificationStates = new WeakMap<ExtensionAPI, HostNotificationState>();
 /** Strong refs so a target-less flush (tests/embedders) can enumerate hosts.
- *  A process holds one live host (+ short-lived ones across session switches),
- *  so this cannot grow unboundedly. */
+ *  Re-added on every state access and pruned once a host goes idle, so this
+ *  stays bounded by hosts holding live notification state instead of pinning
+ *  every retired session forever in a long-lived process (#2390). */
 const knownHosts = new Set<ExtensionAPI>();
+
+/** Count of hosts retained in the notification registry (test/diagnostic hook
+ *  for asserting the #2390 boundedness guarantee). */
+export function knownDelegateHostCount(): number {
+  return knownHosts.size;
+}
 
 function hostNotificationState(pi: ExtensionAPI): HostNotificationState {
   let st = hostNotificationStates.get(pi);
   if (!st) {
     st = { queue: [], activeRuns: 0, flushScheduled: false };
     hostNotificationStates.set(pi, st);
-    knownHosts.add(pi);
   }
+  // Re-add on EVERY access (idempotent): a host pruned while idle rejoins
+  // enumeration the moment it is touched again, even though its state object
+  // persists in the WeakMap.
+  knownHosts.add(pi);
   return st;
+}
+
+/** Drop a host from enumeration only when it has nothing left to deliver: no
+ *  in-flight runs, an empty coalescing queue, and no pending idle flush. Reads
+ *  the state map directly (never the creating getter above) so the delete is
+ *  not immediately undone by a re-add. The state object itself is never
+ *  deleted — it lives as long as the host does — so pruning cannot desync any
+ *  handler that captured it. */
+function pruneKnownHostIfIdle(pi: ExtensionAPI): void {
+  const st = hostNotificationStates.get(pi);
+  if (!st) return;
+  if (st.activeRuns === 0 && st.queue.length === 0 && !st.flushScheduled) {
+    knownHosts.delete(pi);
+  }
 }
 
 /** Register the host hooks that drive notification commits. Called from
@@ -881,6 +905,7 @@ function ensureHostNotificationHandlers(pi: ExtensionAPI): void {
   pi.on("agent_settled", () => {
     if (st.activeRuns > 0) st.activeRuns -= 1;
     maybeFlushNotifications(pi);
+    pruneKnownHostIfIdle(pi);
   });
   // Busy-tier commit point: fires before every LLM call of this host. Inert on
   // hosts that lack the event (registration stays a harmless no-op then).
@@ -901,6 +926,7 @@ function maybeFlushNotifications(pi: ExtensionAPI): void {
   const t = setTimeout(() => {
     st.flushScheduled = false;
     flushHostNotifications(pi);
+    pruneKnownHostIfIdle(pi);
   }, 0);
   t.unref?.();
 }
