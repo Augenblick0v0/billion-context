@@ -93,7 +93,14 @@ test("createForkAdopter skips without consuming anything on ineligible input", a
     await adopter.maybeAdopt(adoptInput({ parent: "" }));
     await adopter.maybeAdopt(adoptInput({ child: "" }));
     await adopter.maybeAdopt(adoptInput({ base: "" }));
+    // A body-less request (opencode V2 ws handshake's synthetic Request) must
+    // not burn an attempt slot: repeated handshakes would otherwise close the
+    // window before the first real model request (#2403 review).
+    for (let i = 0; i < 5; i += 1) await adopter.maybeAdopt(adoptInput({ body: undefined }));
     assert.equal(calls.length, 0);
+    const after = adoptInput();
+    await adopter.maybeAdopt(after);
+    assert.ok(calls.some((c) => c.url.includes("snapshot")), "the window is still open for the first real body");
 });
 
 test("createForkAdopter marks done on manifest-incapable proxies and never refetches", async () => {

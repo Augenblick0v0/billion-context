@@ -105,9 +105,9 @@ export function anthropicBodyToCore(body: unknown): CoreMessage[] | null {
 
 /** Project an outgoing chat body of either chat dialect. Responses/google
  *  bodies return null — the fork snapshot prefix match is text/role based and
- *  those dialects are not projected client-side yet, so adoption for them
- *  skips without consuming an attempt (the child simply starts fresh, as
- *  today). */
+ *  those dialects are not projected client-side yet, so adoption degrades as a
+ *  transient "body unmappable" and retries up to the coordinator's cap (the
+ *  child simply starts fresh, as today). */
 export function chatBodyToCore(body: unknown): CoreMessage[] | null {
     const format = detectWireFormat(body);
     if (format === "anthropic") return anthropicBodyToCore(body);
@@ -251,8 +251,11 @@ export type ForkAdoptInput = { base: string; parent: string; child: string; body
  *  - the adoption window is BEFORE the child's first model request — a later
  *    retry can only CHILD_CONFLICT, so every terminal outcome (adopted OR
  *    degraded) marks the child done;
- *  - responses/google bodies and manifest-incapable proxies skip WITHOUT
- *    consuming an attempt (nothing was sent to the fork endpoints);
+ *  - bodies with no parseable payload (undefined — e.g. opencode V2's ws
+ *    handshake synthetic request) and side-shaped bodies skip WITHOUT
+ *    consuming an attempt; responses/google bodies degrade as transient
+ *    "body unmappable" and retry up to the cap; a manifest-incapable proxy
+ *    terminates after one probe;
  *  - never throws: an adoption failure degrades to today's behavior (fresh
  *    conversation, preflight refolds the replayed history). */
 /** Side-shaped request body: no tools AND a tiny output budget (host
@@ -305,6 +308,12 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             if (input === undefined) return;
             if (input.parent === "" || input.child === "" || input.parent === input.child) return;
             if (input.base === "") return;
+            // No parseable payload: nothing to match against the snapshot.
+            // opencode V2's ws-handshake synthetic request (and any Request
+            // whose body the host did not hand us) lands here — skipping
+            // WITHOUT attempt bookkeeping keeps reconnects from burning the
+            // 2399 retry budget before the first real model request (#2403 review).
+            if (input.body === undefined) return;
             // #2399 spec gate ④: a side-shaped request (host title-gen / classify
             // sidecar — no tools + a tiny output budget) carries no replayed
             // prefix; matching it would N=0-degrade the child terminally before
