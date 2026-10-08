@@ -11,7 +11,8 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { listSessions } from "../src/session.ts";
 import { PrefixAffinityResolver } from "../src/prefix-affinity.ts";
 import { queuePluginRegister, consumePluginRegisterFor, _resetPluginStateForTest } from "../src/plugin.ts";
-import { claudeForkParentFromArgv } from "../src/claude-native-bootstrap.ts";
+import { claudeForkParentFromArgv, hookMainWithDeps } from "../src/claude-native-bootstrap.ts";
+import { PassThrough } from "node:stream";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -381,4 +382,61 @@ test("declared parent with NON-matching replay: no adoption, link-only fallback 
         await close(h.proxy);
         await close(h.relay);
     }
+});
+
+// — hook entrypoint stdin wiring (#2409 review) ——————————————————————————
+// The blocking review found the original wiring called run(payload)
+// synchronously, before Node's asynchronous 'data' events had delivered the
+// SessionStart JSON — every fork declaration shipped "". These tests drive
+// the REAL entrypoint wiring (hookMainWithDeps) through a pipe-shaped
+// stream with production timing: chunks arrive only after the call returns.
+
+test("hook entrypoint: run() receives the FULL stdin payload only after drain", async () => {
+    const input = new PassThrough();
+    const payloadJson = JSON.stringify({ source: "fork", session_id: "11111111-2222-3333-4444-555555555555" });
+    const runs: string[] = [];
+    const exits: number[] = [];
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c) });
+    // The synchronous-call-site bug: at this point run() must NOT have fired
+    // yet — and the payload below arrives asynchronously, exactly like a real
+    // claude SessionStart pipe.
+    assert.equal(runs.length, 0, "run() must not fire synchronously with an empty accumulator");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    input.write(payloadJson.slice(0, 20));
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    input.write(payloadJson.slice(20));
+    input.end();
+    const deadline = Date.now() + 2_000;
+    while (runs.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(runs.length, 1, "run() fires exactly once");
+    assert.equal(runs[0], payloadJson, "run() sees the complete payload (the old wiring passed \"\")");
+    assert.deepEqual(exits, [0]);
+});
+
+test("hook entrypoint: a never-closed stdin still fires via the drain timeout", async () => {
+    const input = new PassThrough();
+    const payloadJson = JSON.stringify({ source: "fork", session_id: "11111111-2222-3333-4444-555555555555" });
+    const runs: string[] = [];
+    const exits: number[] = [];
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c), drainTimeoutMs: 40 });
+    input.write(payloadJson);
+    // No end(): only the timeout safety net may release the hook — claude
+    // waits for this process to exit, so a hang here would stall the session.
+    const deadline = Date.now() + 2_000;
+    while (runs.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0], payloadJson, "timeout path still carries the buffered payload");
+    assert.deepEqual(exits, [0]);
+});
+
+test("hook entrypoint: empty stdin (end with no data) exits cleanly", async () => {
+    const input = new PassThrough();
+    const runs: string[] = [];
+    const exits: number[] = [];
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c) });
+    input.end();
+    const deadline = Date.now() + 2_000;
+    while (exits.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(runs, [""]);
+    assert.deepEqual(exits, [0]);
 });

@@ -494,18 +494,63 @@ async function run(payloadJson: string): Promise<void> {
     }
 }
 
-function hookMain(): void {
-    // Capture the hook's stdin payload (claude SessionStart JSON:
-    // session_id, source, ...) — #2408 reads source/session_id for fork
-    // lineage; claude waits for this process to exit, and draining avoids a
-    // blocked writer if the payload ever exceeds the socket buffer.
+/** Safety net for the stdin drain below: claude writes the SessionStart
+ *  JSON and closes the pipe, so 'end' fires within milliseconds — but a
+ *  never-closed or exotic pipe must not hang the hook (claude blocks session
+ *  start until this process exits). Two seconds is far above any real
+ *  SessionStart payload latency while staying invisible to the user. */
+export const HOOK_STDIN_DRAIN_TIMEOUT_MS = 2_000;
+
+/** The hook entrypoint's stdin wiring, isolated for tests (#2408 review):
+ *  collect the SessionStart payload chunks, call `runImpl` with the FULL
+ *  payload exactly once — only after the stream has drained ('end'/'error',
+ *  or the timeout safety net) — then exit 0. Node delivers 'data'
+ *  asynchronously: calling run with the accumulator before drain would ship
+ *  an empty string on every session (the bug the entrypoint tests pin).
+ *  Exported with injectable deps so the real wiring — not a re-implementation
+ *  — is what the tests drive. */
+export function hookMainWithDeps(deps: {
+    input?: NodeJS.ReadableStream;
+    runImpl?: (payload: string) => Promise<void>;
+    exit?: (code: number) => void;
+    drainTimeoutMs?: number;
+} = {}): void {
+    const input = deps.input ?? process.stdin;
+    const runImpl = deps.runImpl ?? run;
+    const exit = deps.exit ?? ((code: number) => process.exit(code));
+    const destroyInput = (): void => {
+        try {
+            (input as { destroy?: () => void }).destroy?.();
+        } catch {
+            // already closed
+        }
+    };
     let payload = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk: string) => { payload += chunk; });
-    void run(payload).finally(() => {
-        process.stdin.destroy();
-        process.exit(0);
+    let started = false;
+    const start = (): void => {
+        if (started) return;
+        started = true;
+        clearTimeout(timer);
+        void runImpl(payload).finally(() => {
+            destroyInput();
+            exit(0);
+        });
+    };
+    const timer = setTimeout(start, deps.drainTimeoutMs ?? HOOK_STDIN_DRAIN_TIMEOUT_MS);
+    if (typeof (input as { setEncoding?: (e: string) => void }).setEncoding === "function") {
+        (input as { setEncoding: (e: string) => void }).setEncoding("utf8");
+    }
+    input.on("data", (chunk: string) => {
+        payload += chunk;
     });
+    input.on("end", start);
+    input.on("error", start);
+}
+
+function hookMain(): void {
+    // claude waits for this process to exit, and draining avoids a blocked
+    // writer if the payload ever exceeds the socket buffer.
+    hookMainWithDeps();
 }
 
 // Direct entry (dist/claude-native-bootstrap.js spawned by claude's hook, or
