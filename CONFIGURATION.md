@@ -201,6 +201,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
+| `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376). |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 "stream required" rejections and never arms on gateway timeouts. |
@@ -1162,6 +1163,12 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
 
+#### `tierNudgeTokens`
+
+- **Type:** `object` — `{ "t1"?: number, "t2"?: number, "t3"?: number }` (each value in tokens, ≥ 1)
+- **Default:** *(unset — every tier uses its derived value)*
+- **Status:** ACTIVE (requires acp-kernel >= 0.0.108)
+- **Description:** Per-tier token-mass trigger thresholds for the T1/T2/T3 compression paths (#2376). By default all three tiers derive from `nudgeGrowthTokens` (T1 = the step, T2/T3 = step × 1.5); this field pins each tier independently — e.g. keep T1 aggressive for long tasks while letting T2 distill earlier or later. Each UNSET sub-field falls back to that tier's derived default, so an absent or empty object is fully backward compatible with the unified value. Only the token-mass trigger comparisons change: count triggers (`tiers.tier2Trigger` / `tiers.tier3Trigger`), the cadence floor, the first-sight mass bypass and pressure/emergency routing keep their existing bases. Merged PER SUB-FIELD across global → provider → model (a model-level `t2` does not discard a provider-level `t1`). Maps to the kernel field `nudge.tierGrowthTokens`.
 #### `nudgeModelDecided`
 
 - **Type:** `boolean`
