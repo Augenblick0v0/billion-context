@@ -14,6 +14,7 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
+import { compressBreakerDetail } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
@@ -121,6 +122,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
         }
     }
+    // #2432: while the compress circuit breaker is armed, advertising ranges
+    // here contradicts the breaker receipt ("STOP calling compress now") and
+    // feeds the exact retry loop the breaker exists to kill — every model that
+    // follows the list fails the same way and climbs the counter. The receipt
+    // wording stays verbatim (#2146 owner decision); this surface gets the
+    // armed state instead, with the counter visible (issue expected behavior 4).
+    const breaker = compressBreakerDetail(ctx.session);
     try {
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
@@ -147,7 +155,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const minChars = ctx.config.compress.minCompressRange;
             const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
-            if (ranges.length > 0 || protectedRanges.length > 0) {
+            if (!breaker && (ranges.length > 0 || protectedRanges.length > 0)) {
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
@@ -163,6 +171,11 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (deadRefs !== undefined && deadRefs.length > 0) {
         extra.push("");
         extra.push(`DEAD REFS — ${deadRefs.length} ref(s) no longer back any visible or folded message (the client history no longer carries them — host-native compaction or a bulk rewrite). Ranges citing them can NEVER compress; target only the live refs listed above: ${formatDeadRefSpans(deadRefs)}`);
+    }
+    if (breaker) {
+        extra.push("");
+        extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
+        extra.push("The Compressible-ranges list is SUPPRESSED while the breaker is armed: recent compress attempts have all failed and re-attempting fails the same way. Do not attempt to compress now; continue the task.");
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
