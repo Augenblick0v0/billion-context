@@ -1,6 +1,7 @@
-// #2186: acp_delegate surface for bili's pi lane, inlined from
-// billion-context-pi-subagents (exact devDependency, tsup-bundled the same
-// way acp-kernel is — see AGENTS.md §2.1). The package ships its own
+// #2186/#2384: acp_delegate surface for bili's pi lane, inlined from
+// billion-context-pi-subagents (vendored under pi-subagents/, consumed via
+// file: devDependency, tsup-bundled the same way acp-kernel is — see
+// AGENTS.md "Pi-Subagents Boundary"). The package ships its own
 // standalone factory (createSubagentsExtension); bili re-wires the building
 // blocks instead so the surface rides bili's registration lifecycle, stays
 // out of omp (no buildContextEntries), and stands down when another embedder

@@ -201,6 +201,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit). |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
+| `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
+| `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 "stream required" rejections and never arms on gateway timeouts. |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
@@ -693,7 +695,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `{ subagents?: PiSubagentsFileConfig | boolean }`
 - **Default:** `{}` (acp_delegate surface enabled with package defaults)
 - **Status:** ACTIVE (#2230 config-home)
-- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the standalone `billion-context-pi-subagents` package reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
+- **Description:** Settings for the built-in **pi-lane sub-agents** (`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`, registered when `bili pi` wires the embedded extension). The `pi.subagents` section is the config home for this surface; the in-repo `pi-subagents/` component (npm name `billion-context-pi-subagents`) reads the same section through its own loader (the file format is the contract, not shared code). Previously these knobs lived in pi's `~/.pi/acp.json` under `delegate` / `delegatePrompt` / `displayUsage` / `debug` — those four keys are a **deprecated fallback**: still read while the section is absent (one-time deprecation warning on the host process stderr), **ignored once the section exists**, slated for removal in a future release. Renames: `delegatePrompt` → `prompt`; `debug` is scoped to the sub-agent subsystem and does **not** collide with the top-level proxy `debug`.
 
 ```jsonc
 "pi": {
@@ -729,7 +731,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents.asyncTimeoutMinutes` | `0` disables. |
 | `PI_ACP_DELEGATE_MAX_CONCURRENT` | `pi.subagents.maxConcurrent` | Integer ≥ 1; invalid falls through to the file value, then unlimited. |
 
-Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](https://github.com/ranxianglei/billion-context-pi-subagents#readme).
+Changes take effect on a **new session** (tools register at session start). Full delegate surface docs (roles, execution model, fleet inspector): [billion-context-pi-subagents README](pi-subagents/README.md).
 
 ### Process-level blocks (#2030)
 
@@ -1159,6 +1161,20 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `50000`
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
+
+#### `nudgeModelDecided`
+
+- **Type:** `boolean`
+- **Default:** *(off unless set)*
+- **Status:** ACTIVE (#2228)
+- **Description:** Model-decided compression timing. When enabled, an armed **tier-1** nudge (gentle growth or over-limit) does not inject its advisory text immediately. Instead bili sends one short **side call** over the session's already-cached prefix (same system/tools/messages prefix, tiny output budget, 15 s idle timeout) asking the model — given the current task — whether compressing NOW is net-beneficial, optionally which span to fold and a short topic. The answer must be strict JSON (`{"compress": true|false, "range": "mNNNNN-mNNNNN"?, "topic": "?"}`); any other output is treated as a failure. On a valid "yes", bili injects an explicit compress directive naming a program-finalized span — the proposed range is honored only when it is fully contained in a live compressible range, otherwise the largest live range is used. On "no", a malformed answer, or a timeout, nothing is injected this round. After **3 consecutive hard failures** the next arm falls back to the legacy advisory once and the counter resets (self-healing ladder). **EMERGENCY** arms and **tier-2/3 distillation** never go through the decision and keep the legacy advisory byte-for-byte. Host-only field — not passed to the kernel. Off by default.
+
+#### `nudgeDecisionMaxTokens`
+
+- **Type:** `number`
+- **Default:** `200`
+- **Status:** ACTIVE (#2228)
+- **Description:** Output budget, in tokens, of the model-decision side call made when `nudgeModelDecided` is enabled. Must be > 0 (invalid values are rejected at config load).
 
 #### `preserveRecentMessages`
 
