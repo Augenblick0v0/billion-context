@@ -2406,38 +2406,6 @@ async function handle(
                 log("warn", `[conflict] third-party plugin scan failed: ${String(err)} (#1206)`);
             }
         }
-        // [#1333] explicitly derived conversations (pi RLM child, omp fork,
-        // opencode subagent: the plugin reported its parent at register)
-        // record the parent link once — normally on the child's first request,
-        // but the register POST can land AFTER it (the extension flips
-        // tools-ready before the register completes), so late requests of the
-        // same session may record it (#1362). No state is copied — acp-kernel's
-        // syncBlocks deactivates blocks whose source messages are absent from
-        // the child's wire, so seeding blocks into an empty-history child never
-        // sticks. Instead decompress/search_context fall back to the linked
-        // parent chain at read time (src/decompress-shared.ts, depth cap 8).
-        // Late binding is harmless (the link copies nothing at link time), so
-        // the gate is idempotence, not first-request.
-        if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
-            try {
-                const parentSession = resolveConversation(derivedParent)?.session;
-                if (parentSession) {
-                    session.metadata.derivedFrom = derivedParent;
-                    session.metadata.derivedFromSessionId = parentSession.id;
-                    markDirty(session);
-                    log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
-                } else if (session.metadata.derivedLinkMissLogged !== true) {
-                    // The relaxed gate retries resolution on EVERY request until the link
-                    // lands — cap the miss signal at one line per session per proxy
-                    // process (in-memory flag: a restart re-warns once, which is useful).
-                    session.metadata.derivedLinkMissLogged = true;
-                    log("warn", `[${session.id}] [derived] parent conversation ${derivedParent} is unknown to this proxy — no inheritance; continuing fresh (#1333)`);
-                }
-            } catch (err) {
-                if (session.metadata.derivedLinkMissLogged !== true) session.metadata.derivedLinkMissLogged = true;
-                log("warn", `[${session.id}] [derived] parent link from ${derivedParent} failed (${String(err)}); continuing fresh (#1333)`);
-            }
-        }
         // #1486: resume-fork inheritance for identified clients. Clients such
         // as Claude Code fork a FRESH client-provided session id on --resume
         // while replaying the full transcript; verbatim identity keying would
@@ -2454,11 +2422,18 @@ async function handle(
         // wire; forkAdoption only gates anonymous forks, #629), and the
         // derivedFrom lineage (decompress/search_context fall back to the parent chain).
         // First request only: the state copy must land before processTurn
-        // assigns refs. A resolved explicit plugin-reported lineage above wins
-        // (gate on derivedFromSessionId); this content match is the fallback
-        // signal for clients that report no lineage.
+        // assigns refs. #2408: this match runs BEFORE the #1333 explicit
+        // parent link below — a DECLARED parent (claude --fork-session
+        // SessionStart register, opencode derived register) scopes the match
+        // to that parent's chain (findResumeParentWithin), and on a hit the
+        // richer inheritance wins while the link gate (derivedFromSessionId
+        // now set) skips the redundant read-only link; on a miss the link
+        // lands on the SAME first request (pi RLM children: no replay, link
+        // as before — no deferral, no timing change).
         if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
-            const resume = prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
+            const resume = derivedParent !== undefined
+                ? prefixAffinity.findResumeParentWithin(derivedParent, affinityMessageList(), sessionId)
+                : prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
             if (resume) {
                 const resumeParent = peekSession(resume.sessionId) ?? getStore().loadSync(resume.sessionId, { protocol, upstreamOrigin }) ?? undefined;
                 if (resumeParent && resumeParent !== session) {
@@ -2483,6 +2458,40 @@ async function handle(
                 } else {
                     log("info", `[${sessionId}] [resume-inheritance] matched tracked chain ${resume.sessionId} but the parent session is not loadable — starting fresh (#1486)`);
                 }
+            }
+        }
+        // [#1333] explicitly derived conversations (pi RLM child, omp fork,
+        // opencode subagent: the plugin reported its parent at register)
+        // record the parent link once — normally on the child's first request,
+        // but the register POST can land AFTER it (the extension flips
+        // tools-ready before the register completes), so late requests of the
+        // same session may record it (#1362). No state is copied — acp-kernel's
+        // syncBlocks deactivates blocks whose source messages are absent from
+        // the child's wire, so seeding blocks into an empty-history child never
+        // sticks. Instead decompress/search_context fall back to the linked
+        // parent chain at read time (src/decompress-shared.ts, depth cap 8).
+        // Late binding is harmless (the link copies nothing at link time), so
+        // the gate is idempotence, not first-request. Runs AFTER the #1486
+        // resume match above: a replay-fork child that already inherited has
+        // derivedFromSessionId set and skips this link.
+        if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
+            try {
+                const parentSession = resolveConversation(derivedParent)?.session;
+                if (parentSession) {
+                    session.metadata.derivedFrom = derivedParent;
+                    session.metadata.derivedFromSessionId = parentSession.id;
+                    markDirty(session);
+                    log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
+                } else if (session.metadata.derivedLinkMissLogged !== true) {
+                    // The relaxed gate retries resolution on EVERY request until the link
+                    // lands — cap the miss signal at one line per session per proxy
+                    // process (in-memory flag: a restart re-warns once, which is useful).
+                    session.metadata.derivedLinkMissLogged = true;
+                    log("warn", `[${session.id}] [derived] parent conversation ${derivedParent} is unknown to this proxy — no inheritance; continuing fresh (#1333)`);
+                }
+            } catch (err) {
+                if (session.metadata.derivedLinkMissLogged !== true) session.metadata.derivedLinkMissLogged = true;
+                log("warn", `[${session.id}] [derived] parent link from ${derivedParent} failed (${String(err)}); continuing fresh (#1333)`);
             }
         }
         // Responses, OpenAI-chat AND Anthropic-wire clients that send their

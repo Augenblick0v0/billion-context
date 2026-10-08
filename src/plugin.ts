@@ -633,7 +633,11 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
         pendingRegisters.push({ conversationId, agent, ts: Date.now(), ...(parentConversationId ? { parentConversationId } : {}) });
         while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
     } else {
-        registeredIds.set(conversationId, { agent, ...(parentConversationId ? { parentConversationId } : {}) });
+        // #2408: a parent declaration is sticky for a conversation — a
+        // follow-up register WITHOUT one (claude's MCP shim re-registering the
+        // session the fork hook already declared) must not erase it.
+        const parent = parentConversationId ?? registeredIds.get(conversationId)?.parentConversationId;
+        registeredIds.set(conversationId, { agent, ...(parent ? { parentConversationId: parent } : {}) });
         while (registeredIds.size > MAX_PENDING_REGISTERS) {
             const oldest = registeredIds.keys().next().value;
             if (oldest !== undefined) registeredIds.delete(oldest);
