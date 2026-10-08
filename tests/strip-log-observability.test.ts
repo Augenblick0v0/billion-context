@@ -135,6 +135,27 @@ test("plugin chat pipe settles with one total line and no double-write (#2405c)"
     assert.ok(!reqLogs.some((m) => m.includes("[tag-echo]")), `double-write detected: ${reqLogs.join(" | ")}`);
 });
 
+test("single-strip response: detail line only, no total line (n==1 boundary, #2405c)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        const events = [
+            chatChunk({ role: "assistant" }),
+            chatChunk({ content: `see ${TAG("m00007")} ok` }),
+            chatChunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 5 } }),
+            DONE,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession("sess-one", "openai"));
+    } finally {
+        setLogCapture(null);
+    }
+    const details = logs.filter((l) => l.includes("stripped model-emitted render tag"));
+    assert.equal(details.length, 1, `one-shot detail line expected, got: ${logs.join(" | ")}`);
+    // n==1 is fully described by the detail line — the total must stay silent
+    assert.ok(!logs.some((l) => l.includes("occurrence(s) total")), logs.join(" | "));
+});
+
 test("plugin responses pipe settles with one total line (#2405c)", async () => {
     const out: string[] = [];
     const logs: string[] = [];
