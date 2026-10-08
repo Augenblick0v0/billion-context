@@ -1762,10 +1762,12 @@ export const WEB_CLIENT = `(function () {
             inp.step = String(NUDGE_STEP);
             inp.spellcheck = false;
             inp.placeholder = t("cfg.q_tiers_auto");
-            inp.title = t("cfg.q_tiers_tip_" + k);
             qCtrls.push(inp);
             tierInps[k] = inp;
         });
+        tierInps.t1.title = t("cfg.q_tiers_tip_t1");
+        tierInps.t2.title = t("cfg.q_tiers_tip_t2");
+        tierInps.t3.title = t("cfg.q_tiers_tip_t3");
         function syncTiers() {
             commit((d) => {
                 if (!compressOf(d)) d.compress = {};
