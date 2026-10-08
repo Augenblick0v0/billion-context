@@ -43,6 +43,7 @@ import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { manifestForkCapable, tryForkAdoption } from "./fork-adopt.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -66,6 +67,11 @@ type AgentLike = {
         // older builds (duck-typed access below degrades to the global
         // selection).
         requestHeader?: () => { config?: { provider?: unknown; model?: unknown } } | undefined;
+        // #2399: dsh fork children (commands.ts fork()) persist the parent
+        // SessionId + isSeeded on the child's SessionHeader; isSeeded gates the
+        // adoption (subagent children also carry parentSession but start from
+        // a fresh task context — no replay to adopt).
+        header?: { parentSession?: unknown; isSeeded?: unknown } | undefined;
     } | undefined;
 };
 // #1677: DSH's command executor hands the invoking agent to the handler via the
@@ -646,6 +652,106 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
     return attr.state === "ok" ? attr.sid : undefined;
 }
 
+// #2399: fork-child adoption state, per dsh session id. A dsh fork child
+// (header.isSeeded === true with a parentSession) replays its parent's event
+// prefix; without adoption the replay lands as a brand-new conversation and
+// preflight refolds the whole inherited history from scratch (#2383). The
+// beforeSend hook below adopts the parent's compression state via the plugin
+// fork protocol BEFORE the child's first stamped model request, so the very
+// request that carries the replay already rides the inherited folds. Adoption
+// runs at most once per sid (success or terminal degrade); transient failures
+// retry on later requests up to the cap, then the session simply keeps today's
+// behavior.
+const FORK_ATTEMPT_CAP = 3;
+const forkDone = new Set<string>();
+const forkAttempts = new Map<string, number>();
+const forkInflight = new Map<string, Promise<void>>();
+
+/** A seeded fork child of the current initiator, or undefined. The gate is
+ *  header.isSeeded === true (set only by dsh's fork seed path): subagent
+ *  sessions carry parentSession WITHOUT isSeeded — they run fresh task
+ *  contexts, never replay the parent history, and must NOT inherit. */
+function forkChildOf(ctx: PluginContext): { sid: string; parent: string } | undefined {
+    let session: AgentLike["session"];
+    try {
+        session = ctx.agents?.currentInitiator?.()?.session;
+    } catch {
+        return undefined;
+    }
+    const sid = typeof session?.id === "string" && session.id.length > 0 ? session.id : undefined;
+    if (sid === undefined || session?.header === undefined) return undefined;
+    const parent = session.header.parentSession;
+    if (session.header.isSeeded !== true || typeof parent !== "string" || parent.length === 0 || parent === sid) return undefined;
+    return { sid, parent };
+}
+
+function bodyJsonOf(init: RequestInit | undefined): unknown {
+    const raw = init?.body;
+    if (typeof raw === "string") {
+        try {
+            return JSON.parse(raw);
+        } catch {
+            return undefined;
+        }
+    }
+    if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) {
+        try {
+            return JSON.parse(new TextDecoder().decode(raw));
+        } catch {
+            return undefined;
+        }
+    }
+    return undefined;
+}
+
+async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
+    if (!register.toolsReady) return;
+    const child = forkChildOf(ctx);
+    if (child === undefined) return;
+    if (forkDone.has(child.sid)) return;
+    const body = bodyJsonOf(init);
+    if (body === undefined) return;
+    const base = register.base;
+    if (base === undefined) return;
+    if ((forkAttempts.get(child.sid) ?? 0) >= FORK_ATTEMPT_CAP) return;
+    const inflight = forkInflight.get(child.sid);
+    if (inflight !== undefined) {
+        await inflight;
+        return;
+    }
+    const run = (async (): Promise<void> => {
+        forkAttempts.set(child.sid, (forkAttempts.get(child.sid) ?? 0) + 1);
+        if (!(await manifestForkCapable(base))) {
+            const line = `bili-native-dsh: fork adoption for ${child.sid} skipped — the proxy does not advertise the fork capability (#2399)`;
+            console.error(line);
+            persistClientEvent(line);
+            forkDone.add(child.sid);
+            return;
+        }
+        const result = await tryForkAdoption({
+            base,
+            parentConversationId: child.parent,
+            childConversationId: child.sid,
+            body,
+            log: (line) => persistClientEvent(`bili-native-dsh: ${line}`),
+        });
+        if (result.outcome === "adopted") {
+            console.error(`bili-native-dsh: fork child ${child.sid} adopted parent ${child.parent} at branch point ${result.branchPoint}${result.replayed ? " (replayed)" : ""} (#2399)`);
+        } else {
+            console.error(`bili-native-dsh: fork adoption for ${child.sid} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
+        }
+        forkDone.add(child.sid);
+    })().catch((err: unknown) => {
+        console.error(`bili-native-dsh: fork adoption for ${child.sid} failed unexpectedly (${err instanceof Error ? err.message : String(err)}) (#2399)`);
+    });
+    forkInflight.set(child.sid, run);
+    try {
+        await run;
+    } finally {
+        forkInflight.delete(child.sid);
+    }
+}
+
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed
 // shapes yield undefined so callers fall through to ALS attribution then latest, never throw.
 function invocationSidOf(invocation: CommandInvocation | undefined): string | undefined {
@@ -1102,6 +1208,11 @@ export function apply(ctx: PluginContext): void {
         }
         return headers;
     };
+
+    // #2399: fork-child adoption runs before headersFor stamps the child's
+    // first plugin request — the proxy then binds the replayed prefix to the
+    // adopted parent state on that very request instead of starting fresh.
+    state.beforeSend = (_url, init) => maybeForkAdoptBeforeSend(ctx, init);
 
     // #1268: arm the interceptor's toolsReady gate — the first model request
     // holds until this resolves, so it stamps into plugin mode instead of

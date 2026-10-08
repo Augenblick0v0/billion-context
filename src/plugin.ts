@@ -940,7 +940,7 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
-function forkMessageIdentityHash(message: CoreMessage): string {
+export function forkMessageIdentityHash(message: CoreMessage): string {
     return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
 }
 
