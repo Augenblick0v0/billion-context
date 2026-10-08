@@ -4417,11 +4417,11 @@ async function preflightCompressIfNeeded(
     }
     // #1933 F1: scale the local text estimate by the per-route calibration
     // factor k̂ learned from this session's own usage reports (local estimate ÷
-    // what upstream actually billed, EMA, clamped 0.25–1 — one-way, deflate
-    // only; see settleUsageReport). Unknown/mismatched origin → raw estimate,
-    // i.e. today's behavior. #2117 B: the model dimension gates too — a factor
-    // learned on another model acts as absent here rather than deciding with a
-    // cross-model billing scale (currentCalibrationFactor).
+    // what upstream actually billed; clamped 0.25–4, two-way since #2366 — see
+    // settleUsageReport). Unknown/mismatched origin → raw estimate, i.e. the
+    // uncalibrated legacy behavior. #2117 B: the model dimension gates too — a
+    // factor learned on another model acts as absent here rather than deciding
+    // with a cross-model billing scale (currentCalibrationFactor).
     const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
@@ -4451,8 +4451,9 @@ async function preflightCompressIfNeeded(
     // upstream's billing scale diverges from the estimator's caliber
     // (incident #2313: a local OpenAI-compatible shim billed ~200 B/token —
     // the trigger read 7.3M-10.3M against a real 305K input, ~24-34x over),
-    // calibration cannot correct it (k̂ is one-way, clamped 0.25-1, and
-    // consistent samples below CALIBRATION_SAMPLE_MIN are discarded), so
+    // calibration cannot correct it (k̂ is two-way since #2366 but clamped
+    // 0.25-4, and a 24-34x shim sits far outside the clamp; consistent
+    // samples below CALIBRATION_SAMPLE_MIN are discarded), so
     // estimate-driven folding demands unreachable targets, cannot finish
     // inside client stream patience (~300s idle abort), and never lets a
     // forward through — 0 successful forwards in 12h while every failed
