@@ -36,7 +36,7 @@ type SnapshotResponse = {
     orderedMessages?: ForkIdentity[];
 };
 
-export type ForkAdoptionResult =
+type ForkAdoptionResult =
     | { outcome: "adopted"; branchPoint: number; replayed: boolean }
     | { outcome: "degraded"; reason: string };
 
