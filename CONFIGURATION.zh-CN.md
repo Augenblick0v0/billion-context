@@ -2031,6 +2031,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 - **扫描**（只读、尽力而为、5 分钟缓存）：opencode 全局 + 项目配置的 `plugin` 数组；pi 全局 + 项目 `.pi/settings.json` 的 `packages`；omp `config.yml` 的 `extensions`；claude 设置的 `enabledPlugins`/`plugins` 键 + `~/.claude/plugins/` 目录；kimi `plugins/installed.json`；hermes `~/.hermes/plugins/` 目录；dsh profile 的 `package.json` 依赖。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`，确定性判定）和**关键词疑似**条目（名称匹配 compress / compact / acp / summar* / context*；bili 自身条目永远跳过，`context7` 这类非压缩工具不会误报）。
 - **发现结果的出口**：客户端启动前的 launcher stderr；每个会话首个请求的一次性代理 warn 日志（client 由 `x-bili-plugin` 头或 wire 头识别）；会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。
 - **运行时证据**：未宣告的历史改写（#1001）与孤儿块废弃（被摘要的内容从客户端历史中被删掉）记入同一台账，让「疑似并存」与「实际观测到的干扰」互相印证。
+- **dsh 的 `auto: false` 只关闭自动触发**。profile bundle patch（`dsh.bundle.patch.yml`）写入的 `compaction-basic: { auto: false }` 跳过压力/溢出自压缩 —— 手动 `/compact`（以及空闲会话压缩）仍会触发。经 bili 路由的调用会被服务端闸门拒绝（#1729/#2360）；未经过 bili 直达上游的调用（桌面端插件接管门无法归因的路径）会落地，bili 在下次重放时检测出来（checkpoint 框架 + 折叠覆盖缺口），一个 turn 内重建自己的压缩状态，而不是让之后每次 compress 永久失败（#2432）。
 - opencode launcher/native 模式下已存在的 `opencode-acp` 按设计只记 info（#920 有意吸收它处理 legacy 会话）；其他场景一律告警。
 - 关闭方式：`BILI_CONFLICT_SCAN=0`。
 
