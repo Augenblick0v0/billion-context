@@ -741,6 +741,74 @@ test("anthropic adapter keeps prose after a self-closing echo (#2348)", async ()
     assert.equal(texts.join(""), "好的 结论", "no prose may be swallowed by the self-closing echo");
 });
 
+// #2348 owner decision §4 (instance C): a valid acplike open + single bare ref
+// closed by a FULLWIDTH corrupt close must die atomically in BOTH modes via
+// the existing drop callback — never silently swallowed, never leaking orphan
+// markup. The specimen bytes are the real ones (U+FF1C fullwidth less-than).
+const C_SPECIMEN = `${OPEN}tokens="38" string="true"\x3em00282${CLOSE}\n${OPEN}tokens="44" type="text"\x3em00281${LT}/\uFF1C\uFF1CDSML\uFF1C\uFF1C parameter>`;
+
+test("fullwidth-corrupt close dies atomically with its ref span, whole-text (#2348 §4)", () => {
+    assert.equal(stripAcpTags(C_SPECIMEN), "\n", "both spans go, only the newline survives");
+    assert.equal(stripAcpTags(`lead ${C_SPECIMEN} tail`), "lead \n tail", "no orphan ref+close residue");
+});
+
+test("streaming filter matches whole-text for the corrupt-close specimen at every split (#2348 §4)", () => {
+    const full = `lead ${C_SPECIMEN} tail`;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+    }
+});
+
+test("the widened close path drops via the warn callback, not silently (#2348 §4 constraint b)", () => {
+    // Mid-stream is the sharp case: without the widened class the fullwidth
+    // close never ends the swallow, the cap releases the ref+garbage back into
+    // the output, and only the trailing pair gets stripped.
+    const tag2 = `${OPEN}tokens="44" type="text"\x3em00281${LT}/\uFF1C\uFF1CDSML\uFF1C\uFF1C parameter>`;
+    const pair2 = `${LT}acpi tokens="1" type="text"\x3em00999${LT}/acpi\x3e`;
+    const stream = `${tag2}  more prose ${pair2}`;
+    const expected = stripAcpTags(stream);
+    assert.equal(expected, "  more prose ", "the span dies atomically, prose survives");
+    let warned = "";
+    const f = createTagEchoFilter((s) => { warned = s; });
+    let visible = "";
+    for (let i = 0; i < stream.length; i += 7) visible += f.push(stream.slice(i, i + 7));
+    visible += f.flush();
+    assert.equal(visible, expected, "streaming matches whole-text");
+    assert.ok(warned.length > 0, "the drop callback fired — the span went through drop(), not an EOF fallback");
+    assert.ok(f.dropped(), "accounted as dropped");
+});
+
+test("empty-name close is NOT swallowed by the widened close class (#2348 §4 constraint a)", () => {
+    const s = `ref m1234${LT}/> stays`;
+    assert.equal(stripAcpTags(s), s, "{1,32} keeps a minimum char: an empty-name close stays visible");
+    const f = createTagEchoFilter();
+    assert.equal(f.push(s) + f.flush(), s, "streaming agrees");
+});
+
+test("bili's own retrieval pointer marker survives both modes untouched (#2348 negative sample)", () => {
+    // The v1 census probe over-counted self-closing tags because \\b holds at
+    // the p/- boundary and swept in bili's own CCR export pointer — this is the
+    // family that must stay a permanent false negative.
+    const marker = `${LT}acp-retrieved-file ref="m0123" path="/tmp/x.txt" lines="42"/>`;
+    const s = `pointer ${marker} note`;
+    assert.equal(stripAcpTags(s), s);
+    for (let split = 0; split <= s.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+        assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+    }
+});
+
+test("attr-drifted self-closing (H-class sample) is stripped in both modes (#2348)", () => {
+    const h = `${LT}acp test="m00430"/>`;
+    assert.equal(stripAcpTags(`a ${h} b`), "a  b");
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`a ${h} b`) + f.flush(), "a  b");
+});
+
 test("filter stats() accumulates lifetime input/output/dropped (#673)", () => {
     const first = `hello ${TAG("m00123")}`;
     const f = createTagEchoFilter();

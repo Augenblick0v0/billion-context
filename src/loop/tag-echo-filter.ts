@@ -139,8 +139,14 @@ const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // acplike name and the body exactly one bare ref, so genuine HTML prose such
 // as "see </p>" or "<a>m1234 text</a>" is untouched. Runs BEFORE the lone
 // passes in stripAcpTags so the pair dies atomically instead of leaving the
-// ref behind.
-const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[a-zA-Z][a-zA-Z0-9]{0,15}>", "g");
+// ref behind. #2348 owner decision §4 (instance C): the close name class is
+// widened to any non-angle-bracket run — the census also contains FULLWIDTH
+// corrupt closes (`</｜｜DSML｜｜ parameter>`), which the ASCII class left as
+// orphan residue after the lone-open pass. {1,32} keeps a MINIMUM of one char
+// on purpose: an empty-name close (`m1234</>`) stays visible, it is more
+// likely shredded normal text than echo. Risk profile unchanged — the gate
+// still requires the valid acplike open AND the single-bare-ref body.
+const DEGEN_PAIR = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>\\s*m\\d{4,}\\s*\x3c\\/[^<>]{1,32}>", "g");
 // #2348: the self-closing render-tag imitation: <name …/> and the bare <name/>.
 // The kernel never emits it (its emitter is paired-form only); the model
 // truncates the shape mid-way. It is a COMPLETE unit — the '/' before '>'
@@ -236,7 +242,11 @@ function looseCloseEnd(s: string): number {
 // markup and keeps the existing hold/budget/flush behavior. Strict >
 // termination, same discipline as looseCloseSpan (a partial close at the
 // buffer end is still undecidable and stays held).
-const DEGEN_CLOSE_NAME = /^[a-zA-Z][a-zA-Z0-9]{0,15}>/;
+// #2348 §4: widened to any non-angle-bracket run so the streaming swallow
+// ends on fullwidth corrupt closes too — same {1,32} class as DEGEN_PAIR, so
+// both modes agree on where the span dies. The termination still routes
+// through drop(), i.e. the existing [tag-echo] warn callback (owner §4(b)).
+const DEGEN_CLOSE_NAME = /^[^<>]{1,32}>/;
 // Single bare ref, exactly one (#2190 DEGEN_PAIR body rule); standalone const so
 // this stays valid when the master REF_* token constants churn (#2025 stack compat, #2229).
 const SINGLE_REF_BODY = /^\s*m\d{4,}\s*$/;
