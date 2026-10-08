@@ -1511,6 +1511,8 @@ export const WEB_CLIENT = `(function () {
             updatePackNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
+            const tt = (cp && cp.tierNudgeTokens && typeof cp.tierNudgeTokens === "object" && !Array.isArray(cp.tierNudgeTokens)) ? cp.tierNudgeTokens : null;
+            ["t1", "t2", "t3"].forEach((k) => { tierInps[k].value = (tt && typeof tt[k] === "number") ? String(tt[k]) : ""; });
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
@@ -1671,6 +1673,52 @@ export const WEB_CLIENT = `(function () {
         nwrap.appendChild(nnote);
         box.appendChild(nwrap);
         nudge.addEventListener("change", syncNudge);
+        const tierInps = {};
+        ["t1", "t2", "t3"].forEach((k) => {
+            const inp = document.createElement("input");
+            inp.type = "number";
+            inp.id = "quick-tiers-" + k;
+            inp.className = "field-input mono";
+            inp.style.width = "96px";
+            inp.min = "1";
+            inp.step = "1000";
+            inp.spellcheck = false;
+            inp.placeholder = t("cfg.q_tiers_auto");
+            inp.title = t("cfg.q_tiers_tip_" + k);
+            qCtrls.push(inp);
+            tierInps[k] = inp;
+        });
+        const trow = document.createElement("div");
+        trow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const tlab = document.createElement("label");
+        tlab.htmlFor = "quick-tiers-t1";
+        tlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        tlab.textContent = t("cfg.q_tiers");
+        const tg = document.createElement("div");
+        tg.style.cssText = "display:flex;gap:6px;align-items:center";
+        ["t1", "t2", "t3"].forEach((k, i) => {
+            if (i > 0) tg.appendChild(document.createTextNode("/"));
+            const tag = document.createElement("span");
+            tag.style.cssText = "font-size:12px;color:#57606a";
+            tag.textContent = k.toUpperCase();
+            tg.appendChild(tag);
+            tg.appendChild(tierInps[k]);
+        });
+        trow.appendChild(tlab);
+        trow.appendChild(tg);
+        box.appendChild(trow);
+        function syncTiers() {
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const next = {};
+                ["t1", "t2", "t3"].forEach((k) => {
+                    const v = parseInt(tierInps[k].value, 10);
+                    if (!isNaN(v) && v >= 1) next[k] = v;
+                });
+                if (Object.keys(next).length === 0) delete d.compress.tierNudgeTokens; else d.compress.tierNudgeTokens = next;
+            });
+        }
+        ["t1", "t2", "t3"].forEach((k) => tierInps[k].addEventListener("change", syncTiers));
         const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
         qCtrls.push(ptInp);
         const ptWarn = document.createElement("div");

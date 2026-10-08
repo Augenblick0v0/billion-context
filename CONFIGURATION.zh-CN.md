@@ -201,6 +201,7 @@
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
+| `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | 派生值（T1 = nudgeGrowthTokens，T2/T3 = ×1.5） | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 "stream required"，网关超时永远无法触发。 |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
@@ -1100,6 +1101,13 @@
 - **默认值：** `50000`
 - **状态：** ACTIVE
 - **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。
+
+#### `tierNudgeTokens`
+
+- **类型：** `object` — `{ "t1"?: number, "t2"?: number, "t3"?: number }`（每个值为 token 数，≥ 1）
+- **默认值：** *（未设置——每层使用各自的派生值）*
+- **状态：** ACTIVE（需要 acp-kernel >= 0.0.106）
+- **说明：** T1/T2/T3 三条压缩路径的分层 token 质量触发阈值（#2376）。默认三层都从 `nudgeGrowthTokens` 派生（T1 = 步长，T2/T3 = 步长 × 1.5）；此字段可逐层独立钉死——例如长任务保持 T1 激进、让 T2 提前或延后蒸馏。每个**未设置**的子字段回退到该层的派生默认值，因此缺省或空对象与统一值完全向后兼容。只有 token 质量触发比较会变化：数量触发（`tiers.tier2Trigger` / `tiers.tier3Trigger`）、节奏下限、first-sight 质量旁路、压力/紧急路由均保持既有基准不变。跨全局 → provider → model 按**子字段**合并（model 层的 `t2` 不会丢掉 provider 层的 `t1`）。映射到内核字段 `nudge.tierGrowthTokens`。
 
 #### `preserveRecentMessages`
 

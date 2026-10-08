@@ -164,11 +164,20 @@ export type CompressSettings = {
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
      *  `truncate.threshold`. */
     emergencyThresholdPercent?: number | string;
-    /** Nudge growth magnitude in tokens — a compression nudge fires roughly
-     *  every time this many tokens become compressible. Flattens the kernel's
-     *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
-     *  `nudge.growthCap`). */
+     /** Nudge growth magnitude in tokens — a compression nudge fires roughly
+      *  every time this many tokens become compressible. Flattens the kernel's
+      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
+      *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** Per-tier nudge growth thresholds in tokens (#2376): independent token
+      *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
+      *  long tasks while letting T2 distill earlier/later. Each UNSET tier
+      *  falls back to the derived default (T1 = `nudgeGrowthTokens`, T2/T3 =
+      *  `nudgeGrowthTokens` × the kernel's 1.5 multiplier), so an absent or
+      *  empty object is fully backward compatible with the unified value.
+      *  Maps to kernel `nudge.tierGrowthTokens` (acp-kernel >= 0.0.106).
+      *  Deepest level wins PER FIELD across global → provider → model. */
+    tierNudgeTokens?: { t1?: number; t2?: number; t3?: number };
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -1626,7 +1635,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens",
+    "nudgeGrowthTokens", "tierNudgeTokens", "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools", "stripImages",
@@ -2022,6 +2031,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("tierNudgeTokens" in obj && obj.tierNudgeTokens !== undefined) {
+        const v = obj.tierNudgeTokens;
+        if (!v || typeof v !== "object" || Array.isArray(v)) {
+            ok = false;
+        } else {
+            const vo = v as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["tierNudgeTokens"]> = {};
+            for (const key of ["t1", "t2", "t3"] as const) {
+                if (!(key in vo)) continue;
+                const x = vo[key];
+                if (typeof x !== "number" || !Number.isFinite(x) || x < 1) { ok = false; continue; }
+                cleaned[key] = x;
+            }
+            if (ok && Object.keys(cleaned).length > 0) out.tierNudgeTokens = cleaned;
+        }
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
