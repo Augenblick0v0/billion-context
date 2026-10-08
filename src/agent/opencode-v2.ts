@@ -49,7 +49,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -133,6 +133,8 @@ export interface V2PluginContext {
 }
 
 const WINDOW_REFRESH_MS = 60000;
+// #2443: cooldown before re-trying a failed conditional-tool manifest fetch (pi/dsh parity); a down proxy must not be re-polled on every routed request.
+const TOOL_DELTA_RETRY_MS = 15000;
 
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
@@ -149,6 +151,9 @@ export interface V2State {
     outputs?: Map<string, number>;
     windowsAt?: number;
     windowsWarned?: boolean;
+    toolDelta?: Promise<void>;
+    toolDeltaReady?: boolean;
+    toolDeltaRetryAt?: number;
 }
 
 function refreshWindows(ctx: V2PluginContext, state: V2State): void {
@@ -342,6 +347,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!state.proxyBase) return;
             refreshWindows(ctx, state);
             stampHeaders(e);
+            ensureConditionalTools();
             // #2399 stage 3: adopt the fork child before its first request
             // reaches the proxy (see the forkAdopter comment above).
             const forkChild = typeof e.sessionID === "string" ? e.sessionID : "";
@@ -391,6 +397,66 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             console.warn("[bili-opencode] WebSocket handshake hook unavailable; Responses WebSocket traffic is not intercepted by this host");
         }
 
+        const makeToolExecutor = (toolName: string): ((input: Record<string, unknown>, c: { sessionID: string }) => Promise<{ content: string }>) => async (args, tctx) => {
+            if (pluginDisabled()) return { content: "bili: disabled (BILLION_CONTEXT_PLUGIN=0)" };
+            const base = state.proxyBase ?? proxyBaseFromEnv();
+            if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
+            try {
+                // Panel-first for acp_status: the proxy's status endpoint renders the same rich panel the /acp command shows; the forwarded kernel tool returns the legacy flat report. acp_status is read-only, so reading the panel changes no state. Fall back to the tool call when no panel comes back (older proxy, unknown conversation).
+                if (toolName === "acp_status") {
+                    const status = await fetchStatus(base, tctx.sessionID);
+                    const panel = status?.["panel"];
+                    if (typeof panel === "string" && panel.length > 0) return { content: panel };
+                }
+                const result = await forwardTool(base, tctx.sessionID, toolName, args, undefined, true);
+                // #2204: the V2 tool shape carries no error flag — a business failure rides the "[decompress FAILED:" receipt text the model reads.
+                return { content: result.text };
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (msg.includes("no model request has arrived with this conversation id yet")) {
+                    return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
+                }
+                return { content: msg };
+            }
+        };
+
+        const STATIC_TOOL_NAMES = new Set(V2_BILI_TOOLS.map((t) => t.name));
+
+        // #2443: the static list covers only the always-on core. The manifest is the host's authoritative declaration of the CONDITIONAL surface (acp_retrieve while CCR is armed, acp_rule while rules are on); without consulting it a CCR placeholder points at a tool the model can never call. The base is discovered lazily (native bootstrap / per-request routing), so register the delta on first routed request — single-flight, degrading inertly (tools stay unregistered) when the manifest is unreachable.
+        const ensureConditionalTools = (): void => {
+            if (state.toolDeltaReady || state.toolDelta !== undefined || pluginDisabled()) return;
+            const base = state.proxyBase;
+            if (base === undefined) return;
+            const retryAt = state.toolDeltaRetryAt;
+            if (retryAt !== undefined && Date.now() < retryAt) return;
+            state.toolDelta = fetchManifest(base, "openai")
+                .then((tools) => {
+                    const delta = tools.filter((t) => !STATIC_TOOL_NAMES.has(t.name));
+                    if (delta.length > 0 && ctx.tool?.transform) {
+                        const extraReg = ctx.tool.transform((editor) => {
+                            for (const t of delta) {
+                                editor.add({
+                                    name: t.name,
+                                    description: t.description,
+                                    input: t.inputSchema,
+                                    options: { codemode: false, permission: "allow" },
+                                    execute: makeToolExecutor(t.name),
+                                });
+                            }
+                        });
+                        void Promise.resolve(extraReg).then((reg) => { if (reg) registrations.push(reg); }).catch(() => {});
+                    }
+                    state.toolDeltaReady = true;
+                    state.toolDeltaRetryAt = undefined;
+                })
+                .catch(() => {
+                    state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
+                })
+                .finally(() => {
+                    state.toolDelta = undefined;
+                });
+        };
+
         const toolReg = await ctx.tool?.transform?.((editor) => {
             for (const t of V2_BILI_TOOLS) {
                 editor.add({
@@ -398,36 +464,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     description: t.description,
                     input: t.input,
                     options: { codemode: false, permission: "allow" },
-                    execute: async (args, tctx) => {
-                        if (pluginDisabled()) return { content: "bili: disabled (BILLION_CONTEXT_PLUGIN=0)" };
-                        const base = state.proxyBase ?? proxyBaseFromEnv();
-                        if (!base) return { content: "bili: no proxy detected (launch opencode through `bili opencode`, or point the provider baseURL at the bili proxy)" };
-                        try {
-                            // Panel-first for acp_status: the proxy's status
-                            // endpoint renders the same rich panel the /acp
-                            // command shows; the forwarded kernel tool returns
-                            // the legacy flat report. acp_status is read-only,
-                            // so reading the panel changes no state. Fall back
-                            // to the tool call when no panel comes back (older
-                            // proxy, unknown conversation).
-                            if (t.name === "acp_status") {
-                                const status = await fetchStatus(base, tctx.sessionID);
-                                const panel = status?.["panel"];
-                                if (typeof panel === "string" && panel.length > 0) return { content: panel };
-                            }
-                            const result = await forwardTool(base, tctx.sessionID, t.name, args, undefined, true);
-                            // #2204: the V2 tool shape carries no error flag — a
-                            // business failure rides the "[decompress FAILED:"
-                            // receipt text the model reads.
-                            return { content: result.text };
-                        } catch (err) {
-                            const msg = err instanceof Error ? err.message : String(err);
-                            if (msg.includes("no model request has arrived with this conversation id yet")) {
-                                return { content: "bili: no ACP state for this session yet — no model request has been routed through the proxy. Tell the user to send one normal message first; ACP activates automatically once model traffic flows through the proxy (verify the provider baseURL goes through bili, or launch via `bili opencode` / the installed plugin)." };
-                            }
-                            return { content: msg };
-                        }
-                    },
+                    execute: makeToolExecutor(t.name),
                 });
             }
         });
