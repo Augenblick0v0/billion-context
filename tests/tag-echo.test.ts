@@ -997,3 +997,91 @@ test("#2348 self-closing forms keep all following prose byte-for-byte (pre-fix s
         assert.ok(f.stats().dropped, `${label}: drop accounting (warn path)`);
     }
 });
+
+// #2348 v4 corpus: the five new attr-drift families from the owner's
+// EMIT-COUNTS audit (13-NEW-SHAPES-FIXTURES). The four paired shapes are
+// ref-body echoes with impossible attribute sets (style / state / type_orig
+// third attribute / hyphenated text-coercion) — stripped atomically in both
+// modes like every other paired echo. The cache fixture is different: a
+// LONE attrs-bearing opening followed by prose at EOF; whole-text keeps the
+// prose (LONE_OPEN drops only the open) while streaming drops it (#1720
+// wrapped-turn semantics, pre-existing — verified identical on pre-fix
+// faea7caf4). Owner's own audit downgrades this family (0 ref-adjacent hits),
+// so the divergence is pinned as-is rather than "fixed" against phantom data.
+const NEWSHAPES_DIR = new URL("./fixtures/painpoint-2348/new-shapes/", import.meta.url);
+
+test("#2348 v4: five attr-drift families — zero markup in either mode", () => {
+    for (const name of ["type_orig.tag.txt", "style.tag.txt", "state.tag.txt", "text-coercion.tag.txt"]) {
+        const input = readFileSync(new URL(name, NEWSHAPES_DIR), "utf8");
+        assert.ok(input.includes(LT), name + ": fixture must contain markup");
+        const wt = stripAcpTags(input);
+        assert.equal(wt, "", name + ": whole-text must strip the tag atomically");
+        for (const chunk of [1, 7, 32]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, "", name + ` chunk=${chunk}: streaming must strip atomically`);
+            assert.ok(f.stats().dropped, name + " must be accounted as dropped");
+        }
+    }
+    const msg = readFileSync(new URL("cache-message.txt", NEWSHAPES_DIR), "utf8");
+    const wtMsg = stripAcpTags(msg);
+    assert.equal(wtMsg, "Cache ledger: 6,672,281 tokens read / 55,971,908 t", "whole-text keeps the payload after a lone open");
+    assert.ok(!wtMsg.includes(LT));
+    const f = createTagEchoFilter();
+    let out = "";
+    for (let i = 0; i < msg.length; i += 7) out += f.push(msg.slice(i, i + 7));
+    out += f.flush();
+    assert.ok(!out.includes(LT), "no markup may leak in streaming");
+});
+
+test("#2348 v4: hard-cut close at EOF (</ap missing >) is dropped with its ref in both modes", () => {
+    const open = `${OPEN}tokens="5" type="text"\x3e`;
+    const cases: Array<[string, string]> = [
+        [`${open}m00992${LT}/ap`, ""],
+        [`前文 ${open}m00992${LT}/ap`, "前文 "],
+        [`${open}m00992${LT}/apicdefghijklmnopqrstuvwxyz`, ""],
+    ];
+    for (const [input, expected] of cases) {
+        assert.equal(stripAcpTags(input), expected, "whole-text: " + JSON.stringify(input));
+        for (const chunk of [1, 5, 16]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < input.length; i += chunk) out += f.push(input.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, expected, `streaming chunk=${chunk}: ` + JSON.stringify(input));
+        }
+    }
+    // controls: mid-text occurrences stay visible ($ anchor), complete closes
+    // ride DEGEN_PAIR, and names over 32 chars are left alone.
+    assert.equal(stripAcpTags(`x m00992${LT}/ap more`), `x m00992${LT}/ap more`);
+    assert.equal(stripAcpTags(`${open}m00991${LT}/apc\x3e`), "");
+    assert.equal(stripAcpTags(`${open}m00993${LT}/abcdefghijklmnopqrstuvwxyzabcdefg`), `m00993${LT}/abcdefghijklmnopqrstuvwxyzabcdefg`, "33-char name exceeds the cap and stays visible");
+});
+
+// #2348 pain point 1 (owner): ordinary turns carry 1-N canonical tags — that
+// is 100% of real traffic (avg 49.7/file), not an edge case. The expanded
+// matcher surface (SELF_CLOSE, widened close classes, TRUNC_REF_CLOSE) must
+// leave such turns byte-for-byte intact in BOTH modes.
+test("#2348 v4: ordinary tag-laden turns are byte-stable through both modes", () => {
+    for (const n of [1, 8, 49, 80]) {
+        let turn = "";
+        let expected = "";
+        for (let i = 1; i <= n; i++) {
+            const tok = i % 7 === 0 ? "1.2K" : String((i * 37) % 900);
+            turn += `第${i}段正文，结论先行。` + `${OPEN}tokens="${tok}" type="text"\x3em${String(i).padStart(4, "0")}${CLOSE}`;
+            expected += `第${i}段正文，结论先行。`;
+        }
+        turn += "收尾句。";
+        expected += "收尾句。";
+        assert.equal(stripAcpTags(turn), expected, `n=${n}: whole-text must be byte-exact`);
+        for (const chunk of [1, 7, 32, 512]) {
+            const f = createTagEchoFilter();
+            let out = "";
+            for (let i = 0; i < turn.length; i += chunk) out += f.push(turn.slice(i, i + chunk));
+            out += f.flush();
+            assert.equal(out, expected, `n=${n} chunk=${chunk}: streaming must be byte-exact`);
+        }
+    }
+});

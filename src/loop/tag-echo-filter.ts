@@ -181,6 +181,16 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$|\x3c" + NAME + "\\s*=\
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
+
+// #2348 v4 corpus (owner EMIT-COUNTS): the `</ap` missing-`>` family (213
+// ref-adjacent hits, 4th most common attested shape) ends a turn with a bare
+// ref flush against a close cut mid-name at the hard stream boundary. Ref
+// adjacency is the gate — prose never puts mNNNNN directly against a dangling
+// </word — so the rule drops [ref][truncated close] together instead of
+// leaving an orphan residue like the acplike-named case does. ASCII names
+// ≤32 mirror the §4 close-name class minus non-ASCII breadth (unattested
+// without the final >); the $ anchor keeps mid-text occurrences visible.
+const TRUNC_REF_CLOSE = new RegExp("m\\d{4,}\\s*\\x3c\\/([a-zA-Z]{0,32})$");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -418,6 +428,7 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
+        .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
         .replace(MARKER_LINE, "");
     return stripBiliArtifacts(out);
 }
@@ -1192,6 +1203,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         result = rest;
                     }
                 }
+            }
+            // #2348 v4: same hard-cut tail as the whole-text TRUNC_REF_CLOSE
+            // pass, applied to whatever survives the branch above so both
+            // modes agree at true EOF.
+            const cut = TRUNC_REF_CLOSE.exec(result);
+            if (cut !== null) {
+                drop(result.slice(cut.index));
+                result = result.slice(0, cut.index);
             }
             if (result.length > 0) lastEmitted = result[result.length - 1];
             if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
