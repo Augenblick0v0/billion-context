@@ -344,7 +344,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
     input: ApplyCompressionInput,
   ): ApplyCompressionResult {
     const state: CompressionState = cloneState(input.state);
-    const runId = allocateRunId(state);
+    // Lazy run-id allocation (#2370): never advance nextRunId on a no-op
+    // failure — the host forkSnapshot fingerprint hashes full state, so a bump
+    // here would churn contextGeneration on every failed manual tool.
+    let allocatedRunId: string | null = null;
+    const runIdOf = (): string => (allocatedRunId ??= allocateRunId(state));
     let blocksCreated = 0;
     let tokensCompressed = 0;
     const errors: string[] = [];
@@ -645,7 +649,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             applyRefolds({
               spec,
               state,
-              runId,
+              runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
             });
@@ -681,7 +685,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           spec,
           messages: input.messages,
           state,
-          runId,
+          runId: runIdOf(),
           config: input.config,
           protectedMessageIds,
           countTokens,
@@ -2082,6 +2086,7 @@ function cloneState(state: CompressionState): CompressionState {
       ? [...state.hiddenOrphanRefs]
       : undefined,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
+    lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
   };
 }
 
