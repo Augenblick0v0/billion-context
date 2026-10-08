@@ -291,7 +291,9 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.match(errs[0].msg, /compression substrate appears destroyed/);
         assert.match(errs[0].msg, /host-native compaction/);
         assert.match(errs[0].msg, /#2193/);
-        assert.ok(logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length >= 5, "per-pass warns keep flowing underneath");
+        // #2297: the per-pass warn now STOPS once the episode escalated —
+        // passes 1-2 warn, pass 3's error supersedes its own warn, 4-5 silent.
+        assert.equal(logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length, 2, "per-pass warns stop after the single escalation error");
     });
 
     test("a clean pass resets the streak; a later episode escalates again", () => {
@@ -467,5 +469,114 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(result.claims, 1);
         assert.equal(result.unmatched, 0);
         assert.equal(session.state.blocks[0].effectiveMessageIds[4], "k4-new");
+    });
+});
+
+describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
+    type LogLine = { level: string; msg: string };
+    function coveredSession(n: number): Session {
+        const ids = Array.from({ length: n }, (_, i) => `c${i}`);
+        return {
+            state: { blocks: [{ active: true, effectiveMessageIds: ids }] },
+            metadata: {},
+        } as unknown as Session;
+    }
+    function makeOpts(logs: LogLine[]): ReconcileOptions & { mode: "repair" } {
+        return { sessionId: "s1", mode: "repair", log: (level: string, m: string) => logs.push({ level, msg: m }) };
+    }
+    const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
+    const driftWarns = (logs: LogLine[]) => logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length;
+    // #2202 guard: reconciliation only runs on conversation-sized passes (>=10
+    // msgs); side-request-shaped short passes take no evidence. Every drift pass
+    // below therefore carries a fresh 10-message tail whose ids never overlap the
+    // covered set — still a total-loss pass, now past the guard.
+    const freshTail = (tag: string, n = 10): CoreMessage[] =>
+        Array.from({ length: n }, (_, i) => msg(`${tag}${i}`, "assistant", `${tag} fresh tail turn ${i} padding words`));
+
+    test("missing counts only ACTIVE block coverage; dead-lineage ids drop out", () => {
+        // #2293 shape: the host truncated its own history; syncBlocks has
+        // already deactivated the old blocks (active=false) but their
+        // effectiveMessageIds persist in state — they can never re-anchor and
+        // must not sit in `missing` forever. Pre-seeded anchors simulate the
+        // persisted state from when those blocks were still live.
+        const liveIds = Array.from({ length: 12 }, (_, i) => `live${i}`);
+        const deadIds = Array.from({ length: 50 }, (_, i) => `dead${i}`);
+        const seedAnchors: Record<string, FoldAnchor> = {};
+        for (const id of [...deadIds, ...liveIds]) seedAnchors[id] = anchorOf(msg(id, "user", `text ${id}`));
+        const session = {
+            state: { blocks: [
+                { active: true, effectiveMessageIds: liveIds },
+                { active: false, effectiveMessageIds: deadIds.slice(0, 40) },
+                { active: false, effectiveMessageIds: deadIds.slice(40) },
+            ]},
+            metadata: { foldAnchors: seedAnchors, foldAnchorOrder: [...deadIds, ...liveIds] },
+        } as unknown as Session;
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        // Owner-deletion pass: the client resends only a fresh tail (>=10 msgs to
+        // clear the #2202 side-request guard), none of which is a covered id.
+        const result = reconcileFoldCoverage(session, freshTail("tail"), opts);
+        assert.equal(result.missing, 12, "only active coverage counts as missing");
+        assert.equal(result.unmatched, 12);
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        assert.equal(Object.keys(anchors).length, 12, "dead-id anchors pruned (MAX_ANCHORS budget freed)");
+        assert.ok(!("dead0" in anchors));
+        assert.ok("live0" in anchors);
+    });
+
+    test("per-pass WARN stops once the episode escalated; recovery re-arms", () => {
+        const n = 12; // above the 10-id escalation floor
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        reconcileFoldCoverage(session, freshTail("p1"), opts);
+        reconcileFoldCoverage(session, freshTail("p2"), opts);
+        assert.equal(driftWarns(logs), 2, "pre-escalation total-loss passes still warn");
+        reconcileFoldCoverage(session, freshTail("p3"), opts);
+        assert.equal(errorLines(logs).length, 1, "third total-loss pass escalates once");
+        assert.equal(driftWarns(logs), 2, "the escalation pass's error supersedes its own warn");
+        reconcileFoldCoverage(session, freshTail("p4"), opts);
+        reconcileFoldCoverage(session, freshTail("p5"), opts);
+        assert.equal(driftWarns(logs), 2, "escalated episode stays silent after the error line");
+        assert.equal(session.metadata.foldDriftEscalated, true);
+        // Recovery resets the latch so a later episode reports fresh.
+        reconcileFoldCoverage(session, originals, opts);
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "recovery clears the latch");
+    });
+
+    test("total-loss warn names both mutation and benign client-side deletion", () => {
+        const n = 12;
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        reconcileFoldCoverage(session, freshTail("p1"), opts);
+        const warn = logs.find((l) => l.level === "warn" && /no anchor match/.test(l.msg));
+        assert.ok(warn, "pre-escalation drift pass warns");
+        assert.match(warn!.msg, /client-side deletion\/truncation/);
+        assert.match(warn!.msg, /benign/);
+        assert.doesNotMatch(warn!.msg, /originals re-enter the wire unfolded/, "deletion-misleading wording removed");
+    });
+
+    test("a persisted escalation latch stays silent across a process restart (#2293 terminal state)", () => {
+        // The #2293 incident window: the episode predates the log window, the
+        // latch is restored from persisted metadata — no duplicate error line,
+        // no per-pass warn flood.
+        const n = 12;
+        const session = coveredSession(n);
+        session.metadata["foldDriftStreak"] = 5;
+        session.metadata["foldDriftSince"] = Date.now() - 3_600_000;
+        session.metadata["foldDriftEscalated"] = true;
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        for (let pass = 1; pass <= 3; pass++) {
+            reconcileFoldCoverage(session, freshTail(`r${pass}`), opts);
+        }
+        assert.equal(errorLines(logs).length, 0, "no duplicate error line after restart");
+        assert.equal(logs.filter((l) => l.level === "warn").length, 0, "no per-pass warn flood either");
+        assert.equal(session.metadata["foldDriftStreak"], 8, "the streak keeps counting across the restart");
     });
 });
