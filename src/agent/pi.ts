@@ -425,7 +425,15 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
-                const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                // #2416: read the LIVE base — a native respawn after a proxy
+                // death moves the origin (the interceptor rewrites
+                // BILLION_CONTEXT_PROXY), and a captured base would keep
+                // firing at a dead port for the whole session while the model
+                // channel recovers on its next dispatch. Same precedence as
+                // registration (baseUrl /bili/ first, env second); the
+                // captured value stays as fallback when nothing resolves.
+                const base = proxyBaseForCtx(ctx) ?? proxyBase;
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
