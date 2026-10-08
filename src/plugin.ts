@@ -2169,17 +2169,19 @@ export async function pipePluginChatWithStrip(
     const maybeWarnDegenerate = () => {
         if (!sawTerminal || res.destroyed || res.writableEnded) return;
         let inputChars = 0;
+        let dropCount = 0;
         let dropped = false;
         for (const s of streams.values()) {
             const st = s.filter.stats();
             inputChars += st.inputChars;
+            dropCount += st.dropCount;
             dropped = dropped || st.dropped;
         }
         const msg = degenerateTurnWarning({
             reason: finalFinishReason,
             terminalReason: protocol === "anthropic" ? "end_turn" : protocol === "google" ? "STOP" : "stop",
             toolCalls: sawToolUse ? 1 : 0,
-            text: { inputChars, outputChars: visibleTextChars, dropped },
+            text: { inputChars, outputChars: visibleTextChars, dropped, dropCount },
             sawThinking,
             wire: `plugin-passthrough-${protocol}`,
         });
@@ -3025,7 +3027,7 @@ export async function pipePluginResponsesWithStrip(
             toolCalls: sawFunctionCall ? 1 : 0,
             // #1778: fast-path prose bypasses the filter, so surface it here —
             // otherwise every clean-prose turn looks like an empty one.
-            text: fastPathChars > 0 ? { inputChars: st.inputChars, outputChars: st.outputChars + fastPathChars, dropped: st.dropped } : st,
+            text: fastPathChars > 0 ? { inputChars: st.inputChars, outputChars: st.outputChars + fastPathChars, dropped: st.dropped, dropCount: st.dropCount } : st,
             sawThinking: sawReasoning,
             wire: "plugin-passthrough-responses",
         });

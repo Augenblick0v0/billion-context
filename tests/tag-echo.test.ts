@@ -827,7 +827,7 @@ test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#6
         reason: "end_turn" as string | undefined,
         terminalReason: "end_turn",
         toolCalls: 0,
-        text: { inputChars: 63, outputChars: 0, dropped: true },
+        text: { inputChars: 63, outputChars: 0, dropped: true, dropCount: 1 },
         sawThinking: true,
         wire: "anthropic",
     };
@@ -837,8 +837,8 @@ test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#6
     assert.match(hit ?? "", /stripped as render-tag echo/);
     assert.equal(degenerateTurnWarning({ ...base, reason: "tool_use" }), null);
     assert.equal(degenerateTurnWarning({ ...base, toolCalls: 1 }), null);
-    assert.equal(degenerateTurnWarning({ ...base, text: { inputChars: 5, outputChars: 3, dropped: false } }), null);
-    assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false } }) ?? "", /no visible text emitted/);
+    assert.equal(degenerateTurnWarning({ ...base, text: { inputChars: 5, outputChars: 3, dropped: false, dropCount: 0 } }), null);
+    assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 } }) ?? "", /no visible text emitted/);
 });
 
 test("anthropic adapter warns on degenerate typo-tag-only turn (#673)", async () => {
