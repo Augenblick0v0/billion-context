@@ -136,6 +136,39 @@ test("createForkAdopter never throws — an exploding network soft-degrades and 
     assert.equal(lines.length, callsBefore, "the child is done after the first terminal outcome");
 });
 
+test("createForkAdopter retries transient failures until the cap, then closes (#2403 review)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    const { fetchImpl, calls } = fakeFetchRouting([
+        manifestRoute,
+        matchSnapshot,
+        { match: (c) => c.url.endsWith("/__bili/plugin/fork"), respond: () => new Response("upstream melted", { status: 503 }) },
+    ]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 3, "each attempt within the cap re-posts");
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 3, "past the cap the window is closed");
+});
+
+test("createForkAdopter skips side-shaped bodies without consuming the attempt budget (#2399 gate ④)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, matchSnapshot, forkRoute]);
+    const adopter = createForkAdopter(() => undefined, { fetchImpl });
+    const side = adoptInput({ body: { messages: [{ role: "user", content: "title please" }], max_tokens: 64 } });
+    await adopter.maybeAdopt(side);
+    await adopter.maybeAdopt(side);
+    assert.equal(calls.length, 0, "a title sidecar neither fetches nor burns attempts");
+    const main = adoptInput();
+    await adopter.maybeAdopt(main);
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 1, "the next real main request adopts normally");
+});
+
 test("createForkAdopter single-flights concurrent adoptions for the same child", async () => {
     resetForkCapabilityCacheForTest();
     let releaseSnapshot: (() => void) | undefined;
