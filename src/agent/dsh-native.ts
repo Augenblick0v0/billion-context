@@ -43,7 +43,8 @@ import { resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
-import { manifestForkCapable, tryForkAdoption } from "./fork-adopt.js";
+import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
+export { sideShapedBody } from "./fork-adopt.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -652,20 +653,19 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
     return attr.state === "ok" ? attr.sid : undefined;
 }
 
-// #2399: fork-child adoption state, per dsh session id. A dsh fork child
-// (header.isSeeded === true with a parentSession) replays its parent's event
-// prefix; without adoption the replay lands as a brand-new conversation and
-// preflight refolds the whole inherited history from scratch (#2383). The
-// beforeSend hook below adopts the parent's compression state via the plugin
-// fork protocol BEFORE the child's first stamped model request, so the very
-// request that carries the replay already rides the inherited folds. Adoption
-// runs at most once per sid (success or terminal degrade); transient failures
-// retry on later requests up to the cap, then the session simply keeps today's
-// behavior.
-const FORK_ATTEMPT_CAP = 3;
-const forkDone = new Set<string>();
-const forkAttempts = new Map<string, number>();
-const forkInflight = new Map<string, Promise<void>>();
+// #2399: dsh fork-child adoption. A dsh fork child (header.isSeeded === true
+// with a parentSession) replays its parent's event prefix; without adoption
+// the replay lands as a brand-new conversation and preflight refolds the whole
+// inherited history from scratch (#2383). The beforeSend hook below adopts the
+// parent's compression state via the plugin fork protocol BEFORE the child's
+// first stamped model request, so the very request that carries the replay
+// already rides the inherited folds. The bookkeeping (once per sid, transient
+// retry cap, single-flight) lives in the shared createForkAdopter coordinator
+// (src/agent/fork-adopt.ts).
+const dshForkAdopter = createForkAdopter((line) => {
+    console.error(`bili-native-dsh: ${line}`);
+    persistClientEvent(`bili-native-dsh: ${line}`);
+});
 
 /** A seeded fork child of the current initiator, or undefined. The gate is
  *  header.isSeeded === true (set only by dsh's fork seed path): subagent
@@ -704,74 +704,17 @@ function bodyJsonOf(init: RequestInit | undefined): unknown {
     return undefined;
 }
 
-// #2399 spec gate ④: side-shaped request = no tools AND a small output budget
-// (dsh title-gen / auto-review sidecars). They carry no replayed parent prefix,
-// so matching one would N=0-degrade the sid and permanently block the real
-// first stamped request from adopting. The server-side side heuristic uses the
-// same budget bound (#388: maxTokens <= 200). Exported for tests.
-export function sideShapedBody(body: unknown): boolean {
-    if (body === null || typeof body !== "object") return false;
-    const rec = body as Record<string, unknown>;
-    if (Array.isArray(rec.tools) && rec.tools.length > 0) return false;
-    const budget = typeof rec.max_tokens === "number" ? rec.max_tokens : typeof rec.max_completion_tokens === "number" ? rec.max_completion_tokens : undefined;
-    return budget !== undefined && budget <= 200;
-}
 
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     if (!register.toolsReady) return;
     const child = forkChildOf(ctx);
     if (child === undefined) return;
-    if (forkDone.has(child.sid)) return;
     const body = bodyJsonOf(init);
     if (body === undefined) return;
     if (sideShapedBody(body)) return;
     const base = register.base;
     if (base === undefined) return;
-    if ((forkAttempts.get(child.sid) ?? 0) >= FORK_ATTEMPT_CAP) return;
-    const inflight = forkInflight.get(child.sid);
-    if (inflight !== undefined) {
-        await inflight;
-        return;
-    }
-    const run = (async (): Promise<void> => {
-        forkAttempts.set(child.sid, (forkAttempts.get(child.sid) ?? 0) + 1);
-        if (!(await manifestForkCapable(base))) {
-            const line = `bili-native-dsh: fork adoption for ${child.sid} skipped — the proxy does not advertise the fork capability (#2399)`;
-            console.error(line);
-            persistClientEvent(line);
-            forkDone.add(child.sid);
-            return;
-        }
-        const result = await tryForkAdoption({
-            base,
-            parentConversationId: child.parent,
-            childConversationId: child.sid,
-            body,
-            log: (line) => persistClientEvent(`bili-native-dsh: ${line}`),
-        });
-        if (result.outcome === "adopted") {
-            console.error(`bili-native-dsh: fork child ${child.sid} adopted parent ${child.parent} at branch point ${result.branchPoint}${result.replayed ? " (replayed)" : ""} (#2399)`);
-            forkDone.add(child.sid);
-            return;
-        }
-        console.error(`bili-native-dsh: fork adoption for ${child.sid} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
-        // Only transient failures (network / 5xx / unmappable body) leave the
-        // window open so a later request retries up to FORK_ATTEMPT_CAP; every
-        // other outcome is terminal. Once this sid's stamped request has
-        // landed, a retry can only ever meet CHILD_CONFLICT (the server
-        // registers the child conversation before any later fork POST), which
-        // latches here as a non-transient outcome.
-        const transient = /^(snapshot|fork) (error|http 5\d\d)/.test(result.reason) || result.reason === "body unmappable";
-        if (!transient || (forkAttempts.get(child.sid) ?? 0) >= FORK_ATTEMPT_CAP) forkDone.add(child.sid);
-    })().catch((err: unknown) => {
-        console.error(`bili-native-dsh: fork adoption for ${child.sid} failed unexpectedly (${err instanceof Error ? err.message : String(err)}) (#2399)`);
-    });
-    forkInflight.set(child.sid, run);
-    try {
-        await run;
-    } finally {
-        forkInflight.delete(child.sid);
-    }
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed

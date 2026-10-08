@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { openaiToCore } from "acp-kernel/wire";
+import { openaiToCore, anthropicToCore, detectWireFormat } from "acp-kernel/wire";
 import type { CoreMessage } from "acp-kernel";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 
@@ -86,6 +86,35 @@ export function openaiBodyToCore(body: unknown): CoreMessage[] | null {
     }
 }
 
+/** Project an outgoing Anthropic body the same way (#2399 stage 2: pi/omp
+ *  can talk Anthropic wire). Mirrors the server's incomingCoreMessages
+ *  anthropic branch: clone → strip panel echoes → strip status markers →
+ *  anthropicToCore. Returns null when the body carries no messages array. */
+export function anthropicBodyToCore(body: unknown): CoreMessage[] | null {
+    if (body === null || typeof body !== "object") return null;
+    try {
+        const clone = structuredClone(body) as Record<string, unknown>;
+        if (!Array.isArray(clone.messages)) return null;
+        stripAcpPanelMessages(clone.messages);
+        stripAcpStatusMarkers(clone.messages);
+        return anthropicToCore(clone as Parameters<typeof anthropicToCore>[0]).msgs;
+    } catch {
+        return null;
+    }
+}
+
+/** Project an outgoing chat body of either chat dialect. Responses/google
+ *  bodies return null — the fork snapshot prefix match is text/role based and
+ *  those dialects are not projected client-side yet, so adoption for them
+ *  skips without consuming an attempt (the child simply starts fresh, as
+ *  today). */
+export function chatBodyToCore(body: unknown): CoreMessage[] | null {
+    const format = detectWireFormat(body);
+    if (format === "anthropic") return anthropicBodyToCore(body);
+    if (format === undefined || format === "openai") return openaiBodyToCore(body);
+    return null;
+}
+
 /** Longest prefix of `core` whose identity hashes equal the snapshot's, in
  *  order. 0 means the child body shares nothing with the parent — sending a
  *  fork would poison the child id, so the caller degrades instead. */
@@ -141,7 +170,7 @@ export async function tryForkAdoption(opts: {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
-        const core = openaiBodyToCore(opts.body);
+        const core = chatBodyToCore(opts.body);
         if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
         const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
         if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
@@ -211,4 +240,92 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
     } catch {
         return false;
     }
+}
+
+export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown };
+
+/** Per-host fork-adoption coordinator (#2399 stage 2): absorbs the bookkeeping
+ *  every host needs (done/attempts/single-flight keyed by child id, the
+ *  manifest capability gate, wire gating). Semantics carried over from the
+ *  stage-1 dsh wiring:
+ *  - the adoption window is BEFORE the child's first model request — a later
+ *    retry can only CHILD_CONFLICT, so every terminal outcome (adopted OR
+ *    degraded) marks the child done;
+ *  - responses/google bodies and manifest-incapable proxies skip WITHOUT
+ *    consuming an attempt (nothing was sent to the fork endpoints);
+ *  - never throws: an adoption failure degrades to today's behavior (fresh
+ *    conversation, preflight refolds the replayed history). */
+/** Side-shaped request body: no tools AND a tiny output budget (host
+ *  title-gen / auto-review sidecars). Mirrors the server-side side heuristic
+ *  budget bound (#388: maxTokens <= 200). Exported for tests. */
+export function sideShapedBody(body: unknown): boolean {
+    if (body === null || typeof body !== "object") return false;
+    const rec = body as Record<string, unknown>;
+    if (Array.isArray(rec.tools) && rec.tools.length > 0) return false;
+    const budget = typeof rec.max_tokens === "number" ? rec.max_tokens : typeof rec.max_completion_tokens === "number" ? rec.max_completion_tokens : undefined;
+    return budget !== undefined && budget <= 200;
+}
+
+export function createForkAdopter(log: (line: string) => void, opts?: { maxAttempts?: number; fetchImpl?: typeof fetch }): { maybeAdopt(input: ForkAdoptInput | undefined): Promise<void> } {
+    const maxAttempts = opts?.maxAttempts ?? 3;
+    const done = new Set<string>();
+    const attempts = new Map<string, number>();
+    const inflight = new Map<string, Promise<void>>();
+    const run = async (input: ForkAdoptInput): Promise<void> => {
+        attempts.set(input.child, (attempts.get(input.child) ?? 0) + 1);
+        if (!(await manifestForkCapable(input.base, opts?.fetchImpl))) {
+            log(`fork adoption for ${input.child} skipped — the proxy does not advertise the fork capability (#2399)`);
+            done.add(input.child);
+            return;
+        }
+        const result = await tryForkAdoption({
+            base: input.base,
+            parentConversationId: input.parent,
+            childConversationId: input.child,
+            body: input.body,
+            fetchImpl: opts?.fetchImpl,
+            log,
+        });
+        if (result.outcome === "adopted") {
+            done.add(input.child);
+            return;
+        }
+        log(`fork adoption for ${input.child} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
+        // Only transient failures (network / 5xx / unmappable body) leave the
+        // window open so a later request retries up to maxAttempts; every other
+        // outcome is terminal. Once this child's stamped request has landed, a
+        // retry can only ever meet CHILD_CONFLICT (the server registers the
+        // child conversation before any later fork POST), which latches here as
+        // a non-transient outcome (#2403 review).
+        const transient = /^(snapshot|fork) (error|http 5\d\d)/.test(result.reason) || result.reason === "body unmappable";
+        if (!transient || (attempts.get(input.child) ?? 0) >= maxAttempts) done.add(input.child);
+    };
+    return {
+        async maybeAdopt(input): Promise<void> {
+            if (input === undefined) return;
+            if (input.parent === "" || input.child === "" || input.parent === input.child) return;
+            if (input.base === "") return;
+            // #2399 spec gate ④: a side-shaped request (host title-gen / classify
+            // sidecar — no tools + a tiny output budget) carries no replayed
+            // prefix; matching it would N=0-degrade the child terminally before
+            // the real first main turn can adopt. Skipped BEFORE any attempt
+            // bookkeeping so it consumes no budget.
+            if (sideShapedBody(input.body)) return;
+            if (done.has(input.child)) return;
+            if ((attempts.get(input.child) ?? 0) >= maxAttempts) return;
+            const existing = inflight.get(input.child);
+            if (existing !== undefined) {
+                await existing.catch(() => undefined);
+                return;
+            }
+            const flight = run(input).catch((err: unknown) => {
+                log(`fork adoption for ${input.child} failed unexpectedly (${err instanceof Error ? err.message : String(err)}) (#2399)`);
+                done.add(input.child);
+            }).finally(() => {
+                inflight.delete(input.child);
+            });
+            inflight.set(input.child, flight);
+            await flight;
+        },
+    };
 }
