@@ -2209,8 +2209,13 @@ export async function pipePluginChatWithStrip(
     // #2405(c): per-response strip total. The one-shot detail line above only
     // proves stripping happened at least once; this makes the full count
     // observable for coverage acceptance without logging every event. n==1 is
-    // already fully described by its detail line, so stay silent there.
+    // already fully described by its detail line, so stay silent there. The
+    // guard mirrors the adapter twins: the terminal sequence and the catch
+    // path both call this, so a throw between the two must not double-log.
+    let stripSummarized = false;
     const maybeSummarizeStrips = () => {
+        if (stripSummarized) return;
+        stripSummarized = true;
         let total = 0;
         for (const s of streams.values()) total += s.filter.stats().dropCount;
         if (total > 1) loggerLog("warn", `${who}[tag-echo] stripped ${total} occurrence(s) total in this response`);
@@ -3033,8 +3038,12 @@ export async function pipePluginResponsesWithStrip(
         });
         if (msg) loggerLog("warn", `${who}${msg}`);
     };
-    // #2405(c): per-response strip total — see the chat-pipe twin above.
+    // #2405(c): per-response strip total — see the chat-pipe twin above, incl.
+    // the terminal/catch double-call guard.
+    let stripSummarized = false;
     const maybeSummarizeStrips = () => {
+        if (stripSummarized) return;
+        stripSummarized = true;
         const total = tagFilter.stats().dropCount;
         if (total > 1) loggerLog("warn", `${who}[tag-echo] stripped ${total} occurrence(s) total in this response`);
     };
