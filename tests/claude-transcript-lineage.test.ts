@@ -184,6 +184,7 @@ async function startRig(): Promise<Rig> {
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
+    const prevXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-lineage-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -236,6 +237,8 @@ async function startRig(): Promise<Rig> {
         closeAll: async () => {
             await closeOne(proxy);
             await closeOne(upstream);
+            if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdg;
         },
     };
 }
