@@ -110,8 +110,6 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // client-native rewrites must not read as "third-party plugin" evidence.
         "conflict.found": "：发现",
         "conflict.what_plugin": "与 bili 并存的第三方压缩插件",
-        // #2261: bili's own siblings are first-party — never label them third-party.
-        "conflict.what_sibling": "与 bili 并存的 bili 自家兄弟扩展（billion-context-pi / opencode-acp）",
         "conflict.what_native": "客户端原生自动压缩改写会话历史",
         "conflict.what_join": "、",
         "conflict.risk_active": "的痕迹。两个压缩器作用于同一会话会双压缩、破坏消息引用，可能导致上下文错乱——请只保留一个压缩器。",
@@ -526,8 +524,6 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         // #2102: composed per kind family present — see the zh entry above.
         "conflict.found": ": traces of ",
         "conflict.what_plugin": "a third-party compression plugin co-resident with bili",
-        // #2261: see the zh entry above — siblings are first-party.
-        "conflict.what_sibling": "a bili sibling extension (billion-context-pi / opencode-acp) co-resident with bili",
         "conflict.what_native": "client-native auto-compaction rewriting conversation history",
         "conflict.what_join": " and ",
         "conflict.risk_active": " were found. Two compressors on one conversation double-compress and corrupt message refs, which can scramble context — keep exactly one compressor.",

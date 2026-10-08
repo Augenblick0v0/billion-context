@@ -83,7 +83,8 @@ export const WEB_CLIENT = `(function () {
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
-        if (siblingN > 0) whatParts.push(t("conflict.what_sibling"));
+        // #2430: siblings are family, never a warning — they no longer appear in the
+        // "what" enumeration even in mixed ledgers (pure-sibling banners are hidden outright).
         if (nativeN > 0) whatParts.push(t("conflict.what_native"));
         const active = typeof c.active === "number" ? c.active : c.events;
         const hasConfirmed = confirmedTpN > 0 || nativeN > 0;
