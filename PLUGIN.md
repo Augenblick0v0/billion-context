@@ -209,6 +209,7 @@ Boundary handling is `exact` when complete blocks fit inside the prefix, `expand
 2. Send both headers on every model request through the proxy.
 3. Forward tool executions verbatim; return `result` as the tool result.
 4. Self-disable when not running behind bili (e.g. the agent's baseURL does not point at the proxy) — same convention as billion-context-pi / opencode-acp extensions.
+5. Keep tool-call ids byte-stable within one conversation, including when projecting it onto another provider. Tool-message identity keys on `toolCallId` as the protocol-stable pairing factor; a projection that rewrites those ids (e.g. sanitizing stored composite ids for a foreign Responses provider) silently loses fold coverage — compressed tool outputs re-enter the wire unfolded (#2396). Canonicalize ids at the host boundary before the payload reaches the proxy; the proxy detects the shape and names it in the fold-drift log, but never repairs onto guessed pairings (see MESSAGE-IDENTITY.md).
 
 ## Reference
 
