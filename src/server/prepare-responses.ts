@@ -13,7 +13,7 @@ import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, saniti
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { foldCoverage, markDirty, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
@@ -304,7 +304,7 @@ export async function prepareResponses(
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : rebuiltInput;
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                     }
@@ -325,7 +325,7 @@ export async function prepareResponses(
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : [...stableItems];
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(buildDirectiveText(span.startRef, span.endRef, outcome.topic)), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] compress directive appended as trailing user turn`);
                     } else {
@@ -340,7 +340,7 @@ export async function prepareResponses(
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : rebuiltInput;
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(renderedWithPayload), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                     }
