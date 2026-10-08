@@ -195,7 +195,7 @@ export type CompressSettings = {
       *  falls back to the derived default (T1 = `nudgeGrowthTokens`, T2/T3 =
       *  `nudgeGrowthTokens` × the kernel's 1.5 multiplier), so an absent or
       *  empty object is fully backward compatible with the unified value.
-      *  Maps to kernel `nudge.tierGrowthTokens` (acp-kernel >= 0.0.106).
+      *  Maps to kernel `nudge.tierGrowthTokens` (acp-kernel >= 0.0.107).
       *  Deepest level wins PER FIELD across global → provider → model. */
     tierNudgeTokens?: { t1?: number; t2?: number; t3?: number };
     /** Trailing messages never offered for compression

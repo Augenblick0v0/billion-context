@@ -220,7 +220,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
   *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
   *  - `tierNudgeTokens` → `nudge.tierGrowthTokens` (per-tier token-mass
-  *    thresholds, acp-kernel >= 0.0.106): each set sub-field pins that tier's
+  *    thresholds, acp-kernel >= 0.0.107): each set sub-field pins that tier's
   *    mass trigger independently; unset sub-fields fall back to the derived
   *    defaults INSIDE the kernel (T1 = growth step, T2/T3 = ×1.5), so a
   *    partially-set object still resolves fully. Absent leaves

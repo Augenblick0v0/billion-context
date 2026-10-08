@@ -1165,7 +1165,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 
 - **Type:** `object` — `{ "t1"?: number, "t2"?: number, "t3"?: number }` (each value in tokens, ≥ 1)
 - **Default:** *(unset — every tier uses its derived value)*
-- **Status:** ACTIVE (requires acp-kernel >= 0.0.106)
+- **Status:** ACTIVE (requires acp-kernel >= 0.0.107)
 - **Description:** Per-tier token-mass trigger thresholds for the T1/T2/T3 compression paths (#2376). By default all three tiers derive from `nudgeGrowthTokens` (T1 = the step, T2/T3 = step × 1.5); this field pins each tier independently — e.g. keep T1 aggressive for long tasks while letting T2 distill earlier or later. Each UNSET sub-field falls back to that tier's derived default, so an absent or empty object is fully backward compatible with the unified value. Only the token-mass trigger comparisons change: count triggers (`tiers.tier2Trigger` / `tiers.tier3Trigger`), the cadence floor, the first-sight mass bypass and pressure/emergency routing keep their existing bases. Merged PER SUB-FIELD across global → provider → model (a model-level `t2` does not discard a provider-level `t1`). Maps to the kernel field `nudge.tierGrowthTokens`.
 
 #### `preserveRecentMessages`
