@@ -17,6 +17,7 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { markDirty } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -73,7 +74,16 @@ import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN
  *    most recent debounce window. Process crashes (SIGKILL) are safe up to
  *    the last successful write.
  *  - No cross-process lock — two proxy processes sharing BILI_SESSIONS_DIR
- *    will clobber each other's writes. Single-instance only.
+ *    race on every write. The #405 monotonic-counter guard refuses to roll
+ *    the disk record back, and since #2401 the stale resident additionally
+ *    converges its in-memory state to the newer disk record at save time, so
+ *    serving tracks the newest lineage within one debounce window instead of
+ *    staying stale until restart. Residual: a lagging instance whose counters
+ *    later CATCH UP numerically is judged fresh again and may re-clobber —
+ *    true multi-writer coherence would need an election/lock, which this
+ *    design deliberately does not attempt. Recommendation: one state dir =
+ *    one live serving instance; restart the proxy on upgrade before resuming
+ *    sessions.
  *  - All writes within a process are serialized per-session by the kernel
  *    store's write chains; there is no per-session *request* serialization
  *    (two concurrent HTTP requests for the same session can interleave
@@ -687,13 +697,56 @@ export class SessionStore {
                 this.staleWarnAt.set(record.id, now);
                 this.log(
                     "warn",
-                    `[persist] rejected stale snapshot for session ${record.id}: in-memory copy is older than the on-disk one (another bili instance holds newer state) — keeping disk state, no rollback (#405)`,
+                    `[persist] rejected stale snapshot for session ${record.id}: in-memory copy is older than the on-disk one (another bili instance holds newer state) — keeping disk state and converging in-memory state to it, so subsequent requests serve the fuller fold coverage instead of the stale view (#405/#2401)`,
                 );
             }
+            // #2401: the guard proved the disk record is strictly newer — but
+            // only protecting DISK left this resident serving forever-stale
+            // fold state (missing blocks' covered content re-entered the wire
+            // unfolded and got re-billed until restart). Apply the disk record
+            // to the live session so serving converges on the same newest-wins
+            // arbitration the write side just used.
+            this.convergeToDisk(session, disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             return disk;
         };
+    }
+
+    /** #2401: read-side convergence. Replace the live session's persisted
+     *  surfaces with the newer disk record, in place (the object identity is
+     *  load-bearing — request handlers and the pool map hold references to
+     *  THIS object). The client/agent re-sends full history on the next
+     *  request in BOTH compression modes, so any in-turn progress made on the
+     *  losing lineage is re-derived from the resend; worst case costs one
+     *  extra compression round-trip. Deliberately NOT copied: contentStore
+     *  (separate-file lifecycle — degrades to retrieve misses, never crashes),
+     *  runtime-only fields (inFlight, pendingRetrievals handled below,
+     *  restored, lockChain), and metadata (kept local; re-stamped per request
+     *  where it matters). */
+    private convergeToDisk(session: Session, disk: PersistedSession): void {
+        const fresh = buildSession(disk);
+        const droppedRetrievals = session.pendingRetrievals.length;
+        session.state = fresh.state;
+        session.blockContents = fresh.blockContents;
+        session.stats = fresh.stats;
+        session.lastMessages = fresh.lastMessages;
+        session.lastMessagesFolded = fresh.lastMessagesFolded;
+        session.pluginSnapshot = fresh.pluginSnapshot;
+        session.lastSeen = fresh.lastSeen;
+        if (!session.meta.protocol && fresh.meta.protocol) session.meta.protocol = fresh.meta.protocol;
+        if (!session.meta.upstreamOrigin && fresh.meta.upstreamOrigin) session.meta.upstreamOrigin = fresh.meta.upstreamOrigin;
+        if (!session.meta.label && fresh.meta.label) session.meta.label = fresh.meta.label;
+        // Queued injections reference refs of the replaced lineage — drop them
+        // the way a full rebase does (#1343 rationale) instead of misattributing
+        // the expected loss as a proxy-restart drop later.
+        session.pendingRetrievals.length = 0;
+        delete session.metadata.ccrUndelivered;
+        delete session.metadata.ccrDropNotes;
+        if (droppedRetrievals > 0) {
+            this.log("warn", `[persist] ${session.id}: dropped ${droppedRetrievals} queued retrieval(s) during state convergence to the newer disk record (#2401)`);
+        }
+        markDirty(session);
     }
 
     /** Schedule a debounced write for a session. Multiple calls within the
