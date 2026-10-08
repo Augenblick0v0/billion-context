@@ -29,7 +29,7 @@ import { stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel
 import type { ConversationIdentity } from "../session-id.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolItems, countSystemAndToolsTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 
 export async function prepareResponses(
@@ -456,8 +456,14 @@ export async function prepareResponses(
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
     // mid-history items the kernel already classifies.
+    const loadedToolTokens = countLoadedToolItems(rebuilt);
     if (transformOk) {
-        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut);
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens;
+        const catalogTokens = defaultCountTokens(JSON.stringify(toolsOut ?? []));
+        const visibleTokens = defaultCountTokens(JSON.stringify(modelVisibleTools(toolsOut)));
+        if (catalogTokens >= 50_000 || catalogTokens !== visibleTokens || loadedToolTokens > 0) {
+            log("info", `[${sessionId}] tool-budget catalog~${catalogTokens} visible~${visibleTokens} loaded~${loadedToolTokens} instruction~${defaultCountTokens(responsesDevContent ?? "")} tokens (estimates; definitions preserved)`);
+        }
     }
     // #728: record this turn's outbound payload upper bound as the fallback
     // token source for upstreams that never report usage (see effectiveTokenCount).
@@ -466,11 +472,13 @@ export async function prepareResponses(
     if (!isCompactionTrigger) {
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + loadedToolTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + loadedToolTokens
             + imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
