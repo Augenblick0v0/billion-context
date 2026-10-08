@@ -2238,7 +2238,11 @@ export async function pipePluginChatWithStrip(
         let isTerminal = false;
         for (let ci = 0; ci < choices.length; ci++) {
             const ch = choices[ci] as Record<string, unknown> | null;
-            if (ch && typeof ch["finish_reason"] === "string") {
+            // #2405: an EMPTY finish_reason is not terminal — relays exist that stamp
+            // finish_reason:"" on every chunk; treating it as terminal folds the held
+            // render-tag tail on each event, releasing fragments before they can be
+            // recognized and silently disabling stripping.
+            if (ch && typeof ch["finish_reason"] === "string" && ch["finish_reason"] !== "") {
                 finalFinishReason = ch["finish_reason"] as string;
                 isTerminal = true;
             }
@@ -2462,7 +2466,8 @@ export async function pipePluginChatWithStrip(
         for (let ci = 0; ci < candidates.length; ci++) {
             const cand = candidates[ci] as Record<string, unknown> | null;
             if (!cand || typeof cand !== "object") continue;
-            if (typeof cand["finishReason"] === "string") {
+            // #2405: same relay quirk on the Gemini wire — empty finishReason is not terminal.
+            if (typeof cand["finishReason"] === "string" && cand["finishReason"] !== "") {
                 // Gemini's terminal event IS this chunk — the client throws when
                 // a stream ends without one, so `lastChunkMeta` carries it for
                 // the synthetic tail (see syntheticTail).
@@ -2751,7 +2756,8 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
     for (const c of choices) {
         if (!c || typeof c !== "object") continue;
         const ch = c as Record<string, unknown>;
-        if (typeof ch["finish_reason"] === "string") return true;
+        // #2405: an empty finish_reason carries nothing the client needs.
+        if (typeof ch["finish_reason"] === "string" && ch["finish_reason"] !== "") return true;
         const d = ch["delta"] as Record<string, unknown> | undefined;
         if (!d) continue;
         for (const k of Object.keys(d)) {
@@ -2811,7 +2817,8 @@ function googleFrameHasNonText(ev: Record<string, unknown>): boolean {
     for (const c of candidates) {
         if (!c || typeof c !== "object") continue;
         const cand = c as Record<string, unknown>;
-        if (typeof cand["finishReason"] === "string") return true;
+        // #2405: an empty finishReason carries nothing the client needs.
+        if (typeof cand["finishReason"] === "string" && cand["finishReason"] !== "") return true;
         const content = cand["content"];
         const parts = content && typeof content === "object" ? (content as Record<string, unknown>)["parts"] : undefined;
         if (!Array.isArray(parts)) continue;
