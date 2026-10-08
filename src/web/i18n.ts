@@ -4,7 +4,7 @@ export const LOCALES: readonly Locale[] = ["zh-CN", "en"];
 
 export const MESSAGES: Record<Locale, Record<string, string>> = {
     "zh-CN": {
-        "summary.title": "统一摘要服务",
+        "summary.title": "统一摘要服务（实验性功能）",
         "summary.enabled": "启用",
         "summary.add": "添加目标",
         "summary.ref": "目标（provider/model）",
@@ -421,7 +421,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "toast.failed": "操作失败：{msg}",
     },
     en: {
-        "summary.title": "Shared summary service",
+        "summary.title": "Shared summary service (experimental)",
         "summary.enabled": "Enabled",
         "summary.add": "Add target",
         "summary.ref": "Target (provider/model)",

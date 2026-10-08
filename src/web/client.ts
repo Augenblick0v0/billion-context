@@ -289,7 +289,7 @@ export const WEB_CLIENT = `(function () {
     function refreshDirtyFlag() {
         const el = $("cfg-file-edit");
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
-        ["card-quick", "card-file"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
+        ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
     }
 
