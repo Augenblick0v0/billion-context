@@ -151,7 +151,8 @@ export const WEB_CLIENT = `(function () {
         if (n === null || n === undefined || isNaN(n)) return t("common.none");
         n = Math.round(Number(n));
         const abs = Math.abs(n);
-        if (abs >= 1e9) return (n / 1e9).toFixed(1) + "B";
+        // #2413: B-tier was toFixed(1) → 100M step, cumulative counters looked frozen for days; toFixed(2) = 10M keeps growth visible.
+        if (abs >= 1e9) return (n / 1e9).toFixed(2) + "B";
         if (abs >= 1e6) return (n / 1e6).toFixed(1) + "M";
         if (abs >= 1e4) return Math.round(n / 1e3) + "K";
         if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K";
@@ -349,9 +350,13 @@ export const WEB_CLIENT = `(function () {
             $("st-sessions").textContent = String(total);
             $("st-sessions-sub").textContent = liveN + " " + t("ov.live_now") + " · " + Math.max(0, total - liveN) + " " + t("ov.hist");
             $("st-reqs").textContent = o.requests ? fmtW(o.requests) : t("common.none");
-            $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            const grossEl = $("st-gross");
+            grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
-            $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            const netEl = $("st-netsaved");
+            netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
