@@ -1578,8 +1578,7 @@ export const WEB_CLIENT = `(function () {
             updatePackNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
-            const tt = (cp && cp.tierNudgeTokens && typeof cp.tierNudgeTokens === "object" && !Array.isArray(cp.tierNudgeTokens)) ? cp.tierNudgeTokens : null;
-            ["t1", "t2", "t3"].forEach((k) => { tierInps[k].value = (tt && typeof tt[k] === "number") ? String(tt[k]) : ""; });
+            refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
@@ -1711,6 +1710,7 @@ export const WEB_CLIENT = `(function () {
                 const v = parseInt(nudge.value, 10);
                 if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) d.compress.nudgeGrowthTokens = v; else delete d.compress.nudgeGrowthTokens;
             });
+            refreshTierInputs();
         }
         function nudgeBtn(label, delta) {
             const b = document.createElement("button");
@@ -1740,21 +1740,54 @@ export const WEB_CLIENT = `(function () {
         nwrap.appendChild(nnote);
         box.appendChild(nwrap);
         nudge.addEventListener("change", syncNudge);
+        function tierDerivedOf(cp) {
+            const base = (cp && typeof cp.nudgeGrowthTokens === "number") ? cp.nudgeGrowthTokens : NUDGE_DEFAULT;
+            const m = Math.round(base * 1.5);
+            return { t1: base, t2: m, t3: m };
+        }
+        function refreshTierInputs() {
+            const cp = compressOf(draft);
+            const tt = (cp && cp.tierNudgeTokens && typeof cp.tierNudgeTokens === "object" && !Array.isArray(cp.tierNudgeTokens)) ? cp.tierNudgeTokens : null;
+            const dv = tierDerivedOf(cp);
+            ["t1", "t2", "t3"].forEach((k) => { tierInps[k].value = String((tt && typeof tt[k] === "number") ? tt[k] : dv[k]); });
+        }
         const tierInps = {};
         ["t1", "t2", "t3"].forEach((k) => {
             const inp = document.createElement("input");
             inp.type = "number";
             inp.id = "quick-tiers-" + k;
             inp.className = "field-input mono";
-            inp.style.width = "96px";
+            inp.style.width = "84px";
             inp.min = "1";
-            inp.step = "1000";
+            inp.step = String(NUDGE_STEP);
             inp.spellcheck = false;
             inp.placeholder = t("cfg.q_tiers_auto");
             inp.title = t("cfg.q_tiers_tip_" + k);
             qCtrls.push(inp);
             tierInps[k] = inp;
         });
+        function syncTiers() {
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const dv = tierDerivedOf(compressOf(d));
+                const next = {};
+                ["t1", "t2", "t3"].forEach((k) => {
+                    const v = parseInt(tierInps[k].value, 10);
+                    if (isNaN(v) || v < 1) { tierInps[k].value = String(dv[k]); return; }
+                    if (v !== dv[k]) next[k] = v;
+                });
+                if (Object.keys(next).length === 0) delete d.compress.tierNudgeTokens; else d.compress.tierNudgeTokens = next;
+            });
+        }
+        function tierBtn(k, delta) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn sm";
+            b.textContent = delta > 0 ? "+" : "\u2212";
+            b.title = t("cfg.q_tiers_step");
+            b.addEventListener("click", () => { const cur = parseInt(tierInps[k].value, 10); const base = isNaN(cur) ? tierDerivedOf(compressOf(draft))[k] : cur; tierInps[k].value = String(Math.max(1, base + delta)); syncTiers(); });
+            return b;
+        }
         const trow = document.createElement("div");
         trow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const tlab = document.createElement("label");
@@ -1762,29 +1795,27 @@ export const WEB_CLIENT = `(function () {
         tlab.style.cssText = "flex:0 1 auto;max-width:520px";
         tlab.textContent = t("cfg.q_tiers");
         const tg = document.createElement("div");
-        tg.style.cssText = "display:flex;gap:6px;align-items:center";
+        tg.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap";
         ["t1", "t2", "t3"].forEach((k, i) => {
             if (i > 0) tg.appendChild(document.createTextNode("/"));
             const tag = document.createElement("span");
             tag.style.cssText = "font-size:12px;color:#57606a";
             tag.textContent = k.toUpperCase();
             tg.appendChild(tag);
+            tg.appendChild(tierBtn(k, -NUDGE_STEP));
             tg.appendChild(tierInps[k]);
+            tg.appendChild(tierBtn(k, NUDGE_STEP));
         });
         trow.appendChild(tlab);
         trow.appendChild(tg);
-        box.appendChild(trow);
-        function syncTiers() {
-            commit((d) => {
-                if (!compressOf(d)) d.compress = {};
-                const next = {};
-                ["t1", "t2", "t3"].forEach((k) => {
-                    const v = parseInt(tierInps[k].value, 10);
-                    if (!isNaN(v) && v >= 1) next[k] = v;
-                });
-                if (Object.keys(next).length === 0) delete d.compress.tierNudgeTokens; else d.compress.tierNudgeTokens = next;
-            });
-        }
+        const twrap = document.createElement("div");
+        twrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+        twrap.appendChild(trow);
+        const tnote = document.createElement("div");
+        tnote.style.cssText = "font-size:12px;color:#57606a";
+        tnote.textContent = t("cfg.q_tiers_desc");
+        twrap.appendChild(tnote);
+        box.appendChild(twrap);
         ["t1", "t2", "t3"].forEach((k) => tierInps[k].addEventListener("change", syncTiers));
         const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
         qCtrls.push(ptInp);
