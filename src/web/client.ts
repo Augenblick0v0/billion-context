@@ -87,11 +87,22 @@ export const WEB_CLIENT = `(function () {
         if (nativeN > 0) whatParts.push(t("conflict.what_native"));
         const active = typeof c.active === "number" ? c.active : c.events;
         const hasConfirmed = confirmedTpN > 0 || nativeN > 0;
-        let onKey, riskKey;
-        if (hasConfirmed) { onKey = "conflict.on"; riskKey = active > 0 ? "conflict.risk_active" : "conflict.risk_historical"; }
-        else if (suspectedN > 0) { onKey = "conflict.on_suspected"; riskKey = "conflict.risk_suspected"; }
-        else { onKey = "conflict.on"; riskKey = "conflict.risk_sibling"; }
-        return { onKey: onKey, riskKey: riskKey, hasConfirmed: hasConfirmed, what: whatParts.join(t("conflict.what_join")), active: active };
+        // Resolve each branch through a direct translate call (not a key-to-text lookup table)
+        // so the #1024 static ref-scanner still counts every conflict.* key used here; surface
+        // both the key (locale-independent, asserted by tests) and the rendered text.
+        let onKey, riskKey, onText, riskText;
+        if (hasConfirmed) {
+            onKey = "conflict.on"; onText = t("conflict.on");
+            if (active > 0) { riskKey = "conflict.risk_active"; riskText = t("conflict.risk_active"); }
+            else { riskKey = "conflict.risk_historical"; riskText = t("conflict.risk_historical"); }
+        } else if (suspectedN > 0) {
+            onKey = "conflict.on_suspected"; onText = t("conflict.on_suspected");
+            riskKey = "conflict.risk_suspected"; riskText = t("conflict.risk_suspected");
+        } else {
+            onKey = "conflict.on"; onText = t("conflict.on");
+            riskKey = "conflict.risk_sibling"; riskText = t("conflict.risk_sibling");
+        }
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, what: whatParts.join(t("conflict.what_join")), active: active };
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
@@ -454,7 +465,7 @@ export const WEB_CLIENT = `(function () {
                 // #2219: per-client remediation block between the summary line and the
                 // details pointer — clients[] comes from summarizeConflicts (server-side
                 // resolution); payloads without it degrade to the generic hint only.
-                cb.innerHTML = '<strong>' + t(sev.onKey) + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + t(sev.riskKey) + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                cb.innerHTML = '<strong>' + sev.onText + "</strong>" + t("conflict.found") + escapeHtml(sev.what) + sev.riskText + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 cb.classList.toggle("info", !(sev.hasConfirmed && sev.active > 0));
                 cb.classList.toggle("warn", sev.hasConfirmed && sev.active > 0);
                 const btn = $("conflicts-clear-btn");
