@@ -1101,13 +1101,13 @@ function noEmergencyTruncate(config: Config): Config {
 // maxSummaryLength and the net-shrink bound by construction; the output is
 // deterministic (no timestamps), so repeated folds of identical content are
 // byte-stable for prefix caching.
-export interface DigestEntry {
+interface DigestEntry {
     ref: string;
     label: string;
     text: string;
 }
 
-export interface DeterministicDigestOptions {
+interface DeterministicDigestOptions {
     /** compress.maxSummaryLength chars; <= 0 means unbounded. */
     maxSummary?: number;
     /** compress.minSummaryLength chars — the floor the kernel requires. */
