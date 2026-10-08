@@ -5029,9 +5029,13 @@ async function forward(
             }
         }
     }
-    if (typeof wireBody === "string" && (opts.debug || bodyDumpEnabled())) {
+    // #2421: passthrough/side lanes forward Buffer bodies — normalize once so
+    // they get the same dumps/ structured view as the string lane; non-JSON
+    // payloads still fall out of the parse below (unchanged behavior).
+    if (opts.debug || bodyDumpEnabled()) {
+        const wireText = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         try {
-            const parsed = JSON.parse(wireBody);
+            const parsed = JSON.parse(wireText);
             if (opts.debug) {
                 const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
                     const fn = t.function as { name?: string } | undefined;
@@ -5046,10 +5050,10 @@ async function forward(
                 const sid = prepared?.session.id ?? "unknown";
                 const out = path.join(dumpDir, `req-${Date.now()}-${safeSessionId(sid)}.json`);
                 try {
-                    const pretty = JSON.stringify(JSON.parse(wireBody), null, 2);
+                    const pretty = JSON.stringify(JSON.parse(wireText), null, 2);
                     fs.writeFileSync(out, pretty);
                 } catch {
-                    fs.writeFileSync(out, wireBody);
+                    fs.writeFileSync(out, wireText);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
             }
