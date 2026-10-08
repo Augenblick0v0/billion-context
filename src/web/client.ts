@@ -102,7 +102,10 @@ export const WEB_CLIENT = `(function () {
             onKey = "conflict.on"; onText = t("conflict.on");
             riskKey = "conflict.risk_sibling"; riskText = t("conflict.risk_sibling");
         }
-        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, what: whatParts.join(t("conflict.what_join")), active: active };
+        // #2430: a ledger that is ONLY bili's own siblings stands down completely — they are
+        // compatible family, not conflicts; the web banner must stay hidden for them.
+        const siblingOnly = !hasConfirmed && suspectedN === 0 && siblingN > 0;
+        return { onKey: onKey, riskKey: riskKey, onText: onText, riskText: riskText, hasConfirmed: hasConfirmed, siblingOnly: siblingOnly, what: whatParts.join(t("conflict.what_join")), active: active };
     }
     window.bili_conflictLine = bili_conflictLine;
     window.bili_conflictSeverity = bili_conflictSeverity;
@@ -457,7 +460,11 @@ export const WEB_CLIENT = `(function () {
         const cb = $("conflicts-banner");
         if (cb) {
             const c = d.conflicts;
-            if (c && c.events > 0) {
+            // #2430: siblings-only ledgers stand down — bili's own family (billion-context-pi /
+            // opencode-acp) is compatible, so a pure-sibling ledger is not a warning. The events
+            // stay recorded (acp_status keeps the calm #2261 footer); only the banner goes quiet.
+            const sev0 = c && c.events > 0 ? bili_conflictSeverity(c) : null;
+            if (c && c.events > 0 && !(sev0 && sev0.siblingOnly)) {
                 cb.hidden = false;
                 cb.classList.add("show");
                 // #2102: attribute per kind family present; split active from historical
