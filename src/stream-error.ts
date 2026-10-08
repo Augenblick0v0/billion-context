@@ -131,32 +131,83 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
  *    only reachable case from a pipe that treats that chunk as terminal).
  * Never throws.
  */
-export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void): void {
+/** #2328 Q2: termination diagnostics carried on the in-band truncation
+ *  error frame (`meta`) and in the log line, so "the upstream never sent a
+ *  terminal event" (#721's no-terminal-seen) and "a terminal was arriving but
+ *  its bytes never completed / were unrecognizable" can be told apart from
+ *  the client side (#2347 forensics). Every field is plain-JSON safe. */
+export interface TruncationDiag {
+    /** Which pipe path fired: clean EOF without a terminal, or a read error. */
+    cause: "eof" | "read-error";
+    /** Q4 classification — see the helpers in plugin.ts that build this. */
+    classification: "no-terminal-seen" | "terminal-bytes-unrecognized";
+    /** Wire protocol of the truncated stream. */
+    protocol: string;
+    /** Parsed SSE events (incl. [DONE] frames; excl. unparseable raw forwards). */
+    events: number;
+    /** Frames forwarded verbatim because JSON.parse failed (#2190 audit twin). */
+    unparseableForwarded: number;
+    /** Sum of decoded upstream bytes across the whole stream. */
+    bytes: number;
+    /** Last ≤5 parsed event labels, oldest first (wire-native `type`, or a
+     *  synthesized `chunk`/`chunk:finish=<r>` for wires without one). */
+    lastEventTypes: string[];
+    /** Dangling partial event left in the normalize buffer at EOF/cut. */
+    eofBufferBytes: number;
+    /** First ≤80 chars of that dangling buffer, newlines flattened. */
+    eofBufferHead?: string;
+    /** Finish reason already delivered before the cut (chat wires), if any. */
+    finishReason?: string;
+    /** Responses wire: status of the last completion-family frame, if any. */
+    responseStatus?: string;
+    /** Post-filter visible chars the client actually assembled. */
+    visibleChars: number;
+    /** The tag filter stripped echo markup somewhere in this stream. */
+    sawStrippedEcho: boolean;
+    /** The one-shot #2171 re-issue was already spent earlier in this request. */
+    retryZeroByteCutSpent: boolean;
+    /** The one-shot #732/#821 degenerate-turn re-issue was already spent. */
+    retryDegenerateSpent: boolean;
+    /** Held done-family frames still buffered at the cut (responses wire). */
+    heldEvents?: number;
+    /** Upstream HTTP status / content-type of the original response, when the
+     *  caller still holds them (plugin lane re-fetches lose them by design). */
+    upstreamStatus?: number;
+    upstreamContentType?: string;
+}
+
+export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void, diag?: TruncationDiag): void {
     const message = "upstream stream ended before a completion event; this turn may be incomplete";
     const action = finished
         ? protocol === "google" ? "finish reason already delivered, stream complete" : "finish reason seen, synthesizing missing terminal byte"
         : "emitting in-band error";
-    log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}]`);
+    // #2328: the diag blob rides the log line too — one grep for
+    // `upstream stream truncated` pulls the full classification + counters
+    // without needing the client-side error frame.
+    log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}${diag ? `; classification=${diag.classification} cause=${diag.cause}; diag=${JSON.stringify(diag)}` : ""}]`);
+    // #2328: attach the diagnostics as `meta` on the in-band error object.
+    // Wire-shape change (new field on an error-only frame) — human-merge item.
+    const metaField = diag === undefined ? {} : { meta: diag };
     try {
         if (protocol === "openai") {
             if (finished) {
                 safeWrite(res, "data: [DONE]\n\n");
             } else {
-                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\ndata: [DONE]\n\n`);
+                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message, ...metaField } })}\n\ndata: [DONE]\n\n`);
             }
         } else if (protocol === "responses") {
-            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message })}\n\n`);
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message, ...metaField })}\n\n`);
         } else if (protocol === "google") {
             // The finishReason chunk IS Gemini's stream terminator: when it was
             // delivered, the client is already done and an extra terminal
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
-            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
+            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE", ...metaField } })}\n\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
             } else {
-                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\n`);
+                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message, ...metaField } })}\n\n`);
             }
         }
     } catch {

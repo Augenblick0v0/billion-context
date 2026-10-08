@@ -8,6 +8,8 @@ import {
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
     METADATA_FOLD_COVERAGE,
+    resetNormalizedIdentityWork,
+    normalizedIdentityWorkCount,
     type FoldAnchor,
     type FoldBlockCoverage,
     type ReconcileOptions,
@@ -291,7 +293,9 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.match(errs[0].msg, /compression substrate appears destroyed/);
         assert.match(errs[0].msg, /host-native compaction/);
         assert.match(errs[0].msg, /#2193/);
-        assert.ok(logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length >= 5, "per-pass warns keep flowing underneath");
+        // #2297: the per-pass warn now STOPS once the episode escalated —
+        // passes 1-2 warn, pass 3's error supersedes its own warn, 4-5 silent.
+        assert.equal(logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length, 2, "per-pass warns stop after the single escalation error");
     });
 
     test("a clean pass resets the streak; a later episode escalates again", () => {
@@ -467,5 +471,222 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(result.claims, 1);
         assert.equal(result.unmatched, 0);
         assert.equal(session.state.blocks[0].effectiveMessageIds[4], "k4-new");
+    });
+});
+
+describe("reconcileFoldCoverage owner-deletion drift (#2297)", () => {
+    type LogLine = { level: string; msg: string };
+    function coveredSession(n: number): Session {
+        const ids = Array.from({ length: n }, (_, i) => `c${i}`);
+        return {
+            state: { blocks: [{ active: true, effectiveMessageIds: ids }] },
+            metadata: {},
+        } as unknown as Session;
+    }
+    function makeOpts(logs: LogLine[]): ReconcileOptions & { mode: "repair" } {
+        return { sessionId: "s1", mode: "repair", log: (level: string, m: string) => logs.push({ level, msg: m }) };
+    }
+    const errorLines = (logs: LogLine[]) => logs.filter((l) => l.level === "error");
+    const driftWarns = (logs: LogLine[]) => logs.filter((l) => l.level === "warn" && /no anchor match/.test(l.msg)).length;
+    // #2202 guard: reconciliation only runs on conversation-sized passes (>=10
+    // msgs); side-request-shaped short passes take no evidence. Every drift pass
+    // below therefore carries a fresh 10-message tail whose ids never overlap the
+    // covered set — still a total-loss pass, now past the guard.
+    const freshTail = (tag: string, n = 10): CoreMessage[] =>
+        Array.from({ length: n }, (_, i) => msg(`${tag}${i}`, "assistant", `${tag} fresh tail turn ${i} padding words`));
+
+    test("missing counts only ACTIVE block coverage; dead-lineage ids drop out", () => {
+        // #2293 shape: the host truncated its own history; syncBlocks has
+        // already deactivated the old blocks (active=false) but their
+        // effectiveMessageIds persist in state — they can never re-anchor and
+        // must not sit in `missing` forever. Pre-seeded anchors simulate the
+        // persisted state from when those blocks were still live.
+        const liveIds = Array.from({ length: 12 }, (_, i) => `live${i}`);
+        const deadIds = Array.from({ length: 50 }, (_, i) => `dead${i}`);
+        const seedAnchors: Record<string, FoldAnchor> = {};
+        for (const id of [...deadIds, ...liveIds]) seedAnchors[id] = anchorOf(msg(id, "user", `text ${id}`));
+        const session = {
+            state: { blocks: [
+                { active: true, effectiveMessageIds: liveIds },
+                { active: false, effectiveMessageIds: deadIds.slice(0, 40) },
+                { active: false, effectiveMessageIds: deadIds.slice(40) },
+            ]},
+            metadata: { foldAnchors: seedAnchors, foldAnchorOrder: [...deadIds, ...liveIds] },
+        } as unknown as Session;
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        // Owner-deletion pass: the client resends only a fresh tail (>=10 msgs to
+        // clear the #2202 side-request guard), none of which is a covered id.
+        const result = reconcileFoldCoverage(session, freshTail("tail"), opts);
+        assert.equal(result.missing, 12, "only active coverage counts as missing");
+        assert.equal(result.unmatched, 12);
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        assert.equal(Object.keys(anchors).length, 12, "dead-id anchors pruned (MAX_ANCHORS budget freed)");
+        assert.ok(!("dead0" in anchors));
+        assert.ok("live0" in anchors);
+    });
+
+    test("per-pass WARN stops once the episode escalated; recovery re-arms", () => {
+        const n = 12; // above the 10-id escalation floor
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        reconcileFoldCoverage(session, freshTail("p1"), opts);
+        reconcileFoldCoverage(session, freshTail("p2"), opts);
+        assert.equal(driftWarns(logs), 2, "pre-escalation total-loss passes still warn");
+        reconcileFoldCoverage(session, freshTail("p3"), opts);
+        assert.equal(errorLines(logs).length, 1, "third total-loss pass escalates once");
+        assert.equal(driftWarns(logs), 2, "the escalation pass's error supersedes its own warn");
+        reconcileFoldCoverage(session, freshTail("p4"), opts);
+        reconcileFoldCoverage(session, freshTail("p5"), opts);
+        assert.equal(driftWarns(logs), 2, "escalated episode stays silent after the error line");
+        assert.equal(session.metadata.foldDriftEscalated, true);
+        // Recovery resets the latch so a later episode reports fresh.
+        reconcileFoldCoverage(session, originals, opts);
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "recovery clears the latch");
+    });
+
+    test("total-loss warn names both mutation and benign client-side deletion", () => {
+        const n = 12;
+        const session = coveredSession(n);
+        const originals = Array.from({ length: n }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, originals, opts);
+        reconcileFoldCoverage(session, freshTail("p1"), opts);
+        const warn = logs.find((l) => l.level === "warn" && /no anchor match/.test(l.msg));
+        assert.ok(warn, "pre-escalation drift pass warns");
+        assert.match(warn!.msg, /client-side deletion\/truncation/);
+        assert.match(warn!.msg, /benign/);
+        assert.doesNotMatch(warn!.msg, /originals re-enter the wire unfolded/, "deletion-misleading wording removed");
+    });
+
+    test("a persisted escalation latch stays silent across a process restart (#2293 terminal state)", () => {
+        // The #2293 incident window: the episode predates the log window, the
+        // latch is restored from persisted metadata — no duplicate error line,
+        // no per-pass warn flood.
+        const n = 12;
+        const session = coveredSession(n);
+        session.metadata["foldDriftStreak"] = 5;
+        session.metadata["foldDriftSince"] = Date.now() - 3_600_000;
+        session.metadata["foldDriftEscalated"] = true;
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        for (let pass = 1; pass <= 3; pass++) {
+            reconcileFoldCoverage(session, freshTail(`r${pass}`), opts);
+        }
+        assert.equal(errorLines(logs).length, 0, "no duplicate error line after restart");
+        assert.equal(logs.filter((l) => l.level === "warn").length, 0, "no per-pass warn flood either");
+        assert.equal(session.metadata["foldDriftStreak"], 8, "the streak keeps counting across the restart");
+    });
+});
+describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
+    // MAX_ANCHORS (src/fold-reconcile.ts) pinned at 16384 — hardcoded here on
+    // purpose so a constant move breaks the pin loudly instead of sliding it.
+    const CAP = 16_384;
+    function capSession(ids: string[]): Session {
+        return {
+            state: { blocks: [{ active: true, effectiveMessageIds: ids }] },
+            metadata: {},
+        } as unknown as Session;
+    }
+    const opts: ReconcileOptions = { mode: "repair", sessionId: "cap", log: () => {} };
+
+    test("steady-state resend beyond the cap pays zero normalizations and stays byte-stable", () => {
+        // The issue's minimal repro shape: 20000 distinct covered ids (> CAP).
+        // Pre-fix the second identical pass re-normalized + re-hashed exactly
+        // the 20000 − 16384 tail ids whose anchors were deleted on pass one.
+        const n = 20_000; // > CAP — the 8K perf history sits below the cap and cannot see this edge
+        const msgs = Array.from({ length: n }, (_, i) => msg(`x${i}`, "user", `covered payload ${i}`));
+        const session = capSession(msgs.map((m) => m.id!));
+
+        resetNormalizedIdentityWork();
+        const first = reconcileFoldCoverage(session, msgs, opts);
+        assert.equal(first.kind, "resend");
+        assert.equal(normalizedIdentityWorkCount(), CAP,
+            "cold fill stops at the cap — never pays for anchors that would be discarded");
+
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        assert.equal(Object.keys(anchors).length, CAP, "anchor table capped");
+        assert.equal(Object.keys(anchors)[0], "x0", "survivors keep covered order (oldest first)");
+        assert.equal(Object.keys(anchors)[CAP - 1], `x${CAP - 1}`);
+        assert.equal(anchors[`x${CAP}`], undefined, "the overflow tail holds no anchor (pre-existing semantics)");
+        assert.deepEqual(anchors["x5"], {
+            n: normalizedIdentity(msgs[5]),
+            r: "user",
+            b: msgs[5].text!.length,
+        }, "retained anchor values keep the fresh anchorFrom shape");
+
+        const snapshot = JSON.stringify(session.metadata);
+        resetNormalizedIdentityWork();
+        const second = reconcileFoldCoverage(session, msgs, opts);
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 });
+        assert.equal(normalizedIdentityWorkCount(), 0,
+            "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
+        assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
+    });
+
+    test("a fully tool-claimable churn pays no candidate norms (lazy normalization)", () => {
+        // Verbatim bookends + 8 churned middles carrying stable protocol
+        // toolCallIds: every claim resolves in the toolCallId pass, so the
+        // normalized-identity pass sees no unclaimed candidates. Expected work
+        // is exactly the 8 claim-anchor rebuilds (post-churn bytes must be
+        // anchored for the next churn) — pre-fix eager normalization paid 8
+        // extra candidate norms that were never compared.
+        const originals: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        const churned: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        for (let i = 1; i <= 8; i++) {
+            originals.push(msg(`t${i}`, "tool_result", `tool payload ${i} raw`, { toolCallId: `call-${i}`, toolName: "probe" }));
+            churned.push(msg(`t${i}-new`, "tool_result", `tool payload ${i}  re-encoded\r\n`, { toolCallId: `call-${i}`, toolName: "probe" }));
+        }
+        originals.push(msg("b9", "assistant", "bookend nine"));
+        churned.push(msg("b9", "assistant", "bookend nine"));
+        const session = capSession(originals.map((m) => m.id!));
+        reconcileFoldCoverage(session, originals, opts); // seed anchors + order backbone
+
+        resetNormalizedIdentityWork();
+        const result = reconcileFoldCoverage(session, churned, opts);
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.byTool, 8);
+        assert.equal(result.byNorm, 0);
+        assert.equal(result.unmatched, 0);
+        assert.equal(normalizedIdentityWorkCount(), 8,
+            "exactly the 8 claim-anchor rebuilds — zero wasted candidate norms");
+        assert.deepEqual(
+            (session.state.blocks[0] as { effectiveMessageIds: string[] }).effectiveMessageIds,
+            ["b0", ...Array.from({ length: 8 }, (_, i) => `t${i + 1}-new`), "b9"],
+        );
+    });
+
+    test("mixed churn normalizes only the tool-unclaimed candidates", () => {
+        // 4 toolCallId-churned + 4 plain-text-churned middles. Expected work:
+        // 8 claim-anchor rebuilds + 4 candidate norms for the plain messages
+        // the tool pass left behind. Pre-fix eager normalization paid all 8
+        // candidate norms up front — the 4 tool-claimed ones included.
+        const originals: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        const churned: CoreMessage[] = [msg("b0", "user", "bookend zero")];
+        for (let i = 1; i <= 4; i++) {
+            originals.push(msg(`t${i}`, "tool_result", `tool payload ${i} raw`, { toolCallId: `call-${i}`, toolName: "probe" }));
+            churned.push(msg(`t${i}-new`, "tool_result", `tool payload ${i}  re-encoded\r\n`, { toolCallId: `call-${i}`, toolName: "probe" }));
+        }
+        for (let i = 5; i <= 8; i++) {
+            originals.push(msg(`u${i}`, "user", `plain turn ${i}`));
+            churned.push(msg(`u${i}-new`, "user", `plain  turn ${i}\r\n`));
+        }
+        originals.push(msg("b9", "assistant", "bookend nine"));
+        churned.push(msg("b9", "assistant", "bookend nine"));
+        const session = capSession(originals.map((m) => m.id!));
+        reconcileFoldCoverage(session, originals, opts);
+
+        resetNormalizedIdentityWork();
+        const result = reconcileFoldCoverage(session, churned, opts);
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.byTool, 4);
+        assert.equal(result.byNorm, 4);
+        assert.equal(result.unmatched, 0);
+        assert.equal(normalizedIdentityWorkCount(), 12,
+            "8 claim-anchor rebuilds + 4 unclaimed-candidate norms, nothing else");
     });
 });

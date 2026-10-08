@@ -88,7 +88,7 @@ Usage:
                                     global install, dsh bundles refresh through
                                     dsh's channel, host-owned copies are pointed
                                     at their host's updater — never overwritten
-   bili plugin list                 show install status + installed (on-disk) version for every host
+  bili plugin list                 show install status + installed (on-disk) version for every host
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)

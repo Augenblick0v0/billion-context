@@ -1,5 +1,6 @@
 import { findRoute, type ProxyOptions } from "./config.js";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
+import { maskUrlForLog } from "./log-mask.js";
 
 /**
  * #2336 lane credential override (forward path). `providers[URL].apiKeyEnv`
@@ -47,7 +48,7 @@ export function laneCredential(
     const fail = (reason: string): undefined => {
         if (!warnedLaneCredentials.has(signature)) {
             warnedLaneCredentials.add(signature);
-            warn(`[lane-credential] ${reference} for ${upstreamUrl ?? "the lane"} ${reason} — keeping the client's own headers (#2336)`);
+            warn(`[lane-credential] ${reference} for ${upstreamUrl ? maskUrlForLog(upstreamUrl) : "the lane"} ${reason} — keeping the client's own headers (#2336)`);
         }
         return undefined;
     };

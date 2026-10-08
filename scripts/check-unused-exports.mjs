@@ -43,7 +43,7 @@ const ENTRY_FILES = new Set([
 const files = execFileSync("git", ["ls-files", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
     cwd: root,
     encoding: "utf8",
-}).split("\n").filter(f => f && !f.startsWith("kernel/") && f !== "scripts/check-unused-exports.mjs");
+}).split("\n").filter(f => f && !f.startsWith("kernel/") && !f.startsWith("pi-subagents/") && f !== "scripts/check-unused-exports.mjs");
 
 // One token-frequency pass per file (word-boundary counting == identifier
 // token counting here — both split on non-[\w$]).

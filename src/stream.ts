@@ -6,7 +6,7 @@ import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from 
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
-import { oneCallTail } from "acp-kernel";
+import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
@@ -14,6 +14,7 @@ import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
 import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "./subagent-sessions.js";
+import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 
@@ -234,6 +235,44 @@ function clearCompressLoopStreak(session: Session): void {
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
 }
 
+// #2360 §2: while the breaker is armed, the kernel's per-error retry guidance
+// ("Run acp_status, then call the compress tool again …") sits in the SAME
+// receipt as the breaker paragraph's "do not poll acp_status" — the looping
+// model got two contradictory orders in one tool result and obeyed neither
+// (observed: 3 blind re-issues, zero acp_status calls). Scrub the known
+// kernel sentences from the model-visible receipt while armed; the operator
+// log keeps the full text. The wording lives in kernel/src/compress.ts
+// (gateMessage variants) — if it drifts the scrub misses and the pre-#2360
+// behavior returns, which is no worse than today.
+const KERNEL_RETRY_GUIDANCE = [
+    "Run acp_status, then call the compress tool again using only the refs it reports.",
+    "Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.",
+] as const;
+
+function scrubKernelRetryGuidance(errs: string): string {
+    let out = errs;
+    for (const g of KERNEL_RETRY_GUIDANCE) out = out.split(g).join("");
+    return out;
+}
+
+/** #2360 §2.4: name the failure class so model and user can tell at a glance
+ *  who owns the fix — stale refs (transient), an already-covered range
+ *  (nothing to do), or a destroyed substrate (host-native compaction landed
+ *  outside bili's knowledge — structural, report it instead of retrying).
+ *  Derived from the kernel's gate-message variants (kernel/src/compress.ts);
+ *  the escalated fold-drift flag (#2193) sharpens the unanchored case into
+ *  the substrate verdict. */
+function compressFailureCause(errs: string, session: Session): string {
+    if (errs.includes("cannot be anchored")) {
+        return session.metadata[METADATA_DRIFT_ESCALATED] === true
+            ? "substrate-destruction — host-native compaction or bulk client-side history rewrite landed outside bili's knowledge (#1729/#2193); structural, report it"
+            : "content-changed — the messages behind those refs changed and carry new refs now";
+    }
+    if (errs.includes("every ref is unknown to this session")) return "stale-ref — the refs belong to another session generation (or are typos)";
+    if (errs.includes("covered by active block")) return "covered-by-block — nothing new to fold in that window";
+    return "";
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated), so the kernel's generic "typo or wrong session" wording
@@ -365,7 +404,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
     const remaining = viableRanges(nudge.compressibleRanges)
         .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
     if (remaining.length > 0) {
-        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}` + oneCallTail(remaining);
+        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
     }
     // A tier-distillation nudge means block-boundary compress calls (bN..bM)
     // are still actionable — a stop signal there would contradict the tier
@@ -575,7 +614,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const hints = loopGuard === ""
                 ? `${beyond}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
-            let receipt = `[Compression FAILED: ${errs}${revNote}${hints}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
+            // #2360 §2: one instruction per receipt — while armed, the kernel's
+            // "run acp_status and retry" guidance is scrubbed from the model-
+            // visible text (the breaker paragraph below forbids exactly that),
+            // and the cause label names who owns the failure. The ctx.log line
+            // above keeps the full kernel text for operators.
+            const receiptErrs = loopGuard === "" ? errs : scrubKernelRetryGuidance(errs);
+            const cause = compressFailureCause(errs, ctx.session);
+            let receipt = `[Compression FAILED: ${receiptErrs}${cause ? ` [cause: ${cause}]` : ""}${revNote}${hints}${dropped ? " " + dropped : ""}${applyErrorNote(r)}]`;
             // #2146: when every requested ref is provably stale-generation, the
             // kernel's per-range error text hands those exact phantom numbers
             // straight back into the client-persisted history — where the

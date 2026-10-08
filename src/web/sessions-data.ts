@@ -1,6 +1,6 @@
 import { orderedRefPair } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session } from "../session.js";
-import { conflictEventsOf } from "../conflict-watch.js";
+import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
@@ -180,6 +180,10 @@ interface WebSessionDetail extends WebSessionSummary {
     /** #2102: this session's compression-conflict ledger (#1206) — the detail
      *  surface the global banner points users to; absent when empty. */
     conflicts?: Array<{ at: number; kind: string; detail: string }>;
+    /** #2219: resolved client name for the per-client remediation hint (same
+     *  resolution as the banner's clients[]); absent when unresolvable or when
+     *  there are no conflicts. */
+    conflictClient?: string;
     blockDetails: Array<{
         blockId: string;
         tier: number;
@@ -433,7 +437,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
  *  Session construction (#1937). */
 interface SummarySource {
     id: string;
-    meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string };
+    meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string }> };
@@ -465,6 +469,7 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             upstreamOrigin: str(meta.upstreamOrigin) ?? str(r.upstreamOrigin),
             label: str(meta.label) ?? str(r.label),
             title: str(meta.title),
+            hostTitle: str(meta.hostTitle),
         },
         stats: {
             requests: num(stats.requests, num(r.requests)),
@@ -560,7 +565,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
-        ...(s.meta.title ? { title: s.meta.title } : {}),
+        // #2322: a host-provided name (pi /name) outranks the derived
+        // first-message title everywhere the row feeds (list, search, export).
+        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
@@ -813,6 +820,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     const clientHint = pluginAgent ?? (typeof session.metadata["clientHint"] === "string" ? session.metadata["clientHint"] : undefined);
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
     const conflicts = conflictEventsOf(session);
+    const conflictClient = conflicts.length > 0 ? conflictClientOf(session) : undefined;
 
     return {
         ...summaryOf(session, live),
@@ -848,6 +856,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffHtml: markdownToHtml(handoffMd),
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
+        ...(conflictClient ? { conflictClient } : {}),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).

@@ -183,6 +183,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 注意:
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
+- **pi:** 原生安装默认自带子代理功能(`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`)—— 如何关闭它们并保留上下文压缩:[Pi 内置子代理](#pi-内置子代理)。
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
@@ -368,6 +369,24 @@ bili --no-auto-update        # 本次启动禁用自动更新
 - **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。
 - **线上兼容角色改写(`compat.roles`)**—— 上游拒绝 `developer` 角色?[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `compat`)已覆盖 —— 包括零配置即用的失败自学习修复。
 - **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
+
+### Pi 内置子代理
+
+使用 `bili pi` 或 pi 原生插件（`bili plugin install pi`）时，会自带默认启用的子代理功能：`acp_delegate`、`acp_delegate_wait` 和 `acp_delegate_cancel`。这组额外工具仅在 pi 上提供。
+
+**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。项目级 `pi-subagents` 安装默认会让内置 delegate 自动让位，但仅有用户级安装时不会，因此不能把这项保护当作所有安装方式都适用的保障。
+
+要关闭内置子代理并保留上下文压缩，请将以下配置合并到 `~/.config/billion-context/billion-context.json`（或 `BILI_CONFIG_FILE` 指定的文件），保留已有的其他设置：
+
+```json
+{
+  "pi": {
+    "subagents": false
+  }
+}
+```
+
+重启 pi 并开启新会话后生效。该配置关闭三个 delegate 工具、配套的系统提示词和子代理管理界面的快捷键，上下文压缩仍然启用；单独安装的其他子代理插件不受此开关控制。更多选项见[子代理配置](CONFIGURATION.zh-CN.md#pi)。
 
 ## 会话机制
 

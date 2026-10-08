@@ -1,5 +1,6 @@
 import {
     buildStatusReport,
+    countMessageTokens,
     defaultCountTokens,
     formatRanges,
     viableRanges,
@@ -7,11 +8,10 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
+import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
-import { oneCallTail } from "acp-kernel";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -38,6 +38,10 @@ function fmtBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
 }
 
+// #2366: usage fraction at which the PRESSURE NOTE becomes worth showing —
+// below it the window still has headroom and "stop folding" is noise.
+const PRESSURE_NOTE_USAGE_FRACTION = 0.6;
+
 export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx): ProxyToolResult {
     const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
     const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
@@ -57,6 +61,40 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     });
     if (scope) return toolOk(base);
     const extra: string[] = [];
+    // #2366: everything in the report above is LOCAL ESTIMATES (defaultCountTokens);
+    // on CJK-heavy routes upstream billing runs 2–4× higher, so an agent judging
+    // pressure from those figures misreads a filling window as healthy and folds
+    // late, when little compressible mass is left. Surface the usage-grade reading
+    // next to the estimate view — statusInputBaseline's provenance contract, the
+    // same number the nudge decision runs on — and flag the ratio when it diverges
+    // hard. Never-reporting upstreams have no anchor → no line.
+    const billed = statusInputBaseline(ctx.session);
+    if (billed > 0) {
+        let estTotal = 0;
+        // #2407: count host-projected thinking mass (countMessageTokens) so the
+        // ratio stays honest on thinking routes — same caliber as the per-message
+        // breakdown the kernel renders above.
+        for (const m of ctx.messages) estTotal += countMessageTokens(m, defaultCountTokens);
+        // Billed input covers system+tools too (and images); the est view must
+        // carry the same overhead — every prepare site keeps
+        // metadata.systemPromptTokens current — or every system-heavy session
+        // reads as divergence with no tokenizer gap behind it.
+        const sysOverhead = ctx.session.metadata?.systemPromptTokens;
+        if (typeof sysOverhead === "number" && sysOverhead > 0) estTotal += sysOverhead;
+        const srcLabel = ctx.session.stats.lastInputTokensSource === "overflow-arm" ? "overflow arm (bounded)" : "upstream usage";
+        let billedLine = `BILLED INPUT (${srcLabel}): ${billed} tok`;
+        const measuredAt = ctx.session.metadata?.contextTokensAt;
+        if (typeof measuredAt === "number") {
+            const ageMin = Math.round((Date.now() - measuredAt) / 60_000);
+            if (ageMin >= 2) billedLine += `, measured ${ageMin}m ago`;
+        }
+        if (estTotal > 0) billedLine += ` · est-view total ${estTotal} tok · ratio ${(billed / estTotal).toFixed(1)}×`;
+        extra.push("");
+        extra.push(billedLine);
+        if (estTotal > 0 && billed / estTotal >= 1.5) {
+            extra.push("NOTE: the token figures in the report above are local estimates and run well below what upstream actually bills (tokenizer-dependent; CJK-heavy content is the usual cause). Judge context pressure from BILLED INPUT; use the breakdown only to locate what to compress.");
+        }
+    }
     try {
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
@@ -70,6 +108,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (nudge) {
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
+            // #2366: high billed pressure + exhausted compressible mass is the
+            // deadlock invisible from the estimate view alone — tell the agent
+            // further folding is futile (each fold rewrites the prefix and
+            // forfeits the cache hit for almost-nothing reclaimed).
+            if (!nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
+                extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
+            }
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
             // be "viable" yet deterministically uncompressible.
@@ -78,7 +123,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const protectedRanges = nudge.protectedRanges ?? [];
             if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
-                extra.push(formatRanges(ranges, protectedRanges) + oneCallTail(ranges));
+                extra.push(formatRanges(ranges, protectedRanges));
             }
         }
     } catch {
@@ -138,8 +183,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // user sees it while the session is still recoverable.
     const cevents = conflictEventsOf(ctx.session);
     if (cevents.length > 0) {
+        // #2219: key the remediation hint on THIS session's resolved client so
+        // the model can relay per-client steps without digging out the docs.
         extra.push("");
-        extra.push(...formatConflictSection(cevents));
+        extra.push(...formatConflictSection(cevents, Date.now(), conflictClientOf(ctx.session)));
     }
     const adv = getAdvisoryState();
     if (adv.active) {

@@ -31,7 +31,7 @@ export async function listSessions(opts: ExportOptions = {}): Promise<SessionSum
     sessions.sort((a, b) => latestBlockTime(b) - latestBlockTime(a));
     return sessions.map((s) => ({
         id: s.id,
-        title: s.meta.title,
+        title: s.meta.hostTitle ?? s.meta.title,
         label: s.meta.label,
         protocol: s.meta.protocol,
         upstreamOrigin: s.meta.upstreamOrigin,
@@ -57,7 +57,7 @@ export function renderHandoff(s: Session, full: boolean): string {
             full,
             folded,
             meta: {
-                title: s.meta.title,
+                title: s.meta.hostTitle ?? s.meta.title,
                 label: s.meta.label,
                 sessionId: s.id,
                 contextTokens: s.stats.contextTokens,
@@ -76,7 +76,7 @@ export function renderHandoff(s: Session, full: boolean): string {
     const lines: string[] = [];
     lines.push(`# billion-context session handoff`);
     lines.push("");
-    lines.push(`- title: ${s.meta.title ?? "(untitled)"}`);
+    lines.push(`- title: ${s.meta.hostTitle ?? s.meta.title ?? "(untitled)"}`);
     if (s.meta.label) lines.push(`- label: ${s.meta.label}`);
     lines.push(`- session id: ${s.id}`);
     if (s.meta.protocol) lines.push(`- protocol: ${s.meta.protocol}`);

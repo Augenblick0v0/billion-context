@@ -65,7 +65,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
+import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -149,6 +149,7 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
@@ -4635,6 +4636,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                     ? "It is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs."
                     : "Its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs.";
                 console.error(`bili: WARNING: co-resident compression plugin on ${base}: ${f.entry} (${f.source}). ${risk} (#1206) — disable the other plugin, or don't route this client through bili.`);
+                // #2219: actionable follow-up — how to stop THIS client's own
+                // compaction (same per-client map as acp_status / web banner).
+                console.error(`bili:   fix (${base}): ${conflictRemediation(base)}`);
             }
         } catch {
             // The scan is diagnostic only — never block client startup on it.
@@ -4933,6 +4937,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         let dshAcpPatch: string | undefined;
         if (!dshNativeInstalled()) {
             dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+        } else if (allowDshCompactionState(process.env).enabled !== true) {
+            // #2360 §3: native install owns the plugin chain — the overlay patch
+            // above would insert a SECOND bili-native entry and hard-fail dsh
+            // boot, and DSH mounts compaction in the agent preset's group where
+            // a profile-level dsh.bundle.patch.yml cannot reach it either
+            // (#1772/#2360) — so compaction-basic auto:false is NOT in force and
+            // dsh native compaction stays armed. Say so at launch instead of
+            // leaving the user to discover a landed checkpoint through
+            // destroyed-substrate errors; the live protection is the proxy's
+            // wire-level refusal on every lane (openai/anthropic/responses).
+            console.error(
+                "bili: dsh native install detected — the launcher's compaction-basic auto:false overlay patch is skipped (a second bili-native entry would hard-fail dsh boot), and DSH mounts compaction in the agent preset where profile patches cannot reach it (#1772/#2360): dsh native compaction stays ARMED. Protection is bili's wire-level refusal of dsh compaction calls on all lanes (openai/anthropic/responses, #1729/#2193/#2360) — if you see 'compression substrate appears destroyed' or chained 'compress FAILED' errors, a dsh checkpoint has landed outside bili's knowledge.",
+            );
         }
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "kimi") {

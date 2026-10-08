@@ -18,7 +18,12 @@ billion-context/
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
+│   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
+│   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
+│   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
+│   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
+│   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
@@ -171,13 +176,17 @@ billion-context/
 │       ├── styles.ts             #   Web UI CSS
 │       ├── i18n.ts               #   Locale message tables (zh-CN/en)
 │       └── index.ts              #   Web UI mount (bundle-safe VERSION reuse, #1426)
-├── kernel/                       # In-repo acp-kernel source (#2092): the compression engine
-│   ├── src/                      #   ~30 modules: processTurn pipeline, wire codecs, persist, panel, filter
-│   ├── tests/                    #   Kernel unit suite (`npm --prefix kernel test`, runs on TS source)
-│   └── package.json              #   Own name/version (npm `acp-kernel`), own build chain (tsup → dist + d.ts)
-├── tests/                        # 426 test files (+ hermetic e2e lanes under tests/e2e/)
-├── tsup.config.ts                # Build config (inlines acp-kernel; zod external)
-└── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`; version bumped ONLY on release branches)
+ ├── kernel/                       # In-repo acp-kernel source (#2092): the compression engine
+ │   ├── src/                      #   ~30 modules: processTurn pipeline, wire codecs, persist, panel, filter
+ │   ├── tests/                    #   Kernel unit suite (`npm --prefix kernel test`, runs on TS source)
+ │   └── package.json              #   Own name/version (npm `acp-kernel`), own build chain (tsup → dist + d.ts)
+ ├── pi-subagents/                 # In-repo billion-context-pi-subagents source (#2384): acp_delegate tools for the pi lane
+ │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
+ │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
+ │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
+ ├── tests/                        # 426 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
+ └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 
 ## Orientation cheat-sheet
 
@@ -192,3 +201,4 @@ When navigating this codebase, these are the load-bearing entry points:
 - **Wire fidelity** — `src/stream-*.ts` files handle per-protocol streaming transformation. The invariant: never alter upstream protocol shape beyond intended injection (§7.3).
 - **E2E regression** — `tests/e2e/` contains real-client suites (codex, opencode, pi, dsh) plus hermetic lanes (registry, advisory-rollback, release-canary, opencode WS, image billing); each carries its own skip gate — read the test header for the exact env var.
 - **Compression kernel** — `kernel/` (in-repo acp-kernel, #2092). Human-gated boundary; see `AGENTS.md` "Kernel Boundary".
+- **Pi sub-agent surface** — `pi-subagents/` (in-repo billion-context-pi-subagents, #2384); wired into the pi lane by `src/agent/pi-subagents.ts`. Lighter-gated boundary than the kernel; see `AGENTS.md` "Pi-Subagents Boundary".

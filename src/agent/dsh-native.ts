@@ -56,7 +56,18 @@ function retryIntervalMs(): number {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : RETRY_INTERVAL_MS;
 }
 
-type AgentLike = { session?: { id?: unknown } | undefined };
+type AgentLike = {
+    session?: {
+        id?: unknown;
+        // #2381: dsh-session Session surface — the EpochHeader the NEXT request
+        // is compared against ({config:{provider,model,...}}). dsh-agent-loop
+        // writes each step's header into the session log BEFORE its fetch, so
+        // at fetch time this is exactly this request's routing. Absent on
+        // older builds (duck-typed access below degrades to the global
+        // selection).
+        requestHeader?: () => { config?: { provider?: unknown; model?: unknown } } | undefined;
+    } | undefined;
+};
 // #1677: DSH's command executor hands the invoking agent to the handler via the
 // invocation object ({ commandId, agent, rawInput, attachments, signal }) — but it
 // does NOT establish the AsyncLocalStorage boundary that currentInitiator() reads,
@@ -173,12 +184,18 @@ function currentOrigin(): string | undefined {
     return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
 }
 
-// Runtime-info cache (#955): the host's current model selection plus what
-// ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
-// async refresh; read synchronously by headersFor on every model request.
-// Stale entries never leak across a model switch: refresh() keys off the
-// LIVE selection, and a changed selection re-resolves before overwriting.
-type ModelInfoCache = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
+// Runtime-info cache (#955, rekeyed per model in #2381): one entry per
+// (provider, model) the host actually routes — what ctx.llm resolved for it
+// (contextWindow / defaultMaxTokens). Written by async refreshes; read
+// synchronously by headersFor on every model request. The pre-#2381 single
+// slot tracked the GLOBAL agent default selection while headersFor ran under
+// a SESSION initiator: a session on another model stamped the default model's
+// name, the proxy's exact-match gate discarded the whole header channel, and
+// the window fell to the unconfigured fallback. Per key, an entry can only
+// ever hold its own key's numbers, so a foreign model's window can never land
+// on another model's request.
+type ModelInfoEntry = { provider: string; model: string; contextWindow?: number; maxOutput?: number };
+const MODEL_INFO_CACHE_CAP = 32;
 // #1812: retry cadence for window resolves that failed (or resolved without a
 // window). The pre-#1812 code cached {provider, model} on failure and the
 // early-return below then NEVER re-resolved — one boot-time race (catalog
@@ -193,36 +210,72 @@ function modelInfoRetryCooldownMs(): number {
     const parsed = raw === undefined ? Number.NaN : Number(raw);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : MODEL_INFO_RETRY_COOLDOWN_MS;
 }
-const modelInfo: { cached?: ModelInfoCache; services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] }; refreshing: boolean; retryAt?: number } = { refreshing: false };
+const modelInfo: {
+    byKey: Map<string, ModelInfoEntry>;
+    refreshingKeys: Set<string>;
+    retryAtByKey: Map<string, number>;
+    services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] };
+} = { byKey: new Map(), refreshingKeys: new Set(), retryAtByKey: new Map() };
 
-function selectionStillCurrent(svc: { agentDefaultModel?: PluginContext["agentDefaultModel"] }, provider: string, model: string): boolean {
-    try {
-        const live = svc.agentDefaultModel?.currentSelection?.();
-        return live?.provider === provider && live?.model === model;
-    } catch {
-        return false;
+function modelInfoKey(provider: string, model: string): string {
+    return `${provider}\u0000${model}`;
+}
+
+function evictModelInfoEntries(): void {
+    while (modelInfo.byKey.size > MODEL_INFO_CACHE_CAP) {
+        const oldest = modelInfo.byKey.keys().next().value;
+        if (oldest === undefined) break;
+        modelInfo.byKey.delete(oldest);
+        modelInfo.retryAtByKey.delete(oldest);
     }
 }
 
-function refreshModelInfo(origin: string | undefined): void {
-    const svc = modelInfo.services;
-    if (svc === undefined || modelInfo.refreshing) return;
-    let selection: { provider?: string; model?: string } | undefined;
-    try {
-        selection = svc.agentDefaultModel?.currentSelection?.();
-    } catch {
-        return;
+function normalizeModelTarget(provider: unknown, model: unknown): { provider: string; model: string } | undefined {
+    if (typeof provider === "string" && provider.length > 0 && typeof model === "string" && model.length > 0) {
+        return { provider, model };
     }
-    const provider = selection?.provider;
-    const model = selection?.model;
-    if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) return;
-    // #1812: a matching cached entry is final only when it actually carries a
+    return undefined;
+}
+
+// #2381: the model THIS request routes to — the session's own live header
+// first (exact at fetch time, correct across per-session model switches), the
+// host's global default selection only as fallback. Any miss degrades to
+// pre-#2381 behavior; it never yields a wrong model.
+function sessionModelTargetOf(ctx: PluginContext): { provider: string; model: string } | undefined {
+    try {
+        const init = ctx.agents?.currentInitiator?.();
+        const header = init?.session?.requestHeader?.();
+        return normalizeModelTarget(header?.config?.provider, header?.config?.model);
+    } catch {
+        return undefined;
+    }
+}
+
+function globalModelTarget(svc: { agentDefaultModel?: PluginContext["agentDefaultModel"] } | undefined): { provider: string; model: string } | undefined {
+    try {
+        const sel = svc?.agentDefaultModel?.currentSelection?.();
+        return normalizeModelTarget(sel?.provider, sel?.model);
+    } catch {
+        return undefined;
+    }
+}
+
+function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
+    const svc = modelInfo.services;
+    if (svc === undefined) return;
+    const sel = target ?? globalModelTarget(svc);
+    if (sel === undefined) return;
+    const provider = sel.provider;
+    const model = sel.model;
+    const key = modelInfoKey(provider, model);
+    // #1812: a cached entry is final only when it actually carries a
     // window (or the service has no resolver at all). A failure-shaped cache
     // ({provider, model}, no contextWindow) retries after the cooldown.
-    if (modelInfo.cached?.provider === provider && modelInfo.cached?.model === model) {
-        if (modelInfo.cached.contextWindow !== undefined) return;
-        if (modelInfo.retryAt !== undefined && Date.now() < modelInfo.retryAt) return;
-    }
+    const cached = modelInfo.byKey.get(key);
+    if (cached !== undefined && cached.contextWindow !== undefined) return;
+    const retryAt = modelInfo.retryAtByKey.get(key);
+    if (cached !== undefined && retryAt !== undefined && Date.now() < retryAt) return;
+    if (modelInfo.refreshingKeys.has(key)) return;
     // The host registers llm as a service object, so resolveModelInfo needs its
     // receiver; called detached below, this threw
     // "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
@@ -230,42 +283,44 @@ function refreshModelInfo(origin: string | undefined): void {
     // left the process without x-bili-plugin-context-window.
     const resolve = svc.llm?.resolveModelInfo?.bind(svc.llm);
     if (resolve === undefined) {
-        modelInfo.cached = { provider, model };
+        modelInfo.byKey.set(key, { provider, model });
+        evictModelInfoEntries();
         return;
     }
-    modelInfo.refreshing = true;
-    modelInfo.retryAt = Date.now() + modelInfoRetryCooldownMs();
+    modelInfo.refreshingKeys.add(key);
+    modelInfo.retryAtByKey.set(key, Date.now() + modelInfoRetryCooldownMs());
     void Promise.resolve()
         .then(() => resolve(provider, model))
         .then((info) => {
-            // Commit only if the LIVE selection still matches what we
-            // resolved: a model switch mid-resolve must not overwrite the
-            // cache (and report) the OLD model's numbers — the next
-            // headersFor refresh re-resolves the new one (review on #956).
-            if (!selectionStillCurrent(svc, provider, model)) return;
-            modelInfo.cached = {
+            // Per-key commit (#2381): the entry belongs to its OWN key, so a
+            // model switch mid-resolve can no longer strand or clobber it —
+            // stamping reads only the live request's key, and a switched-away
+            // model's numbers stay parked under their own key (#956's
+            // user-visible contract, now structural instead of guarded).
+            modelInfo.byKey.set(key, {
                 provider,
                 model,
                 contextWindow: typeof info?.context?.contextWindow === "number" && info.context.contextWindow > 0 ? Math.floor(info.context.contextWindow) : undefined,
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
-            };
-            if (modelInfo.cached.contextWindow !== undefined) modelInfo.retryAt = undefined;
+            });
+            evictModelInfoEntries();
+            if (modelInfo.byKey.get(key)?.contextWindow !== undefined) modelInfo.retryAtByKey.delete(key);
         })
         .catch(() => {
-            if (!selectionStillCurrent(svc, provider, model)) return;
             // Resolution failed (transient catalog read, model offline): keep
             // the model id (usable for registry lookup) without window claims.
-            modelInfo.cached = { provider, model };
+            modelInfo.byKey.set(key, { provider, model });
+            evictModelInfoEntries();
         })
         .finally(() => {
-            modelInfo.refreshing = false;
-            const cached = modelInfo.cached;
-            if (cached !== undefined && cached.provider === provider && cached.model === model && origin !== undefined) {
+            modelInfo.refreshingKeys.delete(key);
+            const entry = modelInfo.byKey.get(key);
+            if (entry !== undefined && origin !== undefined) {
                 void reportRuntimeInfo(origin, {
                     agent: "dsh",
-                    model: cached.model,
-                    contextWindow: cached.contextWindow,
-                    maxOutput: cached.maxOutput,
+                    model: entry.model,
+                    contextWindow: entry.contextWindow,
+                    maxOutput: entry.maxOutput,
                     source: "client-config",
                 }).catch(() => {});
             }
@@ -1027,14 +1082,23 @@ export function apply(ctx: PluginContext): void {
     state.headersFor = (_url) => {
         maybeRetry(ctx);
         if (!register.toolsReady) return undefined;
-        const sid = sessionIdOf(ctx);
-        if (sid === undefined) return undefined;
-        refreshModelInfo(register.base);
+        const attr = attributionOf(ctx);
+        if (attr.state !== "ok") return undefined;
+        const sid = attr.sid;
+        // #2381: size this request against the model IT routes to — session
+        // header first, global default only as fallback. Stamping reads ONLY
+        // that key's own entry, so a mismatched model's numbers can never be
+        // sent (the proxy-side exact-match gate stays as defense in depth).
+        const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
+        refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
-        if (modelInfo.cached !== undefined) {
-            headers["x-bili-plugin-model"] = modelInfo.cached.model;
-            if (modelInfo.cached.contextWindow !== undefined) headers["x-bili-plugin-context-window"] = String(modelInfo.cached.contextWindow);
-            if (modelInfo.cached.maxOutput !== undefined) headers["x-bili-plugin-max-output"] = String(modelInfo.cached.maxOutput);
+        if (target !== undefined) {
+            const cached = modelInfo.byKey.get(modelInfoKey(target.provider, target.model));
+            if (cached !== undefined) {
+                headers["x-bili-plugin-model"] = cached.model;
+                if (cached.contextWindow !== undefined) headers["x-bili-plugin-context-window"] = String(cached.contextWindow);
+                if (cached.maxOutput !== undefined) headers["x-bili-plugin-max-output"] = String(cached.maxOutput);
+            }
         }
         return headers;
     };
@@ -1138,9 +1202,10 @@ export function _resetRegisterForTest(base: string | undefined): void {
     register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;
-    modelInfo.cached = undefined;
+    modelInfo.byKey.clear();
+    modelInfo.refreshingKeys.clear();
+    modelInfo.retryAtByKey.clear();
     modelInfo.services = undefined;
-    modelInfo.refreshing = false;
 }
 
 /** Test hook (#2082): drive the recovery loop directly — production callers

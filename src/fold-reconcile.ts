@@ -38,7 +38,10 @@ type FoldReconcileMode = "off" | "warn" | "repair";
 
 const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
-const METADATA_SYSTEM_FP = "systemFp";
+/** #1921: last-noted system-prompt fingerprint ({fp, size}), consumed by both
+ *  the fold-reconcile drift alert and the cache ledger's prompt-rewrite
+ *  attribution (#2350). */
+export const METADATA_SYSTEM_FP = "systemFp";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
@@ -48,7 +51,10 @@ const MAX_ANCHORS = 16384;
 const MAX_ORDER = 32768;
 const METADATA_DRIFT_STREAK = "foldDriftStreak";
 const METADATA_DRIFT_SINCE = "foldDriftSince";
-const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
+/** Exported so the compress-failure receipt can sharpen its cause label into
+ *  the substrate-destruction verdict (#2360 §2.4) without hardcoding a second
+ *  copy of the key here. */
+export const METADATA_DRIFT_ESCALATED = "foldDriftEscalated";
 /** #2193: total-loss drift (covered ids missing with ZERO reanchoring) across
  *  this many consecutive passes means the fold state can never recover —
  *  escalate once from warn to error and name the suspect cause instead of
@@ -100,8 +106,9 @@ interface ReconciliationPlan {
     claims: Map<string, string>;
     byTool: number;
     byNorm: number;
-    /** Covered ids missing from the resent history with no match — their
-     *  originals re-enter the wire unfolded (honest, unchanged behavior). */
+    /** Covered ids missing from the resent history with no match — either
+     *  mutation (originals re-enter the wire unfolded) or benign client-side
+     *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
     unmatched: string[];
 }
 
@@ -163,7 +170,22 @@ export function normalizeMessageText(text: string | undefined): string {
         .trim();
 }
 
+/** #2334: full-text normalized-identity computations performed by this module
+ *  (anchor seeding/rebuild + churn-region candidate norms). A measurement seam
+ *  for the work-count pins in tests/fold-reconcile.test.ts — the over-cap
+ *  defect paid O(overflow) normalizations per steady-state pass while returning
+ *  byte-identical results, so wall-clock thresholds alone cannot prove the work
+ *  is gone. */
+let normalizedIdentityWork = 0;
+export function resetNormalizedIdentityWork(): void {
+    normalizedIdentityWork = 0;
+}
+export function normalizedIdentityWorkCount(): number {
+    return normalizedIdentityWork;
+}
+
 export function normalizedIdentity(message: CoreMessage): string {
+    normalizedIdentityWork++;
     const h = createHash("sha256");
     h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(message.text)}`);
     return h.digest("hex").slice(0, 16);
@@ -177,13 +199,21 @@ function anchorFrom(message: CoreMessage): FoldAnchor {
 
 interface BlockLike {
     blockId?: string;
+    active?: boolean;
     effectiveMessageIds?: string[];
     directMessageIds?: string[];
 }
 
+/** #2297: only LIVE blocks count as covered. The kernel deactivates a block
+ *  (consumed into a newer fold, host-expanded, or drifted out of the resent
+ *  history) by setting active=false while KEEPING its effectiveMessageIds —
+ *  those dead-lineage ids can never re-anchor and would sit in `missing`
+ *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
+ *  #1195 pre-turn snapshot. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
     const covered = new Set<string>();
     for (const block of blocks) {
+        if (!block.active) continue;
         for (const id of block.effectiveMessageIds ?? []) covered.add(id);
     }
     return covered;
@@ -230,13 +260,16 @@ export function planReconciliation(
     // Candidates: inbound messages inside the churn region whose id is not
     // already covered (covered-present ids are exact matches of other old ids
     // and must not be claimed twice).
-    const candidates: { id: string; message: CoreMessage; norm: string }[] = [];
+    // #2334: norms are computed LAZILY — pass 1 (toolCallId) never needs them,
+    // so a fully tool-claimable churn region pays zero normalizations; pass 2
+    // computes each norm once, only for the candidates pass 1 left behind.
+    const candidates: { id: string; message: CoreMessage; norm?: string }[] = [];
     for (let i = prefix; i < newOrder.length - suffix; i++) {
         const id = newOrder[i];
         if (covered.has(id)) continue;
         const message = byId.get(id);
         if (message === undefined) continue;
-        candidates.push({ id, message, norm: normalizedIdentity(message) });
+        candidates.push({ id, message });
     }
     const claimedCandidates = new Set<string>();
 
@@ -282,8 +315,9 @@ export function planReconciliation(
     const normGroups = new Map<string, { ids: string[]; anchors: FoldAnchor[] }>();
     for (const cand of candidates) {
         if (claimedCandidates.has(cand.id)) continue;
-        const g = normGroups.get(cand.norm);
-        if (g === undefined) normGroups.set(cand.norm, { ids: [cand.id], anchors: [] });
+        const norm = cand.norm ?? (cand.norm = normalizedIdentity(cand.message));
+        const g = normGroups.get(norm);
+        if (g === undefined) normGroups.set(norm, { ids: [cand.id], anchors: [] });
         else g.ids.push(cand.id);
     }
     for (const oldId of missingMiddle) {
@@ -380,11 +414,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
     const nextAnchors: Record<string, FoldAnchor> = {};
+    let anchorCount = 0;
     for (const id of covered) {
+        // #2334: enforce the cap WHILE building. The old build-all-then-delete
+        // form computed a full normalization + sha256 for every covered id and
+        // discarded the overflow — and the discarded ids had no stored anchor
+        // to reuse, so EVERY subsequent pass recomputed and dropped them again
+        // (a 20k-id session paid 3616 wasted hashes per request). Breaking at
+        // the cap keeps exactly the old survivor set (first MAX_ANCHORS in
+        // covered order — the deletion loop removed precisely the tail) and the
+        // key order; ids past the cap still get no anchor, as before.
+        if (anchorCount >= MAX_ANCHORS) break;
         const claimed = plan.claims.get(id);
         if (claimed !== undefined) {
             const message = byId.get(claimed);
-            if (message !== undefined) nextAnchors[claimed] = anchorFrom(message);
+            if (message !== undefined) {
+                nextAnchors[claimed] = anchorFrom(message);
+                anchorCount++;
+            }
             continue;
         }
         // An unchanged id means unchanged bytes (kernel deriveMessageId hashes
@@ -393,14 +440,12 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // re-hashing the full text every pass (#1930-2: keeps steady-state
         // rounds near-free on 8K-message histories).
         const prior = anchors[id];
-        if (prior !== undefined) { nextAnchors[id] = prior; continue; }
+        if (prior !== undefined) { nextAnchors[id] = prior; anchorCount++; continue; }
         const message = byId.get(id);
-        if (message !== undefined) nextAnchors[id] = anchorFrom(message);
-    }
-    let anchorCount = 0;
-    for (const id of Object.keys(nextAnchors)) {
-        if (anchorCount >= MAX_ANCHORS) delete nextAnchors[id];
-        else anchorCount++;
+        if (message !== undefined) {
+            nextAnchors[id] = anchorFrom(message);
+            anchorCount++;
+        }
     }
     const nextOrder = msgs.map((m) => m.id).filter((id): id is string => id !== undefined).slice(-MAX_ORDER);
 
@@ -489,9 +534,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         } else if (plan.claims.size > 0) {
             opts.log("warn",
                 `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
-        } else {
+        } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
+            // #2297: once the episode escalated, the single error line IS the
+            // report — repeating this warn per pass contradicts the #2193
+            // contract ("one error line per episode ... instead of letting the
+            // identical warn print hundreds of times"). Recovery resets the
+            // latch, so a later episode reports fresh; the persisted latch also
+            // keeps a restarted process silent mid-episode (#2293 terminal state).
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — originals re-enter the wire unfolded (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.unmatched.length} covered id(s) missing with no anchor match — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire) (#1921)`);
         }
     }
     return {

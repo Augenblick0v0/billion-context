@@ -79,6 +79,12 @@ export type Session = {
          *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
          *  Set once on the first request that has a user message. */
         title?: string;
+        /** #2322: session name set by the host itself (pi /name). Sent by the
+         *  plugin over POST /__bili/plugin/session-name; latest-wins and a
+         *  clear (empty) removes it. Kept separate from `title` so the four
+         *  first-message derivation sites never touch it; display precedence
+         *  is hostTitle || title. */
+        hostTitle?: string;
         /** Effective compress prompt pack for the most recent request
          *  ("default" when none). Route/model can change it mid-session, so
          *  this is stamped per request (latest wins) — persisted so post-hoc
@@ -191,10 +197,11 @@ export type Session = {
         lastInputTokensOrigin?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
-          *  text estimate), clamped to [0.25, 1] — one-way by design: the
-          *  correction can only deflate the estimate (never fire earlier
-          *  than the raw proxy); routes billing above the local estimate
-          *  publish k̂=1 (legacy behavior, overflow arm covers them). A
+         *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
+         *  correction can inflate OR deflate the estimate toward the route's
+         *  real billing scale (the one-way max-1 design failed empirically on
+         *  CJK-heavy routes where billing runs 2.4–4.0× above the local
+         *  estimate, so under-estimating routes learned nothing). A
           *  sample is only admitted
           *  when it falls in the plausibility band [0.2, 5] — outside it the
           *  report and the payload clearly don't correspond (placeholder
@@ -229,7 +236,8 @@ export type Session = {
          calibrationRing?: { origin: string; model?: string; values: number[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
-         *  system/tools overhead + image reserve, defaultCountTokens rate),
+         *  system/tools overhead + image reserve, defaultCountTokens rate;
+         *  includes host-projected thinking mass since #2407),
          *  recorded in prepare*. settleUsageReport pairs it with the NEXT
          *  usage report's billed total (same request) to sample k̂, then
          *  overwrites it with the current turn's value. In-memory only — a

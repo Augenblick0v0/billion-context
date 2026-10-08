@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.187",
+  "version": "0.1.188",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,13 +16,13 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "npm --prefix kernel run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs",
+    "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
-    "pretypecheck": "npm --prefix kernel run build",
+    "pretypecheck": "npm --prefix kernel run build && npm --prefix pi-subagents run build",
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "check:unused-exports": "node scripts/check-unused-exports.mjs",
-    "pretest": "npm --prefix kernel run build",
+    "pretest": "npm --prefix kernel run build && npm --prefix pi-subagents run build",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
     "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
@@ -65,7 +65,7 @@
     "@types/semver": "^7.7.1",
     "@types/ws": "8.18.2",
     "acp-kernel": "file:./kernel",
-    "billion-context-pi-subagents": "0.1.1",
+    "billion-context-pi-subagents": "file:./pi-subagents",
     "esbuild": "^0.27.0",
     "fzstd": "0.1.1",
     "jsonc-parser": "^3.3.1",
@@ -75,6 +75,7 @@
     "tar": "^7.5.22",
     "tsup": "^8.0.0",
     "tsx": "^4.0.0",
+    "typebox": "^1.3.34",
     "typescript": "^5.5.0",
     "undici": "^7.29.0",
     "verdaccio": "^6.10.4",
@@ -88,7 +89,9 @@
     "README.md",
     "dist",
     "dsh.bundle.patch.yml",
-    "hermes-plugin"
+    "hermes-plugin",
+    "paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md",
+    "paper/figures/*.png"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",

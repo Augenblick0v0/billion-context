@@ -206,12 +206,24 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     return cap;
 }
 
-// Only override genuine cadence silences: skip the kernel's deliberate
-// "nothing compressible to offer" suppression (empty ranges).
-export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT): boolean {
+// Only override genuine cadence silences — never the kernel's deliberate
+// "nothing worth offering" suppressions. #2104: that includes the NON-empty
+// kind: decideNudge suppresses while compressibleRanges still carries the raw
+// list (reason "max compressible < threshold" / "max pending < min benefit" —
+// every range below minCompressRange). "List non-empty" used to read as
+// "worth advertising", so past the escalation line the override injected a
+// nudge whose range list compress would atomically reject — the
+// nudge-vs-compress/acp_status contradiction of #2104, which fed a
+// compress-loop (4 rejected/burned calls in 9 steps). Gate the override on
+// the SAME submit gate compress applies — chars >= minCompressRange (#847,
+// the postCompressTail/handleAcpStatus filter, mirroring the kernel's own
+// pendingByTier expression): the emergency line may only advertise ranges
+// that are executable. minCompressRange 0 (default) preserves the legacy
+// any-non-empty-list semantics for direct callers.
+export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
-    if (nudge.compressibleRanges.length === 0) return false;
-    return nudge.contextUsage >= escalationPct;
+    if (nudge.contextUsage < escalationPct) return false;
+    return nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange);
 }
 
 export function clampOutgoingOutput(

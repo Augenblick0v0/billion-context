@@ -330,6 +330,14 @@ export interface NudgeConfig {
    *  pending ≥ nudgeGrowthTokens × this multiplier AND T2 > T1 effective.
    *  Default 1.5. */
   tier2GrowthMultiplier: number;
+  /** Per-tier growth thresholds in tokens (#2376): independent trigger sizes
+   *  for the T1/T2/T3 token-mass paths. Each UNSET tier falls back to the
+   *  derived default (T1 = resolved nudgeGrowthTokens, T2/T3 =
+   *  nudgeGrowthTokens × tier2GrowthMultiplier), so an absent or empty object
+   *  is fully backward compatible. Only the token-mass trigger comparisons
+   *  change — count triggers, cadence floor, first-sight mass bypass and the
+   *  pressure/emergency routing keep their existing bases. */
+  tierGrowthTokens?: { t1?: number; t2?: number; t3?: number };
   /** Minimum tokens the pressure band (usage ≥ maxContextLimitPct /
    *  emergencyThresholdPct) must be able to reclaim before injecting. Below
    *  this, the rewrite reclaims almost nothing while high usage keeps the

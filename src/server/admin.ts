@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
-import { handleAcpCache, readKeySwitchStats, readModelSwitchStats } from "../cache-ledger.js";
+import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings } from "../compress-settings.js";
@@ -12,7 +12,7 @@ import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
@@ -399,6 +399,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/plugin/session-name") {
+        // #2322: host-provided conversation name (pi /name) — becomes the
+        // session's display title in the web UI (clear = empty string).
+        try {
+            const body = await readBody(req);
+            handlePluginSessionName(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
     // management prefixes; forwarding would leak the internal path to the
     // upstream (which 403s it) — #346.
@@ -480,12 +493,13 @@ function sendStats(res: http.ServerResponse): void {
     const sessions = all.map((s) => {
         const sw = readModelSwitchStats(s);
         const ks = readKeySwitchStats(s);
+        const ps = readPromptSwitchStats(s);
         return {
             id: s.id,
             protocol: s.meta.protocol,
             upstream: s.meta.upstreamOrigin,
             label: s.meta.label,
-            title: s.meta.title,
+            title: s.meta.hostTitle ?? s.meta.title,
             requests: s.stats.requests,
             contextTokens: s.stats.contextTokens,
             contextTokensSource: s.stats.contextTokensSource,
@@ -499,6 +513,8 @@ function sendStats(res: http.ServerResponse): void {
             switchMissedTokens: sw?.missedTokens ?? 0,
             keySwitches: ks?.count ?? 0,
             keySwitchMissedTokens: ks?.missedTokens ?? 0,
+            promptSwitches: ps?.count ?? 0,
+            promptSwitchMissedTokens: ps?.missedTokens ?? 0,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.

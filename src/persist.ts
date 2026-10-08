@@ -101,6 +101,7 @@ interface PersistedSession {
         label?: string;
         title?: string;
         activePack?: string;
+        hostTitle?: string;
     };
     /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
      *  fallbacks below. */
@@ -786,11 +787,11 @@ function isBlockView(v: unknown): v is BlockView {
 }
 
 // #2129: restore-time validation for the #1933 F1 calibrated factor. The learner
-// publishes factors clamped to [CLAMP_MIN, CLAMP_MAX], but applyEstimateCalibration
-// applies whatever it is given UNCLAMPED — a corrupt/hand-edited file with k̂>1
-// would INFLATE every estimate (violating the one-way deflate contract) and
-// k̂<0.25 over-deflates past the published band. Reject out-of-band values instead
-// of trusting them: absent falls back to the raw estimate (today's behavior).
+// publishes factors clamped to [CLAMP_MIN, CLAMP_MAX] (two-way since #2366), but
+// applyEstimateCalibration applies whatever it is given UNCLAMPED — a corrupt or
+// hand-edited file outside the published band would move every calibrated reading
+// off-scale (k̂>4 over-inflates, k̂<0.25 over-deflates). Reject out-of-band values
+// instead of trusting them: absent falls back to the raw estimate (legacy behavior).
 function restoreCalibratedEstimate(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) && v >= CALIBRATION_CLAMP_MIN && v <= CALIBRATION_CLAMP_MAX ? v : undefined;
 }
@@ -836,6 +837,8 @@ function buildSession(parsed: PersistedSession): Session {
             title: meta.title,
             // #1724: buildRecord persists activePack via spread but this reader dropped it
             activePack: typeof meta.activePack === "string" ? meta.activePack : undefined,
+            // #2322: same as activePack above — buildRecord persists hostTitle via the spread; restore so the name survives restart
+            hostTitle: typeof meta.hostTitle === "string" ? meta.hostTitle : undefined,
         },
         stats: {
             requests: stats.requests ?? parsed.requests ?? 0,
