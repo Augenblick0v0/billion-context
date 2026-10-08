@@ -10,7 +10,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startServer } from "../src/server.ts";
-import { clampOutgoingOutput, countLoadedToolItems, countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, modelVisibleTools } from "../src/server/budget.ts";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, modelVisibleTools } from "../src/server/budget.ts";
 
 const deferred = {
     type: "function", name: "large_schema", description: "x".repeat(1_200_000),
@@ -65,13 +65,13 @@ test("#2391: loaded records count in full even when the definitions still say de
         const body = { instructions: "SHORT", tools, input: [loaded] };
         const before = JSON.stringify(body);
         const loadedTokens = defaultCountTokens(JSON.stringify(loaded));
-        assert.equal(countLoadedToolItems(body), loadedTokens);
+        assert.equal(countLoadedToolTokens(body), loadedTokens);
         assert.equal(estimateWireOverhead("responses", before), countSystemAndToolsTokens(body.instructions, tools) + loadedTokens);
         assert.ok(estimateWireOverhead("responses", before) > 272_000);
         assert.equal(JSON.stringify(body), before);
     }
-    assert.equal(countLoadedToolItems({ input: [] }), 0);
-    assert.equal(countLoadedToolItems({ input: "hello" }), 0);
+    assert.equal(countLoadedToolTokens({ input: [] }), 0);
+    assert.equal(countLoadedToolTokens({ input: "hello" }), 0);
 });
 
 test("#2391: usage remains authoritative; loaded definitions enter calibration before the max", () => {

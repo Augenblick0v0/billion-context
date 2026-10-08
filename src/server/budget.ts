@@ -43,7 +43,7 @@ export function modelVisibleTools(tools: unknown): unknown {
 }
 
 /** Loaded definitions count in full even if they still carry defer_loading. */
-export function countLoadedToolItems(body: Record<string, unknown>): number {
+export function countLoadedToolTokens(body: Record<string, unknown>): number {
     if (!Array.isArray(body.input)) return 0;
     let tokens = 0;
     for (const item of body.input) {
@@ -219,7 +219,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     }
     return defaultCountTokens(sysText)
         + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
-        + (protocol === "responses" ? countLoadedToolItems(parsed) : 0);
+        + (protocol === "responses" ? countLoadedToolTokens(parsed) : 0);
 }
 
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or
@@ -281,7 +281,7 @@ export function clampOutgoingOutput(
     if (typeof raw !== "number") return;
     // #488: images ride along in the rebuilt body but are invisible to the text model —
     // without them the cap is too generous and input+output can still overflow.
-    const loadedToolTokens = field === "max_output_tokens" ? countLoadedToolItems(rebuilt) : 0;
+    const loadedToolTokens = field === "max_output_tokens" ? countLoadedToolTokens(rebuilt) : 0;
     const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin, loadedToolTokens) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {

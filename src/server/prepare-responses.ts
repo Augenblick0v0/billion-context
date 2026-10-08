@@ -29,7 +29,7 @@ import { stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "../acp-panel
 import type { ConversationIdentity } from "../session-id.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
 import { keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
-import { clampOutgoingOutput, countLoadedToolItems, countSystemAndToolsTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
+import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, emergencyNudge, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 
 export async function prepareResponses(
@@ -456,7 +456,7 @@ export async function prepareResponses(
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
     // mid-history items the kernel already classifies.
-    const loadedToolTokens = countLoadedToolItems(rebuilt);
+    const loadedToolTokens = countLoadedToolTokens(rebuilt);
     if (transformOk) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut) + loadedToolTokens;
         const catalogTokens = defaultCountTokens(JSON.stringify(toolsOut ?? []));
