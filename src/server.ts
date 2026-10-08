@@ -4451,8 +4451,9 @@ async function preflightCompressIfNeeded(
     // upstream's billing scale diverges from the estimator's caliber
     // (incident #2313: a local OpenAI-compatible shim billed ~200 B/token —
     // the trigger read 7.3M-10.3M against a real 305K input, ~24-34x over),
-    // calibration cannot correct it (k̂ is one-way, clamped 0.25-1, and
-    // consistent samples below CALIBRATION_SAMPLE_MIN are discarded), so
+    // calibration cannot correct it (k̂ is two-way since #2366 but clamped
+    // 0.25-4, and a 24-34x shim sits far outside the clamp; consistent
+    // samples below CALIBRATION_SAMPLE_MIN are discarded), so
     // estimate-driven folding demands unreachable targets, cannot finish
     // inside client stream patience (~300s idle abort), and never lets a
     // forward through — 0 successful forwards in 12h while every failed

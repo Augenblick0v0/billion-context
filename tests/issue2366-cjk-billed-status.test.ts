@@ -75,6 +75,7 @@ interface CtxOverrides {
     lastInputTokens?: number;
     source?: string;
     contextTokensAt?: number;
+    systemPromptTokens?: number;
 }
 
 function makeCtx(messages: CoreMessage[], o?: CtxOverrides): {
@@ -97,7 +98,10 @@ function makeCtx(messages: CoreMessage[], o?: CtxOverrides): {
                 compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0,
                 storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0,
             },
-            metadata: o?.contextTokensAt !== undefined ? { contextTokensAt: o.contextTokensAt } : {},
+            metadata: {
+                ...(o?.contextTokensAt !== undefined ? { contextTokensAt: o.contextTokensAt } : {}),
+                ...(o?.systemPromptTokens !== undefined ? { systemPromptTokens: o.systemPromptTokens } : {}),
+            },
             state: createInitialState(),
             createdAt: Date.now(),
             lastSeen: Date.now(),
@@ -130,6 +134,16 @@ test("#2366 B: acp_status shows the billed input next to the estimate view, with
     assert.ok(out.includes("est-view total 12000 tok · ratio 2.5×"), "estimate-view total + ratio rendered");
     assert.ok(out.includes("Judge context pressure from BILLED INPUT"), "divergence note present at ratio 2.5×");
     assert.ok(!out.includes("measured "), "fresh measurement carries no age suffix");
+});
+
+test("#2366 B: system-heavy sessions don't read as divergence — est view carries the system+tools overhead", () => {
+    // 12,000 tok of message text + 20,000 tok system/tools vs billed 36,000:
+    // message-only caliber would show 3.0× and blame the tokenizer; the
+    // like-for-like caliber (32,000 incl. overhead) shows 1.1× → no note.
+    const ctx = withRefs(makeCtx(MSGS(), { lastInputTokens: 36000, source: "usage", contextTokensAt: Date.now(), systemPromptTokens: 20000 }));
+    const out = handleAcpStatus({}, ctx).text;
+    assert.ok(out.includes("est-view total 32000 tok · ratio 1.1×"), `overhead folded into the est view (got: ${out.slice(0, 400)})`);
+    assert.ok(!out.includes("Judge context pressure from BILLED INPUT"), "same-caliber ratio 1.1× < 1.5 → no divergence note");
 });
 
 test("#2366 B: stale measurement carries an age suffix; no note below ratio 1.5", () => {

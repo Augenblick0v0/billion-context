@@ -71,6 +71,12 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (billed > 0) {
         let estTotal = 0;
         for (const m of ctx.messages) estTotal += defaultCountTokens(m.text ?? "");
+        // Billed input covers system+tools too (and images); the est view must
+        // carry the same overhead — every prepare site keeps
+        // metadata.systemPromptTokens current — or every system-heavy session
+        // reads as divergence with no tokenizer gap behind it.
+        const sysOverhead = ctx.session.metadata?.systemPromptTokens;
+        if (typeof sysOverhead === "number" && sysOverhead > 0) estTotal += sysOverhead;
         const srcLabel = ctx.session.stats.lastInputTokensSource === "overflow-arm" ? "overflow arm (bounded)" : "upstream usage";
         let billedLine = `BILLED INPUT (${srcLabel}): ${billed} tok`;
         const measuredAt = ctx.session.metadata?.contextTokensAt;
