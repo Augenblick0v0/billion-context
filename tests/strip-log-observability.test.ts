@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createTagEchoFilter, createMarkerLineFilter, createBiliArtifactFilter, createIdentityStreamFilter, composeStreamFilters, stripAcpTags } from "../src/loop/tag-echo-filter.ts";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
+import { createAnthropicAdapter } from "../src/loop/adapter-anthropic.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { Session } from "../src/session.ts";
 
@@ -80,7 +81,7 @@ test("filters count every drop event, composition sums, identity stays zero (#24
     tag.flush();
     const ts = tag.stats();
     assert.equal(ts.dropped, true);
-    assert.ok(ts.dropCount >= 3, `expected >=3 drop events, got ${ts.dropCount}`);
+    assert.equal(ts.dropCount, 3, `three tags in one push = three artifacts, got ${ts.dropCount}`);
 
     const marker = createMarkerLineFilter();
     marker.push(`line\n📦 [ACP] Compressed m00120–m0300 → 1 block(s), ~12K tokens saved.\nnext`);
@@ -101,7 +102,7 @@ test("filters count every drop event, composition sums, identity stays zero (#24
     composed.push(`a ${TAG("m00010")} b\n📦 [ACP] Compressed m00120–m0300 → 1 block(s), ~12K tokens saved.\n`);
     composed.flush();
     const cs = composed.stats();
-    assert.ok(cs.dropCount >= 2, `composition must SUM family counts, got ${cs.dropCount}`);
+    assert.equal(cs.dropCount, 2, `composition must SUM family counts, got ${cs.dropCount}`);
 
     // whole-text stripper parity: the same input loses every tag
     const whole = stripAcpTags(`a ${TAG("m00001")} b ${TAG("m00002")} c`);
@@ -133,6 +134,25 @@ test("plugin chat pipe settles with one total line and no double-write (#2405c)"
     assert.ok(totals[0].includes("[sess-strip]"), totals[0]);
     // the request-logger twin write is gone: no family line may arrive there
     assert.ok(!reqLogs.some((m) => m.includes("[tag-echo]")), `double-write detected: ${reqLogs.join(" | ")}`);
+});
+
+test("a pair split across pushes counts once, not per drop call (#2405c review)", () => {
+    // SSE deltas split tags arbitrarily: an opening completing in one push and
+    // its close in the next is ONE artifact even though the state machine
+    // drops the opening and the completion as two separate calls.
+    const tag = createTagEchoFilter();
+    const text = `x ${TAG("m00001")} y`;
+    const cut = text.indexOf(`${GT}m00001`) + 1;
+    tag.push(text.slice(0, cut));
+    tag.push(text.slice(cut));
+    tag.flush();
+    assert.equal(tag.stats().dropCount, 1, `split pair must count once, got ${tag.stats().dropCount}`);
+
+    const many = createTagEchoFilter();
+    const two = `before ${TAG("m00002")} mid ${TAG("m00003")} after`;
+    for (let i = 0; i < two.length; i += 9) many.push(two.slice(i, i + 9));
+    many.flush();
+    assert.equal(many.stats().dropCount, 2, `two fragmented tags = two artifacts, got ${many.stats().dropCount}`);
 });
 
 test("single-strip response: detail line only, no total line (n==1 boundary, #2405c)", async () => {
@@ -200,4 +220,33 @@ test("detection lines never say 'stripped' and single-drop responses stay silent
     assert.ok(!logs.some((l) => l.includes("stripped model-emitted")), logs.join(" | "));
     assert.ok(!logs.some((l) => l.includes("occurrence(s) total")), logs.join(" | "));
     assert.ok(!logs.some((l) => l.includes("not stripped")), logs.join(" | "));
+});
+
+test("proxy-mode adapter settles exactly one strip-total line (anthropic, #2405c)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    try {
+        const text = `before ${TAG("m00020")} mid ${TAG("m00021")} after`;
+        const parts: string[] = [];
+        for (let i = 0; i < text.length; i += 9) parts.push(text.slice(i, i + 9));
+        const sseParts = [
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 100 } } })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+            ...parts.map((p) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } })}\n\n`),
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+            `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}\n\n`,
+            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ];
+        const adapter = createAnthropicAdapter({ model: "test" });
+        let clientBytes = "";
+        for await (const ev of adapter.parseStream(streamOf(sseParts), 1)) {
+            if (ev.kind === "meta") clientBytes += ev.chunk.toString("utf8");
+        }
+        assert.ok(!clientBytes.includes(LT + "acp "), `stripped tags must not leak to the client: ${clientBytes}`);
+        const totals = logs.filter((l) => l.includes("occurrence(s) total in this response"));
+        assert.equal(totals.length, 1, `exactly one total line expected, got: ${logs.join(" | ")}`);
+        assert.ok(totals[0].includes("stripped 2 occurrence(s)"), totals[0]);
+    } finally {
+        setLogCapture(null);
+    }
 });

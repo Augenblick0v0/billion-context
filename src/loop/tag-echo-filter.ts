@@ -327,7 +327,8 @@ export interface TagEchoFilterStats {
     outputChars: number;
     /** Whether anything was dropped as an imitation. */
     dropped: boolean;
-    /** Count of individual drop events (each stripped occurrence), lifetime. #2405(c). */
+    /** Stripped echo artifacts (one per logical occurrence — a pair split across
+     *  pushes or a multi-chunk imitation counts once), lifetime. #2405(c). */
     dropCount: number;
 }
 
@@ -916,13 +917,32 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     let inputChars = 0;
     let outputChars = 0;
     let dropCount = 0;
-    const drop = (snippet: string) => {
+    // #2405(c) review: count LOGICAL ARTIFACTS, not state-machine drop calls.
+    // A pair split across pushes drops its opening and its completion as two
+    // calls yet is one artifact (SSE deltas split tags arbitrarily, so call
+    // counting would double most production tags); a wrapped imitation past
+    // the cap drops repeatedly until its close. swallowSessionCounted keeps
+    // any one swallow session at exactly one count.
+    let swallowSessionCounted = false;
+    const recordDrop = (snippet: string) => {
         droppedAny = true;
-        dropCount++;
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
         }
+    };
+    /** One self-contained artifact resolved by a single drop call. */
+    const drop = (snippet: string) => {
+        dropCount += 1;
+        recordDrop(snippet);
+    };
+    /** Any drop inside a live swallow session — the session counts once. */
+    const dropSwallowSpan = (snippet: string) => {
+        if (!swallowSessionCounted) {
+            dropCount += 1;
+            swallowSessionCounted = true;
+        }
+        recordDrop(snippet);
     };
     /** Character immediately before the refs run of an orphan-unit match —
      *  within the buffer, or the last emitted char when the run sits at the
@@ -947,10 +967,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // whatever the body is.
                     const inner = combined.slice(0, span.start);
                     if (REFS_ONLY.test(inner) || !swallowReleases) {
-                        drop(combined.slice(0, span.end));
+                        dropSwallowSpan(combined.slice(0, span.end));
                     } else {
                         out += inner;
-                        drop(combined.slice(span.start, span.end));
+                        dropSwallowSpan(combined.slice(span.start, span.end));
                     }
                     swallowed = "";
                     swallowUntilClose = false;
@@ -965,7 +985,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // markup and must be discarded whole).
                     const dspan = degenCloseAfterRef(combined);
                     if (dspan !== null) {
-                        drop(combined.slice(0, dspan.end));
+                        dropSwallowSpan(combined.slice(0, dspan.end));
                         swallowed = "";
                         swallowUntilClose = false;
                         buf = combined.slice(dspan.end);
@@ -979,7 +999,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         // marker list, not prose — discard it. Mixed tails are
                         // content and still release losslessly.
                         if (REFS_ONLY.test(combined)) {
-                            drop(combined);
+                            dropSwallowSpan(combined);
                             return out;
                         }
                         swallowUntilClose = false;
@@ -989,7 +1009,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     }
                     // The span is an attested imitation's payload: discard it and
                     // keep swallowing, so no part of it reaches the client.
-                    drop(combined);
+                    dropSwallowSpan(combined);
                     return out;
                 }
                 swallowed = combined;
@@ -1034,7 +1054,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // list ends at its `>`, which the class cannot cross.
             const broken = BROKEN_ATTRS.exec(buf);
             if (broken && (m === null || broken.index < m.index)) {
-                drop(broken[0]);
+                swallowSessionCounted = false;
+                recordDrop(broken[0]);
                 out += buf.slice(0, broken.index);
                 buf = buf.slice(broken.index + broken[0].length);
                 swallowUntilClose = true;
@@ -1067,7 +1088,6 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 }
                 break;
             }
-            drop(m[0]);
             out += buf.slice(0, m.index);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
@@ -1079,9 +1099,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // follows in this same chunk: then the bare open wraps or sits
             // beside inner markup, so drop it alone and let the loop decide
             // the inner structure on its own merits (#1720 nesting).
+            // Artifact counting (#2405c review): a session-starting open is
+            // recorded without counting here — its artifact completes at the
+            // session's first counted span; every other match is self-contained.
             if (m === o) {
                 const bare = !OPEN_WITH_ATTRS.test(m[0]);
-                if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) continue;
+                if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) {
+                    drop(m[0]);
+                    continue;
+                }
+                swallowSessionCounted = false;
+                recordDrop(m[0]);
                 // An odd number of quotes means the opening's attribute list
                 // never closed: the model wrapped its turn inside the value (the
                 // sibling shape opens with such a value and then runs into a `<`,
@@ -1095,6 +1123,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 swallowReleases = !wrapped;
                 swallowBareOpen = bare;
                 swallowed = "";
+            } else {
+                drop(m[0]);
             }
         }
         return out;
@@ -1172,7 +1202,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // imitation (never released, #1720), or an attrs-bearing
                 // opening whose tail never closed — that tail is tag content
                 // (a ref, possibly truncated), not prose (#644 EOF rule).
-                if (rest.length > 0) drop(rest);
+                if (rest.length > 0) dropSwallowSpan(rest);
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
@@ -1181,15 +1211,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    drop(t[0]);
+                    dropSwallowSpan(t[0]);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        drop(tc[0]);
+                        dropSwallowSpan(tc[0]);
                         result = rest.slice(0, tc.index);
                     } else if (REFS_ONLY.test(rest)) {
-                        drop(rest);
+                        dropSwallowSpan(rest);
                         result = "";
                     } else {
                         result = rest;
