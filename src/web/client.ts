@@ -69,6 +69,43 @@ export const WEB_CLIENT = `(function () {
         return line;
     }
     window.bili_conflictLine = bili_conflictLine;
+    // #2219: per-client remediation block for the conflict surfaces — one
+    // actionable i18n line per resolved client (capped so the banner stays a
+    // summary), unknown clients fall back to the generic hint, and every block
+    // ends at the docs pointer instead of duplicating the full matrix.
+    // Explicit branches keep every key a literal t("…") reference so the #1024
+    // liveness gate sees them (dynamic "conflict.hint." + cl reads as dead);
+    // the whitelist mirrors the server map (conflictRemediation), unknown → generic.
+    function conflictHintLine(cl) {
+        switch (cl) {
+            case "opencode": return t("conflict.hint.opencode");
+            case "claude": return t("conflict.hint.claude");
+            case "codex": return t("conflict.hint.codex");
+            case "pi": return t("conflict.hint.pi");
+            case "omp": return t("conflict.hint.omp");
+            default: return t("conflict.hint.generic");
+        }
+    }
+    function conflictHintBlock(clients) {
+        const uniq = [];
+        for (const x of Array.isArray(clients) ? clients : []) {
+            if (typeof x !== "string" || !x || uniq.indexOf(x) >= 0) continue;
+            uniq.push(x);
+        }
+        const MAX_HINTS = 3;
+        let html = '<div style="margin-top:6px">' + t("conflict.hint_label");
+        if (uniq.length === 0) {
+            html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(t("conflict.hint.generic")) + "</div>";
+        } else {
+            for (const cl of uniq.slice(0, MAX_HINTS)) {
+                html += '<div class="mono small" style="margin-top:2px">' + escapeHtml(conflictHintLine(cl)) + "</div>";
+            }
+            if (uniq.length > MAX_HINTS) html += '<div class="dim small">' + t("conflict.hint_more", { n: uniq.length - MAX_HINTS }) + "</div>";
+        }
+        html += '<div class="dim small">' + escapeHtml(t("conflict.docs")) + "</div></div>";
+        return html;
+    }
+    window.bili_conflictHintBlock = conflictHintBlock;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -394,7 +431,10 @@ export const WEB_CLIENT = `(function () {
                 const what = [tpN > 0 ? t("conflict.what_plugin") : "", siblingN > 0 ? t("conflict.what_sibling") : "", nativeN > 0 ? t("conflict.what_native") : ""].filter(Boolean).join(t("conflict.what_join"));
                 const active = typeof c.active === "number" ? c.active : c.events;
                 const risk = tpN === 0 && nativeN === 0 ? t("conflict.risk_sibling") : (active > 0 ? t("conflict.risk_active") : t("conflict.risk_historical"));
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
+                // #2219: per-client remediation block between the summary line and the
+                // details pointer — clients[] comes from summarizeConflicts (server-side
+                // resolution); payloads without it degrade to the generic hint only.
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong>" + t("conflict.found") + escapeHtml(what) + risk + '<span class="mono">(' + bili_conflictLine(c) + ")</span>" + conflictHintBlock(c.clients) + t("conflict.where") + '<button id="conflicts-clear-btn" class="btn sm">' + t("conflict.clear_btn") + "</button>";
                 cb.classList.toggle("info", active === 0);
                 cb.classList.toggle("warn", active > 0);
                 const btn = $("conflicts-clear-btn");
@@ -1117,6 +1157,9 @@ export const WEB_CLIENT = `(function () {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
             parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.conflicts_title") + '</span><span class="hint">' + t("det.conflicts_hint") + '</span></div><div class="card-b">');
+            // #2219: per-client remediation for THIS session — conflictClient is
+            // resolved server-side (sessions-data), unknown/absent → generic hint.
+            parts.push('<div class="mono small dim" style="margin-bottom:8px">' + escapeHtml(conflictHintLine(d.conflictClient)) + "</div>");
             for (const ev of d.conflicts.slice(-10).reverse()) {
                 parts.push('<div class="alert-row"><span class="mono">' + escapeHtml(fmtDT(ev.at)) + ' · ' + escapeHtml(ev.kind) + "</span><span>" + escapeHtml(ev.detail) + "</span></div>");
             }
