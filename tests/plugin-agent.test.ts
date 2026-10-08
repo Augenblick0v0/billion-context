@@ -11,6 +11,24 @@ import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
+// A developer machine may leak ambient bili state into these tests:
+//  - BILLION_CONTEXT_PROXY (any shell launched THROUGH bili) — detectProxyBase
+//    would resolve it, the "inert host" tests would fetch a REAL manifest
+//    from the live proxy and register tools (CI has none, local runs broke);
+//  - ~/.pi/acp.json / billion-context.json delegate config — kept inert by
+//    the HOME isolation below.
+// Strip both for the whole file (restored on exit). The manifest-fetch paths
+// are exercised against the file's own fake servers, exactly like CI.
+const realHome = process.env.HOME;
+const realProxyEnv = process.env.BILLION_CONTEXT_PROXY;
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-"));
+delete process.env.BILLION_CONTEXT_PROXY;
+process.on("exit", () => {
+    try { fs.rmSync(process.env.HOME!, { recursive: true, force: true }); } catch { /* best effort */ }
+    process.env.HOME = realHome;
+    if (realProxyEnv !== undefined) process.env.BILLION_CONTEXT_PROXY = realProxyEnv;
+});
+
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus, destinationRoutedThroughProxy } from "../src/agent/shared.ts";
 import { wrapCacheReport, wrapRuleReport } from "../src/acp-panel.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";

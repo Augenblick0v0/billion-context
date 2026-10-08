@@ -84,6 +84,9 @@ type ExtensionAPI = {
     // pi-web); notify() is a transient toast — only the fallback for hosts
     // without sendMessage (issue #359).
     sendMessage?: (message: { customType: string; content: string; display: boolean }) => void;
+    // #2322: current session name (pi /name); optional because older hosts
+    // lack it (the session_info_changed event is the primary channel).
+    getSessionName?: () => string | undefined;
 };
 
 function agentName(override: string | undefined): string {
@@ -241,6 +244,32 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     } catch {
         return undefined;
     }
+}
+
+// #2322: report the host session name (pi /name) so the proxy's web UI labels
+// the conversation with it instead of staying pinned to the truncated first
+// user message. B-channel: a dedicated POST per change (set/rename/clear —
+// empty string clears) rather than piggybacking a header on model requests,
+// which could never express "cleared" and would only land on the next
+// request. Deduped per sid; a failed POST re-arms so the next event retries.
+const lastReportedNames = new Map<string, string>();
+
+function reportSessionName(ctx: Ctx | undefined, name: string): void {
+    const proxyBase = proxyBaseForCtx(ctx);
+    if (proxyBase === undefined) return;
+    const sid = ctx !== undefined ? sessionIdOf(ctx) : undefined;
+    if (sid === undefined || sid.length === 0) return;
+    const prev = lastReportedNames.get(sid);
+    if (prev === name || (name === "" && prev === undefined)) return;
+    lastReportedNames.set(sid, name);
+    fetch(`${proxyBase}/__bili/plugin/session-name`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId: sid, name }),
+        signal: AbortSignal.timeout(5000),
+    }).catch(() => {
+        lastReportedNames.delete(sid);
+    });
 }
 
 /** [#1333/#1362] Session files declare derivation in their header: the header
@@ -1022,6 +1051,17 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
             void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            // #2322: a resumed session may carry a name without ever firing
+            // session_info_changed (nothing changed) — stamp the current
+            // value once per session start so the proxy label follows it.
+            if (typeof pi.getSessionName === "function") {
+                try {
+                    const n = pi.getSessionName();
+                    if (typeof n === "string" && n.length > 0) reportSessionName(ctx, n);
+                } catch {
+                    // optional host API — ignore
+                }
+            }
         });
         // #2185: drop our required-child-extension entry when this session's
         // extension runtime tears down (quit/reload/new/resume/fork).
@@ -1043,6 +1083,13 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 body: JSON.stringify({ conversationId: sid }),
                 signal: AbortSignal.timeout(5000),
             }).catch(() => {});
+        });
+        // #2322: follow the host session name. The event carries the
+        // authoritative value (name: undefined = cleared) and fires on
+        // rename — no need to wait for the next model request.
+        pi.on("session_info_changed", (event, ctx) => {
+            const name = (event as { name?: unknown }).name;
+            reportSessionName(ctx, typeof name === "string" ? name : "");
         });
         // #2186: acp_delegate surface for the pi lane, inlined from
         // billion-context-pi-subagents. omp never reaches the wiring (the

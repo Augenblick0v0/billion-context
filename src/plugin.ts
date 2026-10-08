@@ -738,6 +738,53 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
     res.end(JSON.stringify({ ok: true, conversationId }));
 }
 
+// #2322: the host named the conversation (pi /name) — remember it as the
+// session's display title. B-channel design: a dedicated endpoint (instead
+// of a request header) so set/rename/CLEAR are all expressible (empty name =
+// clear, falling display back to the derived first-message title) and the
+// name lands immediately, not on the next model request.
+const HOST_TITLE_MAX = 200;
+
+export function handlePluginSessionName(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: { conversationId?: unknown; name?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown; name?: unknown };
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
+        return;
+    }
+    if (typeof parsed.name !== "string") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "name must be a string (empty clears)" }));
+        return;
+    }
+    const { session, entry } = resolveConversation(conversationId);
+    if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+            ok: false,
+            error: entry
+                ? `unknown plugin conversation id "${conversationId}" (id registered but session not resident)`
+                : `unknown plugin conversation id "${conversationId}" (no model request has arrived with this conversation id yet)`,
+        }));
+        return;
+    }
+    let name = parsed.name.replace(/\s+/g, " ").trim();
+    if (name.length > HOST_TITLE_MAX) name = name.slice(0, HOST_TITLE_MAX);
+    if (name) session.meta.hostTitle = name;
+    else delete session.meta.hostTitle;
+    markDirty(session);
+    if (entry) entry.lastSeen = Date.now();
+    res.end(JSON.stringify({ ok: true, conversationId }));
+}
+
 // #1685: the conversation_id tool parameter is GONE from the manifest — the
 // model must never see or echo a conversation id (zero-injection identity:
 // the proxy routes by outbound tool_use witness / body id / single-active

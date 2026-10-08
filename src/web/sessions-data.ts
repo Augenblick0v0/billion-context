@@ -433,7 +433,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
  *  Session construction (#1937). */
 interface SummarySource {
     id: string;
-    meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string };
+    meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
     stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string }> };
@@ -465,6 +465,7 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             upstreamOrigin: str(meta.upstreamOrigin) ?? str(r.upstreamOrigin),
             label: str(meta.label) ?? str(r.label),
             title: str(meta.title),
+            hostTitle: str(meta.hostTitle),
         },
         stats: {
             requests: num(stats.requests, num(r.requests)),
@@ -560,7 +561,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     return {
         id: s.id,
         ...(best ? { contextBest: best } : {}),
-        ...(s.meta.title ? { title: s.meta.title } : {}),
+        // #2322: a host-provided name (pi /name) outranks the derived
+        // first-message title everywhere the row feeds (list, search, export).
+        ...((s.meta.hostTitle || s.meta.title) ? { title: s.meta.hostTitle || s.meta.title } : {}),
         // #1426: meta.label is auto-stamped with the session id on many clients —
         // treat label === id as "no title" so lists/details show 无标题 + block hint.
         ...(s.meta.label && s.meta.label !== s.id ? { label: s.meta.label } : {}),
