@@ -327,6 +327,8 @@ export interface TagEchoFilterStats {
     outputChars: number;
     /** Whether anything was dropped as an imitation. */
     dropped: boolean;
+    /** Count of individual drop events (each stripped occurrence), lifetime. #2405(c). */
+    dropCount: number;
 }
 
 export interface TagEchoFilter {
@@ -797,8 +799,10 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
+    let dropCount = 0;
     const drop = (snippet: string) => {
         droppedAny = true;
+        dropCount++;
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
@@ -874,7 +878,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
         },
         dropped: () => droppedAny,
         pending: () => buf.length > 0 || swallowing,
-        stats: () => ({ inputChars, outputChars, dropped: droppedAny }),
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
 
@@ -911,8 +915,10 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
+    let dropCount = 0;
     const drop = (snippet: string) => {
         droppedAny = true;
+        dropCount++;
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
@@ -1224,7 +1230,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return held.length > 0 || swallowUntilClose;
         },
         stats(): TagEchoFilterStats {
-            return { inputChars, outputChars, dropped: droppedAny };
+            return { inputChars, outputChars, dropped: droppedAny, dropCount };
         },
     };
 }
@@ -1363,9 +1369,11 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
     let notified = false;
     let inputChars = 0;
     let outputChars = 0;
+    let dropCount = 0;
 
     const noteDrop = (snippet: string) => {
         droppedAny = true;
+        dropCount++;
         if (!notified) {
             notified = true;
             onDrop?.(snippet);
@@ -1434,7 +1442,7 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
         },
         dropped: () => droppedAny,
         pending: () => buf.length > 0,
-        stats: () => ({ inputChars, outputChars, dropped: droppedAny }),
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
 
@@ -1455,6 +1463,7 @@ export function composeStreamFilters(a: TagEchoFilter, b: TagEchoFilter): TagEch
             inputChars: a.stats().inputChars,
             outputChars: b.stats().outputChars,
             dropped: a.dropped() || b.dropped(),
+            dropCount: a.stats().dropCount + b.stats().dropCount,
         }),
     };
 }
@@ -1476,6 +1485,6 @@ export function createIdentityStreamFilter(): TagEchoFilter {
         flush: () => "",
         dropped: () => false,
         pending: () => false,
-        stats: () => ({ inputChars, outputChars, dropped: false }),
+        stats: () => ({ inputChars, outputChars, dropped: false, dropCount: 0 }),
     };
 }
