@@ -890,4 +890,15 @@ test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)
         styles.includes(".embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }"),
         "embed reuses the phone-compact column set at any panel width",
     );
+    // The hidden TDs' <col> tracks still claim their px under table-layout:
+    // fixed unless zeroed — otherwise the SESSION column collapses to 0 and
+    // rows render double-exposed (title overflowing onto adjacent cells).
+    assert.ok(
+        styles.includes("\n    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "phone-compact releases the hidden <col> tracks",
+    );
+    assert.ok(
+        styles.includes(".embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "embed releases the hidden <col> tracks",
+    );
 });
