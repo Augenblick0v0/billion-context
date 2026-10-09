@@ -99,6 +99,13 @@ export interface FoldAnchor {
     t?: string;
     /** Length of the anchor-time text — collision guard for norm claims. */
     b: number;
+    /** #2454: protocol-invariant canonical fingerprint for tool calls/results —
+     *  sha256-16 of role\0toolName\0canonicalArgs, EXCLUDING the protocol-volatile
+     *  toolCallId and arg/result serialization. Lets a cross-protocol switch
+     *  (openai↔anthropic↔…) re-anchor a covered tool message whose exact id AND
+     *  normalized identity both drifted while its logical (name, args) is intact.
+     *  Undefined for non-tool messages and anchors persisted before this field. */
+    c?: string;
 }
 
 interface ReconciliationPlan {
@@ -106,6 +113,7 @@ interface ReconciliationPlan {
     claims: Map<string, string>;
     byTool: number;
     byNorm: number;
+    byCanon: number;
     /** Covered ids missing from the resent history with no match — either
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
@@ -118,6 +126,7 @@ interface FoldReconcileResult {
     claims: number;
     byTool: number;
     byNorm: number;
+    byCanon: number;
     unmatched: number;
 }
 
@@ -191,9 +200,45 @@ export function normalizedIdentity(message: CoreMessage): string {
     return h.digest("hex").slice(0, 16);
 }
 
+/** #2454: parse-normalize a tool payload into a deterministic byte form. JSON
+ *  values collapse via recursive key-sort (so openai's raw `arguments` string
+ *  and anthropic's safeStringify(input) of the SAME object agree); non-JSON text
+ *  (typical tool RESULTS: raw command/file output) falls back to whitespace+
+ *  unicode normalization. */
+export function canonicalArgs(text: string | undefined): string {
+    const t = text ?? "";
+    let parsed: unknown;
+    try { parsed = JSON.parse(t); } catch { parsed = undefined; }
+    if (t !== "" && parsed !== null && typeof parsed === "object") return canonicalJson(parsed);
+    return normalizeMessageText(t);
+}
+
+function canonicalJson(value: unknown): string {
+    if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+    if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+    const obj = value as Record<string, unknown>;
+    const parts = Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`);
+    return `{${parts.join(",")}}`;
+}
+
+/** #2454: protocol-invariant identity for a tool call (role assistant + toolName)
+ *  or result (role tool). Excludes toolCallId (call_ vs toolu_) and contentType
+ *  (literals differ per codec) so it is stable across a codec switch; returns
+ *  undefined for non-tool messages. */
+export function canonicalToolFingerprint(message: CoreMessage): string | undefined {
+    const isCall = message.toolName !== undefined && message.toolName !== "";
+    const isResult = message.role === "tool";
+    if (!isCall && !isResult) return undefined;
+    const h = createHash("sha256");
+    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalArgs(message.text)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
 function anchorFrom(message: CoreMessage): FoldAnchor {
     const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
     if (message.toolCallId !== undefined && message.toolCallId !== "") anchor.t = message.toolCallId;
+    const c = canonicalToolFingerprint(message);
+    if (c !== undefined) anchor.c = c;
     return anchor;
 }
 
@@ -227,7 +272,7 @@ export function planReconciliation(
     msgs: CoreMessage[],
     covered: Set<string>,
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, unmatched: [] };
+    const plan: ReconciliationPlan = { claims: new Map(), byTool: 0, byNorm: 0, byCanon: 0, unmatched: [] };
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) {
@@ -340,6 +385,47 @@ export function planReconciliation(
         plan.byNorm++;
     }
 
+    // Pass 3 — #2454 cross-protocol canonical fingerprint. A codec switch
+    // (openai↔anthropic↔…) re-serializes tool calls/results so BOTH the exact
+    // id (toolCallId scheme call_ vs toolu_) AND normalizedIdentity (which embeds
+    // toolCallId + raw arg bytes) drift, while the logical (role, toolName,
+    // args-object) is unchanged. Re-anchor such a covered tool message onto the
+    // positionally-aligned candidate sharing its canonical fingerprint. Fires
+    // only after passes 1-2 left the id unmatched and only for tool messages
+    // (anchor.c set): prose keeps exact/norm-only matching, and a REAL edit
+    // (different args → different fingerprint) stays unmatched. Same k-th→k-th
+    // occurrence discipline + length-ratio guard as pass 2.
+    if (missingMiddle.length > 0 && candidates.length > 0) {
+        const canonGroups = new Map<string, string[]>();
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            const fp = canonicalToolFingerprint(cand.message);
+            if (fp === undefined) continue;
+            const g = canonGroups.get(fp);
+            if (g === undefined) canonGroups.set(fp, [cand.id]);
+            else g.push(cand.id);
+        }
+        const canonUsed = new Map<string, number>();
+        for (const oldId of missingMiddle) {
+            if (plan.claims.has(oldId)) continue;
+            const anchor = anchors[oldId];
+            if (anchor === undefined || anchor.c === undefined) continue;
+            const g = canonGroups.get(anchor.c);
+            if (g === undefined) continue;
+            const used = canonUsed.get(anchor.c) ?? 0;
+            if (used >= g.length) continue;
+            const newId = g[used];
+            const message = byId.get(newId);
+            if (message === undefined) continue;
+            const len = message.text?.length ?? 0;
+            if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
+            canonUsed.set(anchor.c, used + 1);
+            plan.claims.set(oldId, newId);
+            claimedCandidates.add(newId);
+            plan.byCanon++;
+        }
+    }
+
     for (const id of missing) {
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
@@ -378,13 +464,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -397,9 +483,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -440,7 +526,19 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // re-hashing the full text every pass (#1930-2: keeps steady-state
         // rounds near-free on 8K-message histories).
         const prior = anchors[id];
-        if (prior !== undefined) { nextAnchors[id] = prior; anchorCount++; continue; }
+        if (prior !== undefined) {
+            // #2454: anchors persisted before FoldAnchor.c existed lack it; backfill
+            // once from the still-present byte-identical message so a later
+            // cross-protocol switch can reclaim this id via pass 3 (one-time —
+            // subsequent passes hit the fast path with c already set).
+            let next = prior;
+            if (prior.c === undefined) {
+                const m = byId.get(id);
+                const c = m === undefined ? undefined : canonicalToolFingerprint(m);
+                if (c !== undefined) next = { ...prior, c };
+            }
+            nextAnchors[id] = next; anchorCount++; continue;
+        }
         const message = byId.get(id);
         if (message !== undefined) {
             nextAnchors[id] = anchorFrom(message);
@@ -525,15 +623,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity, ${plan.byCanon} by canonical fingerprint) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded (#1921/#2454)`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byTool} toolCallId, ${plan.byNorm} normalized, ${plan.byCanon} canonical) but reconcile=warn made no repair (#1921/#2454)`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
@@ -551,6 +649,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         claims: plan.claims.size,
         byTool: plan.byTool,
         byNorm: plan.byNorm,
+        byCanon: plan.byCanon,
         unmatched: plan.unmatched.length,
     };
 }

@@ -7,6 +7,8 @@ import {
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
+    canonicalToolFingerprint,
+    canonicalArgs,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
     normalizedIdentityWorkCount,
@@ -24,6 +26,8 @@ function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage
 function anchorOf(m: CoreMessage): FoldAnchor {
     const a: FoldAnchor = { n: normalizedIdentity(m), r: m.role, b: m.text?.length ?? 0 };
     if (m.toolCallId) a.t = m.toolCallId;
+    const c = canonicalToolFingerprint(m);
+    if (c !== undefined) a.c = c;
     return a;
 }
 
@@ -622,7 +626,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byTool: 0, byNorm: 0, byCanon: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -688,5 +692,115 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         assert.equal(result.unmatched, 0);
         assert.equal(normalizedIdentityWorkCount(), 12,
             "8 claim-anchor rebuilds + 4 unclaimed-candidate norms, nothing else");
+    });
+});
+
+describe("canonicalArgs (#2454)", () => {
+    test("JSON key order is irrelevant", () => {
+        assert.equal(canonicalArgs('{"a":1,"b":2}'), canonicalArgs('{"b":2,"a":1}'));
+    });
+    test("JSON whitespace differences collapse", () => {
+        assert.equal(canonicalArgs('{"a": 1, "b": [3, 2]}'), canonicalArgs('{"a":1,"b":[3,2]}'));
+    });
+    test("array ORDER is preserved (meaningful in JSON)", () => {
+        assert.notEqual(canonicalArgs('[1,2,3]'), canonicalArgs('[3,2,1]'));
+    });
+    test("nested objects sort keys recursively", () => {
+        assert.equal(canonicalArgs('{"x":{"b":1,"a":2},"y":0}'), canonicalArgs('{"y":0,"x":{"a":2,"b":1}}'));
+    });
+    test("non-JSON falls back to whitespace/unicode normalization", () => {
+        assert.equal(canonicalArgs("hello  world\r\nfoo"), normalizeMessageText("hello  world\r\nfoo"));
+    });
+    test("empty / undefined normalize to empty", () => {
+        assert.equal(canonicalArgs(""), "");
+        assert.equal(canonicalArgs(undefined), "");
+    });
+});
+
+describe("canonicalToolFingerprint (#2454)", () => {
+    test("undefined for non-tool messages", () => {
+        assert.equal(canonicalToolFingerprint(msg("m", "user", "hi")), undefined);
+        assert.equal(canonicalToolFingerprint(msg("m", "assistant", "hi there")), undefined);
+    });
+    test("defined for a tool call and a tool result", () => {
+        assert.ok(canonicalToolFingerprint(msg("m", "assistant", "{}", { contentType: "tool-call", toolName: "bash", toolCallId: "t1" })));
+        assert.ok(canonicalToolFingerprint(msg("m", "tool", "out", { contentType: "tool-result", toolCallId: "t1" })));
+    });
+    test("same logical call across toolCallId schemes shares a fingerprint", () => {
+        const a = canonicalToolFingerprint(msg("a", "assistant", '{"k":1}', { contentType: "tool-call", toolName: "bash", toolCallId: "toolu_X" }));
+        const b = canonicalToolFingerprint(msg("b", "assistant", '{"k": 1}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_Y" }));
+        assert.equal(a, b);
+    });
+    test("different args or different tool name diverge", () => {
+        const base = canonicalToolFingerprint(msg("a", "assistant", '{"k":1}', { contentType: "tool-call", toolName: "bash", toolCallId: "toolu_X" }));
+        assert.notEqual(base, canonicalToolFingerprint(msg("b", "assistant", '{"k":2}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_Y" })));
+        assert.notEqual(base, canonicalToolFingerprint(msg("c", "assistant", '{"k":1}', { contentType: "tool-call", toolName: "sh", toolCallId: "call_Y" })));
+    });
+});
+
+describe("planReconciliation cross-protocol canonical claim (#2454)", () => {
+    // Model A turn recorded under one codec; the switch to model B resends the
+    // SAME logical conversation through another codec — exact id AND
+    // normalizedIdentity both drift (toolCallId scheme + arg/result bytes), but
+    // the logical (role, toolName, args) is unchanged. These pin that pass 3
+    // reclaims such covered tool messages (previously they leaked unfolded).
+    test("cross-protocol tool-call drift is reclaimed by canonical fingerprint", () => {
+        const u0 = msg("u0", "user", "list the files");
+        const cOld = msg("c-old", "assistant", '{"command":"ls -la"}', { contentType: "tool-call", toolName: "bash", toolCallId: "toolu_AAA" });
+        const u2 = msg("u2", "user", "now count them");
+        const oldOrder = ["u0", "c-old", "u2"];
+        const anchors: Record<string, FoldAnchor> = { "u0": anchorOf(u0), "c-old": anchorOf(cOld), "u2": anchorOf(u2) };
+        const covered = new Set(["c-old"]);
+        const cNew = msg("c-new", "assistant", '{"command": "ls -la"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_BBB" });
+        const incoming = [msg("u0", "user", "list the files"), cNew, msg("u2", "user", "now count them")];
+        const plan = planReconciliation(oldOrder, anchors, incoming, covered);
+        assert.equal(plan.claims.get("c-old"), "c-new");
+        assert.equal(plan.byCanon, 1);
+        assert.equal(plan.byTool, 0, "toolCallId scheme differs -> pass 1 must not fire");
+        assert.equal(plan.byNorm, 0, "normalizedIdentity embeds toolCallId -> pass 2 must not fire");
+        assert.deepEqual(plan.unmatched, []);
+    });
+
+    test("cross-protocol tool-result drift is reclaimed by canonical fingerprint", () => {
+        const u0 = msg("u0", "user", "run the build");
+        const rOld = msg("r-old", "tool", "BUILD OK\nexit 0", { contentType: "tool-result", toolCallId: "toolu_RES1" });
+        const u2 = msg("u2", "user", "why did it warn");
+        const oldOrder = ["u0", "r-old", "u2"];
+        const anchors: Record<string, FoldAnchor> = { "u0": anchorOf(u0), "r-old": anchorOf(rOld), "u2": anchorOf(u2) };
+        const covered = new Set(["r-old"]);
+        const rNew = msg("r-new", "tool", "BUILD OK\r\nexit 0", { contentType: "tool-result", toolCallId: "call_RES2" });
+        const incoming = [msg("u0", "user", "run the build"), rNew, msg("u2", "user", "why did it warn")];
+        const plan = planReconciliation(oldOrder, anchors, incoming, covered);
+        assert.equal(plan.claims.get("r-old"), "r-new");
+        assert.equal(plan.byCanon, 1);
+        assert.deepEqual(plan.unmatched, []);
+    });
+
+    test("genuinely-different args are NOT claimed (real edit stays unmatched)", () => {
+        const u0 = msg("u0", "user", "list files");
+        const cOld = msg("c-old", "assistant", '{"command":"ls"}', { contentType: "tool-call", toolName: "bash", toolCallId: "toolu_A" });
+        const u2 = msg("u2", "user", "ok");
+        const oldOrder = ["u0", "c-old", "u2"];
+        const anchors: Record<string, FoldAnchor> = { "u0": anchorOf(u0), "c-old": anchorOf(cOld), "u2": anchorOf(u2) };
+        const covered = new Set(["c-old"]);
+        const cNew = msg("c-new", "assistant", '{"command":"ls -laR /etc"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_B" });
+        const incoming = [msg("u0", "user", "list files"), cNew, msg("u2", "user", "ok")];
+        const plan = planReconciliation(oldOrder, anchors, incoming, covered);
+        assert.equal(plan.claims.size, 0);
+        assert.deepEqual(plan.unmatched, ["c-old"]);
+    });
+
+    test("different tool name with identical args is NOT claimed", () => {
+        const u0 = msg("u0", "user", "do it");
+        const cOld = msg("c-old", "assistant", '{"path":"/a/b"}', { contentType: "tool-call", toolName: "read", toolCallId: "toolu_R" });
+        const u2 = msg("u2", "user", "done");
+        const oldOrder = ["u0", "c-old", "u2"];
+        const anchors: Record<string, FoldAnchor> = { "u0": anchorOf(u0), "c-old": anchorOf(cOld), "u2": anchorOf(u2) };
+        const covered = new Set(["c-old"]);
+        const cNew = msg("c-new", "assistant", '{"path":"/a/b"}', { contentType: "tool-call", toolName: "write", toolCallId: "call_W" });
+        const incoming = [msg("u0", "user", "do it"), cNew, msg("u2", "user", "done")];
+        const plan = planReconciliation(oldOrder, anchors, incoming, covered);
+        assert.equal(plan.claims.size, 0);
+        assert.deepEqual(plan.unmatched, ["c-old"]);
     });
 });
