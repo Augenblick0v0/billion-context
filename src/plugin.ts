@@ -1131,6 +1131,10 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
             child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            // #2362: inverse of the orphan filter — a dead ref whose message IS
+            // in the forked prefix is visible again in the child; refs outside
+            // it stay dead (their messages are absent from the child too).
+            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
@@ -1632,7 +1636,7 @@ export async function handlePluginTool(
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
-    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"})`);
+    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"}${result.reason ? `, reason=${result.reason}` : ""})`);
     // Same deep link on the /acp-cache display surfaces: clients wrap this text in
     // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
     // (src/acp-panel.ts). The MCP acp_cache path shares this endpoint — one extra line

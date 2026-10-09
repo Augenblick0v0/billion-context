@@ -149,9 +149,19 @@ type ProcReader = (pid: number) => ProcInfo | null;
 
 type ExecFn = (cmd: string, args: string[]) => string | null;
 
+/** #2441: exec options for the process-table lookups below (ps on POSIX, the
+ *  PowerShell fallback on Windows — fired on every claude SessionStart hook,
+ *  the closest analog of the #2439 console flash: a host that owns no console
+ *  makes Windows allocate a NEW console window for any unhidden console child).
+ *  windowsHide is a documented no-op off Windows, so the ps path is untouched.
+ *  Exported pure so tests can pin it without spawning anything. */
+export function procTableExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean } {
+    return { encoding: "utf8", timeout: 5000, windowsHide: true };
+}
+
 function defaultExec(cmd: string, args: string[]): string | null {
     try {
-        return execFileSync(cmd, args, { encoding: "utf8", timeout: 5000 });
+        return execFileSync(cmd, args, procTableExecOptions());
     } catch {
         return null;
     }

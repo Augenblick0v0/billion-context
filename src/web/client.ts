@@ -5,9 +5,21 @@ export const WEB_CLIENT = `(function () {
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
-        const saved = localStorage.getItem("bili-language");
-        if (saved === "en" || saved === "zh-CN") locale = saved;
-        else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        // #2321: an embedding host may pin the locale explicitly (?lang=zh|en) —
+        // it outranks both the stored choice and the browser default so the
+        // framed UI follows the host's language. Regex parse + typeof guard on
+        // purpose: this IIFE also executes in vm sandboxes without URLSearchParams
+        // and in host contexts with no location global at all (test harnesses).
+        const search = typeof location !== "undefined" ? location.search || "" : "";
+        const pinMatch = /[?&]lang=([^&]*)/i.exec(search);
+        const pinned = pinMatch && pinMatch[1] ? pinMatch[1] : null;
+        if (pinned === "zh" || pinned === "zh-CN") locale = "zh-CN";
+        else if (pinned === "en") locale = "en";
+        else {
+            const saved = localStorage.getItem("bili-language");
+            if (saved === "en" || saved === "zh-CN") locale = saved;
+            else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+        }
     } catch (e) {}
     function t(key, vars) {
         let text = MESSAGES[locale][key];
@@ -2152,7 +2164,14 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.addEventListener("click", () => {
             locale = locale === "zh-CN" ? "en" : "zh-CN";
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
-            location.reload();
+            // #2321: a ?lang= pin would silently re-force the old language on a
+            // plain reload — drop it so the manual choice sticks.
+            if (/[?&]lang=[^&]*/i.test(location.search)) {
+                const qs = location.search.slice(1).replace(/(?:^|&)lang=[^&]*/i, "").replace(/^[?&]+|[?&]+$/g, "");
+                location.href = location.pathname + (qs ? "?" + qs : "") + location.hash;
+            } else {
+                location.reload();
+            }
         });
         // #1937: search is server-side (?q=) — debounced re-query, not a local filter.
         const search = $("ses-search");
