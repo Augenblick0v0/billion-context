@@ -278,6 +278,25 @@ function collectButtons(node: unknown, out: ElementNode[] = []): ElementNode[] {
     return out;
 }
 
+// #2448 follow-up: document-order count of the buttons rendered BEFORE the
+// embedded frame — pins that the open-in-browser button lives in the tab row
+// above the frame, not in a footer below it.
+function buttonsBeforeFrame(node: unknown, acc: { n: number; done: boolean }): void {
+    if (acc.done) return;
+    if (Array.isArray(node)) {
+        for (const child of node) buttonsBeforeFrame(child, acc);
+        return;
+    }
+    if (node === null || typeof node !== "object") return;
+    const el = node as ElementNode;
+    if (el.type === "iframe") {
+        acc.done = true;
+        return;
+    }
+    if (el.type === "button") acc.n += 1;
+    for (const child of el.children ?? []) buttonsBeforeFrame(child, acc);
+}
+
 test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
     const { build } = await import("esbuild");
     // Reuse tsup.config.ts as the single source of truth for the wrapper
@@ -441,6 +460,11 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     collectText(buttons[4], openLabel);
     assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
     assert.equal(buttons[4].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
+    {
+        const acc = { n: 0, done: false };
+        buttonsBeforeFrame(tree, acc);
+        assert.equal(acc.n, 5, "all five buttons (tabs + open-in-browser) precede the frame — the open button sits in the top tab row");
+    }
     const tabLabels: string[] = [];
     for (const b of buttons.slice(0, 4)) {
         const bt: string[] = [];
@@ -477,6 +501,11 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         "http://127.0.0.1:8787",
         "bundle backup button tooltip carries the origin",
     );
+    {
+        const acc = { n: 0, done: false };
+        buttonsBeforeFrame(btree, acc);
+        assert.equal(acc.n, 5, "bundle panel keeps the open button in the top tab row too");
+    }
     opened.length = 0;
     (bButtons[bButtons.length - 1].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);

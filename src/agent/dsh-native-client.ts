@@ -25,7 +25,9 @@
 // open-in-browser button survives as the escape hatch; #2448: the host panel
 // is a NARROW column, so the backup button keeps the origin in a tooltip
 // instead of the label (a URL + nowrap squeezed the hint row into a sliver)
-// and the frame height follows the host viewport. lang mirrors the host
+// and the frame height follows the host viewport; the open-in-browser button
+// sits in the tab row (peer of the four page tabs) instead of the footer.
+// lang mirrors the host
 // locale: bind() resolves against the live dsh locale, and comparing the
 // resolved nav label with the registered zh value is the only locale signal
 // the client contract exposes. The same panel is mounted at two slots (#2125): settings.section
@@ -210,6 +212,33 @@ export function apply(ctx: ClientContext): void {
                                 t(PAGE_KEYS[id]),
                             ),
                         ),
+                        // #2448 follow-up: the open-in-browser escape hatch lives in the
+                        // tab row (a peer of overview/sessions/config/logs), not in the
+                        // footer below the frame — origin stays in the tooltip (#2448).
+                        origin === undefined
+                            ? null
+                            : createElement(
+                                "button",
+                                {
+                                    type: "button",
+                                    title: origin,
+                                    onClick: () => openExternal(`${origin}/__bili/`),
+                                    style: {
+                                        cursor: "pointer",
+                                        borderRadius: 8,
+                                        border: "1px solid rgba(127,127,127,0.4)",
+                                        background: "transparent",
+                                        color: "inherit",
+                                        fontFamily: "inherit",
+                                        fontSize: 13,
+                                        fontWeight: 400,
+                                        lineHeight: "20px",
+                                        padding: "4px 14px",
+                                        whiteSpace: "nowrap",
+                                    },
+                                },
+                                t("open"),
+                            ),
                     ),
                     createElement("iframe", {
                         src: `${origin}/__bili/?embed=1&lang=${lang}#/${page}`,
@@ -224,34 +253,7 @@ export function apply(ctx: ClientContext): void {
                         },
                     }),
                 ),
-            createElement(
-                "div",
-                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
-                createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
-                origin === undefined
-                    ? null
-                    : createElement(
-                        "button",
-                        {
-                            type: "button",
-                            title: origin,
-                            onClick: () => openExternal(`${origin}/__bili/`),
-                            style: {
-                                cursor: "pointer",
-                                borderRadius: 8,
-                                border: "1px solid rgba(127,127,127,0.4)",
-                                background: "transparent",
-                                color: "inherit",
-                                fontFamily: "inherit",
-                                fontSize: 14,
-                                lineHeight: "22px",
-                                padding: "7px 16px",
-                                whiteSpace: "nowrap",
-                            },
-                        },
-                        t("open"),
-                    ),
-            ),
+            createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6 } }, t("hint")),
         );
     };
     ctx.slots.inject(
