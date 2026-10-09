@@ -76,6 +76,61 @@ test("instance-B tool-call XML flood trips as tool-xml-flood", () => {
     assert.ok(v.detail && v.detail.toolXmlFragments >= TOOL_XML_THRESHOLD);
 });
 
+test("#2451 review: tool-xml count >= threshold but spread over real content does NOT trip (corroboration required)", () => {
+    // The same safety property the acp lane already had: raw fragment count alone
+    // must not abort a turn — a parameter payload that legitimately CONTAINS
+    // tool-shape XML (transcript export, protocol doc, fixture) spaces the
+    // fragments with hundreds of bytes of real content per fragment.
+    const text = Array.from({ length: 320 }, (_, i) => `<parameter name="k${i}">${"real content ".repeat(20)}(${i})</parameter>`).join("\n");
+    const v = createRunawayGuard().feed(text);
+    assert.equal(v.tripped, false, JSON.stringify(v.detail));
+    assert.ok(v.detail && v.detail.toolXmlFragments >= TOOL_XML_THRESHOLD, "sanity: count was above threshold");
+    assert.ok(v.detail && v.detail.toolXmlGapBytes / v.detail.toolXmlFragments > 64, "sanity: gap average carried the corroboration signal");
+});
+
+test("#2451 review: realistic skeleton flood (short names/values) still trips despite non-zero gaps", () => {
+    const unit = '<antml:invoke name="t">\n<antml:parameter name="k">v</antml:parameter>\n</antml:invoke>';
+    const text = Array.from({ length: 90 }, () => unit).join("");
+    // 4 fragments per unit (invoke open/close + parameter open/close) x 90 = 360.
+    const v = createRunawayGuard().feed(text);
+    assert.equal(v.tripped, true, JSON.stringify(v.detail));
+    assert.equal(v.reason, "tool-xml-flood");
+});
+
+test("#2451 review: skeleton flood split across tiny chunks still trips (cross-boundary gap accounting)", () => {
+    const unit = '<antml:invoke name="t">\n<antml:parameter name="k">v</antml:parameter>\n</antml:invoke>';
+    const text = Array.from({ length: 90 }, () => unit).join("");
+    const g = createRunawayGuard();
+    let v: RunawayVerdict = { tripped: false };
+    for (let i = 0; i < text.length && !v.tripped; i += 7) {
+        v = g.feed(text.slice(i, i + 7));
+    }
+    assert.equal(v.tripped, true);
+    assert.equal(v.reason, "tool-xml-flood");
+});
+
+test("#2451 review: prose/fragment-alternating stream via wrapStream counts skipped-prose gaps and does NOT trip", async () => {
+    // The no-angle-bracket fast path must still count its bytes toward the gap
+    // average: 320 fragments spread through a turn whose prose chunks carry no
+    // "<" at all. Before feedGapOnly the prose was invisible to the average and
+    // the guard could abort a legitimate transcript-writing turn (#1039).
+    const prose = "A long paragraph of perfectly ordinary prose without any angle bracket at all. ".repeat(6);
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < 160; i++) {
+        parts.push(enc.encode(`<parameter name="k${i}">payload-${i}-content</parameter>`));
+        parts.push(enc.encode(prose));
+    }
+    // 2 fragments per unit x 160 = 320 >= threshold; gap average is dominated by prose.
+    const source = new ReadableStream<Uint8Array>({ start(c) { for (const p of parts) c.enqueue(p); c.close(); } });
+    let tripped = false;
+    const wrapped = wrapStreamWithRunawayGuard(source, () => { tripped = true; });
+    const reader = wrapped.getReader();
+    let bytes = 0;
+    for (;;) { const r = await reader.read(); if (r.done) break; bytes += r.value.length; }
+    assert.equal(tripped, false, "legit alternating turn must not trip");
+    assert.equal(bytes, parts.reduce((n, p) => n + p.length, 0), "byte-exact forward");
+});
+
 test("legit multi-tool turn (dozens of fragments) does NOT trip", () => {
     const text = Array.from({ length: 10 }, () => "\x3cfunction_calls\x3e\x3cfunction\x3efoo\x3c/function\x3e\x3c/function_calls").join("\n");
     const v = createRunawayGuard().feed(text);

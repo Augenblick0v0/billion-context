@@ -18,6 +18,7 @@ export interface RunawayVerdict {
     detail?: {
         acpTags: number;
         toolXmlFragments: number;
+        toolXmlGapBytes: number;
         maxMonotonicRefRun: number;
         zeroTokenFraction: number;
     };
@@ -26,6 +27,11 @@ export interface RunawayVerdict {
 interface RunawayGuard {
     /** Feed one chunk of RAW wire text (utf8-decoded SSE/JSON body). Stateful across chunk boundaries. */
     feed(chunkText: string): RunawayVerdict;
+    /** Count chunk bytes toward the tool-xml gap average WITHOUT scanning (the
+     *  no-angle-bracket fast path): skipping them would under-count gaps and
+     *  bias the corroborator toward false trips on legit turns whose prose and
+     *  fragments alternate across chunks (#2451 review). */
+    feedGapOnly(chunkText: string): void;
 }
 
 // Scale thresholds sit far above any legitimate single-message maximum.
@@ -33,6 +39,14 @@ export const ACP_TAG_THRESHOLD = 50; // legit single-msg ceiling observed: 11
 const MONO_REF_RUN_THRESHOLD = 50; // corroborator: consecutive +1 kernel refs
 const ZERO_TOKEN_FRACTION = 0.9; // corroborator: >=90% of counted tags carry tokens="0"
 export const TOOL_XML_THRESHOLD = 300; // legit multi-tool turns << this; runaway B ~= 8700
+// #2451 review: corroborator for the tool-xml lane (the acp lane always had two):
+// raw count alone must not abort a turn whose parameter payload legitimately
+// CONTAINS tool-shape XML (transcript exports, protocol docs, test fixtures —
+// #1039: tool args are user intent). A flood skeleton interleaves almost no
+// non-fragment bytes per fragment (incident B ≈ 10–20 B/fragment, values are
+// empty or single-token); real content spaces fragments with the payload.
+// Trip requires count ≥ threshold AND average inter-fragment gap ≤ this floor.
+export const TOOL_XML_GAP_AVG_BYTES = 64;
 
 // Bounded carry-over so a marker split across two chunks is still seen whole. Longer
 // than any single runaway marker (short tags with short attrs); a pathological long
@@ -53,6 +67,14 @@ export function createRunawayGuard(): RunawayGuard {
     let pending = "";
     let acpTags = 0;
     let toolXml = 0;
+    // Bytes fed but not consumed by a tool-xml match. Fed bytes count as gap the
+    // feed they arrive in; a match completing over pending-carry bytes subtracts
+    // exactly its full length (those bytes were counted once when originally
+    // fed). Bytes dropped past TAIL_CAP stay counted — over-counting gaps is the
+    // fail-safe direction (a miss, never a false corroboration). Render-tag
+    // bytes are deliberately NOT subtracted: mixing lanes only inflates the gap
+    // average, and the acp lane has its own corroborators.
+    let toolGapBytes = 0;
     let zeroTokens = 0;
     let lastRef: number | null = null;
     let monoRun = 0;
@@ -62,6 +84,7 @@ export function createRunawayGuard(): RunawayGuard {
     const detail = (): NonNullable<RunawayVerdict["detail"]> => ({
         acpTags,
         toolXmlFragments: toolXml,
+        toolXmlGapBytes: toolGapBytes,
         maxMonotonicRefRun: maxMonoRun,
         zeroTokenFraction: acpTags > 0 ? zeroTokens / acpTags : 0,
     });
@@ -70,6 +93,7 @@ export function createRunawayGuard(): RunawayGuard {
         if (tripped) return { tripped: true, reason: undefined, detail: detail() };
         if (chunkText.length === 0) return { tripped: false };
         const scan = pending + chunkText;
+        toolGapBytes += chunkText.length;
         let lastEnd = 0;
 
         ACP_OPEN_RE.lastIndex = 0;
@@ -96,6 +120,7 @@ export function createRunawayGuard(): RunawayGuard {
         TOOL_XML_RE.lastIndex = 0;
         while ((m = TOOL_XML_RE.exec(scan)) !== null) {
             toolXml += 1;
+            toolGapBytes -= m[0].length;
             const end = m.index + m[0].length;
             if (end > lastEnd) lastEnd = end;
         }
@@ -111,7 +136,7 @@ export function createRunawayGuard(): RunawayGuard {
             tripped = true;
             return { tripped: true, reason: "acp-enumeration", detail: detail() };
         }
-        if (toolXml >= TOOL_XML_THRESHOLD) {
+        if (toolXml >= TOOL_XML_THRESHOLD && toolGapBytes / toolXml <= TOOL_XML_GAP_AVG_BYTES) {
             tripped = true;
             return { tripped: true, reason: "tool-xml-flood", detail: detail() };
         }
@@ -120,7 +145,11 @@ export function createRunawayGuard(): RunawayGuard {
         return { tripped: false, detail: detail() };
     };
 
-    return { feed };
+    const feedGapOnly = (chunkText: string): void => {
+        toolGapBytes += chunkText.length;
+    };
+
+    return { feed, feedGapOnly };
 }
 
 /** Tee a raw response stream through a runaway guard. Bytes are forwarded BYTE-EXACT;
@@ -145,7 +174,10 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
             }
             const value = r.value;
             // Cheap pre-gate: a chunk with no angle bracket cannot start a marker, so it
-            // needs no regex pass (pending stays intact for a later completing chunk).
+            // needs no regex pass (pending stays intact for a later completing chunk) —
+            // but its bytes still count toward the tool-xml gap average (#2451 review:
+            // skipping them would under-count gaps on prose/fragment-alternating turns
+            // and bias the corroborator toward false trips).
             const text = decoder.decode(value, { stream: true });
             if (text.includes("\x3c")) {
                 const v = guard.feed(text);
@@ -156,6 +188,8 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
                     reader.cancel().catch(() => {});
                     return;
                 }
+            } else {
+                guard.feedGapOnly(text);
             }
             controller.enqueue(value);
         },
