@@ -341,9 +341,10 @@ export interface ReplayRetryInfo {
  *  For acp-loop replay requests, where provider risk-control may briefly
  *  reject a request whose context was just rewritten (#189). Network-level
  *  failures are classified (#1263, #1453): fail-fast pre-response kinds
- *  (proxy-reset / upstream-reset / connect-refused / connect-timeout / dns —
- *  the attempt died BEFORE any response byte, so a replay cannot double-
- *  deliver and each attempt costs at most one connect timeout) get the same
+ *  (proxy-reset / upstream-reset / connect-refused / connect-timeout /
+ *  upstream-unreachable / dns — the attempt died BEFORE any response byte, so
+ *  a replay cannot double-deliver and each attempt costs at most one connect
+ *  timeout) get the same
  *  bounded retry; headers/body timeouts and aborts still propagate unchanged
  *  — NOT retried, to avoid stacking the 12-min idle budget across attempts. */
 export async function fetchWithRetry(

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS } from "../src/upstream-fail.ts";
+import { _resetUpstreamAlertsForTest, getUpstreamAlerts, recordUpstreamAlert } from "../src/upstream-alerts.ts";
 import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import { proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
@@ -45,6 +46,13 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(netError("UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error")), "connect-timeout");
     const wrappedConnectTimeout = new TypeError("fetch failed", { cause: netError("UND_ERR_CONNECT_TIMEOUT", "connect timed out") });
     assert.equal(classifyUpstreamFailure(wrappedConnectTimeout, { viaProxy: true }), "connect-timeout");
+    // #2465: the ICMP "no route" family is the other half of the connect phase
+    // — an immediate kernel refusal, not an expiry. It must not land in unknown.
+    assert.equal(classifyUpstreamFailure(netError("EHOSTUNREACH", "connect EHOSTUNREACH 10.0.0.5:12808"), { viaProxy: false }), "upstream-unreachable");
+    assert.equal(classifyUpstreamFailure(netError("ENETUNREACH", "connect ENETUNREACH 10.0.0.5:12808")), "upstream-unreachable");
+    assert.equal(classifyUpstreamFailure(netError("EHOSTDOWN", "connect EHOSTDOWN 10.0.0.5:12808")), "upstream-unreachable");
+    const wrappedUnreachable = new TypeError("fetch failed", { cause: netError("EHOSTUNREACH", "connect EHOSTUNREACH 10.0.0.5:12808") });
+    assert.equal(classifyUpstreamFailure(wrappedUnreachable, { viaProxy: true }), "upstream-unreachable");
     assert.equal(classifyUpstreamFailure(netError("EAI_AGAIN", "getaddrinfo EAI_AGAIN relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("ENOTFOUND", "getaddrinfo ENOTFOUND relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("EPROTO", "protocol error")), "tls");
@@ -60,10 +68,10 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(undefined), "unknown");
 });
 
-test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns)", () => {
+test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns, #2465 to upstream-unreachable)", () => {
     assert.deepEqual(
-        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
-        5,
+        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "upstream-unreachable", "dns"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
+        6,
     );
     for (const kind of ["client-abort", "upstream-timeout", "tls", "unknown"] as const) {
         assert.equal(isFailFastUpstreamKind(kind), false, `${kind} must not be retried`);
@@ -71,6 +79,32 @@ test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#14
     for (const kind of Object.keys(UPSTREAM_FAIL_HINTS)) {
         assert.ok((UPSTREAM_FAIL_HINTS as Record<string, string>)[kind]!.length > 10, `hint exists for ${kind}`);
     }
+});
+
+test("connect-phase errno coverage: every classified connect failure is both replayable and alertable (#2465)", () => {
+    // The #2465 bug class: an errno that the taxonomy knows nothing about falls
+    // to "unknown", which is neither fail-fast nor an alert kind — the failure
+    // is silently never replayed and never shown. Pin all three tables at once.
+    const samples: Array<[string, string]> = [
+        ["ECONNREFUSED", "connect-refused"],
+        ["EHOSTUNREACH", "upstream-unreachable"],
+        ["ENETUNREACH", "upstream-unreachable"],
+        ["EHOSTDOWN", "upstream-unreachable"],
+        ["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"],
+        ["ECONNRESET", "upstream-reset"],
+        ["ENOTFOUND", "dns"],
+        ["EAI_AGAIN", "dns"],
+    ];
+    for (const [code, expected] of samples) {
+        const err = netError(code, `connect ${code} 10.0.0.5:12808`);
+        const kind = classifyUpstreamFailure(err, { viaProxy: false });
+        assert.equal(kind, expected, `${code} must classify as ${expected}`);
+        assert.ok(isFailFastUpstreamKind(kind), `${code} (${kind}) died pre-response and must be replayable`);
+        _resetUpstreamAlertsForTest();
+        recordUpstreamAlert("http://10.0.0.5:12808/v1/messages", err, false);
+        assert.deepEqual(getUpstreamAlerts().map((a) => a.kind), [kind], `${code} (${kind}) must reach the alert table`);
+    }
+    _resetUpstreamAlertsForTest();
 });
 
 test("fetchWithRetry: pre-response reset is transparently replayed once, then succeeds (#1263)", async () => {
@@ -193,13 +227,13 @@ test("fetchWithRetry: external abort is never replayed", async () => {
     }
 });
 
-test("fetchWithRetry: connect-phase timeout and DNS failures are replayed within the budget (#1453)", async () => {
+test("fetchWithRetry: connect-phase timeout, ICMP-unreachable and DNS failures are replayed within the budget (#1453, #2465)", async () => {
     _resetFetchUtilForTest();
     const prevBase = process.env.BILI_REPLAY_RETRY_BASE_MS;
     process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
     const origFetch = globalThis.fetch;
     try {
-        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["ENOTFOUND", "dns"]] as const) {
+        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["EHOSTUNREACH", "upstream-unreachable"], ["ENOTFOUND", "dns"]] as const) {
             let attempts = 0;
             const retries: Array<{ status: number; detail: string }> = [];
             globalThis.fetch = (async () => {

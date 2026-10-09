@@ -32,6 +32,7 @@ export interface UpstreamAlert {
 const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "connect-timeout",
     "connect-refused",
+    "upstream-unreachable",
     "proxy-reset",
     "upstream-reset",
     "dns",

@@ -84,8 +84,9 @@ test("alert table: every v1 kind enters, keyed by (kind, host)", () => {
         recordUpstreamAlert("http://h4.example.com/", netError("ECONNRESET"), false);
         recordUpstreamAlert("http://h5.example.com/", netError("ENOTFOUND"), false);
         recordUpstreamAlert("https://h6.example.com:8443/", netError("EPROTO"), false);
+        recordUpstreamAlert("http://h7.example.com/", netError("EHOSTUNREACH"), false);
         const kinds = getUpstreamAlerts().map((a) => a.kind).sort();
-        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset"]);
+        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset", "upstream-unreachable"]);
         const tls = getUpstreamAlerts().find((a) => a.kind === "tls");
         assert.equal(tls?.host, "h6.example.com:8443");
     } finally {

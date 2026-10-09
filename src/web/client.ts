@@ -548,6 +548,7 @@ export const WEB_CLIENT = `(function () {
         switch (kind) {
             case "connect-timeout": return t("alert.hint.connect_timeout");
             case "connect-refused": return t("alert.hint.connect_refused");
+            case "upstream-unreachable": return t("alert.hint.upstream_unreachable");
             case "proxy-reset": return t("alert.hint.proxy_reset");
             case "upstream-reset": return t("alert.hint.upstream_reset");
             case "dns": return t("alert.hint.dns");

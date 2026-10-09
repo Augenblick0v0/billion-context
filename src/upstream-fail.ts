@@ -34,6 +34,13 @@ export type UpstreamFailureKind =
     | "upstream-reset"
     /** TCP refused — the proxy when one is configured, else the upstream. */
     | "connect-refused"
+    /** ICMP "no route" family at connect time (EHOSTUNREACH / ENETUNREACH /
+     *  EHOSTDOWN): the kernel rejected the route immediately, so nothing was
+     *  sent and no timeout budget was consumed. Fail-fast for the same reason
+     *  as connect-timeout, but an IMMEDIATE refusal rather than an expiry, so
+     *  it keeps its own remedy (routing / ACL / firewall REJECT) instead of
+     *  the upstream-health one (#2465). */
+    | "upstream-unreachable"
     /** Name resolution failed (ENOTFOUND / EAI_AGAIN). */
     | "dns"
     /** TLS/certificate failure at the proxy CONNECT or upstream handshake. */
@@ -76,6 +83,10 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
         if (code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "upstream-timeout";
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
+        // #2465: the ICMP "no route" family is the other half of the connect
+        // phase — the kernel refuses immediately instead of timing out.
+        // Unclassified it fell to "unknown": not fail-fast, not an alert kind.
+        if (code === "EHOSTUNREACH" || code === "ENETUNREACH" || code === "EHOSTDOWN") return "upstream-unreachable";
         if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
         // #1987: OpenSSL/undici certificate-TRUST codes (corporate interception /
         // MITM) are TLS failures too — before this they classified as "unknown",
@@ -88,11 +99,11 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
 
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a
  *  replay cannot double-deliver anything. Per-attempt cost stays bounded —
- *  milliseconds for resets/refusals/DNS, at most one connect timeout for
- *  connect-timeout — so retrying never stacks the 12-min idle budget across
- *  attempts the way a headers/body timeout would (#1263, #1453). */
+ *  milliseconds for resets/refusals/DNS/unreachable, at most one connect
+ *  timeout for connect-timeout — so retrying never stacks the 12-min idle
+ *  budget across attempts the way a headers/body timeout would (#1263, #1453). */
 export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
-    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns";
+    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "upstream-unreachable" || kind === "dns";
 }
 
 /** One-line remediation hint per kind — used by logs and the docs so the
@@ -104,6 +115,7 @@ export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "proxy-reset": "proxy dropped the connection before the response — check proxy idle-recycle/payload limits (BILI_PROXY_KEEPALIVE_MAX_MS can shorten our reuse window); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-reset": "upstream/network reset before the response — check upstream and local network; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "connect-refused": "TCP refused (proxy when configured, else upstream) — endpoint down or wrong port",
+    "upstream-unreachable": "no route to the upstream host (ICMP unreachable) — check routing/ACL/firewall REJECT between bili and the endpoint; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     dns: "name resolution failed — DNS server or hostname typo; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     tls: "TLS/certificate failure at CONNECT or upstream handshake — CA/proxy MITM config",
     unknown: "unclassified transport failure — report with full error chain",
