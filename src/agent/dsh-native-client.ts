@@ -22,7 +22,10 @@
 // switches move only the fragment, so the frame navigates same-document
 // (hashchange) without a full reload — and since its src tracks the polled
 // origin, a mid-session re-bind moves the frame in place too. The
-// open-in-browser button survives as the escape hatch. lang mirrors the host
+// open-in-browser button survives as the escape hatch; #2448: the host panel
+// is a NARROW column, so the backup button keeps the origin in a tooltip
+// instead of the label (a URL + nowrap squeezed the hint row into a sliver)
+// and the frame height follows the host viewport. lang mirrors the host
 // locale: bind() resolves against the live dsh locale, and comparing the
 // resolved nav label with the registered zh value is the only locale signal
 // the client contract exposes. The same panel is mounted at two slots (#2125): settings.section
@@ -81,7 +84,7 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
 };
-const EMBED_HEIGHT_PX = 640;
+const EMBED_HEIGHT = "min(640px, 78vh)";
 
 const zh: Dict = {
     "nav": "bili设置",
@@ -214,7 +217,7 @@ export function apply(ctx: ClientContext): void {
                         style: {
                             display: "block",
                             width: "100%",
-                            height: EMBED_HEIGHT_PX,
+                            height: EMBED_HEIGHT,
                             border: "1px solid rgba(127,127,127,0.4)",
                             borderRadius: 8,
                             background: "transparent",
@@ -223,14 +226,15 @@ export function apply(ctx: ClientContext): void {
                 ),
             createElement(
                 "div",
-                { style: { display: "flex", alignItems: "center", gap: 10 } },
-                createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1 } }, t("hint")),
+                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+                createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1, minWidth: 200 } }, t("hint")),
                 origin === undefined
                     ? null
                     : createElement(
                         "button",
                         {
                             type: "button",
+                            title: origin,
                             onClick: () => openExternal(`${origin}/__bili/`),
                             style: {
                                 cursor: "pointer",
@@ -245,7 +249,7 @@ export function apply(ctx: ClientContext): void {
                                 whiteSpace: "nowrap",
                             },
                         },
-                        `${t("open")}（${origin}）`,
+                        t("open"),
                     ),
             ),
         );
