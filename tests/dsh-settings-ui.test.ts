@@ -427,8 +427,20 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     const frame = findTag(tree, "iframe");
     assert.ok(frame !== undefined, "origin present renders the embedded iframe");
     assert.equal(frame.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
+    assert.equal(
+        ((frame.props?.style) as Record<string, unknown> | undefined)?.height,
+        "min(640px, 78vh)",
+        "#2448: frame height follows the host viewport instead of a flat 640px",
+    );
     const buttons = collectButtons(tree);
     assert.equal(buttons.length, 5, "four tabs plus the backup open-in-browser button");
+    // #2448: the backup button drops the origin URL from the label (a narrow
+    // host panel squeezed the hint row into a sliver) and keeps it in the
+    // tooltip instead.
+    const openLabel: string[] = [];
+    collectText(buttons[4], openLabel);
+    assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
+    assert.equal(buttons[4].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
     const tabLabels: string[] = [];
     for (const b of buttons.slice(0, 4)) {
         const bt: string[] = [];
@@ -458,11 +470,13 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     const bframe = findTag(btree, "iframe");
     assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
     assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
-    const btexts: string[] = [];
-    collectText(btree, btexts);
-    assert.ok(btexts.some((x) => x.includes("http://127.0.0.1:8787")), `bundle backup button label carries the origin: ${JSON.stringify(btexts)}`);
     const bButtons = collectButtons(btree);
     assert.equal(bButtons.length, 5, "the bundle panel offers the same tabs plus backup button");
+    assert.equal(
+        bButtons[bButtons.length - 1].props?.title,
+        "http://127.0.0.1:8787",
+        "bundle backup button tooltip carries the origin",
+    );
     opened.length = 0;
     (bButtons[bButtons.length - 1].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
@@ -640,15 +654,21 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        const firstTexts: string[] = [];
-        collectText(first, firstTexts);
-        assert.ok(firstTexts.some((x) => x.includes("http://127.0.0.1:8787")), "the snapshot paints immediately (first-paint hint)");
+        const firstFrame = findTag(first, "iframe");
+        assert.ok(firstFrame !== undefined, "the snapshot paints immediately (first-paint hint)");
+        assert.equal(
+            firstFrame.props?.src,
+            "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview",
+            "the snapshot binds the frame before the live probe lands",
+        );
         await tick();
         const second = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(second, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18798")), `stale snapshot upgraded to the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":8787")), "the stale origin is gone from the label");
+        const secondButtons = collectButtons(second);
+        assert.equal(
+            secondButtons[secondButtons.length - 1].props?.title,
+            "http://127.0.0.1:18798",
+            "stale snapshot upgraded to the live origin (backup button tooltip)",
+        );
         const sframe = findTag(second, "iframe");
         assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
         assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
@@ -696,10 +716,12 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         }
         await tick();
         const tree = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(tree, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18800")), `mid-session re-bind follows the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":18798")), "the pre-re-bind origin is gone from the label");
+        const treeButtons = collectButtons(tree);
+        assert.equal(
+            treeButtons[treeButtons.length - 1].props?.title,
+            "http://127.0.0.1:18800",
+            "mid-session re-bind follows the live origin (backup button tooltip)",
+        );
         const rframe = findTag(tree, "iframe");
         assert.ok(rframe !== undefined, "the re-bound entry keeps its frame");
         assert.equal(rframe.props?.src, "http://127.0.0.1:18800/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the mid-session re-bind");
@@ -849,4 +871,34 @@ test("#2125: the manifest declares no dsh.client.inject (pre-0.2 dsh compat)", (
         dsh?: { client?: { inject?: unknown } };
     };
     assert.equal(pkg.dsh?.client?.inject ?? null, null, "dsh.client.inject would break pre-0.2 dsh clients");
+});
+
+test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)", () => {
+    // The embed iframe lives inside a dsh settings column (400-760px), not a
+    // browser tab — the standalone-page table floors (940px/520px + fixed
+    // colgroup) crushed the sessions table there (#2448).
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8");
+    assert.ok(
+        styles.includes(".embed .twide table.data { min-width: 0; }"),
+        "embed drops the standalone-page 940px floor",
+    );
+    assert.ok(
+        styles.includes(".embed .tproc table.data { min-width: 0; }"),
+        "embed drops the protocol-table 520px floor",
+    );
+    assert.ok(
+        styles.includes(".embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }"),
+        "embed reuses the phone-compact column set at any panel width",
+    );
+    // The hidden TDs' <col> tracks still claim their px under table-layout:
+    // fixed unless zeroed — otherwise the SESSION column collapses to 0 and
+    // rows render double-exposed (title overflowing onto adjacent cells).
+    assert.ok(
+        styles.includes("\n    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "phone-compact releases the hidden <col> tracks",
+    );
+    assert.ok(
+        styles.includes(".embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }"),
+        "embed releases the hidden <col> tracks",
+    );
 });

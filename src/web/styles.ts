@@ -250,6 +250,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
     .fork-link { display: none; }
     .nav { order: 3; flex: 1 1 100%; min-width: 0; }
     table.data th:nth-child(n + 6), table.data td:nth-child(n + 6) { display: none; }
+    /* hiding TDs frees nothing under table-layout: fixed — the <col> tracks of
+       the hidden columns still claim their px, so the SESSION column (the only
+       auto track) collapses to a sliver and its nowrap title overflows onto the
+       adjacent cells (double-exposed rows). Zero the hidden tracks so the freed
+       space lands on the title column again. */
+    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
     main { padding: 12px; }
     .kv { grid-template-columns: 1fr; row-gap: 3px; }
     .kv .k { margin-top: 6px; }
@@ -362,6 +368,19 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
     --border: rgba(127, 127, 127, 0.4);
     --border-soft: rgba(127, 127, 127, 0.22);
 }
+/* #2448: the embed face lives in a NARROW host panel (a dsh settings
+   column), never a full browser tab — reuse the phone-compact column set
+   (cols 6+ hidden, same as the ≤720px rule) at ANY width and drop the
+   standalone-page min-widths so the tables fit the panel instead of
+   scrolling sideways. */
+.embed .tproc table.data { min-width: 0; }
+.embed .twide table.data { min-width: 0; }
+.embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }
+/* same fixed-layout trap as the ≤720px rule above — the hidden
+   columns' <col> tracks must release their widths or the title column
+   collapses and rows render double-exposed. */
+.embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+.embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
 .embed main { max-width: none; padding: 4px 0 12px; }
 .embed .banner { margin: 8px 0 0; }
 `;
