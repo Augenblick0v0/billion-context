@@ -100,7 +100,7 @@ function refNum(ref: string): number {
  *  retry loop without another round-trip. Boundary counts ACTIVE blocks
  *  only — after a decompress (blocks inactive) the restored span shows as
  *  compressible again, which is exactly the recoverable truth. */
-export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs" | "blocks">): string {
+export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs" | "blocks" | "deadRefs">): string {
     const refs = Object.keys(state.messageRefs?.byRef ?? {});
     const highest = refs.reduce((m, r) => Math.max(m, r.startsWith("m") ? Number(r.slice(1)) || 0 : 0), 0);
     const boundary = state.blocks.reduce((m, b) => (b.active && b.endRef?.startsWith("m") ? Math.max(m, Number(b.endRef.slice(1)) || 0) : m), 0);
@@ -114,7 +114,29 @@ export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs"
     // (e.g. m05027–m05052 between two blocks) is still compressible raw space, so
     // claiming "everything up to N is inside blocks" misleads models into skipping it.
     const covered = boundary > 0 ? ` (refs up to ${fmt(boundary)} are largely inside active blocks; isolated free gaps may still exist below it)` : "";
-    return ` Live compressible refs: ${fmt(boundary + 1)}–${fmt(highest)}${covered}. Retry NOW in this same turn with startId/endId inside that span.`;
+    // #2362: dead refs (the client history no longer carries their messages)
+    // can never compress — subtract them from the advertised span so a retry
+    // does not steer the model back into a doomed range (self-amplifying loop).
+    const dead = new Set<number>();
+    for (const r of state.deadRefs ?? []) {
+        const n = Number(r.replace(/\D/g, ""));
+        if (Number.isFinite(n) && n > boundary && n <= highest) dead.add(n);
+    }
+    const spans: string[] = [];
+    let cursor = boundary + 1;
+    for (const d of [...dead].sort((a, b) => a - b)) {
+        if (d > cursor) spans.push(cursor === d - 1 ? fmt(cursor) : `${fmt(cursor)}–${fmt(d - 1)}`);
+        cursor = d + 1;
+        if (cursor > highest) break;
+    }
+    if (cursor <= highest) spans.push(cursor === highest ? fmt(cursor) : `${fmt(cursor)}–${fmt(highest)}`);
+    if (spans.length === 0) {
+        return ` No live raw refs right now: every ref between ${fmt(boundary + 1)} and ${fmt(highest)} is DEAD — the client history no longer carries those messages (host-native compaction or a bulk rewrite), so no range citing them can ever compress. Compress a run of ACTIVE blocks instead or work within your current visible context.`;
+    }
+    const deadNote = dead.size > 0
+        ? ` Excluded as DEAD (${dead.size} ref(s) whose messages the client no longer sends — they can never compress): ${[...dead].sort((a, b) => a - b).slice(0, 4).map(fmt).join(", ")}${dead.size > 4 ? ", …" : ""}.`
+        : "";
+    return ` Live compressible refs: ${spans.join(", ")}${covered}. Retry NOW in this same turn with startId/endId inside that span.${deadNote}`;
 }
 
 const M_REF_NUM_RE = /^m0*(\d{1,7})$/i;
@@ -254,6 +276,7 @@ function clearCompressLoopStreak(session: Session): void {
 const KERNEL_RETRY_GUIDANCE = [
     "Run acp_status, then call the compress tool again using only the refs it reports.",
     "Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.",
+    "Do not retry this range in any form \u2014 run acp_status and target only the live refs it reports.",
 ] as const;
 
 function scrubKernelRetryGuidance(errs: string): string {
@@ -534,13 +557,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         );
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -631,6 +654,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
+            // #2362: machine-readable failure class for the [plugin] execution
+            // line — outcome=refused alone never says why in the logs.
+            const gateReason = /cannot be anchored/.test(errs) ? "gate:cannot-anchor"
+                : /already compressed/.test(errs) ? "gate:already-compressed"
+                : /requested range\(s\) resolved/.test(errs) ? "gate:none-resolved"
+                : /too small/.test(errs) ? "gate:too-small"
+                : "gate:other";
             const revNote = revs.length > 0
                 ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
                 : "";
@@ -688,7 +718,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     }
                 }
             }
-            return compressResult(receipt, "refused", 0);
+            return compressResult(receipt, "refused", 0, gateReason);
         }
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);
@@ -848,7 +878,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
         const specKey = normalizedSpecKey(ranges);
-        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0);
+        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0, "exception");
     }
 }
 

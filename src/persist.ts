@@ -208,6 +208,9 @@ function mergeState(parsed: CompressionState): CompressionState {
         tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
         lastPassIds: parsed.lastPassIds ?? fresh.lastPassIds,
         hiddenOrphanRefs: parsed.hiddenOrphanRefs ?? fresh.hiddenOrphanRefs,
+        // #2362: without this a restart forgets which refs are dead and the
+        // model re-learns each one by failing a compress call again.
+        deadRefs: parsed.deadRefs ?? fresh.deadRefs,
         terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
         nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
         // Without this, a restart re-exposes absorbed tool outputs: state
