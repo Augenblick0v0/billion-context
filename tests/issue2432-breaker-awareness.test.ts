@@ -116,7 +116,7 @@ test("#2432: compressBreakerDetail/Armed mirror the receipt's arming conditions"
     assert.equal(compressBreakerArmed(s), true);
 });
 
-test("#2432: acp_status shows the armed counter and suppresses the Compressible-ranges list", () => {
+test("#2432/#2451: acp_status shows the armed counter and keeps reporting the live ranges table", () => {
     // Six big messages: with no breaker the surface advertises ranges.
     const msgs = Array.from({ length: 6 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "y".repeat(8000)));
     const session = makeSession();
@@ -131,8 +131,9 @@ test("#2432: acp_status shows the armed counter and suppresses the Compressible-
     const armed = handleAcpStatus({}, ctx);
     assert.match(armed.text, /COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: 4 \/ 3\./, "armed section with the visible counter");
     assert.match(armed.text, /Disarms on one successful compress or 10 min/, "disarm condition stated");
-    assert.ok(!(armed.text).includes("Compressible ranges ("), "ranges list suppressed while armed — no contradiction with the breaker receipt");
-    assert.match(armed.text, /SUPPRESSED while the breaker is armed/, "suppression is explained, not silent");
+    assert.ok(armed.text.includes("Compressible ranges ("), "armed surface still reports the live table — it is re-derived from the current view, and hiding it contradicts the recovery receipts that point here");
+    assert.match(armed.text, /do not attempt to compress now; continue the task/, "unknown-cause armed note mirrors the receipt's STOP order instead of inventing a second command");
+    assert.doesNotMatch(armed.text, /SUPPRESSED/, "no false claim that the list is hidden");
 });
 
 test("#2432: failure cause persists on the streak and is readable before the breaker arms", () => {
@@ -156,7 +157,7 @@ test("#2432: failure cause persists on the streak and is readable before the bre
     assert.equal(compressLastFailureCause(ctx.session), undefined, "decayed streak lapses the verdict");
 });
 
-test("#2432: substrate/stale-ref verdicts stop range advertising BEFORE arming; other causes do not", () => {
+test("#2432/#2451: substrate/stale-ref verdicts annotate honestly BEFORE arming; the table stays up", () => {
     const msgs = Array.from({ length: 6 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "y".repeat(8000)));
     const session = makeSession();
     session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
@@ -167,19 +168,53 @@ test("#2432: substrate/stale-ref verdicts stop range advertising BEFORE arming; 
     const sub = handleAcpStatus({}, ctx).text ?? "";
     assert.match(sub, /FOLD SUBSTRATE INVALID/, "explicit invalid-substrate section at n=1");
     assert.match(sub, /start a fresh conversation/, "recovery path stated");
-    assert.ok(!sub.includes("Compressible ranges ("), "ranges suppressed at n=1 — no pointing at unanchorable refs");
+    assert.ok(sub.includes("Compressible ranges ("), "ranges stay reported at n=1 — they are re-derived from the current view, so they anchor");
     assert.doesNotMatch(sub, /COMPRESS CIRCUIT BREAKER: ARMED/, "no armed section below threshold");
 
     session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now(), cause: "stale-ref — the refs belong to another session generation (or are typos)" };
     const stale = handleAcpStatus({}, ctx).text ?? "";
     assert.match(stale, /FOLD BASE GENERATION MISMATCH/, "stale-ref gets its own section");
-    assert.ok(!stale.includes("Compressible ranges ("), "ranges suppressed for stale-ref too");
+    assert.ok(stale.includes("Compressible ranges ("), "ranges stay reported for stale-ref too — the failed refs were the model's stale input, not this table");
 
     session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now(), cause: "covered-by-block — nothing new to fold in that window" };
-    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "covered-by-block does NOT over-suppress");
+    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "covered-by-block does not over-suppress");
 
     session.metadata["compressFailStreak"] = { n: 1, lastAt: Date.now() - 11 * 60 * 1000, cause: "substrate-destruction — structural" };
-    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "decayed verdict lapses suppression");
+    assert.ok(handleAcpStatus({}, ctx).text?.includes("Compressible ranges ("), "decayed verdict lapses its annotation");
+});
+
+test("#2451 review: armed + substrate-destruction reports live ranges — the receipt's recovery path is reachable", () => {
+    // The armed receipt (#2432) orders: "run acp_status once, then compress
+    // ONLY a range it currently reports as compressible — one success clears
+    // this breaker." Before this fix acp_status suppressed the list whenever
+    // armed, so the promised recovery was unreachable and the output carried
+    // two contradictory orders ("do not attempt to compress now" /
+    // "start a fresh conversation") — the #2360 two-orders shape.
+    const msgs = Array.from({ length: 6 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "y".repeat(8000)));
+    const session = makeSession();
+    session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    const ctx = { core: createCore(), config: defaultConfig(200000), messages: msgs, session };
+
+    session.metadata["compressFailStreak"] = { n: 4, lastAt: Date.now(), cause: "substrate-destruction — host-native compaction or bulk client-side history rewrite landed outside bili's knowledge (#1729/#2193); structural, report it" };
+    const armed = handleAcpStatus({}, ctx).text ?? "";
+    assert.ok(armed.includes("Compressible ranges ("), "armed substrate-destruction still reports live ranges (the receipt's single recovery step)");
+    assert.match(armed, /COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: 4 \/ 3\./, "armed section with the visible counter");
+    assert.match(armed, /re-derived from the CURRENT resent view/, "tailored recovery line replaces the blanket suppression order");
+    assert.match(armed, /one success clears this breaker/, "disarm-by-success is restated on the status surface");
+    assert.doesNotMatch(armed, /SUPPRESSED while the breaker is armed/, "no blanket suppression on the receipt's own recovery path");
+    assert.doesNotMatch(armed, /Do not attempt to compress now/, "no contradictory compress ban");
+    assert.doesNotMatch(armed, /start a fresh conversation/, "no second, contradictory recovery order (#2360 shape)");
+
+    // Control: armed + stale-ref ALSO reports the live table — the failed
+    // refs were the model's stale input, not this table (the table is
+    // re-derived from the current view), so honest reporting is safe and the
+    // armed note mirrors the receipt's STOP order for non-substrate causes.
+    session.metadata["compressFailStreak"] = { n: 4, lastAt: Date.now(), cause: "stale-ref — the refs belong to another session generation (or are typos)" };
+    const stale = handleAcpStatus({}, ctx).text ?? "";
+    assert.ok(stale.includes("Compressible ranges ("), "stale-ref armed still reports the live table");
+    assert.doesNotMatch(stale, /SUPPRESSED/, "no suppression claim anywhere");
+    assert.match(stale, /do not attempt to compress now; continue the task/, "receipt STOP order mirrored for non-substrate causes");
+    assert.match(stale, /FOLD BASE GENERATION MISMATCH/, "stale-ref section still renders while armed");
 });
 
 test("#2432: conflict footer stops presenting host-native landings as a second compressor", () => {

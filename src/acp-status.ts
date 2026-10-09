@@ -129,13 +129,17 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // wording stays verbatim (#2146 owner decision); this surface gets the
     // armed state instead, with the counter visible (issue expected behavior 4).
     const breaker = compressBreakerDetail(ctx.session);
-    // #2432: react to the failure verdict at n=1, not at arming. A compress
-    // failure attributed to a dead substrate or a foreign ref generation means
-    // every range this surface would advertise cannot anchor — advertising
-    // them anyway is exactly how the model burned 15+ attempts in the incident
-    // (it compressed the ranges this very surface had broadcast moments before).
+    // #2451 review (v2): the table is always reported — see the comment at
+    // the formatRanges call site for the live-by-construction argument. These
+    // flags only pick WHICH honest annotation rides along: a substrate-
+    // destruction attribution arms the receipt's single recovery step ("run
+    // acp_status once, then compress ONLY a range it currently reports as
+    // compressible; one success clears this breaker"), so the armed note must
+    // point at the live table; every other cause mirrors the receipt's STOP
+    // order instead of inventing a second command (#2360 two-orders shape).
     const lastCause = compressLastFailureCause(ctx.session);
-    const substrateInvalid = lastCause !== undefined && (lastCause.startsWith("substrate-destruction") || lastCause.startsWith("stale-ref"));
+    const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
+    const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
     try {
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
@@ -162,7 +166,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const minChars = ctx.config.compress.minCompressRange;
             const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
-            if (!breaker && !substrateInvalid && (ranges.length > 0 || protectedRanges.length > 0)) {
+            // #2451 review (v2): the table is ALWAYS reported. It is live by
+            // construction — buildCompressibleRanges (kernel/src/recommend.ts)
+            // derives refs from the CURRENT resent view only (byRaw[msg.id]),
+            // after screening covered/media/protected/withdrawn messages — so
+            // an advertised range always anchors. Hiding it behind
+            // cause-string policy is how the receipt-vs-status contradiction
+            // (#2451 M2) was born; anti-loop pressure belongs to the receipts
+            // (which carry the STOP order), not to lying by omission here.
+            if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
@@ -182,15 +194,24 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (breaker) {
         extra.push("");
         extra.push(`COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: ${breaker.n} / ${breaker.threshold}. Disarms on one successful compress or ${breaker.decayMinutes} min without further failures.`);
-        extra.push("The Compressible-ranges list is SUPPRESSED while the breaker is armed: recent compress attempts have all failed and re-attempting fails the same way. Do not attempt to compress now; continue the task.");
-    }
-    if (substrateInvalid) {
-        extra.push("");
-        if (lastCause.startsWith("stale-ref")) {
-            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The Compressible-ranges list is SUPPRESSED: refs from a previous generation cannot anchor in this session. Recovery: run acp_status again after the next request and compress only what it then reports; if refs keep failing, start a fresh conversation.`);
+        if (substrateDestroyed) {
+            extra.push("Last failures were attributed to substrate-destruction (an out-of-band history rewrite). The Compressible-ranges list above was re-derived from the CURRENT resent view: per the receipt, compress ONLY a range listed there — one success clears this breaker. If no ranges are listed, continue the task without compressing.");
         } else {
-            extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. Advertised ranges cannot anchor in this session; compression is unavailable here.`);
-            extra.push("Recovery: start a fresh conversation — the folded base no longer matches what the client resends.");
+            extra.push("The Compressible-ranges list above was re-derived from the current view — the table is live; it is the earlier attempts that failed, not these ranges. Per the failure receipt: do not attempt to compress now; continue the task.");
+        }
+    }
+    // #2451 review (v2): the standalone paragraphs state the failure CAUSE and
+    // its recovery path; they no longer claim the list is suppressed (it never
+    // is now). The fresh-conversation advice stays pre-arming only — when the
+    // breaker is armed on substrate-destruction the tailored armed line above
+    // IS the recovery order, and a second order would recreate the
+    // two-orders-in-one-output #2360 shape.
+    if (staleRef || (substrateDestroyed && breaker === undefined)) {
+        extra.push("");
+        if (staleRef) {
+            extra.push(`FOLD BASE GENERATION MISMATCH — last compress failure: ${lastCause}. The refs that failed belong to another session generation; the Compressible-ranges list above was re-derived from the current view — compress only ranges it lists. If refs keep failing, start a fresh conversation.`);
+        } else {
+            extra.push(`FOLD SUBSTRATE INVALID — last compress failure was attributed to ${lastCause}. The Compressible-ranges list above was re-derived from the current view; if folding a listed range fails again, start a fresh conversation — the folded base no longer matches what the client resends.`);
         }
     }
     // #1097: the processTurn above already resolved the envelope when armed
