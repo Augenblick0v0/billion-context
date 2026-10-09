@@ -167,7 +167,7 @@ export async function forward(
         const laneCred = laneCredential(opts.routes, upstreamUrl, (message) => log("warn", `[${prepared?.session.id ?? "passthrough"}] ${message}`));
         if (laneCred !== undefined) {
             applyLaneCredential(headers, laneCred, (message) => log("warn", `[${prepared?.session.id ?? "passthrough"}] ${message}`));
-            log("debug", `[${prepared?.session.id ?? "passthrough"}] [lane-credential] applied ${laneCred.reference} for ${upstreamUrl} (#2336)`);
+            log("debug", `[${prepared?.session.id ?? "passthrough"}] [lane-credential] applied ${laneCred.reference} for ${maskUrlForLog(upstreamUrl)} (#2336)`);
         }
     }
     const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
