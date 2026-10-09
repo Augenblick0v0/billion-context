@@ -14,6 +14,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
@@ -196,26 +197,42 @@ export async function prepareResponses(
         const absorbActive = absorbBlock?.enabled === true && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-        // #2372: codex's LOCAL auto-compaction (rollout event type:"compacted")
-        // never transits the proxy — the first the proxy hears of it is this
-        // request replaying [compaction summary, retained tail…]. Without a
-        // boundary here the folded head's covered ids simply vanish: syncBlocks
-        // keeps partially-alive blocks active forever, fold anchors
+        // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
+        // and the call never transits the proxy; the first the proxy hears of
+        // it is this request replaying [compaction summary, retained tail…].
+        // Without a boundary here the folded head's covered ids simply vanish:
+        // syncBlocks keeps partially-alive blocks active forever, fold anchors
         // self-destruct on the first pass, and every later turn logs coverage
         // drift without recovering (the #2193 escalation is observe-only).
-        // Detect the signature (codex client + summary template heading a
-        // resent message + decimated fold coverage) and rebase through the same
-        // reset the /responses/compact endpoint path uses — mark + reconcile
-        // back-to-back resets NOW, so this turn's processTurn assigns fresh
-        // refs onto the compacted view instead of poisoning anchors first.
-        if (!isCompactionTrigger && session.state.blocks.some((b) => b.active) && isCodexClient(req.headers)) {
+        // TWO producers replay that shape on this wire: codex (rollout event
+        // type:"compacted", #2372) and dsh desktop's compaction-basic
+        // checkpoint (#2432) — CONFIGURATION.md names responses "the lane dsh
+        // desktop's compaction actually rides" (#2360), yet before the #2451
+        // review this slot covered codex only and the dsh desktop scenario
+        // fell back into the pre-#2432 death spiral. Detect (client identity
+        // + summary template in a resent message + decimated fold coverage)
+        // and rebase through the same reset the /responses/compact endpoint
+        // path uses — mark + reconcile back-to-back resets NOW, so this turn's
+        // processTurn assigns fresh refs onto the compacted view instead of
+        // poisoning anchors first.
+        const codexLane = !isCompactionTrigger && isCodexClient(req.headers);
+        const dshLane = !isCompactionTrigger && session.metadata["pluginAgent"] === "dsh";
+        if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
             const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
-            if (localGap && carriesCodexLocalCompactionSummary(msgs)) {
+            const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
+            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs);
+            if (localGap && (codexHit || dshHit)) {
                 const missing = localGap.expected - localGap.matched;
-                if (missing >= CODEX_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= localGap.expected) {
-                    recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
-                    log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
+                if (missing >= minMissing && missing * 2 >= localGap.expected) {
+                    if (dshHit) {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log("warn", `[${sessionId}] dsh native compaction detected (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    } else {
+                        recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                        log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                    }
                     markNativeCompactionBoundary(session);
                     reconcileNativeCompactionBoundary(session);
                 }
