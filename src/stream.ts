@@ -220,14 +220,18 @@ const COMPRESS_LOOP_KEY = "compressFailStreak";
 const COMPRESS_LOOP_THRESHOLD = 3;
 const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
 
-type CompressLoopStreak = { n: number; lastAt: number };
+type CompressLoopStreak = { n: number; lastAt: number; cause?: string };
 
 function readCompressLoopStreak(session: Session): CompressLoopStreak | undefined {
     const v = session.metadata[COMPRESS_LOOP_KEY];
     if (!v || typeof v !== "object") return undefined;
     const o = v as Record<string, unknown>;
     if (typeof o["n"] !== "number" || !Number.isFinite(o["n"]) || typeof o["lastAt"] !== "number") return undefined;
-    return { n: Math.max(0, Math.floor(o["n"] as number)), lastAt: o["lastAt"] as number };
+    return {
+        n: Math.max(0, Math.floor(o["n"] as number)),
+        lastAt: o["lastAt"] as number,
+        ...(typeof o["cause"] === "string" && (o["cause"] as string).length > 0 ? { cause: o["cause"] as string } : {}),
+    };
 }
 
 function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undefined): void {
@@ -236,20 +240,45 @@ function writeCompressLoopStreak(session: Session, s: CompressLoopStreak | undef
     markDirty(session);
 }
 
+// #2146: the loop-noise pause paragraph. Wording kept VERBATIM on purpose
+// (owner decision, 2026-10-07) — the direct voice is part of the fix's
+// measured behavior. This comment is written in neutral terms because
+// provider-side content scanners read source files that agents open.
+function loopNoisePauseParagraph(n: number): string {
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed and further attempts will keep failing. STOP calling compress now: do not try other ranges, do not re-issue any previous range, and do not poll acp_status. Continue your actual task without compressing — compression happens again only when there is genuinely new content to fold.]`;
+}
+
+// #2432: substrate-destruction is NOT loop noise. When the fold substrate was
+// destroyed by an out-of-band history rewrite, blind stopping leaves the model
+// in a room with no exit — the ONLY recovery is one acp_status plus a
+// live-range re-anchor, and one success clears the breaker. The blanket "do
+// not poll acp_status" order above is right for noise and wrong for this
+// cause, so the armed receipt branches on compressFailureCause (#2360 §2.4
+// already computes it at the same sites).
+function substrateDestructionPauseParagraph(n: number): string {
+    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one success clears this breaker. If acp_status reports no compressible ranges, continue your task without compressing.]`;
+}
+
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
  *  it: successful calls always go through, and one success clears the streak
- *  (clearCompressLoopStreak). Receipt wording is kept verbatim on purpose
- *  (owner decision, 2026-10-07) — the direct voice is part of the fix's
- *  measured behavior. This comment is written in neutral terms because
- *  provider-side content scanners read source files that agents open. */
-function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
+ *  (clearCompressLoopStreak). The pause paragraph branches on the failure
+ *  cause (#2432): substrate-destruction gets the single-recovery-step
+ *  wording, everything else keeps the verbatim loop-noise paragraph. */
+function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string): string {
     const now = Date.now();
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
-    writeCompressLoopStreak(ctx.session, { n, lastAt: now });
+    // #2432: persist the failure cause on the streak so surfaces OUTSIDE the
+    // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
+    // instead of waiting for the third failure to arm the breaker. A cause
+    // only ever moves forward: an unknown-cause failure keeps the last known
+    // verdict rather than erasing it.
+    const freshCause = errs !== undefined ? compressFailureCause(errs, ctx.session) : "";
+    const cause = freshCause !== "" ? freshCause : streak?.cause;
+    writeCompressLoopStreak(ctx.session, { n, lastAt: now, ...(cause !== undefined ? { cause } : {}) });
     if (n < COMPRESS_LOOP_THRESHOLD) return "";
     const label = specLabel || "unparseable call";
     if (n === COMPRESS_LOOP_THRESHOLD) {
@@ -257,11 +286,41 @@ function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string): string {
     } else {
         ctx.log(`[warn: compress-loop] failure ${n} in armed streak (last spec: ${label})`);
     }
-    return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed and further attempts will keep failing. STOP calling compress now: do not try other ranges, do not re-issue any previous range, and do not poll acp_status. Continue your actual task without compressing — compression happens again only when there is genuinely new content to fold.]`;
+    if (errs !== undefined && compressFailureCause(errs, ctx.session).startsWith("substrate-destruction")) {
+        return substrateDestructionPauseParagraph(n);
+    }
+    return loopNoisePauseParagraph(n);
 }
 
 function clearCompressLoopStreak(session: Session): void {
     if (readCompressLoopStreak(session)) writeCompressLoopStreak(session, undefined);
+}
+
+/** #2432: armed-breaker state for surfaces outside the receipt (acp_status,
+ *  nudge injection gates). A streak counts as armed while n ≥ threshold AND
+ *  within the decay window — the same two conditions noteCompressLoopFailure
+ *  applies, so a decayed-but-not-yet-overwritten streak reads as disarmed
+ *  here even before the next failure rewrites the metadata. */
+export function compressBreakerDetail(session: Session): { n: number; threshold: number; decayMinutes: number; cause?: string } | undefined {
+    const s = readCompressLoopStreak(session);
+    if (!s || s.n < COMPRESS_LOOP_THRESHOLD) return undefined;
+    if (Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
+    return { n: s.n, threshold: COMPRESS_LOOP_THRESHOLD, decayMinutes: Math.round(COMPRESS_LOOP_DECAY_MS / 60000), ...(s.cause !== undefined ? { cause: s.cause } : {}) };
+}
+
+export function compressBreakerArmed(session: Session): boolean {
+    return compressBreakerDetail(session) !== undefined;
+}
+
+/** #2432: the last recorded compress-failure cause, readable while the breaker
+ *  is NOT yet armed (n < threshold) and within the decay window. acp_status
+ *  uses it to stop advertising ranges the moment a failure is attributed to a
+ *  dead substrate or a foreign ref generation — before the third failure arms
+ *  the breaker and the model has already been pointed at failing ranges twice. */
+export function compressLastFailureCause(session: Session): string | undefined {
+    const s = readCompressLoopStreak(session);
+    if (!s || Date.now() - s.lastAt > COMPRESS_LOOP_DECAY_MS) return undefined;
+    return s.cause;
 }
 
 // #2360 §2: while the breaker is armed, the kernel's per-error retry guidance
@@ -685,7 +744,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const dropped = droppedEntriesNote(diagnostics);
             const specKey = normalizedSpecKey(ranges);
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
@@ -878,7 +937,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
         const specKey = normalizedSpecKey(ranges);
-        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey) : ""}]`, "refused", 0, "exception");
+        return compressResult(`[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, specKey)}${trackLoop ? noteCompressLoopFailure(ctx, specKey, String(err)) : ""}]`, "refused", 0, "exception");
     }
 }
 

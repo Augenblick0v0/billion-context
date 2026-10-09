@@ -125,6 +125,13 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
     }
     const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
+    // #2432: a ledger pointing at the client's OWN native compaction landing is
+    // not "a second compressor fighting you" — commanding the model to hunt for
+    // and disable another plugin sends it on a useless errand (the incident
+    // model did exactly that). Only foreign CONFIRMED third-party events keep
+    // the one-compressor command; suspected names never do (#1736 tiering).
+    const foreignConfirmed = events.some((e) => e.kind === "third-party-plugin" && !isSuspectedEvent(e));
+    const nativePresent = events.some((e) => e.kind === "native-compaction");
     // #2261: a ledger naming ONLY bili's own siblings (billion-context-pi /
     // opencode-acp) is not a foreign-compressor alarm — they stand down while
     // bili drives the session (#820/#920), so never command removal for them.
@@ -136,7 +143,9 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
             ? "All events above are older than 7 days (historical stock): the double-compression risk may no longer be live. Verify the other compression plugin is removed or blocked by bili, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : allSuspected
                 ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
-                : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+                : nativePresent && !foreignConfirmed
+                    ? "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation."
+                    : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
     // #2219: actionable per-client remediation — the surfaces used to stop at
     // WHAT happened; answering HOW required digging out four separate doc
     // locations, none linked from any conflict surface. Skipped for the #2261
