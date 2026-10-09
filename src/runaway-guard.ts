@@ -46,7 +46,7 @@ export const TOOL_XML_THRESHOLD = 300; // legit multi-tool turns << this; runawa
 // non-fragment bytes per fragment (incident B ≈ 10–20 B/fragment, values are
 // empty or single-token); real content spaces fragments with the payload.
 // Trip requires count ≥ threshold AND average inter-fragment gap ≤ this floor.
-export const TOOL_XML_GAP_AVG_BYTES = 64;
+const TOOL_XML_GAP_AVG_BYTES = 64;
 
 // Bounded carry-over so a marker split across two chunks is still seen whole. Longer
 // than any single runaway marker (short tags with short attrs); a pathological long
