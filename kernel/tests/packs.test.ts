@@ -101,8 +101,8 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
   };
   const howTo = pi.promptSections.howToCompress ?? "";
   assert.ok(
-    howTo.length > 800 && howTo.length < 3100,
-    `condensed, not full (len=${howTo.length}; ceiling raised for the #442 open-objectives rule)`,
+    howTo.length > 800 && howTo.length < 3300,
+    `condensed, not full (len=${howTo.length}; ceiling raised for the #442 open-objectives rule, #4313 timeline rule)`,
   );
   for (const marker of [
     "TASK AS OF THIS BLOCK",
@@ -113,6 +113,9 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
     "PRIORITY",
     "Do not mimic",
     "Open objectives",
+    // #4313: summaries open with a diary time line
+    "TIMELINE",
+    "Occurred:",
   ]) {
     assert.ok(howTo.includes(marker), `missing: ${marker}`);
   }

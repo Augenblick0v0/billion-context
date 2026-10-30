@@ -233,6 +233,7 @@ KEEP VERBATIM — never paraphrase or abbreviate:
 - Open questions and unresolved TODOs.
 - Open objectives: user-requested work neither completed nor superseded gets a one-line "Open objectives:" entry with message refs; scan absorbed block summaries too. Last to drop, first to restore at every tier — carrying is not a directive to re-execute unconfirmed.
 - Message refs of key anchors (m00420, m00510–m00520) for decompress.
+- TIMELINE — open each summary with one diary line stating when it happened: "Occurred: <first covered time> – <last covered time>" (yyyy-mm-dd hh:mm:ss, copied from the covered messages' time attributes; omit the line when none carry a time).
 
 DROP — keep the signal, discard the vessel: verbose logs once the error/result is captured; duplicate reads; consumed exploration (search hits, agent returns, successful outputs); dead ends (one lesson line: "tried X, failed because Y"); back-and-forth once the final position is kept; repeated status checks. For each dropped item add one line of CONTENT: what it covers ("probe.py: tests n-gram baseline..."), not where it lives.
 

@@ -23,6 +23,25 @@ function formatTokens(tokens: number): string {
   return Math.round(tokens / 1000) + "K";
 }
 
+/** #4313: epoch ms -> LOCAL wall-clock string "yyyy-mm-dd hh:mm:ss" for the
+ *  <acp> tag's time attribute. The stored value is always epoch ms (stable
+ *  across TZ), only the DISPLAY is local. Uses Date methods (getFullYear,
+ *  getMonth, ...) NOT a wall-clock read of "now" — it formats a persisted
+ *  timestamp, so prefix-cache is unaffected: re-formatting the same ms in the
+ *  same TZ yields byte-identical output. */
+export function formatTagTime(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return (
+    p(d.getFullYear(), 4) +
+    "-" + p(d.getMonth() + 1) +
+    "-" + p(d.getDate()) +
+    " " + p(d.getHours()) +
+    ":" + p(d.getMinutes()) +
+    ":" + p(d.getSeconds())
+  );
+}
+
 function classifyType(message: CoreMessage): string {
   if (
     message.contentType === "tool-call" ||
@@ -42,7 +61,7 @@ const GT = "\x3e";
 const TAG_OPEN = LT + "acp ";
 const TAG_CLOSE = LT + "/acp" + GT;
 
-function acpTag(ref: string, tokens: number, type: string): string {
+function acpTag(ref: string, tokens: number, type: string, ts?: number): string {
   return (
     TAG_OPEN +
     'tokens="' +
@@ -50,6 +69,7 @@ function acpTag(ref: string, tokens: number, type: string): string {
     '" type="' +
     type +
     '"' +
+    (typeof ts === "number" ? ' time="' + formatTagTime(ts) + '"' : "") +
     GT +
     ref +
     TAG_CLOSE
@@ -102,7 +122,9 @@ function renderMessage(
     : countTokens(cleanText);
   const tokens = textTokens + thinkingTokenValue(message.thinkingTokens);
   const type = classifyType(message);
-  const prefix = acpTag(ref, tokens, type) + "\n";
+  // #4313: render the message's immutable first-sight timestamp into the tag
+  // (absent for pre-feature messages = legacy bytes unchanged).
+  const prefix = acpTag(ref, tokens, type, message.ts) + "\n";
 
   if (!cleanText) return { ...message, text: prefix };
   return { ...message, text: prefix + cleanText };

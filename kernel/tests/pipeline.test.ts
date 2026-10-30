@@ -26,6 +26,7 @@ test("defaultNodes exposes the canonical ordered pipeline", () => {
   const names = core.defaultNodes().map((n) => n.name);
   assert.deepEqual(names, [
     "reconcile-live-ids",
+    "stamp-timestamps",
     "assign-refs",
     "sync-blocks",
     "prune",
@@ -190,13 +191,15 @@ test("processTurn tags every mapped message with a derived ref (end-to-end)", ()
     config: defaultConfig(100000),
     tokenCount: 100,
   });
+  // #4313: fresh state ⇒ both ids are first-sight arrivals ⇒ the <acp>
+  // tag carries its immutable local time-of-occurrence.
   assert.match(
     result.messages[0]!.text!,
-    /^<acp tokens="\d+" type="text">m00001<\/acp>\nalpha$/,
+    /^<acp tokens="\d+" type="text" time="\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}">m00001<\/acp>\nalpha$/,
   );
   assert.match(
     result.messages[1]!.text!,
-    /^<acp tokens="\d+" type="text">m00002<\/acp>\nbeta$/,
+    /^<acp tokens="\d+" type="text" time="\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}">m00002<\/acp>\nbeta$/,
   );
 });
 

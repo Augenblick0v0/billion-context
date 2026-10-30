@@ -292,6 +292,7 @@ export {
   renderVisibleRefs,
   renderRefsNode,
   createRenderRefsNode,
+  formatTagTime,
 } from "./render-refs.js";
 export type { RenderStrategy } from "./render-refs.js";
 export { resolveTransformChannel } from "./transform-channel.js";

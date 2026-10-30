@@ -335,15 +335,15 @@ test("render-refs preserves user content that starts with a ref-like token", () 
 
   assert.match(
     rendered[0]!.text!,
-    /^<acp tokens="\d+" type="text">m00001<\/acp>\n\[m1\] is my first point$/,
+    /^<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m00001<\/acp>\n\[m1\] is my first point$/,
   );
   assert.match(
     rendered[1]!.text!,
-    /^<acp tokens="\d+" type="text">m00002<\/acp>\n\[m00005\] please review$/,
+    /^<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m00002<\/acp>\n\[m00005\] please review$/,
   );
   assert.match(
     rendered[2]!.text!,
-    /^<acp tokens="\d+" type="text">m00003<\/acp>\n\[m00003\] \[m00003\] dup tags$/,
+    /^<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m00003<\/acp>\n\[m00003\] \[m00003\] dup tags$/,
   );
 });
 
@@ -363,11 +363,11 @@ test("render-refs is idempotent across repeated renders", () => {
   );
   assert.match(
     once[0]!.text!,
-    /^<acp tokens="\d+" type="text">m00001<\/acp>\nalpha$/,
+    /^<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m00001<\/acp>\nalpha$/,
   );
   assert.match(
     once[1]!.text!,
-    /^<acp tokens="\d+" type="text">m00002<\/acp>\n\[m00002\] beta$/,
+    /^<acp tokens="\d+" type="text"(?:\s[^<>]*)?>m00002<\/acp>\n\[m00002\] beta$/,
   );
 });
 
