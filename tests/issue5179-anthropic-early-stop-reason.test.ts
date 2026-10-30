@@ -96,6 +96,37 @@ test("the round limit ends the Anthropic turn with stop_reason max_tokens", asyn
     assert.deepEqual(stopReasons(out), ["max_tokens"]);
 });
 
+// #5220 guard-branch: on a threads-continue turn the server-side thread delta
+// structurally excludes visibility markers (client-side noise, #2701), so a
+// receipt could never ride it — such turns keep the old break contract, and
+// the break still arrives as max_tokens.
+test("a failed-only compress round on a threads-continue turn breaks WITHOUT re-requesting, ending max_tokens", async () => {
+    const body = { model: "claude-opus-5-5", stream: true, messages: [{ role: "user", content: "go on" }], thread: { type: "continue" } };
+    let reRequests = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { reRequests++; return new Response(toolRound("compress", {}), { status: 200, headers: { "content-type": "text/event-stream" } }); }) as typeof fetch;
+    let out = "";
+    try {
+        const ctx = {
+            core: createCore(),
+            config: { modelContextLimit: 200000 } as Config,
+            messages: [],
+            session: makeSession(),
+            log: () => {},
+            protocol: "anthropic" as const,
+        };
+        const round = toolRound("compress", { content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+        for await (const c of runCompressLoop(new Response(round, { status: 200 }).body!, ctx, body, { url: "http://mock", headers: {} }, createAnthropicAdapter(body), buildCompressSystemPrompt())) {
+            out += c.toString("utf8");
+        }
+    } finally {
+        globalThis.fetch = orig;
+    }
+    assert.equal(reRequests, 0, "threads-delta cannot carry the receipt → old break contract, zero re-requests");
+    assert.ok(out.includes("❌"), "the failure receipt still reaches the client");
+    assert.deepEqual(stopReasons(out), ["max_tokens"]);
+});
+
 test("upstream's own stop reasons reach the client unchanged", () => {
     for (const reason of ["end_turn", "tool_use", "max_tokens", "stop_sequence", "pause_turn", "refusal", "model_context_window_exceeded", "a_future_reason"]) {
         const frame = createAnthropicAdapter({ model: "claude-opus-5-5" }).emitCompletion({ finishReason: reason }).toString("utf8");

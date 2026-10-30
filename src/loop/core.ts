@@ -1581,8 +1581,18 @@ export async function* runCompressLoop(
                     dropIds.add(`acp_loop_r${round}_tool_${pr.callId}`);
                 }
                 coreMessages.splice(0, coreMessages.length, ...coreMessages.filter((m) => !dropIds.has(m.id)));
-                ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
-                coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
+                if (streamedMarkers.length > 0) {
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
+                    coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
+                } else {
+                    // Every failure marker of this round was deduped against an
+                    // earlier round — the client saw nothing new, so a receipt
+                    // would be a zero-byte assistant frame (strict wires reject
+                    // empty text blocks). Skip it: the body degrades to history +
+                    // prose, stays cache-clean, and the signature breaker /
+                    // MAX_LOOP_ROUNDS bound any resulting ping-pong.
+                    ctx.log(`[acp-loop] round ${round}: failed-only mutating round; all markers deduped (nothing new reached the client), re-requesting without a receipt (#5220)`);
+                }
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
