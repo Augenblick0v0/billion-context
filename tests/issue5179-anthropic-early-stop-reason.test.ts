@@ -6,11 +6,10 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
-// #5179: the loop ends a turn early in two places — a failed-only compress
-// round (#156/#4186) and the round limit — both with finishReason "length",
-// OpenAI's word. The Anthropic wire has no such stop reason, and Claude Code
-// reads an unknown one as a plain end of turn, stopping the task mid-flight.
-// The adapter must translate to "max_tokens", which Claude Code auto-resumes.
+// #5179: early turn-ends emit finishReason "length" (OpenAI's word); the
+// Anthropic wire has no such stop reason, and Claude Code reads an unknown one
+// as a plain end of turn, stopping the task mid-flight. The adapter must
+// translate to "max_tokens", which Claude Code auto-resumes.
 
 function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -78,11 +77,15 @@ function stopReasons(out: string): unknown[] {
         .map((e) => e.delta?.stop_reason);
 }
 
-test("a failed-only compress round ends the Anthropic turn with stop_reason max_tokens, so Claude Code resumes", async () => {
+// #5220 contract: the FIRST failed-only compress round feeds the model a
+// recovery receipt and re-requests; this fixture resubmits the identical
+// failing call on round 2, where the restored #156 signature breaker ends the
+// turn — and whatever the reason, it arrives as "max_tokens", never "length".
+test("a failed-only compress round that resubmits its failure ends the Anthropic turn with stop_reason max_tokens, so Claude Code resumes", async () => {
     const { out, reRequests } = await runAnthropicLoop(
         toolRound("compress", { content: [{ startId: "m00001", endId: "m00002", summary: "s" }] }),
     );
-    assert.equal(reRequests, 0, "the #156/#4186 early end still holds: the failed frame never reaches upstream");
+    assert.equal(reRequests, 1, "first-time failure re-requests once (recovery receipt, #5220); the identical round-2 resubmit trips the #156 signature breaker");
     assert.ok(out.includes("❌"), "the failure receipt still reaches the client");
     assert.deepEqual(stopReasons(out), ["max_tokens"]);
 });
