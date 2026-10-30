@@ -191,15 +191,14 @@ test("processTurn tags every mapped message with a derived ref (end-to-end)", ()
     config: defaultConfig(100000),
     tokenCount: 100,
   });
-  // #4313: fresh state ⇒ both ids are first-sight arrivals ⇒ the <acp>
-  // tag carries its immutable local time-of-occurrence.
+  // Default construction is flag-OFF (#4313 toggle, PR #5236): legacy bytes, no time attr.
   assert.match(
     result.messages[0]!.text!,
-    /^<acp tokens="\d+" type="text" time="\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}">m00001<\/acp>\nalpha$/,
+    /^<acp tokens="\d+" type="text">m00001<\/acp>\nalpha$/,
   );
   assert.match(
     result.messages[1]!.text!,
-    /^<acp tokens="\d+" type="text" time="\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}">m00002<\/acp>\nbeta$/,
+    /^<acp tokens="\d+" type="text">m00002<\/acp>\nbeta$/,
   );
 });
 

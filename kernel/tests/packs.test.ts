@@ -9,6 +9,8 @@ import {
   defaultPack,
   leanPack,
   LEAN_HOW_TO_COMPRESS,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   leanHowToCompress,
   HOW_TO_COMPRESS_RULES,
   TIER2_DISTILL_RULES,
@@ -101,8 +103,8 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
   };
   const howTo = pi.promptSections.howToCompress ?? "";
   assert.ok(
-    howTo.length > 800 && howTo.length < 3300,
-    `condensed, not full (len=${howTo.length}; ceiling raised for the #442 open-objectives rule, #4313 timeline rule)`,
+    howTo.length > 800 && howTo.length < 3100,
+    `condensed, not full (len=${howTo.length}; ceiling raised for the #442 open-objectives rule)`,
   );
   for (const marker of [
     "TASK AS OF THIS BLOCK",
@@ -113,12 +115,15 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
     "PRIORITY",
     "Do not mimic",
     "Open objectives",
-    // #4313: summaries open with a diary time line
-    "TIMELINE",
-    "Occurred:",
   ]) {
     assert.ok(howTo.includes(marker), `missing: ${marker}`);
   }
+  // #4313 toggle: the BASE pack stays pre-feature; the timestamped variant is
+  // base + the diary-line rule, selected at host exits by the flag.
+  assert.equal(howTo, LEAN_HOW_TO_COMPRESS);
+  assert.ok(!howTo.includes("TIMELINE"), "base lean pack must not carry the timeline rule");
+  assert.ok(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.includes(TIMELINE_RULE_LINE));
+  assert.equal(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.replace(TIMELINE_RULE_LINE + "\n", ""), LEAN_HOW_TO_COMPRESS);
   // #265: summariesInContext is a compact trust guardrail now, not null
   assert.equal(
     typeof pi.promptSections.summariesInContext,

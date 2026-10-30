@@ -83,6 +83,7 @@ function renderMessage(
   strategy: RenderStrategy,
   snapshot: Record<string, number> | null = null,
   deferred: ReadonlySet<string> | null = null,
+  timestamps = false,
 ): CoreMessage {
   const ref = refForRaw(map, message.id);
   if (!ref || ref === BLOCKED_REF) return message;
@@ -122,9 +123,12 @@ function renderMessage(
     : countTokens(cleanText);
   const tokens = textTokens + thinkingTokenValue(message.thinkingTokens);
   const type = classifyType(message);
-  // #4313: render the message's immutable first-sight timestamp into the tag
-  // (absent for pre-feature messages = legacy bytes unchanged).
-  const prefix = acpTag(ref, tokens, type, message.ts) + "\n";
+  // #4313 (toggle, PR #5236): render the message's immutable first-sight
+  // timestamp into the tag ONLY when the host opted in (compress.
+  // messageTimestamps / BILI_MESSAGE_TIMESTAMPS) — absent for pre-feature
+  // messages AND for every message while the flag is off, so off renders
+  // byte-identical to pre-#4313 masters even when ts values are hydrated.
+  const prefix = acpTag(ref, tokens, type, timestamps ? message.ts : undefined) + "\n";
 
   if (!cleanText) return { ...message, text: prefix };
   return { ...message, text: prefix + cleanText };
@@ -135,6 +139,7 @@ export function renderVisibleRefs(
   state: CompressionState,
   countTokens: (text: string) => number = (text) => Math.ceil(text.length / 4),
   strategy: RenderStrategy = "all",
+  timestamps = false,
 ): CoreMessage[] {
   // Legacy behavior: recompute tokens every render (snapshot = null).
   const map = state.messageRefs;
@@ -142,7 +147,7 @@ export function renderVisibleRefs(
     ? new Set(state.renderDeferredRefs)
     : null;
   return messages.map((message) =>
-    renderMessage(message, map, countTokens, strategy, null, deferred),
+    renderMessage(message, map, countTokens, strategy, null, deferred, timestamps),
   );
 }
 
@@ -160,6 +165,7 @@ export function renderWithSnapshot(
   state: CompressionState,
   countTokens: (text: string) => number = (text) => Math.ceil(text.length / 4),
   strategy: RenderStrategy = "all",
+  timestamps = false,
 ): RenderWithSnapshotResult {
   const map = state.messageRefs;
   const snapshot = { ...(state.tokenSnapshot ?? {}) };
@@ -167,13 +173,19 @@ export function renderWithSnapshot(
     ? new Set(state.renderDeferredRefs)
     : null;
   const rendered = messages.map((message) =>
-    renderMessage(message, map, countTokens, strategy, snapshot, deferred),
+    renderMessage(message, map, countTokens, strategy, snapshot, deferred, timestamps),
   );
   return { messages: rendered, tokenSnapshot: snapshot };
 }
 
-/** Factory: build a render-refs node bound to a specific render strategy. */
-export function createRenderRefsNode(strategy: RenderStrategy): PipelineNode {
+/** Factory: build a render-refs node bound to a specific render strategy and
+ *  timestamp flag (#4313 toggle — `timestamps` gates the <acp> time attribute;
+ *  default false renders legacy bytes). */
+export function createRenderRefsNode(
+  strategy: RenderStrategy,
+  options?: { timestamps?: boolean },
+): PipelineNode {
+  const timestamps = options?.timestamps === true;
   return {
     name: "render-refs",
     run(io: NodeIO, ctx: PipelineContext): NodeIO {
@@ -182,6 +194,7 @@ export function createRenderRefsNode(strategy: RenderStrategy): PipelineNode {
         io.state,
         ctx.countTokens,
         strategy,
+        timestamps,
       );
       // Write the snapshot back only when it grew: steady-state (all hits)
       // must not churn the state object and force an adapter save every turn.

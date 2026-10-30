@@ -94,6 +94,8 @@ export {
   leanPack,
   LEAN_HOW_TO_COMPRESS,
   leanHowToCompress,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   builtinSource,
   createDirPackSource,
   createPackResolver,
