@@ -138,6 +138,11 @@ export interface MessageRow {
      *  content CAS, refcounted via message_media rows). Ingest-only —
      *  readers always receive hydrated content. */
     media?: { hash: string; bytes: string }[];
+    /** #4313: immutable local time-of-occurrence (epoch ms). Ingest input:
+     *  taken from the message's first-sight stamp when present, else the
+     *  per-batch sampled now. Readers: NULL for pre-v10 rows (no backfill).
+     *  Never UPDATEd once written — INSERT OR IGNORE keeps the first value. */
+    ts?: number | null;
     /** #4390: position-independent identity (stored-bytes serialization
      *  minus id/wireIndex) — the cross-save JOIN key. content_hash stays
      *  the byte-faithful CAS key; identity is what remap/sweep/guard join
@@ -957,13 +962,16 @@ export class UnifiedStore {
                 )
                 .run(s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt);
 
+            // #4313: one wall-clock sample per save batch — rows without a
+            //  per-message first-sight stamp all carry the same second.
+            const batchTs = Date.now();
             for (const m of messages) {
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
-                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content));
+                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs);
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -1794,7 +1802,7 @@ export class UnifiedStore {
         const exportPath = join(opts.archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
         if (row.status === "archived") return { ok: true, exportPath };
         // --- read everything the session owns (before any mutation) ---
-        const messages = (this.db.prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq").all(sessionId) as Record<string, unknown>[]);
+        const messages = (this.db.prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? ORDER BY seq").all(sessionId) as Record<string, unknown>[]);
         const mediaMaps = (this.db.prepare("SELECT seq, media_hash FROM message_media WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const blocks = (this.db.prepare("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
@@ -1894,8 +1902,8 @@ export class UnifiedStore {
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
             for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
-            const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-            for (const m of dump.messages) insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash);
+            const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            for (const m of dump.messages) insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, typeof m.ts === "number" ? m.ts : null);
             const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
             const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
@@ -2675,8 +2683,8 @@ export class UnifiedStore {
             }
             this.db
                 .prepare(
-                    `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
-                     SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                    `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts)
+                     SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts FROM messages
                      WHERE session_id = ? AND seq <= ?`,
                 )
                 .run(childId, parentId, throughSeq);
@@ -2744,11 +2752,11 @@ export class UnifiedStore {
      *  POSITION and id (block anchoring, seam chain byId), but covered rows'
      *  BYTES never ride the outbound — loading them per request is pure read
      *  amplification on big folded sessions. */
-    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+    messageIdRows(sessionId: string): { seq: number; msgId: string; ts: number | null }[] {
         const rows = this.db
-            .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+            .prepare("SELECT seq, msg_id, ts FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
             .all(sessionId) as Record<string, unknown>[];
-        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string }));
+        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string, ts: (r.ts as number | null) ?? null }));
     }
 
     /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
@@ -2756,7 +2764,7 @@ export class UnifiedStore {
      *  are harmless (each pair contributes an outside-of-pair conjunct).
      *  Empty interval list = every live row. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
-        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL";
+        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? AND retired_at IS NULL";
         const params: unknown[] = [sessionId];
         for (const [a, b] of intervals) {
             sql += " AND (seq < ? OR seq > ?)";
@@ -2772,6 +2780,7 @@ export class UnifiedStore {
             role: r.role as string,
             kind: r.kind as string,
             contentHash: r.content_hash as string,
+            ts: (r.ts as number | null) ?? null,
             content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
         }));
     }
@@ -2791,7 +2800,7 @@ export class UnifiedStore {
         if (!opts?.seqs && opts?.fromSeqExclusive !== undefined) params.push(opts.fromSeqExclusive);
         const rows = this.db
             .prepare(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
             )
             .all(...params) as Record<string, unknown>[];
         return rows.map((r) => {
@@ -2805,6 +2814,7 @@ export class UnifiedStore {
             kind: r.kind as string,
             contentHash: r.content_hash as string,
             retiredAt: (r.retired_at as number | null) ?? null,
+            ts: (r.ts as number | null) ?? null,
             content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
             };
         });
@@ -2825,7 +2835,7 @@ export class UnifiedStore {
             const chunk = unique.slice(i, i + CHUNK);
             const rows = this.db
                 .prepare(
-                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages
+                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
                      WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 )
                 .all(sessionId, ...chunk) as Record<string, unknown>[];
@@ -2839,6 +2849,7 @@ export class UnifiedStore {
                     role: r.role as string,
                     kind: r.kind as string,
                     contentHash: r.content_hash as string,
+                    ts: (r.ts as number | null) ?? null,
                     content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
                 });
             }

@@ -828,10 +828,10 @@ export class UnifiedShadow {
         return this.sync.activeForeignWriter();
     }
 
-    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] {
         if (this.sync === null) return [];
         this.assertLive();
-        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
@@ -1225,8 +1225,8 @@ export class UnifiedShadow {
         return this.viaAsync({ ok: false, reason: "async backend" }, () => this.restoreArchived(sessionId, opts), () => this.enqueue(() => this.backend!.restoreArchived(sessionId, opts)));
     }
 
-    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string }[]> {
-        return this.viaAsync([], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content })));
+    rawMessagesAsync(sessionId: string): Promise<{ seq: number; content: string; ts: number | null }[]> {
+        return this.viaAsync([] as { seq: number; content: string; ts: number | null }[], () => this.rawMessages(sessionId), async () => (await this.backend!.getMessages(sessionId)).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null })));
     }
 
     tailSeqsAsync(sessionId: string): Promise<number[] | null> {
