@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
+import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
@@ -1416,9 +1417,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return prev === undefined || prev !== b.summary;
         });
         syncSubagentSessions(ctx.session, changedBlocks, ctx.compressMessages ?? ctx.messages);
+        // #4313 toggle (PR #5236): the [start – end] coverage span rides the
+        // same flag as the wire tags — default OFF keeps receipts byte-identical
+        // to pre-feature master. Storage still stamps unconditionally; this only
+        // gates the display span.
+        const messageTimestampsOn = resolveMessageTimestamps(loadConfigFile().compress);
         const subagentMap = subagentSessionsOf(ctx.session);
         for (const b of changedBlocks) {
-            msg += `\n${summaryFingerprintLine(b.blockId, b.summary, blockCoverageTimes(b, res.state))}`;
+            msg += `\n${summaryFingerprintLine(b.blockId, b.summary, messageTimestampsOn ? blockCoverageTimes(b, res.state) : null)}`;
             logMsg += `\n${summaryFingerprintLogLine(b.blockId, b.summary)}`;
             const ids = subagentMap[b.blockId];
             if (ids !== undefined && ids.length > 0) {
