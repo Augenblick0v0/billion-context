@@ -95,23 +95,13 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
-<<<<<<< HEAD
- "stateDigest": "37aa2517b86bc8d8ebbb69f3b2b88ae846f44b269feb401956b28f65712967f9",
- "stateDigestAligned": "aebc5d16e500e193c08652c54214ac50f8acfc6ba89d24e33371a7eb2a06d2a9",
- "sectionDigests": {
-  "state": "3b0f64f8e2b16e36",
-  "blockContents": "473264d9df8ba338",
-  "stats": "b215001eb0f2a5ff",
-  "metadata": "b7105b705a1d792b"
-=======
- "stateDigest": "e3aa459b7ac55f00fd55dfd4a3cc8ab76edbd44df40d8125664b2949038e7ca8",
+ "stateDigest": "b713f8a3aad07dd679b8c78f9808e2b9df98f7e7caa7dd981b356e060378a232",
  "stateDigestAligned": "3edf30944b7403d092147e15f1d9016ab51ef38d2a34c23ff477f1ba67e39885",
  "sectionDigests": {
   "state": "3b0f64f8e2b16e36",
   "blockContents": "473264d9df8ba338",
   "stats": "f64d110552f24023",
-  "metadata": "cabdc8b044bfd2f2"
->>>>>>> c0fa5b2d62b91464028caa66c6b6f6a054675934
+  "metadata": "208e2ec2bd313ec5"
  },
  "stateKeyDigests": {
   "blocks": "0cfd0b9c0fc53073",
